@@ -77,6 +77,11 @@ cargo build --locked
 - `compact` runs vacuum compaction + index rebuilds (SOTA maintenance).
 - `doctor` exposes full repair/verify controls.
 
+## Deployment and connectors
+
+- `docs/DEPLOYMENT.md` for local, Docker, and cloud deployment.
+- `docs/CONNECTORS.md` for Telegram + WhatsApp bridges and subagent fan‑out.
+
 ## Maintenance (SOTA compaction)
 
 ```bash
@@ -149,6 +154,8 @@ Optional: persist the hook in the capsule config so you can omit `--model-hook`:
   }
 }'
 ```
+
+Note: lower `log_commit_interval` improves durability (set to 1 for audit‑grade logging).
 
 ## Docker deploy (minimal)
 

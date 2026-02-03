@@ -917,6 +917,7 @@ where
 }
 
 fn with_write_mem<F, R>(
+    mem_read: &mut Option<Vault>,
     mem_write: &mut Option<Vault>,
     mv2: &Path,
     allow_create: bool,
@@ -926,6 +927,7 @@ where
     F: FnOnce(&mut Vault) -> Result<R, String>,
 {
     if mem_write.is_none() {
+        *mem_read = None;
         let opened = if allow_create {
             open_or_create(mv2).map_err(|e| e.to_string())?
         } else {
@@ -2676,7 +2678,7 @@ fn execute_tool_with_handles(
             let Some(text) = parsed.text else {
                 return Err("put requires text".into());
             };
-            let result = with_write_mem(mem_write, mv2, true, |mem| {
+            let result = with_write_mem(mem_read, mem_write, mv2, true, |mem| {
                 let mut options = PutOptions::default();
                 options.uri = Some(parsed.uri.clone());
                 options.title = Some(parsed.title.unwrap_or_else(|| parsed.uri.clone()));
@@ -2711,7 +2713,7 @@ fn execute_tool_with_handles(
                 meta: parsed.meta.clone(),
                 ts_utc: Some(Utc::now().timestamp()),
             };
-            let result = with_write_mem(mem_write, mv2, false, |mem| {
+            let result = with_write_mem(mem_read, mem_write, mv2, false, |mem| {
                 let uri = append_agent_log(mem, &entry).map_err(|e| e.to_string())?;
                 let details = serde_json::json!({ "uri": uri });
                 Ok(ToolExecution {
@@ -2733,7 +2735,7 @@ fn execute_tool_with_handles(
                 session: parsed.session.clone(),
                 ts_utc: Some(Utc::now().timestamp()),
             };
-            let result = with_write_mem(mem_write, mv2, false, |mem| {
+            let result = with_write_mem(mem_read, mem_write, mv2, false, |mem| {
                 let uri_log = append_feedback(mem, &event).map_err(|e| e.to_string())?;
                 let details = serde_json::json!({ "uri": uri_log });
                 Ok(ToolExecution {
