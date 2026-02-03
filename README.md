@@ -1,26 +1,47 @@
-# KairosVault
+# AetherVault
 
-KairosVault is a **single‑file, append‑only memory capsule** plus a **hybrid retrieval engine** for agents.  
+**AetherVault** is a **single‑file, append‑only memory capsule** plus a **hybrid retrieval engine** for agents.  
 All content, indexes, embeddings, queries, and feedback live inside one `.mv2` archive.
 
-## What we’re building
+## Why it’s novel
 
-- **Single‑file capsule**: treat `.mv2` as the index *and* the content store (no SQLite DB, no sidecar files).
-- **Hybrid query pipeline**:
-  - query expansion (optional),
-  - lexical BM25 + vector search in parallel,
-  - fusion (RRF + bonuses),
-  - reranking (local or hook-based),
-  - position-aware blending (protect exact matches, improve recall).
-- **Time-travel retrieval**: query “as-of” a frame/timestamp to reproduce what the agent “knew” then.
-- **Feedback becomes memory**: store queries, expansions, reranks, and user feedback as frames so the capsule can improve and remain auditable.
-- **Agent harness surface**: context packs, logs, feedback, MCP server, and a minimal hook‑based agent loop.
+- **Memory is portable, auditable, and mergeable**: everything (content + indexes + query/feedback traces) lives in one capsule you can diff/merge like a repo.
+- **Queries are first‑class memory**: searches, expansions, reranks, and feedback are stored as frames, so the system improves while staying explainable.
+- **Hybrid retrieval by design**: expansion → lex + vec lanes → fusion → rerank → blend, with hook points for local or remote models.
+- **Time‑travel retrieval**: “what did the agent know at time T?” is a built‑in query mode.
+- **Agent‑ready surface**: MCP server compatibility, context packs, and a minimal hook‑based agent loop.
+
+## System at a glance
+
+```mermaid
+flowchart LR
+  A[Agent / Tool Caller] -->|query| B[AetherVault CLI]
+  B --> C{Expansion Hook}
+  C --> D[Lexical Lane (BM25)]
+  C --> E[Vector Lane (Optional)]
+  D --> F[Fusion (RRF + bonuses)]
+  E --> F
+  F --> G[Rerank Hook]
+  G --> H[Blended Results]
+  H --> I[Context Pack / JSON / Files]
+  I -->|feedback + logs| J[(.mv2 Capsule)]
+```
+
+```mermaid
+flowchart TB
+  CAP[(.mv2 Capsule)]
+  CAP --> WAL[Append‑only WAL]
+  CAP --> TOC[TOC + Index Manifests]
+  CAP --> FR[Frames: content + metadata]
+  CAP --> TR[Tracks: queries, feedback, agent logs]
+  CAP --> CFG[aethervault://config/*]
+```
 
 ## Design docs
 
 - `docs/ARCHITECTURE.md`
 
-## Quick start (current prototype)
+## Quick start
 
 ```bash
 cargo build --locked
@@ -40,13 +61,13 @@ cargo build --locked
 ./target/debug/aethervault merge knowledge.mv2 other.mv2 merged.mv2 --force
 ```
 
-### Tool surface (agent-friendly)
+## Tool surface (agent‑friendly)
 
 - `--json` returns a structured plan + results payload.
 - `--files` emits tab‑separated `score,frame_id,uri,title`.
 - `--log` appends the query + ranked results back into the capsule as an auditable frame.
 - `embed` precomputes local embeddings for fast vector retrieval.
-- `context` builds a prompt-ready JSON pack (context + citations + plan).
+- `context` builds a prompt‑ready JSON pack (context + citations + plan).
 - `log` records agent turns in the capsule for later audits.
 - `feedback` records explicit relevance feedback to bias future rankings.
 - `config` stores portable capsule config at `aethervault://config/...`.
@@ -54,7 +75,12 @@ cargo build --locked
 - `mcp` starts a stdio tool server.
 - `agent` runs a minimal hook‑based assistant loop.
 
-### Optional vector lane
+## URI schemes
+
+- `aether://<collection>/<path>` for content
+- `aethervault://config/<key>` for portable capsule config
+
+## Optional vector lane
 
 Build with vector support and provide local embedding models:
 
@@ -62,10 +88,10 @@ Build with vector support and provide local embedding models:
 cargo build --locked --features vec
 ```
 
-The embed backend will print a download command if the ONNX model/tokenizer is missing.
-You can tune performance with `embed --batch N` and query flags like `--embed-cache`.
+The embed backend prints a download command if the ONNX model/tokenizer is missing.  
+Tune performance with `embed --batch N` and query flags like `--embed-cache`.
 
-### Agent hook (minimal harness)
+## Agent hook (minimal harness)
 
 `agent` expects a hook command that reads JSON on stdin and returns JSON:
 
@@ -77,8 +103,8 @@ See `docs/ARCHITECTURE.md` for the hook payload shapes.
 
 ## Implemented roadmap
 
-- Optional vector search lane with on-device embeddings (default build is lex-only).
+- Optional vector search lane with on‑device embeddings (default build is lex‑only).
 - Pluggable reranker + expansion hooks (drop‑in local or remote).
-- MCP-compatible tool server backed by the capsule.
+- MCP‑compatible tool server backed by the capsule.
 - Portable capsule config stored at `aethervault://config/...`.
-- Capsule diff + merge tooling (git-like for memory).
+- Capsule diff + merge tooling (git‑like for memory).
