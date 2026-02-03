@@ -15,26 +15,26 @@ All content, indexes, embeddings, queries, and feedback live inside one `.mv2` a
 
 ```mermaid
 flowchart LR
-  A[Agent / Tool Caller] -->|query| B[AetherVault CLI]
-  B --> C{Expansion Hook}
-  C --> D[Lexical Lane (BM25)]
-  C --> E[Vector Lane (Optional)]
-  D --> F[Fusion (RRF + bonuses)]
-  E --> F
-  F --> G[Rerank Hook]
-  G --> H[Blended Results]
-  H --> I[Context Pack / JSON / Files]
-  I -->|feedback + logs| J[(.mv2 Capsule)]
+  A["Agent / Tool Caller"] -->|query| B["AetherVault CLI"];
+  B --> C{"Expansion Hook"};
+  C --> D["Lexical Lane (BM25)"];
+  C --> E["Vector Lane (Optional)"];
+  D --> F["Fusion (RRF + bonuses)"];
+  E --> F;
+  F --> G["Rerank Hook"];
+  G --> H["Blended Results"];
+  H --> I["Context Pack / JSON / Files"];
+  I -->|feedback + logs| J[(".mv2 Capsule")];
 ```
 
 ```mermaid
 flowchart TB
-  CAP[(.mv2 Capsule)]
-  CAP --> WAL[Append‑only WAL]
-  CAP --> TOC[TOC + Index Manifests]
-  CAP --> FR[Frames: content + metadata]
-  CAP --> TR[Tracks: queries, feedback, agent logs]
-  CAP --> CFG[aethervault://config/*]
+  CAP[(".mv2 Capsule")];
+  CAP --> WAL["Append-only WAL"];
+  CAP --> TOC["TOC + Index Manifests"];
+  CAP --> FR["Frames: content + metadata"];
+  CAP --> TR["Tracks: queries, feedback, agent logs"];
+  CAP --> CFG["aethervault://config/*"];
 ```
 
 ## Design docs
