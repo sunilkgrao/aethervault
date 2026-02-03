@@ -1,0 +1,11 @@
+services:
+  aethervault:
+    build:
+      context: .
+    image: aethervault:latest
+    volumes:
+      - ./data:/data
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+    command: ["mcp", "/data/knowledge.mv2"]

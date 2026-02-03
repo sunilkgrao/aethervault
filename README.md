@@ -96,10 +96,60 @@ Tune performance with `embed --batch N` and query flags like `--embed-cache`.
 `agent` expects a hook command that reads JSON on stdin and returns JSON:
 
 ```bash
-./target/debug/aethervault agent knowledge.mv2 --model-hook "python3 ./hooks/llm.py"
+./target/debug/aethervault agent knowledge.mv2 --model-hook "python3 ./hooks/claude.py"
 ```
 
 See `docs/ARCHITECTURE.md` for the hook payload shapes.
+
+## Claude hook (Anthropic)
+
+Set env vars and run the agent with the hook:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_MODEL=claude-sonnet-4-5
+export ANTHROPIC_MAX_TOKENS=1024
+
+./target/release/aethervault agent knowledge.mv2 --model-hook "python3 ./hooks/claude.py"
+```
+
+Optional: persist the hook in the capsule config so you can omit `--model-hook`:
+
+```bash
+./target/release/aethervault config set --key index --json '{
+  "agent": {
+    "model_hook": { "command": ["python3", "hooks/claude.py"], "timeout_ms": 60000 },
+    "log": true
+  }
+}'
+```
+
+## Docker deploy (minimal)
+
+Build and run the CLI in a container (mount a capsule at `/data`):
+
+```bash
+docker build -t aethervault .
+docker run --rm -it -v "$(pwd)/data:/data" aethervault init /data/knowledge.mv2
+docker run --rm -it -v "$(pwd)/data:/data" aethervault mcp /data/knowledge.mv2
+```
+
+Or with Compose:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+docker compose up --build
+```
+
+If you want to run the Claude hook inside the container, build with Python:
+
+```bash
+docker build --build-arg WITH_PYTHON=1 -t aethervault .
+docker run --rm -it \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  -v "$(pwd)/data:/data" \
+  aethervault agent /data/knowledge.mv2 --model-hook "python3 /app/hooks/claude.py"
+```
 
 ## Implemented roadmap
 
