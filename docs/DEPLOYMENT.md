@@ -65,3 +65,11 @@ docker run -d --restart unless-stopped \
 ## Kubernetes / other cloud
 
 Use the Docker image and mount a persistent volume to `/data`. The CLI is stateless; the `.mv2` capsule is the only state you need to persist.
+
+## Production tuning
+
+- Build/run in `--release` (Docker already does this).
+- Keep the capsule on SSD-backed storage.
+- Use `aethervault compact` during low-traffic windows to keep indexes tight.
+- For audit-grade logs set `--log-commit-interval 1` (or `agent.log_commit_interval=1` in config).
+- For higher throughput set `--log-commit-interval 8` or higher.

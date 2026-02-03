@@ -1,0 +1,15 @@
+.git
+.gitignore
+/tmp
+.target
+/target
+/.tmp
+/data
+*.mv2
+*.mv2e
+*.log
+*.sqlite
+*.db
+.env
+.env.*
+.DS_Store

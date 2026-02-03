@@ -81,6 +81,7 @@ cargo build --locked
 
 - `docs/DEPLOYMENT.md` for local, Docker, and cloud deployment.
 - `docs/CONNECTORS.md` for Telegram + WhatsApp bridges and subagent fan‑out.
+- Production path is Rust‑only; Python bridges are optional glue.
 
 ## Maintenance (SOTA compaction)
 

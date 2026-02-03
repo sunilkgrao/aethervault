@@ -63,3 +63,4 @@ The outputs are appended to the main response.
 
 - Each chat ID maps to a stable `--session` ID. Sessions can run in parallel.
 - If you want strict audit‑grade logging, set `AETHERVAULT_LOG_COMMIT_INTERVAL=1`.
+- These bridges are optional; the core agent and memory system remain Rust‑only.
