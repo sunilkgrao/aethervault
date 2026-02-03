@@ -4,6 +4,7 @@ import os
 import sys
 import urllib.request
 import urllib.error
+import time
 
 def _env(name, default=None):
     value = os.environ.get(name)
@@ -60,13 +61,16 @@ def _to_anthropic_messages(messages):
             if not tool_id:
                 continue
             content = msg.get("content") or ""
+            block = {
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": content,
+            }
+            if msg.get("is_error") is True:
+                block["is_error"] = True
             out.append({
                 "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": content,
-                }],
+                "content": [block],
             })
             continue
     return out
@@ -120,11 +124,17 @@ def main():
         return 1
 
     base_url = _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1/messages")
-    model = _env("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+    model = _env("ANTHROPIC_MODEL")
+    if not model:
+        sys.stderr.write("Missing ANTHROPIC_MODEL\n")
+        return 1
     max_tokens = int(_env("ANTHROPIC_MAX_TOKENS", "1024"))
     temperature = _env("ANTHROPIC_TEMPERATURE")
     top_p = _env("ANTHROPIC_TOP_P")
     timeout = float(_env("ANTHROPIC_TIMEOUT", "60"))
+    max_retries = int(_env("ANTHROPIC_MAX_RETRIES", "2"))
+    retry_base = float(_env("ANTHROPIC_RETRY_BASE", "0.5"))
+    retry_max = float(_env("ANTHROPIC_RETRY_MAX", "4"))
 
     system = _merge_system(messages)
     payload = {
@@ -156,15 +166,38 @@ def main():
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(base_url, data=data, headers=headers, method="POST")
 
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as err:
-        body = err.read().decode("utf-8") if err.fp else str(err)
-        sys.stderr.write(f"Anthropic API error: {err.code} {body}\n")
-        return 1
-    except urllib.error.URLError as err:
-        sys.stderr.write(f"Anthropic API request failed: {err}\n")
+    body = None
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as err:
+            status = err.code
+            retryable = status in (429, 500, 502, 503, 504, 529)
+            body = err.read().decode("utf-8") if err.fp else str(err)
+            if attempt < max_retries and retryable:
+                wait = min(retry_max, retry_base * (2 ** attempt))
+                retry_after = err.headers.get("retry-after") if err.headers else None
+                if retry_after:
+                    try:
+                        wait = max(wait, float(retry_after))
+                    except ValueError:
+                        pass
+                time.sleep(wait)
+                continue
+            sys.stderr.write(f"Anthropic API error: {status} {body}\n")
+            return 1
+        except urllib.error.URLError as err:
+            if attempt < max_retries:
+                wait = min(retry_max, retry_base * (2 ** attempt))
+                time.sleep(wait)
+                continue
+            sys.stderr.write(f"Anthropic API request failed: {err}\n")
+            return 1
+
+    if body is None:
+        sys.stderr.write("Anthropic API request failed without a response\n")
         return 1
 
     try:

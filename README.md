@@ -74,6 +74,21 @@ cargo build --locked
 - `diff` / `merge` provide git‑like ops for capsules.
 - `mcp` starts a stdio tool server.
 - `agent` runs a minimal hook‑based assistant loop.
+- `compact` runs vacuum compaction + index rebuilds (SOTA maintenance).
+- `doctor` exposes full repair/verify controls.
+
+## Maintenance (SOTA compaction)
+
+```bash
+./target/release/aethervault compact knowledge.mv2
+```
+
+For full control:
+
+```bash
+./target/release/aethervault doctor knowledge.mv2 --vacuum --rebuild-time --rebuild-lex --rebuild-vec
+./target/release/aethervault doctor knowledge.mv2 --dry-run --json
+```
 
 ## URI schemes
 
@@ -96,7 +111,13 @@ Tune performance with `embed --batch N` and query flags like `--embed-cache`.
 `agent` expects a hook command that reads JSON on stdin and returns JSON:
 
 ```bash
-./target/debug/aethervault agent knowledge.mv2 --model-hook "python3 ./hooks/claude.py"
+./target/debug/aethervault agent knowledge.mv2 --model-hook "./target/debug/aethervault hook claude"
+```
+
+For longer tool‑using sessions, raise the step budget:
+
+```bash
+./target/release/aethervault agent knowledge.mv2 --model-hook "./target/release/aethervault hook claude" --max-steps 128 --log-commit-interval 8
 ```
 
 See `docs/ARCHITECTURE.md` for the hook payload shapes.
@@ -107,19 +128,24 @@ Set env vars and run the agent with the hook:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-export ANTHROPIC_MODEL=claude-sonnet-4-5
+export ANTHROPIC_MODEL=claude-<model>
 export ANTHROPIC_MAX_TOKENS=1024
 
-./target/release/aethervault agent knowledge.mv2 --model-hook "python3 ./hooks/claude.py"
+./target/release/aethervault agent knowledge.mv2 --model-hook "./target/release/aethervault hook claude"
 ```
+
+Optional hook env vars: `ANTHROPIC_BASE_URL`, `ANTHROPIC_TEMPERATURE`, `ANTHROPIC_TOP_P`,
+`ANTHROPIC_TIMEOUT`, `ANTHROPIC_MAX_RETRIES`.
 
 Optional: persist the hook in the capsule config so you can omit `--model-hook`:
 
 ```bash
 ./target/release/aethervault config set --key index --json '{
   "agent": {
-    "model_hook": { "command": ["python3", "hooks/claude.py"], "timeout_ms": 60000 },
-    "log": true
+    "model_hook": { "command": ["aethervault", "hook", "claude"], "timeout_ms": 60000 },
+    "log": true,
+    "max_steps": 128,
+    "log_commit_interval": 8
   }
 }'
 ```
@@ -138,15 +164,28 @@ Or with Compose:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_MODEL=claude-<model>
 docker compose up --build
 ```
 
-If you want to run the Claude hook inside the container, build with Python:
+If you want to run the Claude hook inside the container, you can use the built‑in Rust hook:
+
+```bash
+docker build -t aethervault .
+docker run --rm -it \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  -e ANTHROPIC_MODEL=claude-<model> \
+  -v "$(pwd)/data:/data" \
+  aethervault agent /data/knowledge.mv2 --model-hook "aethervault hook claude"
+```
+
+If you want to run the Python hook instead, build with Python:
 
 ```bash
 docker build --build-arg WITH_PYTHON=1 -t aethervault .
 docker run --rm -it \
   -e ANTHROPIC_API_KEY=sk-ant-... \
+  -e ANTHROPIC_MODEL=claude-<model> \
   -v "$(pwd)/data:/data" \
   aethervault agent /data/knowledge.mv2 --model-hook "python3 /app/hooks/claude.py"
 ```
