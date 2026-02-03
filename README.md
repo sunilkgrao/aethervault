@@ -15,26 +15,26 @@ All content, indexes, embeddings, queries, and feedback live inside one `.mv2` a
 
 ```mermaid
 flowchart LR
-  A["Agent / Tool Caller"] -->|query| B["AetherVault CLI"];
-  B --> C{"Expansion Hook"};
-  C --> D["Lexical Lane (BM25)"];
-  C --> E["Vector Lane (Optional)"];
-  D --> F["Fusion (RRF + bonuses)"];
-  E --> F;
-  F --> G["Rerank Hook"];
-  G --> H["Blended Results"];
-  H --> I["Context Pack / JSON / Files"];
-  I -->|feedback + logs| J[(".mv2 Capsule")];
+  A[Agent / Tool Caller] -->|query| B[AetherVault CLI]
+  B --> C{Expansion Hook}
+  C --> D[Lexical Lane BM25]
+  C --> E[Vector Lane Optional]
+  D --> F[Fusion RRF + bonuses]
+  E --> F
+  F --> G[Rerank Hook]
+  G --> H[Blended Results]
+  H --> I[Context Pack / JSON / Files]
+  I -->|feedback + logs| J[.mv2 Capsule]
 ```
 
 ```mermaid
 flowchart TB
-  CAP[(".mv2 Capsule")];
-  CAP --> WAL["Append-only WAL"];
-  CAP --> TOC["TOC + Index Manifests"];
-  CAP --> FR["Frames: content + metadata"];
-  CAP --> TR["Tracks: queries, feedback, agent logs"];
-  CAP --> CFG["aethervault://config/*"];
+  CAP[.mv2 Capsule]
+  CAP --> WAL[Append-only WAL]
+  CAP --> TOC[TOC + Index Manifests]
+  CAP --> FR[Frames: content + metadata]
+  CAP --> TR[Tracks: queries, feedback, agent logs]
+  CAP --> CFG[aethervault://config/*]
 ```
 
 ## Design docs
@@ -74,6 +74,7 @@ cargo build --locked
 - `diff` / `merge` provide git‑like ops for capsules.
 - `mcp` starts a stdio tool server.
 - `agent` runs a minimal hook‑based assistant loop.
+- `bridge` runs Rust‑native Telegram/WhatsApp connectors.
 - `compact` runs vacuum compaction + index rebuilds (SOTA maintenance).
 - `doctor` exposes full repair/verify controls.
 
@@ -81,7 +82,7 @@ cargo build --locked
 
 - `docs/DEPLOYMENT.md` for local, Docker, and cloud deployment.
 - `docs/CONNECTORS.md` for Telegram + WhatsApp bridges and subagent fan‑out.
-- Production path is Rust‑only; Python bridges are optional glue.
+- Rust‑native connectors are built in (`bridge`). Legacy Python scripts live in `examples/bridge`.
 
 ## Maintenance (SOTA compaction)
 
@@ -117,13 +118,15 @@ Tune performance with `embed --batch N` and query flags like `--embed-cache`.
 `agent` expects a hook command that reads JSON on stdin and returns JSON:
 
 ```bash
-./target/debug/aethervault agent knowledge.mv2 --model-hook "./target/debug/aethervault hook claude"
+./target/debug/aethervault agent knowledge.mv2 --model-hook builtin:claude
 ```
+
+`builtin:claude` runs the Rust hook in‑process (no subprocess).
 
 For longer tool‑using sessions, raise the step budget:
 
 ```bash
-./target/release/aethervault agent knowledge.mv2 --model-hook "./target/release/aethervault hook claude" --max-steps 128 --log-commit-interval 8
+./target/release/aethervault agent knowledge.mv2 --model-hook builtin:claude --max-steps 128 --log-commit-interval 8
 ```
 
 See `docs/ARCHITECTURE.md` for the hook payload shapes.
@@ -137,7 +140,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 export ANTHROPIC_MODEL=claude-<model>
 export ANTHROPIC_MAX_TOKENS=1024
 
-./target/release/aethervault agent knowledge.mv2 --model-hook "./target/release/aethervault hook claude"
+./target/release/aethervault agent knowledge.mv2 --model-hook builtin:claude
 ```
 
 Optional hook env vars: `ANTHROPIC_BASE_URL`, `ANTHROPIC_TEMPERATURE`, `ANTHROPIC_TOP_P`,
@@ -148,7 +151,7 @@ Optional: persist the hook in the capsule config so you can omit `--model-hook`:
 ```bash
 ./target/release/aethervault config set --key index --json '{
   "agent": {
-    "model_hook": { "command": ["aethervault", "hook", "claude"], "timeout_ms": 60000 },
+    "model_hook": { "command": "builtin:claude", "timeout_ms": 60000 },
     "log": true,
     "max_steps": 128,
     "log_commit_interval": 8
@@ -184,18 +187,7 @@ docker run --rm -it \
   -e ANTHROPIC_API_KEY=sk-ant-... \
   -e ANTHROPIC_MODEL=claude-<model> \
   -v "$(pwd)/data:/data" \
-  aethervault agent /data/knowledge.mv2 --model-hook "aethervault hook claude"
-```
-
-If you want to run the Python hook instead, build with Python:
-
-```bash
-docker build --build-arg WITH_PYTHON=1 -t aethervault .
-docker run --rm -it \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
-  -e ANTHROPIC_MODEL=claude-<model> \
-  -v "$(pwd)/data:/data" \
-  aethervault agent /data/knowledge.mv2 --model-hook "python3 /app/hooks/claude.py"
+  aethervault agent /data/knowledge.mv2 --model-hook builtin:claude
 ```
 
 ## Implemented roadmap

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Legacy Claude hook. Prefer `aethervault hook claude` for production."""
+"""Legacy Claude hook. Prefer `--model-hook builtin:claude` for production."""
 import json
 import os
 import sys

@@ -73,3 +73,28 @@ Use the Docker image and mount a persistent volume to `/data`. The CLI is statel
 - Use `aethervault compact` during low-traffic windows to keep indexes tight.
 - For audit-grade logs set `--log-commit-interval 1` (or `agent.log_commit_interval=1` in config).
 - For higher throughput set `--log-commit-interval 8` or higher.
+
+## Chat connectors
+
+Rust-native Telegram + WhatsApp bridges are built in. See `docs/CONNECTORS.md` for full setup.
+
+Minimal Docker example (Telegram):
+
+```bash
+docker run --rm -it \
+  -e TELEGRAM_BOT_TOKEN=123456:ABC \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  -e ANTHROPIC_MODEL=claude-<model> \
+  -v "$(pwd)/data:/data" \
+  aethervault bridge telegram --mv2 /data/knowledge.mv2
+```
+
+Minimal Docker example (WhatsApp + Twilio):
+
+```bash
+docker run --rm -it -p 8080:8080 \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  -e ANTHROPIC_MODEL=claude-<model> \
+  -v "$(pwd)/data:/data" \
+  aethervault bridge whatsapp --mv2 /data/knowledge.mv2 --bind 0.0.0.0 --port 8080
+```

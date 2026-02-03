@@ -1,11 +1,6 @@
-# Connectors: Telegram + WhatsApp
+# Connectors: Telegram + WhatsApp (Rust‑native)
 
-The simplest way to connect chat platforms is to run a small bridge that calls `aethervault agent` and maps chat IDs to session IDs.
-
-This repo includes stdlib‑only bridges:
-- `examples/bridge/telegram_longpoll.py` (Telegram long polling)
-- `examples/bridge/whatsapp_twilio_webhook.py` (Twilio WhatsApp webhook)
-- `examples/bridge/agent_runner.py` (shared runner + optional subagents)
+AetherVault ships a built‑in `bridge` command. It runs the agent loop directly in Rust and maps chat IDs to stable session IDs.
 
 ## Telegram (long polling)
 
@@ -14,15 +9,14 @@ This repo includes stdlib‑only bridges:
 
 ```bash
 export TELEGRAM_BOT_TOKEN=123456:ABC
-export AETHERVAULT_BIN=./target/release/aethervault
 export AETHERVAULT_MV2=./data/knowledge.mv2
 export ANTHROPIC_API_KEY=sk-ant-...
 export ANTHROPIC_MODEL=claude-<model>
 
-python3 examples/bridge/telegram_longpoll.py
+./target/release/aethervault bridge telegram --mv2 ./data/knowledge.mv2
 ```
 
-That’s it. Messages now route into `aethervault agent` and back to Telegram.
+Messages now route into `aethervault agent` and back to Telegram.
 
 ## WhatsApp (Twilio webhook)
 
@@ -30,21 +24,18 @@ That’s it. Messages now route into `aethervault agent` and back to Telegram.
 2. Run the webhook bridge (publicly accessible). For local dev, expose the port with ngrok or Cloudflare Tunnel.
 
 ```bash
-export AETHERVAULT_BIN=./target/release/aethervault
 export AETHERVAULT_MV2=./data/knowledge.mv2
 export ANTHROPIC_API_KEY=sk-ant-...
 export ANTHROPIC_MODEL=claude-<model>
 
-python3 examples/bridge/whatsapp_twilio_webhook.py
+./target/release/aethervault bridge whatsapp --bind 0.0.0.0 --port 8080
 ```
 
 3. Configure Twilio to POST to `https://<public-url>/`.
 
 ## Subagents / multi-session orchestration
 
-The bridge supports optional subagent fan‑out using `AETHERVAULT_SUBAGENTS`.
-
-Example:
+Enable optional subagent fan‑out with `AETHERVAULT_SUBAGENTS`:
 
 ```bash
 export AETHERVAULT_SUBAGENTS='[
@@ -57,10 +48,16 @@ Each incoming message spawns additional agents with their own sessions:
 - `telegram:<chat_id>/planner`
 - `telegram:<chat_id>/critic`
 
-The outputs are appended to the main response.
+Outputs are appended to the main response.
 
-## Notes
+## Useful env vars
 
-- Each chat ID maps to a stable `--session` ID. Sessions can run in parallel.
-- If you want strict audit‑grade logging, set `AETHERVAULT_LOG_COMMIT_INTERVAL=1`.
-- These bridges are optional; the core agent and memory system remain Rust‑only.
+- `AETHERVAULT_MODEL_HOOK` (override model hook; defaults to `builtin:claude` if ANTHROPIC env vars are set)
+- `AETHERVAULT_LOG` (`1` to log turns, default enabled for bridges)
+- `AETHERVAULT_LOG_COMMIT_INTERVAL` (set to `1` for audit‑grade durability)
+- `AETHERVAULT_AGENT_TIMEOUT` (seconds)
+- `AETHERVAULT_SESSION_PREFIX` (prefix for all sessions)
+
+## Legacy Python bridges
+
+If you need stdlib‑only scripts, the previous Python bridges remain in `examples/bridge` as reference.

@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,8 @@ use clap::{Parser, Subcommand};
 use aether_core::types::{Frame, FrameStatus, SearchHit, SearchRequest, TemporalFilter};
 use aether_core::{DoctorOptions, DoctorReport, PutOptions, Vault, VaultError};
 use serde::{Deserialize, Serialize};
+use tiny_http::{Header, Method, Response, Server};
+use url::form_urlencoded;
 use walkdir::WalkDir;
 
 #[cfg(feature = "vec")]
@@ -441,6 +444,12 @@ enum Command {
         provider: HookCommand,
     },
 
+    /// Rust-native chat connectors (Telegram + WhatsApp).
+    Bridge {
+        #[command(subcommand)]
+        command: BridgeCommand,
+    },
+
     /// Capsule maintenance (verification, index rebuild, compaction).
     Doctor {
         mv2: PathBuf,
@@ -486,6 +495,91 @@ enum Command {
 enum HookCommand {
     /// Anthropic Claude hook (stdio JSON)
     Claude,
+}
+
+#[derive(Subcommand)]
+enum BridgeCommand {
+    /// Telegram long-polling bridge.
+    Telegram {
+        /// Capsule path (defaults to AETHERVAULT_MV2 or ./data/knowledge.mv2)
+        #[arg(long)]
+        mv2: Option<PathBuf>,
+        /// Telegram bot token (env: TELEGRAM_BOT_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
+        /// Long-poll timeout in seconds
+        #[arg(long, default_value_t = 25)]
+        poll_timeout: u64,
+        /// Max updates per poll
+        #[arg(long, default_value_t = 50)]
+        poll_limit: usize,
+        /// Override model hook command (env: AETHERVAULT_MODEL_HOOK)
+        #[arg(long)]
+        model_hook: Option<String>,
+        /// Override system prompt
+        #[arg(long)]
+        system: Option<String>,
+        /// Disable memory context
+        #[arg(long)]
+        no_memory: bool,
+        /// Override memory query
+        #[arg(long)]
+        context_query: Option<String>,
+        /// Max results for memory context
+        #[arg(long, default_value_t = 8)]
+        context_results: usize,
+        /// Max bytes for memory context
+        #[arg(long, default_value_t = 12_000)]
+        context_max_bytes: usize,
+        /// Max tool/LLM steps
+        #[arg(long, default_value_t = 64)]
+        max_steps: usize,
+        /// Log turns to capsule
+        #[arg(long)]
+        log: bool,
+        /// Commit agent logs every N entries (1 = fsync each log)
+        #[arg(long, default_value_t = 8)]
+        log_commit_interval: usize,
+    },
+    /// WhatsApp (Twilio) webhook bridge.
+    Whatsapp {
+        /// Capsule path (defaults to AETHERVAULT_MV2 or ./data/knowledge.mv2)
+        #[arg(long)]
+        mv2: Option<PathBuf>,
+        /// Bind address
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+        /// Bind port
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Override model hook command (env: AETHERVAULT_MODEL_HOOK)
+        #[arg(long)]
+        model_hook: Option<String>,
+        /// Override system prompt
+        #[arg(long)]
+        system: Option<String>,
+        /// Disable memory context
+        #[arg(long)]
+        no_memory: bool,
+        /// Override memory query
+        #[arg(long)]
+        context_query: Option<String>,
+        /// Max results for memory context
+        #[arg(long, default_value_t = 8)]
+        context_results: usize,
+        /// Max bytes for memory context
+        #[arg(long, default_value_t = 12_000)]
+        context_max_bytes: usize,
+        /// Max tool/LLM steps
+        #[arg(long, default_value_t = 64)]
+        max_steps: usize,
+        /// Log turns to capsule
+        #[arg(long)]
+        log: bool,
+        /// Commit agent logs every N entries (1 = fsync each log)
+        #[arg(long, default_value_t = 8)]
+        log_commit_interval: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -863,6 +957,46 @@ struct AgentSession {
     context: Option<ContextPack>,
     messages: Vec<AgentMessage>,
     tool_results: Vec<AgentToolResult>,
+}
+
+struct AgentRunOutput {
+    session: Option<String>,
+    context: Option<ContextPack>,
+    messages: Vec<AgentMessage>,
+    tool_results: Vec<AgentToolResult>,
+    final_text: Option<String>,
+}
+
+#[derive(Clone)]
+struct BridgeAgentConfig {
+    mv2: PathBuf,
+    model_hook: Option<String>,
+    system: Option<String>,
+    no_memory: bool,
+    context_query: Option<String>,
+    context_results: usize,
+    context_max_bytes: usize,
+    max_steps: usize,
+    log: bool,
+    log_commit_interval: usize,
+    session_prefix: String,
+    timeout: Duration,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SubagentSpec {
+    name: String,
+    #[serde(default)]
+    system: Option<String>,
+    #[serde(default)]
+    model_hook: Option<String>,
+}
+
+#[derive(Debug)]
+struct SubagentResult {
+    name: String,
+    text: String,
+    is_error: bool,
 }
 
 #[derive(Debug)]
@@ -2978,6 +3112,16 @@ fn env_f64(name: &str, default: f64) -> Result<f64, Box<dyn std::error::Error>> 
     }
 }
 
+fn env_bool(name: &str, default: bool) -> bool {
+    match env_optional(name) {
+        Some(value) => {
+            let v = value.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "y" | "on")
+        }
+        None => default,
+    }
+}
+
 fn merge_system_messages(messages: &[AgentMessage]) -> String {
     let mut parts = Vec::new();
     for msg in messages {
@@ -3125,14 +3269,7 @@ fn parse_claude_response(payload: &serde_json::Value) -> Result<AgentHookRespons
     })
 }
 
-fn run_claude_hook() -> Result<(), Box<dyn std::error::Error>> {
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
-    if input.trim().is_empty() {
-        return Err("Claude hook received empty input".into());
-    }
-    let req: AgentHookRequest = serde_json::from_str(&input)?;
-
+fn call_claude(request: &AgentHookRequest) -> Result<AgentHookResponse, Box<dyn std::error::Error>> {
     let api_key = env_required("ANTHROPIC_API_KEY")?;
     let model = env_required("ANTHROPIC_MODEL")?;
     let base_url = env_optional("ANTHROPIC_BASE_URL")
@@ -3154,16 +3291,16 @@ fn run_claude_hook() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "2023-06-01".to_string());
     let beta = env_optional("ANTHROPIC_BETA");
 
-    let system = merge_system_messages(&req.messages);
+    let system = merge_system_messages(&request.messages);
     let mut payload = serde_json::json!({
         "model": model,
         "max_tokens": max_tokens,
-        "messages": to_anthropic_messages(&req.messages),
+        "messages": to_anthropic_messages(&request.messages),
     });
     if !system.is_empty() {
         payload["system"] = serde_json::json!(system);
     }
-    let tools = to_anthropic_tools(&req.tools);
+    let tools = to_anthropic_tools(&request.tools);
     if !tools.is_empty() {
         payload["tools"] = serde_json::json!(tools);
     }
@@ -3221,12 +3358,39 @@ fn run_claude_hook() -> Result<(), Box<dyn std::error::Error>> {
 
     let body = body.ok_or("Anthropic API request failed without a response")?;
     let payload: serde_json::Value = serde_json::from_str(&body)?;
-    let response = parse_claude_response(&payload)?;
+    parse_claude_response(&payload)
+}
+
+fn run_claude_hook() -> Result<(), Box<dyn std::error::Error>> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    if input.trim().is_empty() {
+        return Err("Claude hook received empty input".into());
+    }
+    let req: AgentHookRequest = serde_json::from_str(&input)?;
+    let response = call_claude(&req)?;
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
 }
 
 fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Result<AgentMessage, String> {
+    let is_builtin = match &hook.command {
+        CommandSpec::String(cmd) => {
+            let cmd = cmd.trim().to_ascii_lowercase();
+            cmd == "builtin:claude" || cmd == "claude"
+        }
+        CommandSpec::Array(items) => items
+            .first()
+            .map(|cmd| cmd.trim().to_ascii_lowercase())
+            .map(|cmd| cmd == "builtin:claude" || cmd == "claude")
+            .unwrap_or(false),
+    };
+    if is_builtin {
+        return call_claude(request)
+            .map(|resp| resp.message)
+            .map_err(|e| format!("claude hook: {e}"));
+    }
+
     let cmd = command_spec_to_vec(&hook.command);
     let timeout = hook.timeout_ms.unwrap_or(60000);
     let value = serde_json::to_value(request).map_err(|e| format!("hook input: {e}"))?;
@@ -3262,6 +3426,55 @@ fn run_agent(
         io::stdin().read_to_string(&mut buffer)?;
         buffer
     };
+    let system_text = if let Some(path) = system_file {
+        Some(fs::read_to_string(path)?)
+    } else {
+        system
+    };
+
+    let output = run_agent_with_prompt(
+        mv2,
+        prompt_text,
+        session,
+        model_hook,
+        system_text,
+        no_memory,
+        context_query,
+        context_results,
+        context_max_bytes,
+        max_steps,
+        log_commit_interval,
+        log,
+    )?;
+
+    if json {
+        let payload = AgentSession {
+            session: output.session,
+            context: output.context,
+            messages: output.messages,
+            tool_results: output.tool_results,
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if let Some(text) = output.final_text {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+fn run_agent_with_prompt(
+    mv2: PathBuf,
+    prompt_text: String,
+    session: Option<String>,
+    model_hook: Option<String>,
+    system_override: Option<String>,
+    no_memory: bool,
+    context_query: Option<String>,
+    context_results: usize,
+    context_max_bytes: usize,
+    max_steps: usize,
+    log_commit_interval: usize,
+    log: bool,
+) -> Result<AgentRunOutput, Box<dyn std::error::Error>> {
     if prompt_text.trim().is_empty() {
         return Err("agent prompt is empty".into());
     }
@@ -3278,9 +3491,7 @@ fn run_agent(
     )
     .ok_or("agent requires --model-hook or config.agent.model_hook or config.hooks.llm")?;
 
-    let mut system_prompt = if let Some(path) = system_file {
-        fs::read_to_string(path)?
-    } else if let Some(system) = system {
+    let mut system_prompt = if let Some(system) = system_override {
         system
     } else if let Some(system) = agent_cfg.system {
         system
@@ -3509,18 +3720,541 @@ fn run_agent(
         .into());
     }
 
-    if json {
-        let payload = AgentSession {
-            session,
-            context: context_pack,
-            messages,
-            tool_results,
-        };
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else if let Some(text) = final_text {
-        println!("{text}");
+    Ok(AgentRunOutput {
+        session,
+        context: context_pack,
+        messages,
+        tool_results,
+        final_text,
+    })
+}
+
+fn resolve_mv2_path(cli_mv2: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = cli_mv2 {
+        return path;
+    }
+    if let Some(value) = env_optional("AETHERVAULT_MV2") {
+        return PathBuf::from(value);
+    }
+    PathBuf::from("./data/knowledge.mv2")
+}
+
+fn resolve_bridge_model_hook(cli: Option<String>) -> Option<String> {
+    if cli.is_some() {
+        return cli;
+    }
+    if let Some(cmd) = env_optional("AETHERVAULT_MODEL_HOOK") {
+        return Some(cmd);
+    }
+    if env_optional("ANTHROPIC_API_KEY").is_some() && env_optional("ANTHROPIC_MODEL").is_some() {
+        return Some("builtin:claude".to_string());
+    }
+    None
+}
+
+fn build_bridge_agent_config(
+    mv2: PathBuf,
+    model_hook: Option<String>,
+    system: Option<String>,
+    no_memory: bool,
+    context_query: Option<String>,
+    context_results: usize,
+    context_max_bytes: usize,
+    max_steps: usize,
+    log: bool,
+    log_commit_interval: usize,
+) -> Result<BridgeAgentConfig, Box<dyn std::error::Error>> {
+    let model_hook = resolve_bridge_model_hook(model_hook);
+    let system = system.or_else(|| env_optional("AETHERVAULT_SYSTEM"));
+    let no_memory = no_memory || env_bool("AETHERVAULT_NO_MEMORY", false);
+    let context_query = context_query.or_else(|| env_optional("AETHERVAULT_CONTEXT_QUERY"));
+    let context_results = env_optional("AETHERVAULT_CONTEXT_RESULTS")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(context_results);
+    let context_max_bytes = env_optional("AETHERVAULT_CONTEXT_MAX_BYTES")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(context_max_bytes);
+    let max_steps = env_optional("AETHERVAULT_MAX_STEPS")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(max_steps);
+    let log_commit_interval = env_optional("AETHERVAULT_LOG_COMMIT_INTERVAL")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(log_commit_interval)
+        .max(1);
+    let log = if log {
+        true
+    } else {
+        env_bool("AETHERVAULT_LOG", true)
+    };
+    let session_prefix = env_optional("AETHERVAULT_SESSION_PREFIX").unwrap_or_default();
+    let timeout_secs = env_f64("AETHERVAULT_AGENT_TIMEOUT", 120.0)?;
+    let timeout = Duration::from_secs_f64(timeout_secs.max(1.0));
+
+    Ok(BridgeAgentConfig {
+        mv2,
+        model_hook,
+        system,
+        no_memory,
+        context_query,
+        context_results,
+        context_max_bytes,
+        max_steps,
+        log,
+        log_commit_interval,
+        session_prefix,
+        timeout,
+    })
+}
+
+fn load_subagents() -> Result<Vec<SubagentSpec>, String> {
+    let raw = env_optional("AETHERVAULT_SUBAGENTS").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut specs: Vec<SubagentSpec> =
+        serde_json::from_str(&raw).map_err(|e| format!("AETHERVAULT_SUBAGENTS: {e}"))?;
+    specs.retain(|s| !s.name.trim().is_empty());
+    Ok(specs)
+}
+
+fn run_agent_for_bridge(
+    config: &BridgeAgentConfig,
+    prompt: &str,
+    session: String,
+    system_override: Option<String>,
+    model_hook_override: Option<String>,
+) -> Result<AgentRunOutput, String> {
+    let (tx, rx) = mpsc::channel();
+    let prompt_text = prompt.to_string();
+    let mv2 = config.mv2.clone();
+    let model_hook = model_hook_override.or_else(|| config.model_hook.clone());
+    let system_text = system_override.or_else(|| config.system.clone());
+    let no_memory = config.no_memory;
+    let context_query = config.context_query.clone();
+    let context_results = config.context_results;
+    let context_max_bytes = config.context_max_bytes;
+    let max_steps = config.max_steps;
+    let log_commit_interval = config.log_commit_interval;
+    let log = config.log;
+
+    thread::spawn(move || {
+        let result = run_agent_with_prompt(
+            mv2,
+            prompt_text,
+            Some(session),
+            model_hook,
+            system_text,
+            no_memory,
+            context_query,
+            context_results,
+            context_max_bytes,
+            max_steps,
+            log_commit_interval,
+            log,
+        )
+        .map_err(|e| e.to_string());
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(config.timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err("Agent timeout".into()),
+        Err(err) => Err(format!("Agent channel error: {err}")),
+    }
+}
+
+fn run_subagents_with_specs(
+    config: &BridgeAgentConfig,
+    prompt: &str,
+    base_session: &str,
+    specs: &[SubagentSpec],
+) -> Result<Vec<SubagentResult>, String> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut handles = Vec::new();
+    for spec in specs.iter().cloned() {
+        let cfg = config.clone();
+        let prompt_text = prompt.to_string();
+        let SubagentSpec {
+            name,
+            system,
+            model_hook,
+        } = spec;
+        let session = format!("{base_session}/{name}");
+        handles.push(thread::spawn(move || {
+            let result =
+                run_agent_for_bridge(&cfg, &prompt_text, session, system, model_hook);
+            match result {
+                Ok(output) => SubagentResult {
+                    name,
+                    text: output.final_text.unwrap_or_default(),
+                    is_error: false,
+                },
+                Err(err) => SubagentResult {
+                    name,
+                    text: err,
+                    is_error: true,
+                },
+            }
+        }));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        match handle.join() {
+            Ok(result) => results.push(result),
+            Err(_) => results.push(SubagentResult {
+                name: "subagent".to_string(),
+                text: "Subagent panic".to_string(),
+                is_error: true,
+            }),
+        }
+    }
+    Ok(results)
+}
+
+fn append_subagent_results(main_text: String, results: &[SubagentResult]) -> String {
+    if results.is_empty() {
+        return main_text;
+    }
+    let mut out = String::new();
+    if !main_text.trim().is_empty() {
+        out.push_str(main_text.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str("Subagents:\n");
+    for result in results {
+        let label = result.name.trim();
+        if result.is_error {
+            out.push_str(&format!("- {label}: {text}\n", text = result.text.trim()));
+        } else {
+            out.push_str(&format!("- {label}: {text}\n", text = result.text.trim()));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramUpdateResponse {
+    ok: bool,
+    #[serde(default)]
+    result: Vec<TelegramUpdate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramUpdate {
+    update_id: i64,
+    #[serde(default)]
+    message: Option<TelegramMessage>,
+    #[serde(default)]
+    edited_message: Option<TelegramMessage>,
+    #[serde(default)]
+    channel_post: Option<TelegramMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramMessage {
+    chat: TelegramChat,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramChat {
+    id: i64,
+}
+
+fn extract_telegram_text(update: &TelegramUpdate) -> Option<(i64, String)> {
+    let msg = update
+        .message
+        .as_ref()
+        .or(update.edited_message.as_ref())
+        .or(update.channel_post.as_ref())?;
+    let text = msg.text.clone()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some((msg.chat.id, text))
+}
+
+fn split_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if count >= max_chars {
+            chunks.push(current);
+            current = String::new();
+            count = 0;
+        }
+        current.push(ch);
+        count += 1;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+fn telegram_send_message(
+    agent: &ureq::Agent,
+    base_url: &str,
+    chat_id: i64,
+    text: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{base_url}/sendMessage");
+    let chunks = split_text_chunks(text, 3900);
+    for chunk in chunks {
+        let payload = serde_json::json!({
+            "chat_id": chat_id,
+            "text": chunk
+        });
+        let response = agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .send_json(payload);
+        if let Err(err) = response {
+            return Err(format!("Telegram send error: {err}").into());
+        }
     }
     Ok(())
+}
+
+fn run_telegram_bridge(
+    token: String,
+    poll_timeout: u64,
+    poll_limit: usize,
+    agent_config: BridgeAgentConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base_url = format!("https://api.telegram.org/bot{token}");
+    let subagent_specs = load_subagents()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_write(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(poll_timeout.saturating_add(10)))
+        .build();
+
+    let mut offset: Option<i64> = None;
+    loop {
+        let mut request = agent
+            .get(&format!("{base_url}/getUpdates"))
+            .query("timeout", &poll_timeout.to_string())
+            .query("limit", &poll_limit.to_string());
+        if let Some(last) = offset {
+            request = request.query("offset", &(last + 1).to_string());
+        }
+
+        let response = request.call();
+        let payload = match response {
+            Ok(resp) => resp.into_json::<TelegramUpdateResponse>(),
+            Err(err) => {
+                eprintln!("Telegram poll error: {err}");
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+
+        let update = match payload {
+            Ok(update) => update,
+            Err(err) => {
+                eprintln!("Telegram decode error: {err}");
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+        if !update.ok {
+            eprintln!("Telegram API returned ok=false");
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+
+        for entry in update.result {
+            offset = Some(entry.update_id);
+            let Some((chat_id, user_text)) = extract_telegram_text(&entry) else {
+                continue;
+            };
+            let session = format!("{}telegram:{chat_id}", agent_config.session_prefix);
+            let response = run_agent_for_bridge(&agent_config, &user_text, session, None, None);
+            let output = match response {
+                Ok(result) => {
+                    let mut text = result.final_text.unwrap_or_default();
+                    if text.trim().is_empty() {
+                        text = "Done.".to_string();
+                    }
+                    if let Ok(subagents) = run_subagents_with_specs(
+                        &agent_config,
+                        &user_text,
+                        &format!("{}telegram:{chat_id}", agent_config.session_prefix),
+                        &subagent_specs,
+                    )
+                    {
+                        text = append_subagent_results(text, &subagents);
+                    }
+                    text
+                }
+                Err(err) => format!("Agent error: {err}"),
+            };
+            if let Err(err) = telegram_send_message(&agent, &base_url, chat_id, &output) {
+                eprintln!("Telegram send failed: {err}");
+            }
+        }
+    }
+}
+
+fn escape_xml(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn run_whatsapp_bridge(
+    bind: String,
+    port: u16,
+    agent_config: BridgeAgentConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = format!("{bind}:{port}");
+    let server = Server::http(&addr)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("server: {e}")))?;
+    eprintln!("WhatsApp bridge listening on http://{addr}");
+    let subagent_specs = load_subagents()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    for mut request in server.incoming_requests() {
+        if *request.method() != Method::Post {
+            let response = Response::from_string("ok");
+            let _ = request.respond(response);
+            continue;
+        }
+
+        let mut body = String::new();
+        request.as_reader().read_to_string(&mut body)?;
+        let params: HashMap<String, String> = form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+
+        let from = params.get("From").cloned().unwrap_or_default();
+        let text = params.get("Body").cloned().unwrap_or_default();
+        if from.trim().is_empty() || text.trim().is_empty() {
+            let response = Response::from_string("missing body");
+            let _ = request.respond(response);
+            continue;
+        }
+
+        let session = format!("{}whatsapp:{from}", agent_config.session_prefix);
+        let response = run_agent_for_bridge(&agent_config, &text, session, None, None);
+        let mut output = match response {
+            Ok(result) => result.final_text.unwrap_or_default(),
+            Err(err) => format!("Agent error: {err}"),
+        };
+        if output.trim().is_empty() {
+            output = "Done.".to_string();
+        }
+        if let Ok(subagents) = run_subagents_with_specs(
+            &agent_config,
+            &text,
+            &format!("{}whatsapp:{from}", agent_config.session_prefix),
+            &subagent_specs,
+        )
+        {
+            output = append_subagent_results(output, &subagents);
+        }
+
+        let twiml = format!(
+            "<Response><Message>{}</Message></Response>",
+            escape_xml(&output)
+        );
+        let mut response = Response::from_string(twiml);
+        let header = Header::from_bytes("Content-Type", "text/xml; charset=utf-8")
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "invalid header"))?;
+        response.add_header(header);
+        let _ = request.respond(response);
+    }
+    Ok(())
+}
+
+fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        BridgeCommand::Telegram {
+            mv2,
+            token,
+            poll_timeout,
+            poll_limit,
+            model_hook,
+            system,
+            no_memory,
+            context_query,
+            context_results,
+            context_max_bytes,
+            max_steps,
+            log,
+            log_commit_interval,
+        } => {
+            let mv2 = resolve_mv2_path(mv2);
+            let token = token
+                .or_else(|| env_optional("TELEGRAM_BOT_TOKEN"))
+                .ok_or("Missing TELEGRAM_BOT_TOKEN")?;
+            let config = build_bridge_agent_config(
+                mv2,
+                model_hook,
+                system,
+                no_memory,
+                context_query,
+                context_results,
+                context_max_bytes,
+                max_steps,
+                log,
+                log_commit_interval,
+            )?;
+            run_telegram_bridge(token, poll_timeout, poll_limit, config)
+        }
+        BridgeCommand::Whatsapp {
+            mv2,
+            bind,
+            port,
+            model_hook,
+            system,
+            no_memory,
+            context_query,
+            context_results,
+            context_max_bytes,
+            max_steps,
+            log,
+            log_commit_interval,
+        } => {
+            let mv2 = resolve_mv2_path(mv2);
+            let config = build_bridge_agent_config(
+                mv2,
+                model_hook,
+                system,
+                no_memory,
+                context_query,
+                context_results,
+                context_max_bytes,
+                max_steps,
+                log,
+                log_commit_interval,
+            )?;
+            run_whatsapp_bridge(bind, port, config)
+        }
+    }
 }
 
 #[cfg(feature = "vec")]
@@ -4486,6 +5220,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Hook { provider } => match provider {
             HookCommand::Claude => run_claude_hook(),
         },
+
+        Command::Bridge { command } => run_bridge(command),
 
         Command::Doctor {
             mv2,
