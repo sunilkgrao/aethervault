@@ -139,20 +139,7 @@ export ANTHROPIC_MODEL=claude-<model>
 
 ## Subagents / multi-session orchestration
 
-Enable optional subagent fan‑out with `AETHERVAULT_SUBAGENTS`:
-
-```bash
-export AETHERVAULT_SUBAGENTS='[
-  {"name":"planner","system":"You plan step-by-step and list tasks."},
-  {"name":"critic","system":"You review for risks and missing steps."}
-]'
-```
-
-Each incoming message spawns additional agents with their own sessions:
-- `telegram:<chat_id>/planner`
-- `telegram:<chat_id>/critic`
-
-Outputs are appended to the main response.
+Subagents are configured in the capsule (`agent.subagents`) and can be invoked automatically or via the `subagent_invoke` tool.
 
 ## Useful env vars
 

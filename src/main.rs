@@ -1095,6 +1095,8 @@ struct AgentConfig {
     log_commit_interval: Option<usize>,
     #[serde(default)]
     model_hook: Option<HookSpec>,
+    #[serde(default)]
+    subagents: Vec<SubagentSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1245,7 +1247,7 @@ struct BridgeAgentConfig {
     timeout: Duration,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct SubagentSpec {
     name: String,
     #[serde(default)]
@@ -1685,6 +1687,16 @@ struct ToolSkillSearchArgs {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolSubagentInvokeArgs {
+    name: String,
+    prompt: String,
+    #[serde(default)]
+    system: Option<String>,
+    #[serde(default)]
+    model_hook: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3574,6 +3586,25 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "subagent_list",
+            "description": "List configured subagents.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        serde_json::json!({
+            "name": "subagent_invoke",
+            "description": "Invoke a named subagent with a prompt.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "system": { "type": "string" },
+                    "model_hook": { "type": "string" }
+                },
+                "required": ["name", "prompt"]
+            }
+        }),
+        serde_json::json!({
             "name": "gmail_list",
             "description": "List Gmail messages (OAuth).",
             "inputSchema": {
@@ -4906,6 +4937,56 @@ fn execute_tool_with_handles(
                 })
             })
         }
+        "subagent_list" => with_read_mem(mem_read, mem_write, mv2, |mem| {
+            let config = load_capsule_config(mem).unwrap_or_default();
+            let subagents = load_subagents_from_config(&config);
+            Ok(ToolExecution {
+                output: format!("{} subagents.", subagents.len()),
+                details: serde_json::json!({ "subagents": subagents }),
+                is_error: false,
+            })
+        }),
+        "subagent_invoke" => {
+            let parsed: ToolSubagentInvokeArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let config = with_read_mem(mem_read, mem_write, mv2, |mem| {
+                Ok(load_capsule_config(mem).unwrap_or_default())
+            })?;
+            let subagents = load_subagents_from_config(&config);
+            let mut system = parsed.system.clone();
+            let mut model_hook = parsed.model_hook.clone();
+            if let Some(spec) = subagents.iter().find(|s| s.name == parsed.name) {
+                if system.is_none() {
+                    system = spec.system.clone();
+                }
+                if model_hook.is_none() {
+                    model_hook = spec.model_hook.clone();
+                }
+            } else if system.is_none() && model_hook.is_none() {
+                return Err(format!("unknown subagent: {}", parsed.name));
+            }
+            let cfg = build_bridge_agent_config(
+                mv2.to_path_buf(),
+                model_hook,
+                system,
+                false,
+                None,
+                8,
+                12_000,
+                64,
+                true,
+                8,
+            )
+            .map_err(|e| e.to_string())?;
+            let session = format!("subagent:{}:{}", parsed.name, Utc::now().timestamp());
+            let result = run_agent_for_bridge(&cfg, &parsed.prompt, session, None, None)
+                .map_err(|e| e.to_string())?;
+            Ok(ToolExecution {
+                output: result.final_text.unwrap_or_default(),
+                details: serde_json::json!({ "session": result.session, "messages": result.messages.len() }),
+                is_error: false,
+            })
+        }
         "gmail_list" => {
             let parsed: ToolGmailListArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
@@ -5879,6 +5960,17 @@ fn tool_score(query_tokens: &[String], name: &str, description: &str) -> i32 {
         score += 4;
     }
     score
+}
+
+fn load_subagents_from_config(config: &CapsuleConfig) -> Vec<SubagentSpec> {
+    config
+        .agent
+        .as_ref()
+        .map(|a| a.subagents.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| !s.name.trim().is_empty())
+        .collect()
 }
 
 fn refresh_google_token(mv2: &Path, token: &serde_json::Value) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -7094,16 +7186,6 @@ fn build_bridge_agent_config(
     })
 }
 
-fn load_subagents() -> Result<Vec<SubagentSpec>, String> {
-    let raw = env_optional("AETHERVAULT_SUBAGENTS").unwrap_or_default();
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut specs: Vec<SubagentSpec> =
-        serde_json::from_str(&raw).map_err(|e| format!("AETHERVAULT_SUBAGENTS: {e}"))?;
-    specs.retain(|s| !s.name.trim().is_empty());
-    Ok(specs)
-}
 
 fn run_agent_for_bridge(
     config: &BridgeAgentConfig,
@@ -7323,8 +7405,9 @@ fn run_telegram_bridge(
     agent_config: BridgeAgentConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let base_url = format!("https://api.telegram.org/bot{token}");
-    let subagent_specs = load_subagents()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut mem = Vault::open_read_only(&agent_config.mv2)?;
+    let config = load_capsule_config(&mut mem).unwrap_or_default();
+    let subagent_specs = load_subagents_from_config(&config);
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_write(Duration::from_secs(10))
@@ -7422,8 +7505,9 @@ fn run_whatsapp_bridge(
     let server = Server::http(&addr)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("server: {e}")))?;
     eprintln!("WhatsApp bridge listening on http://{addr}");
-    let subagent_specs = load_subagents()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut mem = Vault::open_read_only(&agent_config.mv2)?;
+    let config = load_capsule_config(&mut mem).unwrap_or_default();
+    let subagent_specs = load_subagents_from_config(&config);
 
     for mut request in server.incoming_requests() {
         if *request.method() != Method::Post {

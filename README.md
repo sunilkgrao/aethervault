@@ -90,6 +90,7 @@ cargo build --locked
 - `session_context` fetches recent session logs efficiently.
 - `reflect` stores self-critique in the capsule for iterative improvement.
 - `skill_store` / `skill_search` capture reusable procedures.
+- `subagent_list` / `subagent_invoke` provide multi-session orchestration.
 - `compact` runs vacuum compaction + index rebuilds (SOTA maintenance).
 - `doctor` exposes full repair/verify controls.
 
