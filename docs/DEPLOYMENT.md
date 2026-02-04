@@ -73,6 +73,7 @@ Use the Docker image and mount a persistent volume to `/data`. The CLI is statel
 - Use `aethervault compact` during low-traffic windows to keep indexes tight.
 - For audit-grade logs set `--log-commit-interval 1` (or `agent.log_commit_interval=1` in config).
 - For higher throughput set `--log-commit-interval 8` or higher.
+  - Note: batched commits can drop the last `log_commit_interval` log entries on crash.
 
 ## Chat connectors
 

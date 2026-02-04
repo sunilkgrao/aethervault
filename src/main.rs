@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hash;
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -3122,6 +3122,19 @@ fn env_bool(name: &str, default: bool) -> bool {
     }
 }
 
+fn jitter_ratio() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos % 1000) as f64 / 1000.0
+}
+
+fn parse_retry_after(resp: &ureq::Response) -> Option<f64> {
+    resp.header("retry-after")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+}
+
 fn merge_system_messages(messages: &[AgentMessage]) -> String {
     let mut parts = Vec::new();
     for msg in messages {
@@ -3193,7 +3206,10 @@ fn to_anthropic_messages(messages: &[AgentMessage]) -> Vec<serde_json::Value> {
     out
 }
 
-fn to_anthropic_tools(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+fn to_anthropic_tools(
+    tools: &[serde_json::Value],
+    cache_control: Option<serde_json::Value>,
+) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     for tool in tools {
         let Some(obj) = tool.as_object() else {
@@ -3209,6 +3225,9 @@ fn to_anthropic_tools(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
         }
         if let Some(schema) = obj.get("inputSchema").or_else(|| obj.get("input_schema")) {
             entry.insert("input_schema".to_string(), schema.clone());
+        }
+        if let Some(cache) = cache_control.clone() {
+            entry.insert("cache_control".to_string(), cache);
         }
         out.push(serde_json::Value::Object(entry));
     }
@@ -3290,17 +3309,52 @@ fn call_claude(request: &AgentHookRequest) -> Result<AgentHookResponse, Box<dyn 
     let version = env_optional("ANTHROPIC_VERSION")
         .unwrap_or_else(|| "2023-06-01".to_string());
     let beta = env_optional("ANTHROPIC_BETA");
+    let token_efficient = env_bool("ANTHROPIC_TOKEN_EFFICIENT", false);
+    let mut beta_values: Vec<String> = Vec::new();
+    if let Some(b) = beta {
+        for item in b.split(',') {
+            let trimmed = item.trim();
+            if !trimmed.is_empty() {
+                beta_values.push(trimmed.to_string());
+            }
+        }
+    }
+    if token_efficient {
+        beta_values.push("token-efficient-tools-2025-02-19".to_string());
+    }
 
     let system = merge_system_messages(&request.messages);
+    let use_prompt_cache = env_bool("ANTHROPIC_PROMPT_CACHE", false);
+    let cache_ttl = env_optional("ANTHROPIC_PROMPT_CACHE_TTL");
+    let cache_control = if use_prompt_cache {
+        let mut obj = serde_json::Map::new();
+        obj.insert("type".to_string(), serde_json::json!("ephemeral"));
+        if let Some(ttl) = cache_ttl {
+            if !ttl.trim().is_empty() {
+                obj.insert("ttl".to_string(), serde_json::json!(ttl));
+            }
+        }
+        Some(serde_json::Value::Object(obj))
+    } else {
+        None
+    };
     let mut payload = serde_json::json!({
         "model": model,
         "max_tokens": max_tokens,
         "messages": to_anthropic_messages(&request.messages),
     });
     if !system.is_empty() {
-        payload["system"] = serde_json::json!(system);
+        if let Some(cache) = cache_control.clone() {
+            payload["system"] = serde_json::json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": cache
+            }]);
+        } else {
+            payload["system"] = serde_json::json!(system);
+        }
     }
-    let tools = to_anthropic_tools(&request.tools);
+    let tools = to_anthropic_tools(&request.tools, cache_control.clone());
     if !tools.is_empty() {
         payload["tools"] = serde_json::json!(tools);
     }
@@ -3326,8 +3380,8 @@ fn call_claude(request: &AgentHookRequest) -> Result<AgentHookResponse, Box<dyn 
             .set("content-type", "application/json")
             .set("x-api-key", &api_key)
             .set("anthropic-version", &version);
-        if let Some(beta) = &beta {
-            request = request.set("anthropic-beta", beta);
+        if !beta_values.is_empty() {
+            request = request.set("anthropic-beta", &beta_values.join(","));
         }
 
         let response = request.send_json(payload.clone());
@@ -3337,9 +3391,15 @@ fn call_claude(request: &AgentHookRequest) -> Result<AgentHookResponse, Box<dyn 
                 break;
             }
             Err(ureq::Error::Status(code, resp)) => {
+                let retry_after = parse_retry_after(&resp);
                 let text = resp.into_string().unwrap_or_default();
                 if attempt < max_retries && retryable(code) {
-                    let delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
+                    let mut delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
+                    if let Some(retry_after) = retry_after {
+                        delay = delay.max(retry_after);
+                    }
+                    let jitter = jitter_ratio() * 0.2;
+                    delay *= 1.0 + jitter;
                     thread::sleep(Duration::from_secs_f64(delay));
                     continue;
                 }
@@ -3347,7 +3407,9 @@ fn call_claude(request: &AgentHookRequest) -> Result<AgentHookResponse, Box<dyn 
             }
             Err(ureq::Error::Transport(err)) => {
                 if attempt < max_retries {
-                    let delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
+                    let mut delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
+                    let jitter = jitter_ratio() * 0.2;
+                    delay *= 1.0 + jitter;
                     thread::sleep(Duration::from_secs_f64(delay));
                     continue;
                 }

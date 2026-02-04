@@ -145,6 +145,8 @@ export ANTHROPIC_MAX_TOKENS=1024
 
 Optional hook env vars: `ANTHROPIC_BASE_URL`, `ANTHROPIC_TEMPERATURE`, `ANTHROPIC_TOP_P`,
 `ANTHROPIC_TIMEOUT`, `ANTHROPIC_MAX_RETRIES`.
+Performance toggles: `ANTHROPIC_PROMPT_CACHE=1`, `ANTHROPIC_PROMPT_CACHE_TTL=5m`,
+`ANTHROPIC_TOKEN_EFFICIENT=1` (token‑efficient tools beta).
 
 Optional: persist the hook in the capsule config so you can omit `--model-hook`:
 
@@ -160,6 +162,7 @@ Optional: persist the hook in the capsule config so you can omit `--model-hook`:
 ```
 
 Note: lower `log_commit_interval` improves durability (set to 1 for audit‑grade logging).
+Batched commits can lose the last `log_commit_interval` log entries on a crash.
 
 ## Docker deploy (minimal)
 

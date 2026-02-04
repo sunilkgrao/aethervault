@@ -57,6 +57,8 @@ Outputs are appended to the main response.
 - `AETHERVAULT_LOG_COMMIT_INTERVAL` (set to `1` for audit‑grade durability)
 - `AETHERVAULT_AGENT_TIMEOUT` (seconds)
 - `AETHERVAULT_SESSION_PREFIX` (prefix for all sessions)
+- `ANTHROPIC_PROMPT_CACHE` / `ANTHROPIC_PROMPT_CACHE_TTL`
+- `ANTHROPIC_TOKEN_EFFICIENT` (token‑efficient tools beta)
 
 ## Legacy Python bridges
 
