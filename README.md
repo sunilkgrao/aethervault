@@ -77,6 +77,7 @@ cargo build --locked
 - `agent` runs a minimal hook‑based assistant loop.
 - `bridge` runs Rust‑native Telegram/WhatsApp connectors.
 - `bootstrap` scaffolds soul + memory workspace and writes default agent config.
+- `schedule` runs daily/weekly autonomous briefings (Telegram optional).
 - `compact` runs vacuum compaction + index rebuilds (SOTA maintenance).
 - `doctor` exposes full repair/verify controls.
 
@@ -136,6 +137,17 @@ Bootstrap creates templates and writes config:
 
 ```bash
 ./target/release/aethervault bootstrap knowledge.mv2 --workspace ./assistant
+```
+
+## Autonomous scheduling
+
+Run daily/weekly briefings (Telegram delivery optional):
+
+```bash
+export TELEGRAM_BOT_TOKEN=123456:ABC
+export AETHERVAULT_TELEGRAM_CHAT_ID=123456789
+
+./target/release/aethervault schedule knowledge.mv2 --workspace ./assistant --model-hook builtin:claude
 ```
 
 For longer tool‑using sessions, raise the step budget:

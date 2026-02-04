@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hash;
-use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc, Timelike, Datelike};
 use clap::{Parser, Subcommand};
 use aether_core::types::{Frame, FrameStatus, SearchHit, SearchRequest, TemporalFilter};
 use aether_core::{DoctorOptions, DoctorReport, PutOptions, Vault, VaultError};
@@ -458,6 +458,35 @@ enum Command {
         force: bool,
     },
 
+    /// Run autonomous schedules (daily/weekly briefings).
+    Schedule {
+        mv2: PathBuf,
+        /// Workspace folder (default: ./assistant or AETHERVAULT_WORKSPACE)
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Timezone offset (e.g. -05:00)
+        #[arg(long)]
+        timezone: Option<String>,
+        /// Telegram bot token (env: TELEGRAM_BOT_TOKEN)
+        #[arg(long)]
+        telegram_token: Option<String>,
+        /// Telegram chat id (env: AETHERVAULT_TELEGRAM_CHAT_ID)
+        #[arg(long)]
+        telegram_chat_id: Option<String>,
+        /// Override model hook command (env: AETHERVAULT_MODEL_HOOK)
+        #[arg(long)]
+        model_hook: Option<String>,
+        /// Max tool/LLM steps
+        #[arg(long, default_value_t = 64)]
+        max_steps: usize,
+        /// Log turns to capsule
+        #[arg(long)]
+        log: bool,
+        /// Commit agent logs every N entries (1 = fsync each log)
+        #[arg(long, default_value_t = 8)]
+        log_commit_interval: usize,
+    },
+
     /// Rust-native chat connectors (Telegram + WhatsApp).
     Bridge {
         #[command(subcommand)]
@@ -840,6 +869,10 @@ struct AgentConfig {
     #[serde(default)]
     timezone: Option<String>,
     #[serde(default)]
+    telegram_token: Option<String>,
+    #[serde(default)]
+    telegram_chat_id: Option<String>,
+    #[serde(default)]
     context_query: Option<String>,
     #[serde(default)]
     max_context_bytes: Option<usize>,
@@ -1181,6 +1214,29 @@ struct ToolEmailArchiveArgs {
 struct ToolConfigSetArgs {
     key: String,
     json: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolMemorySyncArgs {
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    include_daily: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolMemoryExportArgs {
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    include_daily: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolMemorySearchArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1587,8 +1643,8 @@ fn run_hook_command(
     if command.is_empty() {
         return Err("hook command is empty".into());
     }
-    let mut cmd = ProcessCommand::new(&command[0]);
-    cmd.args(&command[1..])
+    let mut cmd = build_external_command(&command[0], &command[1..]);
+    cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2736,6 +2792,40 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "memory.sync",
+            "description": "Sync workspace memory files into the capsule.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string" },
+                    "include_daily": { "type": "boolean" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "memory.export",
+            "description": "Export capsule memory back to workspace files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string" },
+                    "include_daily": { "type": "boolean" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "memory.search",
+            "description": "Search memory stored in the capsule.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer" }
+                },
+                "required": ["query"]
+            }
+        }),
+        serde_json::json!({
             "name": "email.list",
             "description": "List email envelopes via Himalaya.",
             "inputSchema": {
@@ -3076,6 +3166,76 @@ fn execute_tool_with_handles(
             *mem_read = None;
             Ok(result)
         }
+        "memory.sync" => {
+            let parsed: ToolMemorySyncArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let workspace = parsed
+                .workspace
+                .map(PathBuf::from)
+                .or_else(|| workspace_override.clone())
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let include_daily = parsed.include_daily.unwrap_or(true);
+            let ids = sync_workspace_memory(mv2, &workspace, include_daily)
+                .map_err(|e| e.to_string())?;
+            *mem_read = None;
+            Ok(ToolExecution {
+                output: format!("Synced {} memory files.", ids.len()),
+                details: serde_json::json!({ "frame_ids": ids }),
+                is_error: false,
+            })
+        }
+        "memory.export" => {
+            let parsed: ToolMemoryExportArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let workspace = parsed
+                .workspace
+                .map(PathBuf::from)
+                .or_else(|| workspace_override.clone())
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let include_daily = parsed.include_daily.unwrap_or(true);
+            let paths = export_capsule_memory(mv2, &workspace, include_daily)
+                .map_err(|e| e.to_string())?;
+            Ok(ToolExecution {
+                output: format!("Exported {} files.", paths.len()),
+                details: serde_json::json!({ "paths": paths }),
+                is_error: false,
+            })
+        }
+        "memory.search" => {
+            let parsed: ToolMemorySearchArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            with_read_mem(mem_read, mem_write, mv2, |mem| {
+                let request = SearchRequest {
+                    query: parsed.query.clone(),
+                    top_k: parsed.limit.unwrap_or(10),
+                    snippet_chars: 300,
+                    uri: None,
+                    scope: Some("aethervault://memory/".to_string()),
+                    cursor: None,
+                    temporal: None,
+                    as_of_frame: None,
+                    as_of_ts: None,
+                    no_sketch: false,
+                };
+                let response = mem.search(request).map_err(|e| e.to_string())?;
+                let mut lines = Vec::new();
+                for hit in response.hits.iter().take(5) {
+                    let title = hit.title.clone().unwrap_or_default();
+                    lines.push(format!("{}. {} {}", hit.rank, hit.uri, title));
+                }
+                let output = if lines.is_empty() {
+                    "No results.".to_string()
+                } else {
+                    lines.join("\n")
+                };
+                let details = serde_json::to_value(response).map_err(|e| e.to_string())?;
+                Ok(ToolExecution {
+                    output,
+                    details,
+                    is_error: false,
+                })
+            })
+        }
         "memory.append_daily" => {
             let parsed: ToolMemoryAppendArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
@@ -3161,7 +3321,7 @@ fn execute_tool_with_handles(
         "email.list" => {
             let parsed: ToolEmailListArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let mut cmd = ProcessCommand::new("himalaya");
+            let mut cmd = build_external_command("himalaya", &[]);
             cmd.arg("envelope").arg("list").arg("--output").arg("json");
             if let Some(limit) = parsed.limit {
                 cmd.arg("--limit").arg(limit.to_string());
@@ -3189,7 +3349,7 @@ fn execute_tool_with_handles(
         "email.read" => {
             let parsed: ToolEmailReadArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let mut cmd = ProcessCommand::new("himalaya");
+            let mut cmd = build_external_command("himalaya", &[]);
             cmd.arg("message")
                 .arg("read")
                 .arg(parsed.id)
@@ -3240,7 +3400,7 @@ fn execute_tool_with_handles(
             template.push_str(&parsed.body);
             template.push('\n');
 
-            let mut cmd = ProcessCommand::new("himalaya");
+            let mut cmd = build_external_command("himalaya", &[]);
             cmd.arg("template").arg("send");
             let mut child = cmd
                 .stdin(Stdio::piped())
@@ -3269,7 +3429,7 @@ fn execute_tool_with_handles(
         "email.archive" => {
             let parsed: ToolEmailArchiveArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let mut cmd = ProcessCommand::new("himalaya");
+            let mut cmd = build_external_command("himalaya", &[]);
             cmd.arg("message").arg("move").arg(parsed.id).arg("Archive");
             if let Some(folder) = parsed.folder {
                 cmd.arg("--folder").arg(folder);
@@ -3542,6 +3702,25 @@ fn parse_retry_after(resp: &ureq::Response) -> Option<f64> {
         .and_then(|v| v.trim().parse::<f64>().ok())
 }
 
+fn command_wrapper() -> Option<Vec<String>> {
+    env_optional("AETHERVAULT_COMMAND_WRAPPER").map(|raw| {
+        raw.split_whitespace()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    })
+}
+
+fn build_external_command(program: &str, args: &[String]) -> ProcessCommand {
+    if let Some(wrapper) = command_wrapper() {
+        let mut cmd = ProcessCommand::new(&wrapper[0]);
+        cmd.args(&wrapper[1..]).arg(program).args(args);
+        return cmd;
+    }
+    let mut cmd = ProcessCommand::new(program);
+    cmd.args(args);
+    cmd
+}
+
 fn resolve_workspace(
     cli: Option<PathBuf>,
     agent_cfg: &AgentConfig,
@@ -3575,6 +3754,148 @@ fn read_optional_file(path: &Path) -> Option<String> {
 fn daily_memory_path(workspace: &Path) -> PathBuf {
     let date = Utc::now().format("%Y-%m-%d").to_string();
     workspace.join("memory").join(format!("{date}.md"))
+}
+
+fn memory_uri(kind: &str) -> String {
+    format!("aethervault://memory/{kind}.md")
+}
+
+fn memory_daily_uri(date: &str) -> String {
+    format!("aethervault://memory/daily/{date}.md")
+}
+
+fn sync_memory_file(
+    mem: &mut Vault,
+    path: &Path,
+    uri: String,
+    title: &str,
+    track: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let text = fs::read_to_string(path)?;
+    let mut options = PutOptions::default();
+    options.uri = Some(uri);
+    options.title = Some(title.to_string());
+    options.kind = Some("text/markdown".to_string());
+    options.track = Some(track.to_string());
+    options.search_text = Some(text.clone());
+    let id = mem.put_bytes_with_options(text.as_bytes(), options)?;
+    mem.commit()?;
+    Ok(id)
+}
+
+fn sync_workspace_memory(
+    mv2: &Path,
+    workspace: &Path,
+    include_daily: bool,
+) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    let mut mem = open_or_create(mv2)?;
+    let mut ids = Vec::new();
+    let soul = workspace.join("SOUL.md");
+    let user = workspace.join("USER.md");
+    let memory = workspace.join("MEMORY.md");
+    if soul.exists() {
+        ids.push(sync_memory_file(
+            &mut mem,
+            &soul,
+            memory_uri("soul"),
+            "memory soul",
+            "aethervault.memory",
+        )?);
+    }
+    if user.exists() {
+        ids.push(sync_memory_file(
+            &mut mem,
+            &user,
+            memory_uri("user"),
+            "memory user",
+            "aethervault.memory",
+        )?);
+    }
+    if memory.exists() {
+        ids.push(sync_memory_file(
+            &mut mem,
+            &memory,
+            memory_uri("longterm"),
+            "memory longterm",
+            "aethervault.memory",
+        )?);
+    }
+    if include_daily {
+        let daily_dir = workspace.join("memory");
+        if daily_dir.exists() {
+            for entry in WalkDir::new(&daily_dir).max_depth(1) {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let uri = memory_daily_uri(stem);
+                let title = format!("memory daily {stem}");
+                ids.push(sync_memory_file(
+                    &mut mem,
+                    path,
+                    uri,
+                    &title,
+                    "aethervault.memory",
+                )?);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn export_capsule_memory(
+    mv2: &Path,
+    workspace: &Path,
+    include_daily: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut mem = Vault::open_read_only(mv2)?;
+    let mut paths = Vec::new();
+    let items = vec![
+        (memory_uri("soul"), workspace.join("SOUL.md")),
+        (memory_uri("user"), workspace.join("USER.md")),
+        (memory_uri("longterm"), workspace.join("MEMORY.md")),
+    ];
+    for (uri, path) in items {
+        if let Ok(frame) = mem.frame_by_uri(&uri) {
+            if let Ok(text) = mem.frame_text_by_id(frame.id) {
+                fs::create_dir_all(workspace)?;
+                fs::write(&path, text)?;
+                paths.push(path.display().to_string());
+            }
+        }
+    }
+    if include_daily {
+        let daily_dir = workspace.join("memory");
+        fs::create_dir_all(&daily_dir)?;
+        let total = mem.frame_count() as u64;
+        for frame_id in 0..total {
+            let frame = match mem.frame_by_id(frame_id) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let Some(uri) = frame.uri.as_deref() else {
+                continue;
+            };
+            if !uri.starts_with("aethervault://memory/daily/") {
+                continue;
+            }
+            if let Some(name) = uri.rsplit('/').next() {
+                let path = daily_dir.join(name);
+                if let Ok(text) = mem.frame_text_by_id(frame_id) {
+                    fs::write(&path, text)?;
+                    paths.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    Ok(paths)
 }
 
 fn load_workspace_context(workspace: &Path) -> String {
@@ -3642,6 +3963,156 @@ fn bootstrap_workspace(
     let bytes = serde_json::to_vec_pretty(&config)?;
     let _ = save_config_entry(&mut mem, "index", &bytes)?;
     Ok(())
+}
+
+fn parse_timezone_offset(value: &str) -> Result<chrono::FixedOffset, Box<dyn std::error::Error>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(chrono::FixedOffset::east_opt(0).unwrap());
+    }
+    let sign = if trimmed.starts_with('-') { -1 } else { 1 };
+    let value = trimmed.trim_start_matches(['+', '-']);
+    let mut parts = value.split(':');
+    let hours: i32 = parts
+        .next()
+        .ok_or("timezone")?
+        .parse()
+        .map_err(|_| "timezone hours")?;
+    let minutes: i32 = parts
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| "timezone minutes")?;
+    let total = sign * (hours * 3600 + minutes * 60);
+    chrono::FixedOffset::east_opt(total).ok_or_else(|| "timezone offset".into())
+}
+
+fn resolve_timezone(agent_cfg: &AgentConfig, override_value: Option<String>) -> chrono::FixedOffset {
+    let raw = override_value
+        .or_else(|| agent_cfg.timezone.clone())
+        .or_else(|| env_optional("AETHERVAULT_TIMEZONE"));
+    raw.and_then(|v| parse_timezone_offset(&v).ok())
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap())
+}
+
+fn should_run_daily(last: &mut Option<chrono::NaiveDate>, now: chrono::DateTime<chrono::FixedOffset>, hour: u32, minute: u32) -> bool {
+    let date = now.date_naive();
+    if now.time().hour() != hour || now.time().minute() != minute {
+        return false;
+    }
+    if last.as_ref().is_some_and(|d| *d == date) {
+        return false;
+    }
+    *last = Some(date);
+    true
+}
+
+fn should_run_weekly(
+    last: &mut Option<chrono::NaiveDate>,
+    now: chrono::DateTime<chrono::FixedOffset>,
+    weekday: chrono::Weekday,
+    hour: u32,
+    minute: u32,
+) -> bool {
+    if now.weekday() != weekday {
+        return false;
+    }
+    should_run_daily(last, now, hour, minute)
+}
+
+fn schedule_prompt(kind: &str) -> String {
+    match kind {
+        "daily_overview" => "Generate the Daily Overview. Sweep inbox (email.list), identify conflicts, and list top priorities. Include \"Needs Your Action\" items.".to_string(),
+        "daily_recap" => "Generate the Daily Recap. Summarize what changed in inbox and calendar, actions taken, and pending follow-ups.".to_string(),
+        "weekly_overview" => "Generate the Weekly Overview. List top priorities and key meetings. Flag conflicts and follow-ups.".to_string(),
+        "weekly_recap" => "Generate the Weekly Recap. Summarize meetings handled, logistics, and outstanding items.".to_string(),
+        _ => "Generate an executive summary.".to_string(),
+    }
+}
+
+fn run_schedule_loop(
+    mv2: PathBuf,
+    workspace: Option<PathBuf>,
+    timezone: Option<String>,
+    telegram_token: Option<String>,
+    telegram_chat_id: Option<String>,
+    model_hook: Option<String>,
+    max_steps: usize,
+    log: bool,
+    log_commit_interval: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut mem_read = Some(Vault::open_read_only(&mv2)?);
+    let config = load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default();
+    let agent_cfg = config.agent.clone().unwrap_or_default();
+    let tz = resolve_timezone(&agent_cfg, timezone);
+    let workspace = resolve_workspace(workspace, &agent_cfg);
+    let telegram_token = telegram_token
+        .or(agent_cfg.telegram_token)
+        .or_else(|| env_optional("TELEGRAM_BOT_TOKEN"));
+    let telegram_chat_id = telegram_chat_id
+        .or(agent_cfg.telegram_chat_id)
+        .or_else(|| env_optional("AETHERVAULT_TELEGRAM_CHAT_ID"));
+
+    let agent_config = build_bridge_agent_config(
+        mv2.clone(),
+        model_hook,
+        None,
+        false,
+        None,
+        8,
+        12_000,
+        max_steps,
+        log,
+        log_commit_interval,
+    )?;
+
+    let mut last_daily_overview = None;
+    let mut last_daily_recap = None;
+    let mut last_weekly_overview = None;
+    let mut last_weekly_recap = None;
+
+    loop {
+        let now = chrono::Utc::now().with_timezone(&tz);
+        let mut tasks = Vec::new();
+        if should_run_daily(&mut last_daily_overview, now, 8, 30) {
+            tasks.push("daily_overview");
+        }
+        if should_run_daily(&mut last_daily_recap, now, 15, 30) {
+            tasks.push("daily_recap");
+        }
+        if should_run_weekly(&mut last_weekly_overview, now, chrono::Weekday::Mon, 8, 15) {
+            tasks.push("weekly_overview");
+        }
+        if should_run_weekly(&mut last_weekly_recap, now, chrono::Weekday::Fri, 15, 15) {
+            tasks.push("weekly_recap");
+        }
+
+        for task in tasks {
+            let mut prompt = schedule_prompt(task);
+            if let Some(ws) = &workspace {
+                prompt.push_str(&format!("\n\nWorkspace: {}", ws.display()));
+            }
+            let session = format!("schedule:{task}");
+            let result = run_agent_for_bridge(&agent_config, &prompt, session, None, None);
+            if let Ok(output) = result {
+                if let Some(text) = output.final_text {
+                    if let (Some(token), Some(chat_id)) = (telegram_token.as_ref(), telegram_chat_id.as_ref()) {
+                        let agent = ureq::AgentBuilder::new()
+                            .timeout_connect(Duration::from_secs(10))
+                            .timeout_write(Duration::from_secs(10))
+                            .timeout_read(Duration::from_secs(20))
+                            .build();
+                        let base_url = format!("https://api.telegram.org/bot{token}");
+                        if let Ok(chat_id) = chat_id.parse::<i64>() {
+                            let _ = telegram_send_message(&agent, &base_url, chat_id, &text);
+                        }
+                    }
+                }
+            }
+        }
+
+        thread::sleep(Duration::from_secs(30));
+    }
 }
 
 fn merge_system_messages(messages: &[AgentMessage]) -> String {
@@ -5825,6 +6296,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
+
+        Command::Schedule {
+            mv2,
+            workspace,
+            timezone,
+            telegram_token,
+            telegram_chat_id,
+            model_hook,
+            max_steps,
+            log,
+            log_commit_interval,
+        } => run_schedule_loop(
+            mv2,
+            workspace,
+            timezone,
+            telegram_token,
+            telegram_chat_id,
+            model_hook,
+            max_steps,
+            log,
+            log_commit_interval,
+        ),
 
         Command::Bridge { command } => run_bridge(command),
 

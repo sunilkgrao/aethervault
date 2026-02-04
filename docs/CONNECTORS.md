@@ -74,6 +74,7 @@ Outputs are appended to the main response.
 - `AETHERVAULT_SESSION_PREFIX` (prefix for all sessions)
 - `ANTHROPIC_PROMPT_CACHE` / `ANTHROPIC_PROMPT_CACHE_TTL`
 - `ANTHROPIC_TOKEN_EFFICIENT` (token‑efficient tools beta)
+- `AETHERVAULT_COMMAND_WRAPPER` (optional command prefix for sandboxing external tools)
 
 ## Legacy Python bridges
 
