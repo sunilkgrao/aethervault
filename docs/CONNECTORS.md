@@ -18,6 +18,26 @@ export ANTHROPIC_MODEL=claude-<model>
 
 Messages now route into `aethervault agent` and back to Telegram.
 
+## Slack / Discord / Teams (webhook receiver)
+
+Run a webhook bridge and point the platform’s event/webhook URL at it.
+
+```bash
+./target/release/aethervault bridge slack --port 8081
+./target/release/aethervault bridge discord --port 8082
+./target/release/aethervault bridge teams --port 8083
+```
+
+These bridges accept JSON payloads and extract `text` fields to feed the agent.
+
+## Signal (signal-cli)
+
+Install `signal-cli`, register a sender number, then use `signal_send` tool.
+
+## iMessage (macOS)
+
+`imessage_send` uses AppleScript and requires macOS with Messages logged in.
+
 ## Gmail via Himalaya (fast path)
 
 Install Himalaya and add your Gmail account (IMAP + App Password).

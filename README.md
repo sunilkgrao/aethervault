@@ -88,6 +88,7 @@ cargo build --locked
 - `docs/CONNECTORS.md` for Telegram + WhatsApp bridges and subagent fan‑out.
 - Rust‑native connectors are built in (`bridge`). Legacy Python scripts live in `examples/bridge`.
 - Optional: Himalaya integration enables `email_*` tools for Gmail IMAP workflows.
+- `notify`, `signal_send`, `imessage_send` provide outbound messaging helpers.
 
 ## Maintenance (SOTA compaction)
 

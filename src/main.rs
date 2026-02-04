@@ -623,6 +623,172 @@ enum BridgeCommand {
         #[arg(long, default_value_t = 8)]
         log_commit_interval: usize,
     },
+    /// Slack events bridge (webhook receiver).
+    Slack {
+        #[arg(long)]
+        mv2: Option<PathBuf>,
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+        #[arg(long, default_value_t = 8081)]
+        port: u16,
+        #[arg(long)]
+        model_hook: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        #[arg(long)]
+        no_memory: bool,
+        #[arg(long)]
+        context_query: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        context_results: usize,
+        #[arg(long, default_value_t = 12_000)]
+        context_max_bytes: usize,
+        #[arg(long, default_value_t = 64)]
+        max_steps: usize,
+        #[arg(long)]
+        log: bool,
+        #[arg(long, default_value_t = 8)]
+        log_commit_interval: usize,
+    },
+    /// Discord bridge (webhook receiver).
+    Discord {
+        #[arg(long)]
+        mv2: Option<PathBuf>,
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+        #[arg(long, default_value_t = 8082)]
+        port: u16,
+        #[arg(long)]
+        model_hook: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        #[arg(long)]
+        no_memory: bool,
+        #[arg(long)]
+        context_query: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        context_results: usize,
+        #[arg(long, default_value_t = 12_000)]
+        context_max_bytes: usize,
+        #[arg(long, default_value_t = 64)]
+        max_steps: usize,
+        #[arg(long)]
+        log: bool,
+        #[arg(long, default_value_t = 8)]
+        log_commit_interval: usize,
+    },
+    /// Teams bridge (webhook receiver).
+    Teams {
+        #[arg(long)]
+        mv2: Option<PathBuf>,
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+        #[arg(long, default_value_t = 8083)]
+        port: u16,
+        #[arg(long)]
+        model_hook: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        #[arg(long)]
+        no_memory: bool,
+        #[arg(long)]
+        context_query: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        context_results: usize,
+        #[arg(long, default_value_t = 12_000)]
+        context_max_bytes: usize,
+        #[arg(long, default_value_t = 64)]
+        max_steps: usize,
+        #[arg(long)]
+        log: bool,
+        #[arg(long, default_value_t = 8)]
+        log_commit_interval: usize,
+    },
+    /// Signal bridge (requires signal-cli).
+    Signal {
+        #[arg(long)]
+        mv2: Option<PathBuf>,
+        #[arg(long)]
+        sender: Option<String>,
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+        #[arg(long, default_value_t = 8084)]
+        port: u16,
+        #[arg(long)]
+        model_hook: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        #[arg(long)]
+        no_memory: bool,
+        #[arg(long)]
+        context_query: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        context_results: usize,
+        #[arg(long, default_value_t = 12_000)]
+        context_max_bytes: usize,
+        #[arg(long, default_value_t = 64)]
+        max_steps: usize,
+        #[arg(long)]
+        log: bool,
+        #[arg(long, default_value_t = 8)]
+        log_commit_interval: usize,
+    },
+    /// Matrix bridge (webhook receiver).
+    Matrix {
+        #[arg(long)]
+        mv2: Option<PathBuf>,
+        #[arg(long)]
+        room: Option<String>,
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+        #[arg(long, default_value_t = 8085)]
+        port: u16,
+        #[arg(long)]
+        model_hook: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        #[arg(long)]
+        no_memory: bool,
+        #[arg(long)]
+        context_query: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        context_results: usize,
+        #[arg(long, default_value_t = 12_000)]
+        context_max_bytes: usize,
+        #[arg(long, default_value_t = 64)]
+        max_steps: usize,
+        #[arg(long)]
+        log: bool,
+        #[arg(long, default_value_t = 8)]
+        log_commit_interval: usize,
+    },
+    /// iMessage bridge (macOS only).
+    IMessage {
+        #[arg(long)]
+        mv2: Option<PathBuf>,
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+        #[arg(long, default_value_t = 8086)]
+        port: u16,
+        #[arg(long)]
+        model_hook: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        #[arg(long)]
+        no_memory: bool,
+        #[arg(long)]
+        context_query: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        context_results: usize,
+        #[arg(long, default_value_t = 12_000)]
+        context_max_bytes: usize,
+        #[arg(long, default_value_t = 64)]
+        max_steps: usize,
+        #[arg(long)]
+        log: bool,
+        #[arg(long, default_value_t = 8)]
+        log_commit_interval: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1246,6 +1412,29 @@ struct ToolExecArgs {
     cwd: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolNotifyArgs {
+    #[serde(default)]
+    channel: Option<String>,
+    text: String,
+    #[serde(default)]
+    webhook: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolSignalSendArgs {
+    to: String,
+    text: String,
+    #[serde(default)]
+    sender: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolIMessageSendArgs {
+    to: String,
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2902,6 +3091,44 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
                 },
                 "required": ["command"]
             }
+        }),
+        serde_json::json!({
+            "name": "notify",
+            "description": "Send a notification to Slack/Discord/Teams via webhook.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string" },
+                    "text": { "type": "string" },
+                    "webhook": { "type": "string" }
+                },
+                "required": ["text"]
+            }
+        }),
+        serde_json::json!({
+            "name": "signal_send",
+            "description": "Send a Signal message via signal-cli.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string" },
+                    "text": { "type": "string" },
+                    "sender": { "type": "string" }
+                },
+                "required": ["to", "text"]
+            }
+        }),
+        serde_json::json!({
+            "name": "imessage_send",
+            "description": "Send an iMessage (macOS only).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["to", "text"]
+            }
         })
     ]
 }
@@ -3521,6 +3748,93 @@ fn execute_tool_with_handles(
                 output: output_text,
                 details,
                 is_error: !output.status.success(),
+            })
+        }
+        "notify" => {
+            let parsed: ToolNotifyArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let channel = parsed
+                .channel
+                .unwrap_or_else(|| "slack".to_string())
+                .to_ascii_lowercase();
+            let webhook = parsed.webhook.or_else(|| match channel.as_str() {
+                "discord" => env_optional("DISCORD_WEBHOOK_URL"),
+                "teams" => env_optional("TEAMS_WEBHOOK_URL"),
+                _ => env_optional("SLACK_WEBHOOK_URL"),
+            });
+            let Some(webhook) = webhook else {
+                return Err("notify requires webhook url".into());
+            };
+            let payload = match channel.as_str() {
+                "discord" => serde_json::json!({ "content": parsed.text }),
+                "teams" => serde_json::json!({ "text": parsed.text }),
+                _ => serde_json::json!({ "text": parsed.text }),
+            };
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
+                .timeout_read(Duration::from_secs(20))
+                .timeout_write(Duration::from_secs(10))
+                .build();
+            let response = agent
+                .post(&webhook)
+                .set("content-type", "application/json")
+                .send_json(payload);
+            match response {
+                Ok(_) => Ok(ToolExecution {
+                    output: "Notification sent.".to_string(),
+                    details: serde_json::json!({ "channel": channel }),
+                    is_error: false,
+                }),
+                Err(err) => Err(format!("notify error: {err}")),
+            }
+        }
+        "signal_send" => {
+            let parsed: ToolSignalSendArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let sender = parsed.sender.or_else(|| env_optional("SIGNAL_SENDER"));
+            let Some(sender) = sender else {
+                return Err("signal_send requires sender".into());
+            };
+            let mut cmd = build_external_command("signal-cli", &[]);
+            cmd.arg("-u")
+                .arg(sender)
+                .arg("send")
+                .arg("-m")
+                .arg(parsed.text)
+                .arg(parsed.to);
+            let output = cmd.output().map_err(|e| format!("signal-cli: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(format!("signal-cli error: {stderr}"));
+            }
+            Ok(ToolExecution {
+                output: "Signal message sent.".to_string(),
+                details: serde_json::json!({ "status": "sent" }),
+                is_error: false,
+            })
+        }
+        "imessage_send" => {
+            let parsed: ToolIMessageSendArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            if !cfg!(target_os = "macos") {
+                return Err("imessage_send requires macOS".into());
+            }
+            let script = format!(
+                "tell application \"Messages\" to send \"{}\" to buddy \"{}\"",
+                parsed.text.replace('"', "\\\""),
+                parsed.to.replace('"', "\\\"")
+            );
+            let mut cmd = build_external_command("osascript", &[]);
+            cmd.arg("-e").arg(script);
+            let output = cmd.output().map_err(|e| format!("osascript: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(format!("osascript error: {stderr}"));
+            }
+            Ok(ToolExecution {
+                output: "iMessage sent.".to_string(),
+                details: serde_json::json!({ "status": "sent" }),
+                is_error: false,
             })
         }
         _ => Err("unknown tool".into()),
@@ -5323,6 +5637,109 @@ fn run_whatsapp_bridge(
     Ok(())
 }
 
+fn parse_json_body(request: &mut tiny_http::Request) -> Result<serde_json::Value, String> {
+    let mut body = String::new();
+    request
+        .as_reader()
+        .read_to_string(&mut body)
+        .map_err(|e| format!("read body: {e}"))?;
+    if body.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("json: {e}"))
+}
+
+fn run_webhook_bridge(
+    name: &str,
+    bind: String,
+    port: u16,
+    agent_config: BridgeAgentConfig,
+    extract_text: fn(&serde_json::Value) -> Option<String>,
+    reply: fn(&BridgeAgentConfig, &str) -> Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = format!("{bind}:{port}");
+    let server = Server::http(&addr)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("server: {e}")))?;
+    eprintln!("{name} bridge listening on http://{addr}");
+
+    for mut request in server.incoming_requests() {
+        if *request.method() != Method::Post {
+            let response = Response::from_string("ok");
+            let _ = request.respond(response);
+            continue;
+        }
+        let payload = parse_json_body(&mut request).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(challenge) = payload.get("challenge").and_then(|v| v.as_str()) {
+            let response = Response::from_string(challenge.to_string());
+            let _ = request.respond(response);
+            continue;
+        }
+        let Some(text) = extract_text(&payload) else {
+            let response = Response::from_string("ok");
+            let _ = request.respond(response);
+            continue;
+        };
+        let session = format!("{}:{name}", agent_config.session_prefix);
+        let result = run_agent_for_bridge(&agent_config, &text, session, None, None);
+        let output = match result {
+            Ok(output) => output.final_text.unwrap_or_else(|| "Done.".to_string()),
+            Err(err) => format!("Agent error: {err}"),
+        };
+        if let Some(response_text) = reply(&agent_config, &output) {
+            let response = Response::from_string(response_text);
+            let _ = request.respond(response);
+        } else {
+            let response = Response::from_string("ok");
+            let _ = request.respond(response);
+        }
+    }
+    Ok(())
+}
+
+fn extract_slack_text(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("event")
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| payload.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+}
+
+fn extract_discord_text(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn extract_teams_text(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("text")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| payload.get("body").and_then(|v| v.get("content")).and_then(|v| v.as_str()).map(|s| s.to_string()))
+}
+
+fn extract_signal_text(payload: &serde_json::Value) -> Option<String> {
+    payload.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+fn extract_matrix_text(payload: &serde_json::Value) -> Option<String> {
+    payload.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+fn extract_imessage_text(payload: &serde_json::Value) -> Option<String> {
+    payload.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+fn reply_none(_: &BridgeAgentConfig, _: &str) -> Option<String> {
+    None
+}
+
+fn reply_slack(_: &BridgeAgentConfig, text: &str) -> Option<String> {
+    Some(serde_json::json!({ "text": text }).to_string())
+}
+
 fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         BridgeCommand::Telegram {
@@ -5386,6 +5803,182 @@ fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::error::Error>> 
                 log_commit_interval,
             )?;
             run_whatsapp_bridge(bind, port, config)
+        }
+        BridgeCommand::Slack {
+            mv2,
+            bind,
+            port,
+            model_hook,
+            system,
+            no_memory,
+            context_query,
+            context_results,
+            context_max_bytes,
+            max_steps,
+            log,
+            log_commit_interval,
+        } => {
+            let mv2 = resolve_mv2_path(mv2);
+            let config = build_bridge_agent_config(
+                mv2,
+                model_hook,
+                system,
+                no_memory,
+                context_query,
+                context_results,
+                context_max_bytes,
+                max_steps,
+                log,
+                log_commit_interval,
+            )?;
+            run_webhook_bridge("slack", bind, port, config, extract_slack_text, reply_slack)
+        }
+        BridgeCommand::Discord {
+            mv2,
+            bind,
+            port,
+            model_hook,
+            system,
+            no_memory,
+            context_query,
+            context_results,
+            context_max_bytes,
+            max_steps,
+            log,
+            log_commit_interval,
+        } => {
+            let mv2 = resolve_mv2_path(mv2);
+            let config = build_bridge_agent_config(
+                mv2,
+                model_hook,
+                system,
+                no_memory,
+                context_query,
+                context_results,
+                context_max_bytes,
+                max_steps,
+                log,
+                log_commit_interval,
+            )?;
+            run_webhook_bridge("discord", bind, port, config, extract_discord_text, reply_none)
+        }
+        BridgeCommand::Teams {
+            mv2,
+            bind,
+            port,
+            model_hook,
+            system,
+            no_memory,
+            context_query,
+            context_results,
+            context_max_bytes,
+            max_steps,
+            log,
+            log_commit_interval,
+        } => {
+            let mv2 = resolve_mv2_path(mv2);
+            let config = build_bridge_agent_config(
+                mv2,
+                model_hook,
+                system,
+                no_memory,
+                context_query,
+                context_results,
+                context_max_bytes,
+                max_steps,
+                log,
+                log_commit_interval,
+            )?;
+            run_webhook_bridge("teams", bind, port, config, extract_teams_text, reply_none)
+        }
+        BridgeCommand::Signal {
+            mv2,
+            bind,
+            port,
+            model_hook,
+            system,
+            no_memory,
+            context_query,
+            context_results,
+            context_max_bytes,
+            max_steps,
+            log,
+            log_commit_interval,
+            sender: _,
+        } => {
+            let mv2 = resolve_mv2_path(mv2);
+            let config = build_bridge_agent_config(
+                mv2,
+                model_hook,
+                system,
+                no_memory,
+                context_query,
+                context_results,
+                context_max_bytes,
+                max_steps,
+                log,
+                log_commit_interval,
+            )?;
+            run_webhook_bridge("signal", bind, port, config, extract_signal_text, reply_none)
+        }
+        BridgeCommand::Matrix {
+            mv2,
+            bind,
+            port,
+            model_hook,
+            system,
+            no_memory,
+            context_query,
+            context_results,
+            context_max_bytes,
+            max_steps,
+            log,
+            log_commit_interval,
+            room: _,
+        } => {
+            let mv2 = resolve_mv2_path(mv2);
+            let config = build_bridge_agent_config(
+                mv2,
+                model_hook,
+                system,
+                no_memory,
+                context_query,
+                context_results,
+                context_max_bytes,
+                max_steps,
+                log,
+                log_commit_interval,
+            )?;
+            run_webhook_bridge("matrix", bind, port, config, extract_matrix_text, reply_none)
+        }
+        BridgeCommand::IMessage {
+            mv2,
+            bind,
+            port,
+            model_hook,
+            system,
+            no_memory,
+            context_query,
+            context_results,
+            context_max_bytes,
+            max_steps,
+            log,
+            log_commit_interval,
+        } => {
+            let mv2 = resolve_mv2_path(mv2);
+            let config = build_bridge_agent_config(
+                mv2,
+                model_hook,
+                system,
+                no_memory,
+                context_query,
+                context_results,
+                context_max_bytes,
+                max_steps,
+                log,
+                log_commit_interval,
+            )?;
+            run_webhook_bridge("imessage", bind, port, config, extract_imessage_text, reply_none)
         }
     }
 }
