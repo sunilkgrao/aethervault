@@ -164,7 +164,3 @@ Outputs are appended to the main response.
 - `ANTHROPIC_PROMPT_CACHE` / `ANTHROPIC_PROMPT_CACHE_TTL`
 - `ANTHROPIC_TOKEN_EFFICIENT` (token‑efficient tools beta)
 - `AETHERVAULT_COMMAND_WRAPPER` (optional command prefix for sandboxing external tools)
-
-## Legacy Python bridges
-
-If you need stdlib‑only scripts, the previous Python bridges remain in `examples/bridge` as reference.
