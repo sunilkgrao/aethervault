@@ -129,7 +129,8 @@ Tune performance with `embed --batch N` and query flags like `--embed-cache`.
 ## Workspace (Soul + Memory)
 
 The agent can optionally read `SOUL.md`, `USER.md`, `MEMORY.md`, and a daily log in `memory/YYYY-MM-DD.md`
-from a workspace directory (default `./assistant` or `AETHERVAULT_WORKSPACE`).
+from a workspace directory (default `./assistant` or `AETHERVAULT_WORKSPACE`). Memory writes via tools
+are mirrored into the capsule under `aethervault://memory/*` so the single‑file `.mv2` remains the source of truth.
 
 Bootstrap creates templates and writes config:
 

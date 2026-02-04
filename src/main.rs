@@ -2714,7 +2714,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "memory.append_daily",
-            "description": "Append a line to the daily memory log (workspace).",
+            "description": "Append a line to the daily memory log (workspace) and store in the capsule.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2726,7 +2726,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "memory.remember",
-            "description": "Append a line to MEMORY.md (workspace).",
+            "description": "Append a line to MEMORY.md (workspace) and store in the capsule.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2814,7 +2814,10 @@ fn execute_tool_with_handles(
     mem_read: &mut Option<Vault>,
     mem_write: &mut Option<Vault>,
 ) -> Result<ToolExecution, String> {
-    let is_write = matches!(name, "put" | "log" | "feedback" | "config.set");
+    let is_write = matches!(
+        name,
+        "put" | "log" | "feedback" | "config.set" | "memory.append_daily" | "memory.remember"
+    );
     if read_only && is_write {
         return Err("tool disabled in read-only mode".into());
     }
@@ -3091,9 +3094,28 @@ fn execute_tool_with_handles(
                 .open(&path)
                 .map_err(|e| format!("memory open: {e}"))?;
             writeln!(file, "{}", parsed.text).map_err(|e| format!("memory write: {e}"))?;
+            let uri = format!("aethervault://memory/daily/{date}.md");
+            let result = with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+                let mut options = PutOptions::default();
+                options.uri = Some(uri.clone());
+                options.title = Some(format!("memory daily {date}"));
+                options.kind = Some("text/markdown".to_string());
+                options.track = Some("aethervault.memory".to_string());
+                options.search_text = Some(parsed.text.clone());
+                let frame_id = mem
+                    .put_bytes_with_options(parsed.text.as_bytes(), options)
+                    .map_err(|e| e.to_string())?;
+                mem.commit().map_err(|e| e.to_string())?;
+                Ok(frame_id)
+            })?;
+            *mem_read = None;
             Ok(ToolExecution {
                 output: format!("Appended to {}", path.display()),
-                details: serde_json::json!({ "path": path.display().to_string() }),
+                details: serde_json::json!({
+                    "path": path.display().to_string(),
+                    "uri": uri,
+                    "frame_id": result
+                }),
                 is_error: false,
             })
         }
@@ -3111,9 +3133,28 @@ fn execute_tool_with_handles(
                 .open(&path)
                 .map_err(|e| format!("memory open: {e}"))?;
             writeln!(file, "{}", parsed.text).map_err(|e| format!("memory write: {e}"))?;
+            let uri = "aethervault://memory/longterm.md".to_string();
+            let result = with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+                let mut options = PutOptions::default();
+                options.uri = Some(uri.clone());
+                options.title = Some("memory longterm".to_string());
+                options.kind = Some("text/markdown".to_string());
+                options.track = Some("aethervault.memory".to_string());
+                options.search_text = Some(parsed.text.clone());
+                let frame_id = mem
+                    .put_bytes_with_options(parsed.text.as_bytes(), options)
+                    .map_err(|e| e.to_string())?;
+                mem.commit().map_err(|e| e.to_string())?;
+                Ok(frame_id)
+            })?;
+            *mem_read = None;
             Ok(ToolExecution {
                 output: format!("Appended to {}", path.display()),
-                details: serde_json::json!({ "path": path.display().to_string() }),
+                details: serde_json::json!({
+                    "path": path.display().to_string(),
+                    "uri": uri,
+                    "frame_id": result
+                }),
                 is_error: false,
             })
         }
