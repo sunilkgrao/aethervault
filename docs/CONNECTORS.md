@@ -29,7 +29,7 @@ himalaya --version
 himalaya account add
 ```
 
-Once configured, the agent can use `email.list`, `email.read`, `email.send`, and `email.archive`.
+Once configured, the agent can use `email_list`, `email_read`, `email_send`, and `email_archive`.
 
 Note: Calendar access still requires OAuth for Google Calendar or Microsoft 365.
 

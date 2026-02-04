@@ -87,7 +87,7 @@ cargo build --locked
 - `docs/DEPLOYMENT.md` for local, Docker, and cloud deployment.
 - `docs/CONNECTORS.md` for Telegram + WhatsApp bridges and subagent fan‑out.
 - Rust‑native connectors are built in (`bridge`). Legacy Python scripts live in `examples/bridge`.
- - Optional: Himalaya integration enables `email.*` tools for Gmail IMAP workflows.
+- Optional: Himalaya integration enables `email_*` tools for Gmail IMAP workflows.
 
 ## Maintenance (SOTA compaction)
 

@@ -2766,7 +2766,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "config.set",
+            "name": "config_set",
             "description": "Set a config JSON document at aethervault://config/<key>.json.",
             "inputSchema": {
                 "type": "object",
@@ -2778,7 +2778,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "memory.append_daily",
+            "name": "memory_append_daily",
             "description": "Append a line to the daily memory log (workspace) and store in the capsule.",
             "inputSchema": {
                 "type": "object",
@@ -2790,7 +2790,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "memory.remember",
+            "name": "memory_remember",
             "description": "Append a line to MEMORY.md (workspace) and store in the capsule.",
             "inputSchema": {
                 "type": "object",
@@ -2801,7 +2801,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "memory.sync",
+            "name": "memory_sync",
             "description": "Sync workspace memory files into the capsule.",
             "inputSchema": {
                 "type": "object",
@@ -2812,7 +2812,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "memory.export",
+            "name": "memory_export",
             "description": "Export capsule memory back to workspace files.",
             "inputSchema": {
                 "type": "object",
@@ -2823,7 +2823,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "memory.search",
+            "name": "memory_search",
             "description": "Search memory stored in the capsule.",
             "inputSchema": {
                 "type": "object",
@@ -2835,7 +2835,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "email.list",
+            "name": "email_list",
             "description": "List email envelopes via Himalaya.",
             "inputSchema": {
                 "type": "object",
@@ -2847,7 +2847,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "email.read",
+            "name": "email_read",
             "description": "Read a full message via Himalaya.",
             "inputSchema": {
                 "type": "object",
@@ -2860,7 +2860,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "email.send",
+            "name": "email_send",
             "description": "Send an email via Himalaya template.",
             "inputSchema": {
                 "type": "object",
@@ -2878,7 +2878,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "email.archive",
+            "name": "email_archive",
             "description": "Archive an email (move to Archive) via Himalaya.",
             "inputSchema": {
                 "type": "object",
@@ -2928,7 +2928,7 @@ fn execute_tool_with_handles(
 ) -> Result<ToolExecution, String> {
     let is_write = matches!(
         name,
-        "put" | "log" | "feedback" | "config.set" | "memory.append_daily" | "memory.remember"
+        "put" | "log" | "feedback" | "config_set" | "memory_append_daily" | "memory_remember"
     );
     if read_only && is_write {
         return Err("tool disabled in read-only mode".into());
@@ -3172,7 +3172,7 @@ fn execute_tool_with_handles(
             *mem_read = None;
             Ok(result)
         }
-        "config.set" => {
+        "config_set" => {
             let parsed: ToolConfigSetArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let payload = serde_json::to_vec(&parsed.json).map_err(|e| format!("json: {e}"))?;
@@ -3188,7 +3188,7 @@ fn execute_tool_with_handles(
             *mem_read = None;
             Ok(result)
         }
-        "memory.sync" => {
+        "memory_sync" => {
             let parsed: ToolMemorySyncArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let workspace = parsed
@@ -3206,7 +3206,7 @@ fn execute_tool_with_handles(
                 is_error: false,
             })
         }
-        "memory.export" => {
+        "memory_export" => {
             let parsed: ToolMemoryExportArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let workspace = parsed
@@ -3223,7 +3223,7 @@ fn execute_tool_with_handles(
                 is_error: false,
             })
         }
-        "memory.search" => {
+        "memory_search" => {
             let parsed: ToolMemorySearchArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             with_read_mem(mem_read, mem_write, mv2, |mem| {
@@ -3258,7 +3258,7 @@ fn execute_tool_with_handles(
                 })
             })
         }
-        "memory.append_daily" => {
+        "memory_append_daily" => {
             let parsed: ToolMemoryAppendArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let workspace = workspace_override
@@ -3301,7 +3301,7 @@ fn execute_tool_with_handles(
                 is_error: false,
             })
         }
-        "memory.remember" => {
+        "memory_remember" => {
             let parsed: ToolMemoryRememberArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let workspace = workspace_override
@@ -3340,7 +3340,7 @@ fn execute_tool_with_handles(
                 is_error: false,
             })
         }
-        "email.list" => {
+        "email_list" => {
             let parsed: ToolEmailListArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let mut cmd = build_external_command("himalaya", &[]);
@@ -3368,7 +3368,7 @@ fn execute_tool_with_handles(
                 is_error: false,
             })
         }
-        "email.read" => {
+        "email_read" => {
             let parsed: ToolEmailReadArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let mut cmd = build_external_command("himalaya", &[]);
@@ -3397,7 +3397,7 @@ fn execute_tool_with_handles(
                 is_error: false,
             })
         }
-        "email.send" => {
+        "email_send" => {
             let parsed: ToolEmailSendArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let mut template = String::new();
@@ -3448,7 +3448,7 @@ fn execute_tool_with_handles(
                 is_error: false,
             })
         }
-        "email.archive" => {
+        "email_archive" => {
             let parsed: ToolEmailArchiveArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let mut cmd = build_external_command("himalaya", &[]);
@@ -4097,7 +4097,7 @@ fn should_run_weekly(
 
 fn schedule_prompt(kind: &str) -> String {
     match kind {
-        "daily_overview" => "Generate the Daily Overview. Sweep inbox (email.list), identify conflicts, and list top priorities. Include \"Needs Your Action\" items.".to_string(),
+        "daily_overview" => "Generate the Daily Overview. Sweep inbox (email_list), identify conflicts, and list top priorities. Include \"Needs Your Action\" items.".to_string(),
         "daily_recap" => "Generate the Daily Recap. Summarize what changed in inbox and calendar, actions taken, and pending follow-ups.".to_string(),
         "weekly_overview" => "Generate the Weekly Overview. List top priorities and key meetings. Flag conflicts and follow-ups.".to_string(),
         "weekly_recap" => "Generate the Weekly Recap. Summarize meetings handled, logistics, and outstanding items.".to_string(),
