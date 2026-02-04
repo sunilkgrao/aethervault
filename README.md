@@ -86,6 +86,10 @@ cargo build --locked
 - `browser_request` proxies automation to a local browser broker (Stagehand/CUA/etc).
 - `fs_list`, `fs_read`, `fs_write` give controlled filesystem access within allowed roots.
 - `approval_*` tools provide human-in-the-loop gating for sensitive actions.
+- `tool_search` enables dynamic tool lookup (no bloated prompt).
+- `session_context` fetches recent session logs efficiently.
+- `reflect` stores self-critique in the capsule for iterative improvement.
+- `skill_store` / `skill_search` capture reusable procedures.
 - `compact` runs vacuum compaction + index rebuilds (SOTA maintenance).
 - `doctor` exposes full repair/verify controls.
 

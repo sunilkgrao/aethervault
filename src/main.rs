@@ -1645,6 +1645,49 @@ struct ToolTriggerRemoveArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct ToolToolSearchArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolSessionContextArgs {
+    session: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolReflectArgs {
+    text: String,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolSkillStoreArgs {
+    name: String,
+    #[serde(default)]
+    trigger: Option<String>,
+    #[serde(default)]
+    steps: Option<Vec<String>>,
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolSkillSearchArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ToolContextArgs {
     query: String,
     #[serde(default)]
@@ -3467,6 +3510,70 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "tool_search",
+            "description": "Search available tools by name/description.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer" }
+                },
+                "required": ["query"]
+            }
+        }),
+        serde_json::json!({
+            "name": "session_context",
+            "description": "Fetch recent log entries for a session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string" },
+                    "limit": { "type": "integer" }
+                },
+                "required": ["session"]
+            }
+        }),
+        serde_json::json!({
+            "name": "reflect",
+            "description": "Store a self-critique reflection in the capsule.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" },
+                    "session": { "type": "string" },
+                    "reason": { "type": "string" }
+                },
+                "required": ["text"]
+            }
+        }),
+        serde_json::json!({
+            "name": "skill_store",
+            "description": "Store a reusable procedure as a skill.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "trigger": { "type": "string" },
+                    "steps": { "type": "array", "items": { "type": "string" } },
+                    "tools": { "type": "array", "items": { "type": "string" } },
+                    "notes": { "type": "string" }
+                },
+                "required": ["name"]
+            }
+        }),
+        serde_json::json!({
+            "name": "skill_search",
+            "description": "Search stored skills.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer" }
+                },
+                "required": ["query"]
+            }
+        }),
+        serde_json::json!({
             "name": "gmail_list",
             "description": "List Gmail messages (OAuth).",
             "inputSchema": {
@@ -3595,6 +3702,8 @@ fn execute_tool_with_handles(
             | "approval_reject"
             | "trigger_add"
             | "trigger_remove"
+            | "reflect"
+            | "skill_store"
     );
     if read_only && is_write {
         return Err("tool disabled in read-only mode".into());
@@ -4601,6 +4710,202 @@ fn execute_tool_with_handles(
                 })
             })
         }
+        "tool_search" => {
+            let parsed: ToolToolSearchArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let query_tokens: Vec<String> = parsed
+                .query
+                .to_ascii_lowercase()
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            let mut results = Vec::new();
+            for tool in tool_definitions_json() {
+                let name = tool
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let desc = tool
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let score = tool_score(&query_tokens, &name, &desc);
+                if score > 0 {
+                    results.push(serde_json::json!({
+                        "name": name,
+                        "description": desc,
+                        "score": score
+                    }));
+                }
+            }
+            results.sort_by(|a, b| {
+                b.get("score")
+                    .and_then(|v| v.as_i64())
+                    .cmp(&a.get("score").and_then(|v| v.as_i64()))
+            });
+            let limit = parsed.limit.unwrap_or(8);
+            let results: Vec<serde_json::Value> = results.into_iter().take(limit).collect();
+            Ok(ToolExecution {
+                output: format!("Found {} tools.", results.len()),
+                details: serde_json::json!({ "results": results }),
+                is_error: false,
+            })
+        }
+        "session_context" => {
+            let parsed: ToolSessionContextArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let scope = format!("aethervault://agent-log/{}/", parsed.session);
+            let limit = parsed.limit.unwrap_or(20);
+            with_read_mem(mem_read, mem_write, mv2, |mem| {
+                let request = SearchRequest {
+                    query: parsed.session.clone(),
+                    top_k: 200,
+                    snippet_chars: 200,
+                    uri: None,
+                    scope: Some(scope),
+                    cursor: None,
+                    temporal: None,
+                    as_of_frame: None,
+                    as_of_ts: None,
+                    no_sketch: true,
+                };
+                let response = mem.search(request).map_err(|e| e.to_string())?;
+                let mut entries = Vec::new();
+                for hit in response.hits {
+                    let uri = hit.uri.clone();
+                    let ts = parse_log_ts_from_uri(&uri).unwrap_or_default();
+                    if let Ok(text) = mem.frame_text_by_id(hit.frame_id) {
+                        if let Ok(entry) = serde_json::from_str::<AgentLogEntry>(&text) {
+                            entries.push(serde_json::json!({
+                                "ts": entry.ts_utc.unwrap_or(ts),
+                                "role": entry.role,
+                                "text": entry.text,
+                                "meta": entry.meta,
+                                "uri": uri
+                            }));
+                        }
+                    }
+                }
+                entries.sort_by(|a, b| {
+                    b.get("ts")
+                        .and_then(|v| v.as_i64())
+                        .cmp(&a.get("ts").and_then(|v| v.as_i64()))
+                });
+                let results: Vec<serde_json::Value> = entries.into_iter().take(limit).collect();
+                Ok(ToolExecution {
+                    output: format!("Loaded {} entries.", results.len()),
+                    details: serde_json::json!({ "entries": results }),
+                    is_error: false,
+                })
+            })
+        }
+        "reflect" => {
+            let parsed: ToolReflectArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let session = parsed
+                .session
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            let ts = Utc::now().timestamp();
+            let payload = serde_json::json!({
+                "session": session,
+                "text": parsed.text,
+                "reason": parsed.reason,
+                "ts_utc": ts
+            });
+            let bytes = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
+            let hash = blake3_hash(&bytes);
+            let uri = format!("aethervault://memory/reflection/{}/{}-{}", session, ts, hash.to_hex());
+            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+                let mut options = PutOptions::default();
+                options.uri = Some(uri.clone());
+                options.title = Some("reflection".to_string());
+                options.kind = Some("application/json".to_string());
+                options.track = Some("aethervault.reflection".to_string());
+                options.search_text = Some(payload.to_string());
+                mem.put_bytes_with_options(&bytes, options)
+                    .map_err(|e| e.to_string())?;
+                mem.commit().map_err(|e| e.to_string())?;
+                Ok(ToolExecution {
+                    output: "Reflection stored.".to_string(),
+                    details: serde_json::json!({ "uri": uri }),
+                    is_error: false,
+                })
+            })
+        }
+        "skill_store" => {
+            let parsed: ToolSkillStoreArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let ts = Utc::now().timestamp();
+            let payload = serde_json::json!({
+                "name": parsed.name,
+                "trigger": parsed.trigger,
+                "steps": parsed.steps,
+                "tools": parsed.tools,
+                "notes": parsed.notes,
+                "ts_utc": ts
+            });
+            let bytes = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
+            let hash = blake3_hash(&bytes);
+            let slug = payload
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("skill")
+                .to_ascii_lowercase()
+                .replace(' ', "-");
+            let uri = format!("aethervault://skills/{}/{}-{}", slug, ts, hash.to_hex());
+            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+                let mut options = PutOptions::default();
+                options.uri = Some(uri.clone());
+                options.title = Some("skill".to_string());
+                options.kind = Some("application/json".to_string());
+                options.track = Some("aethervault.skill".to_string());
+                options.search_text = Some(payload.to_string());
+                mem.put_bytes_with_options(&bytes, options)
+                    .map_err(|e| e.to_string())?;
+                mem.commit().map_err(|e| e.to_string())?;
+                Ok(ToolExecution {
+                    output: "Skill stored.".to_string(),
+                    details: serde_json::json!({ "uri": uri }),
+                    is_error: false,
+                })
+            })
+        }
+        "skill_search" => {
+            let parsed: ToolSkillSearchArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            with_read_mem(mem_read, mem_write, mv2, |mem| {
+                let request = SearchRequest {
+                    query: parsed.query.clone(),
+                    top_k: parsed.limit.unwrap_or(10),
+                    snippet_chars: 200,
+                    uri: None,
+                    scope: Some("aethervault://skills/".to_string()),
+                    cursor: None,
+                    temporal: None,
+                    as_of_frame: None,
+                    as_of_ts: None,
+                    no_sketch: true,
+                };
+                let response = mem.search(request).map_err(|e| e.to_string())?;
+                let mut out = Vec::new();
+                for hit in response.hits {
+                    out.push(serde_json::json!({
+                        "uri": hit.uri,
+                        "title": hit.title,
+                        "text": hit.text,
+                        "score": hit.score
+                    }));
+                }
+                Ok(ToolExecution {
+                    output: format!("Found {} skills.", out.len()),
+                    details: serde_json::json!({ "results": out }),
+                    is_error: false,
+                })
+            })
+        }
         "gmail_list" => {
             let parsed: ToolGmailListArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
@@ -5553,6 +5858,33 @@ fn resolve_fs_path(path: &str, roots: &[PathBuf]) -> Result<PathBuf, String> {
         }
     }
     Err("path outside allowed roots".into())
+}
+
+fn parse_log_ts_from_uri(uri: &str) -> Option<i64> {
+    let tail = uri.rsplit('/').next()?;
+    let ts_str = tail.split('-').next()?;
+    ts_str.parse::<i64>().ok()
+}
+
+fn tool_score(query_tokens: &[String], name: &str, description: &str) -> i32 {
+    let mut score = 0;
+    let name_lc = name.to_ascii_lowercase();
+    let desc_lc = description.to_ascii_lowercase();
+    for token in query_tokens {
+        if token.is_empty() {
+            continue;
+        }
+        if name_lc.contains(token) {
+            score += 3;
+        }
+        if desc_lc.contains(token) {
+            score += 1;
+        }
+    }
+    if name_lc.contains(&query_tokens.join(" ")) {
+        score += 4;
+    }
+    score
 }
 
 fn refresh_google_token(mv2: &Path, token: &serde_json::Value) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
