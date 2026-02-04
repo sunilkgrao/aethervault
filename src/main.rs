@@ -1240,6 +1240,15 @@ struct ToolMemorySearchArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct ToolExecArgs {
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ToolContextArgs {
     query: String,
     #[serde(default)]
@@ -2880,6 +2889,19 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
                 },
                 "required": ["id"]
             }
+        }),
+        serde_json::json!({
+            "name": "exec",
+            "description": "Execute a shell command on the host (use with care).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "cwd": { "type": "string" },
+                    "timeout_ms": { "type": "integer" }
+                },
+                "required": ["command"]
+            }
         })
     ]
 }
@@ -3446,6 +3468,59 @@ fn execute_tool_with_handles(
                 output: "Archived email.".to_string(),
                 details: serde_json::json!({ "status": "archived" }),
                 is_error: false,
+            })
+        }
+        "exec" => {
+            let parsed: ToolExecArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let timeout_ms = parsed.timeout_ms.unwrap_or(60_000).max(1);
+            let command = if cfg!(windows) {
+                vec!["cmd".to_string(), "/C".to_string(), parsed.command]
+            } else {
+                vec!["sh".to_string(), "-c".to_string(), parsed.command]
+            };
+            let mut cmd = build_external_command(&command[0], &command[1..]);
+            if let Some(cwd) = parsed.cwd {
+                cmd.current_dir(cwd);
+            }
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn().map_err(|e| format!("exec spawn: {e}"))?;
+            let timeout = Duration::from_millis(timeout_ms);
+            let start = Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if start.elapsed() > timeout {
+                            let _ = child.kill();
+                            return Err(format!("exec timed out after {timeout_ms}ms"));
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => return Err(format!("exec wait failed: {err}")),
+                }
+            }
+            let output = child
+                .wait_with_output()
+                .map_err(|e| format!("exec output: {e}"))?;
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let details = serde_json::json!({
+                "status": output.status.code(),
+                "stdout": stdout,
+                "stderr": stderr
+            });
+            let output_text = if output.status.success() {
+                "Command executed.".to_string()
+            } else {
+                "Command failed.".to_string()
+            };
+            Ok(ToolExecution {
+                output: output_text,
+                details,
+                is_error: !output.status.success(),
             })
         }
         _ => Err("unknown tool".into()),
