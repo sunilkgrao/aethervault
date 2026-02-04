@@ -3709,7 +3709,7 @@ fn execute_tool_with_handles(
         return Err("tool disabled in read-only mode".into());
     }
     let workspace_override = env_optional("AETHERVAULT_WORKSPACE").map(PathBuf::from);
-    if approval_mode_enabled() && requires_approval(name, &args) {
+    if requires_approval(name, &args) {
         if read_only {
             return Err("approval required but tool disabled in read-only mode".into());
         }
@@ -5752,12 +5752,6 @@ fn run_oauth_broker(
 fn load_config_json(mem: &mut Vault, key: &str) -> Option<serde_json::Value> {
     let bytes = load_config_entry(mem, key)?;
     serde_json::from_slice(&bytes).ok()
-}
-
-fn approval_mode_enabled() -> bool {
-    env_optional("AETHERVAULT_APPROVAL_MODE")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
 }
 
 fn approval_hash(tool: &str, args: &serde_json::Value) -> String {

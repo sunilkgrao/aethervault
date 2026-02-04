@@ -100,7 +100,7 @@ cargo build --locked
 - Rust‑native connectors are built in (`bridge`). Legacy Python scripts live in `examples/bridge`.
 - Optional: Himalaya integration enables `email_*` tools for Gmail IMAP workflows.
 - `notify`, `signal_send`, `imessage_send` provide outbound messaging helpers.
-- Set `AETHERVAULT_APPROVAL_MODE=1` to require approval for risky tools.
+- Approval gates are always enforced for sensitive tools.
 - Set `AETHERVAULT_FS_ROOTS` to restrict filesystem tools.
 - Set `AETHERVAULT_BROWSER_ENDPOINT` to a local browser broker.
 

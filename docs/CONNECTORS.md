@@ -95,7 +95,7 @@ Then use the `browser_request` tool to drive actions (`open`, `click`, `type`, `
 
 ## Approval mode (human-in-the-loop)
 
-Set `AETHERVAULT_APPROVAL_MODE=1`. Sensitive tools will return an approval request and no action will be taken until approved.
+Sensitive tools always return an approval request and no action will be taken until approved.
 
 Tools:
 - `approval_list`
