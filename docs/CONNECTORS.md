@@ -71,6 +71,14 @@ export MICROSOFT_CLIENT_SECRET=...
 ./target/release/aethervault connect ./data/knowledge.mv2 microsoft --bind 0.0.0.0 --port 8787
 ```
 
+## OAuth tools
+
+After authorization, the following tools are available:
+- `gmail_list`, `gmail_read`, `gmail_send`
+- `gcal_list`, `gcal_create`
+- `ms_mail_list`, `ms_mail_read`
+- `ms_calendar_list`, `ms_calendar_create`
+
 ## WhatsApp (Twilio webhook)
 
 1. Create a Twilio WhatsApp sender and note your webhook URL.

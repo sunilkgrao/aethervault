@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hash;
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc, Timelike, Datelike};
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use aether_core::types::{Frame, FrameStatus, SearchHit, SearchRequest, TemporalFilter};
 use aether_core::{DoctorOptions, DoctorReport, PutOptions, Vault, VaultError};
@@ -1451,6 +1452,67 @@ struct ToolSignalSendArgs {
 struct ToolIMessageSendArgs {
     to: String,
     text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolGmailListArgs {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolGmailReadArgs {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolGmailSendArgs {
+    to: String,
+    subject: String,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolGCalListArgs {
+    #[serde(default)]
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolGCalCreateArgs {
+    summary: String,
+    start: String,
+    end: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolMsMailListArgs {
+    #[serde(default)]
+    top: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolMsMailReadArgs {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolMsCalendarListArgs {
+    #[serde(default)]
+    top: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolMsCalendarCreateArgs {
+    subject: String,
+    start: String,
+    end: String,
+    #[serde(default)]
+    body: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3145,6 +3207,100 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
                 },
                 "required": ["to", "text"]
             }
+        }),
+        serde_json::json!({
+            "name": "gmail_list",
+            "description": "List Gmail messages (OAuth).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "max_results": { "type": "integer" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "gmail_read",
+            "description": "Read a Gmail message by id (OAuth).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "gmail_send",
+            "description": "Send a Gmail message (OAuth).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "body": { "type": "string" }
+                },
+                "required": ["to", "subject", "body"]
+            }
+        }),
+        serde_json::json!({
+            "name": "gcal_list",
+            "description": "List Google Calendar events (OAuth).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "max_results": { "type": "integer" } }
+            }
+        }),
+        serde_json::json!({
+            "name": "gcal_create",
+            "description": "Create a Google Calendar event on primary calendar (OAuth).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "summary": { "type": "string" },
+                    "start": { "type": "string" },
+                    "end": { "type": "string" },
+                    "description": { "type": "string" }
+                },
+                "required": ["summary", "start", "end"]
+            }
+        }),
+        serde_json::json!({
+            "name": "ms_mail_list",
+            "description": "List Microsoft mail messages (OAuth).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "top": { "type": "integer" } }
+            }
+        }),
+        serde_json::json!({
+            "name": "ms_mail_read",
+            "description": "Read Microsoft mail message by id (OAuth).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "ms_calendar_list",
+            "description": "List Microsoft calendar events (OAuth).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "top": { "type": "integer" } }
+            }
+        }),
+        serde_json::json!({
+            "name": "ms_calendar_create",
+            "description": "Create Microsoft calendar event (OAuth).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject": { "type": "string" },
+                    "start": { "type": "string" },
+                    "end": { "type": "string" },
+                    "body": { "type": "string" }
+                },
+                "required": ["subject", "start", "end"]
+            }
         })
     ]
 }
@@ -3853,6 +4009,246 @@ fn execute_tool_with_handles(
                 is_error: false,
             })
         }
+        "gmail_list" => {
+            let parsed: ToolGmailListArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
+            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let mut url = format!(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={}",
+                parsed.max_results.unwrap_or(10)
+            );
+            if let Some(q) = parsed.query {
+                url.push_str("&q=");
+                url.push_str(&urlencoding::encode(&q));
+            }
+            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let payload = match resp {
+                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    return Err(format!("gmail_list error {code}: {text}").into());
+                }
+                Err(err) => return Err(format!("gmail_list failed: {err}").into()),
+            };
+            Ok(ToolExecution {
+                output: "Gmail messages listed.".to_string(),
+                details: payload,
+                is_error: false,
+            })
+        }
+        "gmail_read" => {
+            let parsed: ToolGmailReadArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
+            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let url = format!(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=full",
+                parsed.id
+            );
+            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let payload = match resp {
+                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    return Err(format!("gmail_read error {code}: {text}").into());
+                }
+                Err(err) => return Err(format!("gmail_read failed: {err}").into()),
+            };
+            Ok(ToolExecution {
+                output: "Gmail message read.".to_string(),
+                details: payload,
+                is_error: false,
+            })
+        }
+        "gmail_send" => {
+            let parsed: ToolGmailSendArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
+            let raw = format!(
+                "To: {}\r\nSubject: {}\r\n\r\n{}\r\n",
+                parsed.to, parsed.subject, parsed.body
+            );
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(raw.as_bytes())
+                .replace('+', "-")
+                .replace('/', "_")
+                .trim_end_matches('=')
+                .to_string();
+            let payload = serde_json::json!({ "raw": encoded });
+            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let resp = agent
+                .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
+                .set("authorization", &format!("Bearer {}", token))
+                .set("content-type", "application/json")
+                .send_json(payload);
+            match resp {
+                Ok(resp) => Ok(ToolExecution {
+                    output: "Gmail message sent.".to_string(),
+                    details: resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                    is_error: false,
+                }),
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    Err(format!("gmail_send error {code}: {text}").into())
+                }
+                Err(err) => Err(format!("gmail_send failed: {err}").into()),
+            }
+        }
+        "gcal_list" => {
+            let parsed: ToolGCalListArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
+            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let url = format!(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults={}",
+                parsed.max_results.unwrap_or(10)
+            );
+            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let payload = match resp {
+                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    return Err(format!("gcal_list error {code}: {text}").into());
+                }
+                Err(err) => return Err(format!("gcal_list failed: {err}").into()),
+            };
+            Ok(ToolExecution {
+                output: "Calendar events listed.".to_string(),
+                details: payload,
+                is_error: false,
+            })
+        }
+        "gcal_create" => {
+            let parsed: ToolGCalCreateArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
+            let payload = serde_json::json!({
+                "summary": parsed.summary,
+                "description": parsed.description,
+                "start": { "dateTime": parsed.start },
+                "end": { "dateTime": parsed.end }
+            });
+            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let resp = agent
+                .post("https://www.googleapis.com/calendar/v3/calendars/primary/events")
+                .set("authorization", &format!("Bearer {}", token))
+                .set("content-type", "application/json")
+                .send_json(payload);
+            match resp {
+                Ok(resp) => Ok(ToolExecution {
+                    output: "Calendar event created.".to_string(),
+                    details: resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                    is_error: false,
+                }),
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    Err(format!("gcal_create error {code}: {text}").into())
+                }
+                Err(err) => Err(format!("gcal_create failed: {err}").into()),
+            }
+        }
+        "ms_mail_list" => {
+            let parsed: ToolMsMailListArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let token = get_oauth_token(mv2, "microsoft").map_err(|e| e.to_string())?;
+            let url = format!(
+                "https://graph.microsoft.com/v1.0/me/messages?$top={}",
+                parsed.top.unwrap_or(10)
+            );
+            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let payload = match resp {
+                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    return Err(format!("ms_mail_list error {code}: {text}").into());
+                }
+                Err(err) => return Err(format!("ms_mail_list failed: {err}").into()),
+            };
+            Ok(ToolExecution {
+                output: "Microsoft mail listed.".to_string(),
+                details: payload,
+                is_error: false,
+            })
+        }
+        "ms_mail_read" => {
+            let parsed: ToolMsMailReadArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let token = get_oauth_token(mv2, "microsoft").map_err(|e| e.to_string())?;
+            let url = format!("https://graph.microsoft.com/v1.0/me/messages/{}", parsed.id);
+            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let payload = match resp {
+                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    return Err(format!("ms_mail_read error {code}: {text}").into());
+                }
+                Err(err) => return Err(format!("ms_mail_read failed: {err}").into()),
+            };
+            Ok(ToolExecution {
+                output: "Microsoft mail read.".to_string(),
+                details: payload,
+                is_error: false,
+            })
+        }
+        "ms_calendar_list" => {
+            let parsed: ToolMsCalendarListArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let token = get_oauth_token(mv2, "microsoft").map_err(|e| e.to_string())?;
+            let url = format!(
+                "https://graph.microsoft.com/v1.0/me/events?$top={}",
+                parsed.top.unwrap_or(10)
+            );
+            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let payload = match resp {
+                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    return Err(format!("ms_calendar_list error {code}: {text}").into());
+                }
+                Err(err) => return Err(format!("ms_calendar_list failed: {err}").into()),
+            };
+            Ok(ToolExecution {
+                output: "Microsoft calendar listed.".to_string(),
+                details: payload,
+                is_error: false,
+            })
+        }
+        "ms_calendar_create" => {
+            let parsed: ToolMsCalendarCreateArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let token = get_oauth_token(mv2, "microsoft").map_err(|e| e.to_string())?;
+            let payload = serde_json::json!({
+                "subject": parsed.subject,
+                "body": {
+                    "contentType": "Text",
+                    "content": parsed.body.unwrap_or_default()
+                },
+                "start": { "dateTime": parsed.start, "timeZone": "UTC" },
+                "end": { "dateTime": parsed.end, "timeZone": "UTC" }
+            });
+            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let resp = agent
+                .post("https://graph.microsoft.com/v1.0/me/events")
+                .set("authorization", &format!("Bearer {}", token))
+                .set("content-type", "application/json")
+                .send_json(payload);
+            match resp {
+                Ok(resp) => Ok(ToolExecution {
+                    output: "Microsoft calendar event created.".to_string(),
+                    details: resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                    is_error: false,
+                }),
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    Err(format!("ms_calendar_create error {code}: {text}").into())
+                }
+                Err(err) => Err(format!("ms_calendar_create failed: {err}").into()),
+            }
+        }
         _ => Err("unknown tool".into()),
     }
 }
@@ -4454,6 +4850,120 @@ fn run_oauth_broker(
         break;
     }
     Ok(())
+}
+
+fn load_config_json(mem: &mut Vault, key: &str) -> Option<serde_json::Value> {
+    let bytes = load_config_entry(mem, key)?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn refresh_google_token(mv2: &Path, token: &serde_json::Value) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let refresh_token = token
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or("missing refresh_token")?;
+    let client_id = oauth_env("GOOGLE_CLIENT_ID")?;
+    let client_secret = oauth_env("GOOGLE_CLIENT_SECRET")?;
+    let payload = form_urlencoded::Serializer::new(String::new())
+        .append_pair("client_id", &client_id)
+        .append_pair("client_secret", &client_secret)
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("refresh_token", refresh_token)
+        .finish();
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(20))
+        .timeout_write(Duration::from_secs(10))
+        .build();
+    let resp = agent
+        .post("https://oauth2.googleapis.com/token")
+        .set("content-type", "application/x-www-form-urlencoded")
+        .send_string(&payload);
+    let refreshed = match resp {
+        Ok(resp) => resp.into_json::<serde_json::Value>()?,
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            return Err(format!("refresh error {code}: {text}").into());
+        }
+        Err(err) => return Err(format!("refresh failed: {err}").into()),
+    };
+    let mut new_token = refreshed.clone();
+    if refreshed.get("refresh_token").is_none() {
+        if let Some(rt) = token.get("refresh_token") {
+            new_token["refresh_token"] = rt.clone();
+        }
+    }
+    let mut mem = open_or_create(mv2)?;
+    let bytes = serde_json::to_vec_pretty(&new_token)?;
+    let _ = save_config_entry(&mut mem, "oauth.google", &bytes)?;
+    Ok(new_token)
+}
+
+fn refresh_microsoft_token(mv2: &Path, token: &serde_json::Value) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let refresh_token = token
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or("missing refresh_token")?;
+    let client_id = oauth_env("MICROSOFT_CLIENT_ID")?;
+    let client_secret = oauth_env("MICROSOFT_CLIENT_SECRET")?;
+    let payload = form_urlencoded::Serializer::new(String::new())
+        .append_pair("client_id", &client_id)
+        .append_pair("client_secret", &client_secret)
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("refresh_token", refresh_token)
+        .append_pair("scope", "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Calendars.ReadWrite")
+        .finish();
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(20))
+        .timeout_write(Duration::from_secs(10))
+        .build();
+    let resp = agent
+        .post("https://login.microsoftonline.com/common/oauth2/v2.0/token")
+        .set("content-type", "application/x-www-form-urlencoded")
+        .send_string(&payload);
+    let refreshed = match resp {
+        Ok(resp) => resp.into_json::<serde_json::Value>()?,
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            return Err(format!("refresh error {code}: {text}").into());
+        }
+        Err(err) => return Err(format!("refresh failed: {err}").into()),
+    };
+    let mut new_token = refreshed.clone();
+    if refreshed.get("refresh_token").is_none() {
+        if let Some(rt) = token.get("refresh_token") {
+            new_token["refresh_token"] = rt.clone();
+        }
+    }
+    let mut mem = open_or_create(mv2)?;
+    let bytes = serde_json::to_vec_pretty(&new_token)?;
+    let _ = save_config_entry(&mut mem, "oauth.microsoft", &bytes)?;
+    Ok(new_token)
+}
+
+fn get_oauth_token(mv2: &Path, provider: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut mem = Vault::open_read_only(mv2)?;
+    let key = format!("oauth.{provider}");
+    let token = load_config_json(&mut mem, &key).ok_or("missing oauth token")?;
+    let access = token.get("access_token").and_then(|v| v.as_str());
+    if let Some(access) = access {
+        return Ok(access.to_string());
+    }
+    if provider == "google" {
+        let refreshed = refresh_google_token(mv2, &token)?;
+        let access = refreshed
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or("missing access_token")?;
+        return Ok(access.to_string());
+    }
+    let refreshed = refresh_microsoft_token(mv2, &token)?;
+    let access = refreshed
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or("missing access_token")?;
+    Ok(access.to_string())
 }
 
 fn load_workspace_context(workspace: &Path) -> String {

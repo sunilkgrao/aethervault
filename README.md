@@ -80,6 +80,7 @@ cargo build --locked
 - `schedule` runs daily/weekly autonomous briefings (Telegram optional).
 - `exec` tool executes host commands (host mode default; wrap with `AETHERVAULT_COMMAND_WRAPPER` for sandboxing).
 - `connect` runs a built-in OAuth broker for Google/Microsoft tokens.
+- Gmail/Calendar and Microsoft mail/calendar tools are available after OAuth (`gmail_*`, `gcal_*`, `ms_*`).
 - `compact` runs vacuum compaction + index rebuilds (SOTA maintenance).
 - `doctor` exposes full repair/verify controls.
 
