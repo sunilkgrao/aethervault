@@ -79,6 +79,7 @@ cargo build --locked
 - `bootstrap` scaffolds soul + memory workspace and writes default agent config.
 - `schedule` runs daily/weekly autonomous briefings (Telegram optional).
 - `exec` tool executes host commands (host mode default; wrap with `AETHERVAULT_COMMAND_WRAPPER` for sandboxing).
+- `connect` runs a built-in OAuth broker for Google/Microsoft tokens.
 - `compact` runs vacuum compaction + index rebuilds (SOTA maintenance).
 - `doctor` exposes full repair/verify controls.
 

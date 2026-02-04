@@ -487,6 +487,22 @@ enum Command {
         log_commit_interval: usize,
     },
 
+    /// OAuth broker for Google/Microsoft connectors.
+    Connect {
+        mv2: PathBuf,
+        /// Provider: google | microsoft
+        provider: String,
+        /// Bind address
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+        /// Bind port
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        /// Redirect base URL (defaults to http://<bind>:<port>)
+        #[arg(long)]
+        redirect_base: Option<String>,
+    },
+
     /// Rust-native chat connectors (Telegram + WhatsApp).
     Bridge {
         #[command(subcommand)]
@@ -4287,6 +4303,159 @@ fn export_capsule_memory(
     Ok(paths)
 }
 
+fn oauth_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    env_optional(name)
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| format!("Missing {name}").into())
+}
+
+fn build_oauth_redirect(base: &str, provider: &str) -> String {
+    format!("{base}/oauth/{provider}/callback")
+}
+
+fn build_google_auth_url(client_id: &str, redirect_uri: &str, scope: &str, state: &str) -> String {
+    format!(
+        "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id={}&redirect_uri={}&scope={}&access_type=offline&prompt=consent&state={}",
+        urlencoding::encode(client_id),
+        urlencoding::encode(redirect_uri),
+        urlencoding::encode(scope),
+        urlencoding::encode(state)
+    )
+}
+
+fn build_microsoft_auth_url(client_id: &str, redirect_uri: &str, scope: &str, state: &str) -> String {
+    format!(
+        "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&response_mode=query&state={}",
+        urlencoding::encode(client_id),
+        urlencoding::encode(redirect_uri),
+        urlencoding::encode(scope),
+        urlencoding::encode(state)
+    )
+}
+
+fn exchange_oauth_code(
+    token_url: &str,
+    client_id: &str,
+    client_secret: &str,
+    redirect_uri: &str,
+    code: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(20))
+        .timeout_write(Duration::from_secs(10))
+        .build();
+    let payload = form_urlencoded::Serializer::new(String::new())
+        .append_pair("client_id", client_id)
+        .append_pair("client_secret", client_secret)
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("code", code)
+        .append_pair("redirect_uri", redirect_uri)
+        .finish();
+    let response = agent
+        .post(token_url)
+        .set("content-type", "application/x-www-form-urlencoded")
+        .send_string(&payload);
+    match response {
+        Ok(resp) => Ok(resp.into_json()?),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(format!("token error {code}: {text}").into())
+        }
+        Err(err) => Err(format!("token request failed: {err}").into()),
+    }
+}
+
+fn run_oauth_broker(
+    mv2: PathBuf,
+    provider: String,
+    bind: String,
+    port: u16,
+    redirect_base: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let provider = provider.to_ascii_lowercase();
+    let redirect_base =
+        redirect_base.unwrap_or_else(|| format!("http://{}:{}", bind, port));
+    let redirect_uri = build_oauth_redirect(&redirect_base, &provider);
+    let state = "aethervault";
+
+    let (client_id, client_secret, _scope, token_url, auth_url) = if provider == "google" {
+        let client_id = oauth_env("GOOGLE_CLIENT_ID")?;
+        let client_secret = oauth_env("GOOGLE_CLIENT_SECRET")?;
+        let scope = env_optional("GOOGLE_SCOPES").unwrap_or_else(|| {
+            "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/gmail.send"
+                .to_string()
+        });
+        let auth_url = build_google_auth_url(&client_id, &redirect_uri, &scope, state);
+        (
+            client_id,
+            client_secret,
+            scope,
+            "https://oauth2.googleapis.com/token".to_string(),
+            auth_url,
+        )
+    } else if provider == "microsoft" {
+        let client_id = oauth_env("MICROSOFT_CLIENT_ID")?;
+        let client_secret = oauth_env("MICROSOFT_CLIENT_SECRET")?;
+        let scope = env_optional("MICROSOFT_SCOPES").unwrap_or_else(|| {
+            "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Calendars.ReadWrite"
+                .to_string()
+        });
+        let auth_url = build_microsoft_auth_url(&client_id, &redirect_uri, &scope, state);
+        (
+            client_id,
+            client_secret,
+            scope,
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token".to_string(),
+            auth_url,
+        )
+    } else {
+        return Err("provider must be google or microsoft".into());
+    };
+
+    println!("Open this URL to authorize:\n{auth_url}");
+    let addr = format!("{bind}:{port}");
+    let server = Server::http(&addr)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("server: {e}")))?;
+    eprintln!("OAuth broker listening on http://{addr}");
+
+    for request in server.incoming_requests() {
+        let url = request.url().to_string();
+        if !url.starts_with(&format!("/oauth/{provider}/callback")) {
+            let response = Response::from_string("ok");
+            let _ = request.respond(response);
+            continue;
+        }
+        let query = url.splitn(2, '?').nth(1).unwrap_or("");
+        let params: HashMap<String, String> =
+            form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+        let code = match params.get("code") {
+            Some(c) => c.to_string(),
+            None => {
+                let response = Response::from_string("missing code");
+                let _ = request.respond(response);
+                continue;
+            }
+        };
+        let token = exchange_oauth_code(
+            &token_url,
+            &client_id,
+            &client_secret,
+            &redirect_uri,
+            &code,
+        )?;
+        let key = format!("oauth.{provider}");
+        let payload = serde_json::to_vec_pretty(&token)?;
+        let mut mem = open_or_create(&mv2)?;
+        let _ = save_config_entry(&mut mem, &key, &payload)?;
+        let response = Response::from_string("Authorized. You can close this tab.");
+        let _ = request.respond(response);
+        println!("Stored token in config key: {key}");
+        break;
+    }
+    Ok(())
+}
+
 fn load_workspace_context(workspace: &Path) -> String {
     let mut sections = Vec::new();
     let soul = workspace.join("SOUL.md");
@@ -6986,6 +7155,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log,
             log_commit_interval,
         ),
+
+        Command::Connect {
+            mv2,
+            provider,
+            bind,
+            port,
+            redirect_base,
+        } => run_oauth_broker(mv2, provider, bind, port, redirect_base),
 
         Command::Bridge { command } => run_bridge(command),
 

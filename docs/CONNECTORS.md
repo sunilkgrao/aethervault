@@ -53,6 +53,24 @@ Once configured, the agent can use `email_list`, `email_read`, `email_send`, and
 
 Note: Calendar access still requires OAuth for Google Calendar or Microsoft 365.
 
+## OAuth broker (Google/Microsoft)
+
+Run the built-in broker to authorize accounts and store tokens in the capsule:
+
+```bash
+export GOOGLE_CLIENT_ID=...
+export GOOGLE_CLIENT_SECRET=...
+./target/release/aethervault connect ./data/knowledge.mv2 google --bind 0.0.0.0 --port 8787
+```
+
+For Microsoft:
+
+```bash
+export MICROSOFT_CLIENT_ID=...
+export MICROSOFT_CLIENT_SECRET=...
+./target/release/aethervault connect ./data/knowledge.mv2 microsoft --bind 0.0.0.0 --port 8787
+```
+
 ## WhatsApp (Twilio webhook)
 
 1. Create a Twilio WhatsApp sender and note your webhook URL.
