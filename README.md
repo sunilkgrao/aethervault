@@ -78,9 +78,14 @@ cargo build --locked
 - `bridge` runs Rust‑native Telegram/WhatsApp connectors.
 - `bootstrap` scaffolds soul + memory workspace and writes default agent config.
 - `schedule` runs daily/weekly autonomous briefings (Telegram optional).
+- `watch` runs event-driven triggers (email/calendar).
 - `exec` tool executes host commands (host mode default; wrap with `AETHERVAULT_COMMAND_WRAPPER` for sandboxing).
 - `connect` runs a built-in OAuth broker for Google/Microsoft tokens.
 - Gmail/Calendar and Microsoft mail/calendar tools are available after OAuth (`gmail_*`, `gcal_*`, `ms_*`).
+- `http_request` provides a generic API surface (approval mode recommended for non-GET).
+- `browser_request` proxies automation to a local browser broker (Stagehand/CUA/etc).
+- `fs_list`, `fs_read`, `fs_write` give controlled filesystem access within allowed roots.
+- `approval_*` tools provide human-in-the-loop gating for sensitive actions.
 - `compact` runs vacuum compaction + index rebuilds (SOTA maintenance).
 - `doctor` exposes full repair/verify controls.
 
@@ -91,6 +96,9 @@ cargo build --locked
 - Rust‑native connectors are built in (`bridge`). Legacy Python scripts live in `examples/bridge`.
 - Optional: Himalaya integration enables `email_*` tools for Gmail IMAP workflows.
 - `notify`, `signal_send`, `imessage_send` provide outbound messaging helpers.
+- Set `AETHERVAULT_APPROVAL_MODE=1` to require approval for risky tools.
+- Set `AETHERVAULT_FS_ROOTS` to restrict filesystem tools.
+- Set `AETHERVAULT_BROWSER_ENDPOINT` to a local browser broker.
 
 ## Maintenance (SOTA compaction)
 

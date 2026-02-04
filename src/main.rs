@@ -488,6 +488,32 @@ enum Command {
         log_commit_interval: usize,
     },
 
+    /// Run event-driven triggers (email/calendar).
+    Watch {
+        mv2: PathBuf,
+        /// Workspace folder (default: ./assistant or AETHERVAULT_WORKSPACE)
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Timezone offset (e.g. -05:00)
+        #[arg(long)]
+        timezone: Option<String>,
+        /// Override model hook command (env: AETHERVAULT_MODEL_HOOK)
+        #[arg(long)]
+        model_hook: Option<String>,
+        /// Max tool/LLM steps
+        #[arg(long, default_value_t = 64)]
+        max_steps: usize,
+        /// Log turns to capsule
+        #[arg(long)]
+        log: bool,
+        /// Commit agent logs every N entries (1 = fsync each log)
+        #[arg(long, default_value_t = 8)]
+        log_commit_interval: usize,
+        /// Poll interval in seconds
+        #[arg(long, default_value_t = 60)]
+        poll_seconds: u64,
+    },
+
     /// OAuth broker for Google/Microsoft connectors.
     Connect {
         mv2: PathBuf,
@@ -1242,6 +1268,30 @@ struct ToolExecution {
     is_error: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ApprovalEntry {
+    id: String,
+    tool: String,
+    args_hash: String,
+    args: serde_json::Value,
+    status: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct TriggerEntry {
+    id: String,
+    kind: String,
+    name: Option<String>,
+    query: Option<String>,
+    prompt: Option<String>,
+    start: Option<String>,
+    end: Option<String>,
+    enabled: bool,
+    last_seen: Option<String>,
+    last_fired: Option<String>,
+}
+
 const TOOL_DETAILS_MAX_CHARS: usize = 4_000;
 const TOOL_OUTPUT_MAX_FOR_DETAILS: usize = 2_000;
 const DEFAULT_WORKSPACE_DIR: &str = "./assistant";
@@ -1513,6 +1563,85 @@ struct ToolMsCalendarCreateArgs {
     end: String,
     #[serde(default)]
     body: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolHttpRequestArgs {
+    #[serde(default)]
+    method: Option<String>,
+    url: String,
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    json: Option<bool>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolBrowserRequestArgs {
+    action: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    selector: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolFsListArgs {
+    path: String,
+    #[serde(default)]
+    recursive: Option<bool>,
+    #[serde(default)]
+    max_entries: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolFsReadArgs {
+    path: String,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolFsWriteArgs {
+    path: String,
+    text: String,
+    #[serde(default)]
+    append: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolApprovalApproveArgs {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolTriggerAddArgs {
+    kind: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolTriggerRemoveArgs {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3209,6 +3338,135 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "http_request",
+            "description": "Generic HTTP request (GET allowed without approval; other methods may require approval).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "method": { "type": "string" },
+                    "url": { "type": "string" },
+                    "headers": { "type": "object" },
+                    "body": { "type": "string" },
+                    "json": { "type": "boolean" },
+                    "timeout_ms": { "type": "integer" }
+                },
+                "required": ["url"]
+            }
+        }),
+        serde_json::json!({
+            "name": "browser_request",
+            "description": "Send a browser automation request to the configured browser broker.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" },
+                    "url": { "type": "string" },
+                    "selector": { "type": "string" },
+                    "text": { "type": "string" },
+                    "data": { "type": "object" }
+                },
+                "required": ["action"]
+            }
+        }),
+        serde_json::json!({
+            "name": "fs_list",
+            "description": "List files within allowed roots.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "recursive": { "type": "boolean" },
+                    "max_entries": { "type": "integer" }
+                },
+                "required": ["path"]
+            }
+        }),
+        serde_json::json!({
+            "name": "fs_read",
+            "description": "Read a file within allowed roots.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "max_bytes": { "type": "integer" }
+                },
+                "required": ["path"]
+            }
+        }),
+        serde_json::json!({
+            "name": "fs_write",
+            "description": "Write a file within allowed roots.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "text": { "type": "string" },
+                    "append": { "type": "boolean" }
+                },
+                "required": ["path", "text"]
+            }
+        }),
+        serde_json::json!({
+            "name": "approval_list",
+            "description": "List pending approval requests.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        serde_json::json!({
+            "name": "approval_approve",
+            "description": "Approve a pending request by id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "approval_reject",
+            "description": "Reject a pending request by id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "trigger_add",
+            "description": "Add an event trigger (email or calendar_free).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string" },
+                    "name": { "type": "string" },
+                    "query": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "start": { "type": "string" },
+                    "end": { "type": "string" },
+                    "enabled": { "type": "boolean" }
+                },
+                "required": ["kind"]
+            }
+        }),
+        serde_json::json!({
+            "name": "trigger_list",
+            "description": "List configured triggers.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        serde_json::json!({
+            "name": "trigger_remove",
+            "description": "Remove a trigger by id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"]
+            }
+        }),
+        serde_json::json!({
             "name": "gmail_list",
             "description": "List Gmail messages (OAuth).",
             "inputSchema": {
@@ -3327,12 +3585,71 @@ fn execute_tool_with_handles(
 ) -> Result<ToolExecution, String> {
     let is_write = matches!(
         name,
-        "put" | "log" | "feedback" | "config_set" | "memory_append_daily" | "memory_remember"
+        "put"
+            | "log"
+            | "feedback"
+            | "config_set"
+            | "memory_append_daily"
+            | "memory_remember"
+            | "approval_approve"
+            | "approval_reject"
+            | "trigger_add"
+            | "trigger_remove"
     );
     if read_only && is_write {
         return Err("tool disabled in read-only mode".into());
     }
     let workspace_override = env_optional("AETHERVAULT_WORKSPACE").map(PathBuf::from);
+    if approval_mode_enabled() && requires_approval(name, &args) {
+        if read_only {
+            return Err("approval required but tool disabled in read-only mode".into());
+        }
+        let args_hash = approval_hash(name, &args);
+        let mut approval_id: Option<String> = None;
+        let mut approved = false;
+        with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+            let mut approvals = load_approvals(mem);
+            if let Some(pos) = approvals.iter().position(|e| {
+                e.tool == name && e.args_hash == args_hash && e.status == "approved"
+            }) {
+                approval_id = Some(approvals[pos].id.clone());
+                approvals.remove(pos);
+                save_approvals(mem, &approvals)?;
+                approved = true;
+                return Ok(());
+            }
+            if let Some(existing) = approvals.iter().find(|e| {
+                e.tool == name && e.args_hash == args_hash && e.status == "pending"
+            }) {
+                approval_id = Some(existing.id.clone());
+                return Ok(());
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let id = format!("apr_{}_{}", now.replace(':', ""), &args_hash[..8]);
+            approvals.push(ApprovalEntry {
+                id: id.clone(),
+                tool: name.to_string(),
+                args_hash: args_hash.clone(),
+                args: args.clone(),
+                status: "pending".to_string(),
+                created_at: now,
+            });
+            save_approvals(mem, &approvals)?;
+            approval_id = Some(id);
+            Ok(())
+        })?;
+        if !approved {
+            return Ok(ToolExecution {
+                output: "approval required".to_string(),
+                details: serde_json::json!({
+                    "approval_id": approval_id,
+                    "tool": name,
+                    "args": args
+                }),
+                is_error: true,
+            });
+        }
+    }
 
     match name {
         "query" => {
@@ -4007,6 +4324,281 @@ fn execute_tool_with_handles(
                 output: "iMessage sent.".to_string(),
                 details: serde_json::json!({ "status": "sent" }),
                 is_error: false,
+            })
+        }
+        "http_request" => {
+            let parsed: ToolHttpRequestArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let method = parsed
+                .method
+                .unwrap_or_else(|| "GET".to_string())
+                .to_ascii_uppercase();
+            let timeout = parsed.timeout_ms.unwrap_or(20_000);
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_millis(timeout))
+                .timeout_write(Duration::from_millis(timeout))
+                .timeout_read(Duration::from_millis(timeout))
+                .build();
+            let mut req = match method.as_str() {
+                "GET" => agent.get(&parsed.url),
+                "POST" => agent.post(&parsed.url),
+                "PUT" => agent.put(&parsed.url),
+                "PATCH" => agent.patch(&parsed.url),
+                "DELETE" => agent.delete(&parsed.url),
+                _ => return Err(format!("unsupported method: {method}")),
+            };
+            if let Some(headers) = parsed.headers {
+                for (k, v) in headers {
+                    req = req.set(&k, &v);
+                }
+            }
+            let resp = if let Some(body) = parsed.body {
+                if parsed.json.unwrap_or(false) {
+                    req.set("content-type", "application/json").send_string(&body)
+                } else {
+                    req.send_string(&body)
+                }
+            } else {
+                req.call()
+            };
+            let (status, text) = match resp {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.into_string().unwrap_or_default();
+                    (status, text)
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    (code, text)
+                }
+                Err(err) => return Err(format!("http_request failed: {err}")),
+            };
+            let truncated = if text.len() > 20_000 {
+                format!("{}...[truncated]", &text[..20_000])
+            } else {
+                text
+            };
+            Ok(ToolExecution {
+                output: format!("http_request {method} {} -> {status}", parsed.url),
+                details: serde_json::json!({
+                    "status": status,
+                    "body": truncated
+                }),
+                is_error: status >= 400,
+            })
+        }
+        "browser_request" => {
+            let parsed: ToolBrowserRequestArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let endpoint =
+                env_optional("AETHERVAULT_BROWSER_ENDPOINT").unwrap_or_else(|| "http://127.0.0.1:4040".to_string());
+            let payload = serde_json::json!({
+                "action": parsed.action,
+                "url": parsed.url,
+                "selector": parsed.selector,
+                "text": parsed.text,
+                "data": parsed.data,
+            });
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
+                .timeout_write(Duration::from_secs(20))
+                .timeout_read(Duration::from_secs(30))
+                .build();
+            let resp = agent
+                .post(&endpoint)
+                .set("content-type", "application/json")
+                .send_json(payload);
+            match resp {
+                Ok(resp) => Ok(ToolExecution {
+                    output: "browser_request completed.".to_string(),
+                    details: resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                    is_error: false,
+                }),
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    Err(format!("browser_request error {code}: {text}"))
+                }
+                Err(err) => Err(format!("browser_request failed: {err}")),
+            }
+        }
+        "fs_list" => {
+            let parsed: ToolFsListArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let roots = allowed_fs_roots(&workspace_override);
+            let resolved = resolve_fs_path(&parsed.path, &roots)?;
+            let mut items = Vec::new();
+            let max_entries = parsed.max_entries.unwrap_or(200);
+            if parsed.recursive.unwrap_or(false) {
+                for entry in WalkDir::new(&resolved).max_depth(6) {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    if items.len() >= max_entries {
+                        break;
+                    }
+                    items.push(entry.path().display().to_string());
+                }
+            } else if resolved.is_dir() {
+                for entry in fs::read_dir(&resolved).map_err(|e| e.to_string())? {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    items.push(entry.path().display().to_string());
+                    if items.len() >= max_entries {
+                        break;
+                    }
+                }
+            } else if resolved.exists() {
+                items.push(resolved.display().to_string());
+            }
+            Ok(ToolExecution {
+                output: format!("Listed {} entries.", items.len()),
+                details: serde_json::json!({ "entries": items }),
+                is_error: false,
+            })
+        }
+        "fs_read" => {
+            let parsed: ToolFsReadArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let roots = allowed_fs_roots(&workspace_override);
+            let resolved = resolve_fs_path(&parsed.path, &roots)?;
+            let max_bytes = parsed.max_bytes.unwrap_or(200_000);
+            let file = fs::File::open(&resolved).map_err(|e| e.to_string())?;
+            let mut buf = Vec::new();
+            file.take(max_bytes as u64)
+                .read_to_end(&mut buf)
+                .map_err(|e| e.to_string())?;
+            let text = String::from_utf8_lossy(&buf).to_string();
+            Ok(ToolExecution {
+                output: format!("Read {} bytes.", buf.len()),
+                details: serde_json::json!({
+                    "path": resolved.display().to_string(),
+                    "text": text
+                }),
+                is_error: false,
+            })
+        }
+        "fs_write" => {
+            let parsed: ToolFsWriteArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let roots = allowed_fs_roots(&workspace_override);
+            let resolved = resolve_fs_path(&parsed.path, &roots)?;
+            if parsed.append.unwrap_or(false) {
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&resolved)
+                    .map_err(|e| e.to_string())?;
+                file.write_all(parsed.text.as_bytes())
+                    .map_err(|e| e.to_string())?;
+            } else {
+                fs::write(&resolved, parsed.text.as_bytes()).map_err(|e| e.to_string())?;
+            }
+            Ok(ToolExecution {
+                output: "File written.".to_string(),
+                details: serde_json::json!({ "path": resolved.display().to_string() }),
+                is_error: false,
+            })
+        }
+        "approval_list" => with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+            let approvals = load_approvals(mem);
+            Ok(ToolExecution {
+                output: format!("{} approvals.", approvals.len()),
+                details: serde_json::json!({ "approvals": approvals }),
+                is_error: false,
+            })
+        }),
+        "approval_approve" => {
+            let parsed: ToolApprovalApproveArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+                let mut approvals = load_approvals(mem);
+                let mut updated = false;
+                for entry in approvals.iter_mut() {
+                    if entry.id == parsed.id {
+                        entry.status = "approved".to_string();
+                        updated = true;
+                    }
+                }
+                if updated {
+                    save_approvals(mem, &approvals)?;
+                }
+                Ok(ToolExecution {
+                    output: if updated { "Approval granted.".to_string() } else { "Approval not found.".to_string() },
+                    details: serde_json::json!({ "id": parsed.id, "updated": updated }),
+                    is_error: !updated,
+                })
+            })
+        }
+        "approval_reject" => {
+            let parsed: ToolApprovalApproveArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+                let mut approvals = load_approvals(mem);
+                let before = approvals.len();
+                approvals.retain(|e| e.id != parsed.id);
+                let updated = approvals.len() != before;
+                if updated {
+                    save_approvals(mem, &approvals)?;
+                }
+                Ok(ToolExecution {
+                    output: if updated { "Approval rejected.".to_string() } else { "Approval not found.".to_string() },
+                    details: serde_json::json!({ "id": parsed.id, "updated": updated }),
+                    is_error: !updated,
+                })
+            })
+        }
+        "trigger_add" => {
+            let parsed: ToolTriggerAddArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+                let mut triggers = load_triggers(mem);
+                let id = format!(
+                    "trg_{}_{}",
+                    chrono::Utc::now().timestamp(),
+                    triggers.len() + 1
+                );
+                let entry = TriggerEntry {
+                    id: id.clone(),
+                    kind: parsed.kind,
+                    name: parsed.name,
+                    query: parsed.query,
+                    prompt: parsed.prompt,
+                    start: parsed.start,
+                    end: parsed.end,
+                    enabled: parsed.enabled.unwrap_or(true),
+                    last_seen: None,
+                    last_fired: None,
+                };
+                triggers.push(entry);
+                save_triggers(mem, &triggers)?;
+                Ok(ToolExecution {
+                    output: "Trigger added.".to_string(),
+                    details: serde_json::json!({ "id": id }),
+                    is_error: false,
+                })
+            })
+        }
+        "trigger_list" => with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+            let triggers = load_triggers(mem);
+            Ok(ToolExecution {
+                output: format!("{} triggers.", triggers.len()),
+                details: serde_json::json!({ "triggers": triggers }),
+                is_error: false,
+            })
+        }),
+        "trigger_remove" => {
+            let parsed: ToolTriggerRemoveArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+                let mut triggers = load_triggers(mem);
+                let before = triggers.len();
+                triggers.retain(|t| t.id != parsed.id);
+                let updated = triggers.len() != before;
+                if updated {
+                    save_triggers(mem, &triggers)?;
+                }
+                Ok(ToolExecution {
+                    output: if updated { "Trigger removed.".to_string() } else { "Trigger not found.".to_string() },
+                    details: serde_json::json!({ "id": parsed.id, "updated": updated }),
+                    is_error: !updated,
+                })
             })
         }
         "gmail_list" => {
@@ -4857,6 +5449,112 @@ fn load_config_json(mem: &mut Vault, key: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+fn approval_mode_enabled() -> bool {
+    env_optional("AETHERVAULT_APPROVAL_MODE")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn approval_hash(tool: &str, args: &serde_json::Value) -> String {
+    let payload = serde_json::json!({ "tool": tool, "args": args });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    blake3_hash(&bytes).to_hex().to_string()
+}
+
+fn load_approvals(mem: &mut Vault) -> Vec<ApprovalEntry> {
+    load_config_json(mem, "approvals")
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+fn save_approvals(mem: &mut Vault, approvals: &[ApprovalEntry]) -> Result<(), String> {
+    let json = serde_json::to_value(approvals).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?;
+    save_config_entry(mem, "approvals", &bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
+    match name {
+        "exec"
+        | "email_send"
+        | "email_archive"
+        | "gmail_send"
+        | "gcal_create"
+        | "ms_calendar_create"
+        | "notify"
+        | "signal_send"
+        | "imessage_send"
+        | "fs_write"
+        | "browser_request" => true,
+        "http_request" => {
+            let method = args
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("GET")
+                .to_ascii_uppercase();
+            method != "GET"
+        }
+        _ => false,
+    }
+}
+
+fn load_triggers(mem: &mut Vault) -> Vec<TriggerEntry> {
+    load_config_json(mem, "triggers")
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+fn save_triggers(mem: &mut Vault, triggers: &[TriggerEntry]) -> Result<(), String> {
+    let json = serde_json::to_value(triggers).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?;
+    save_config_entry(mem, "triggers", &bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn allowed_fs_roots(workspace_override: &Option<PathBuf>) -> Vec<PathBuf> {
+    if let Some(raw) = env_optional("AETHERVAULT_FS_ROOTS") {
+        let roots: Vec<PathBuf> = raw
+            .split(':')
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !roots.is_empty() {
+            return roots;
+        }
+    }
+    if let Some(ws) = workspace_override {
+        return vec![ws.clone()];
+    }
+    vec![env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
+}
+
+fn resolve_fs_path(path: &str, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    let raw = PathBuf::from(path);
+    let candidates: Vec<PathBuf> = if raw.is_absolute() {
+        vec![raw.clone()]
+    } else {
+        roots.iter().map(|r| r.join(&raw)).collect()
+    };
+    for root in roots {
+        let root_canon = fs::canonicalize(root).map_err(|e| e.to_string())?;
+        for cand in &candidates {
+            let cand_canon = if cand.exists() {
+                fs::canonicalize(cand).map_err(|e| e.to_string())?
+            } else if let Some(parent) = cand.parent() {
+                let parent_canon = fs::canonicalize(parent).map_err(|e| e.to_string())?;
+                parent_canon.join(cand.file_name().unwrap_or_default())
+            } else {
+                continue;
+            };
+            if cand_canon.starts_with(&root_canon) {
+                return Ok(cand.clone());
+            }
+        }
+    }
+    Err("path outside allowed roots".into())
+}
+
 fn refresh_google_token(mv2: &Path, token: &serde_json::Value) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let refresh_token = token
         .get("refresh_token")
@@ -5180,6 +5878,163 @@ fn run_schedule_loop(
         }
 
         thread::sleep(Duration::from_secs(30));
+    }
+}
+
+fn run_watch_loop(
+    mv2: PathBuf,
+    workspace: Option<PathBuf>,
+    timezone: Option<String>,
+    model_hook: Option<String>,
+    max_steps: usize,
+    log: bool,
+    log_commit_interval: usize,
+    poll_seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut mem_read = Some(Vault::open_read_only(&mv2)?);
+    let config = load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default();
+    let agent_cfg = config.agent.clone().unwrap_or_default();
+    let tz = resolve_timezone(&agent_cfg, timezone);
+    let workspace = resolve_workspace(workspace, &agent_cfg);
+    let agent_config = build_bridge_agent_config(
+        mv2.clone(),
+        model_hook,
+        None,
+        false,
+        None,
+        8,
+        12_000,
+        max_steps,
+        log,
+        log_commit_interval,
+    )?;
+
+    loop {
+        let now = chrono::Utc::now().with_timezone(&tz);
+        let mut mem = open_or_create(&mv2)?;
+        let mut triggers = load_triggers(&mut mem);
+        let mut updated = false;
+
+        for trigger in triggers.iter_mut() {
+            if !trigger.enabled {
+                continue;
+            }
+            match trigger.kind.as_str() {
+                "email" => {
+                    let query = match &trigger.query {
+                        Some(q) if !q.trim().is_empty() => q.clone(),
+                        _ => continue,
+                    };
+                    let token = match get_oauth_token(&mv2, "google") {
+                        Ok(token) => token,
+                        Err(_) => continue,
+                    };
+                    let agent = ureq::AgentBuilder::new()
+                        .timeout_connect(Duration::from_secs(10))
+                        .timeout_read(Duration::from_secs(20))
+                        .build();
+                    let mut url = "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=1".to_string();
+                    url.push_str("&q=");
+                    url.push_str(&urlencoding::encode(&query));
+                    let resp = agent
+                        .get(&url)
+                        .set("authorization", &format!("Bearer {}", token))
+                        .call();
+                    let payload = match resp {
+                        Ok(resp) => resp.into_json::<serde_json::Value>().unwrap_or_default(),
+                        Err(_) => continue,
+                    };
+                    let id = payload
+                        .get("messages")
+                        .and_then(|m| m.as_array())
+                        .and_then(|arr| arr.get(0))
+                        .and_then(|m| m.get("id"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    if let Some(id) = id {
+                        if trigger.last_seen.as_deref() != Some(&id) {
+                            trigger.last_seen = Some(id.clone());
+                            trigger.last_fired = Some(now.to_rfc3339());
+                            updated = true;
+                            let mut prompt = trigger
+                                .prompt
+                                .clone()
+                                .unwrap_or_else(|| "New email received. Review and take action.".to_string());
+                            prompt.push_str(&format!("\n\nQuery: {query}\nMessage ID: {id}\nUse gmail_read to inspect."));
+                            if let Some(ws) = &workspace {
+                                prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
+                            }
+                            let session = format!("trigger:email:{}", trigger.id);
+                            let _ = run_agent_for_bridge(&agent_config, &prompt, session, None, None);
+                        }
+                    }
+                }
+                "calendar_free" => {
+                    let start = match &trigger.start {
+                        Some(s) => s.clone(),
+                        None => continue,
+                    };
+                    let end = match &trigger.end {
+                        Some(e) => e.clone(),
+                        None => continue,
+                    };
+                    let token = match get_oauth_token(&mv2, "google") {
+                        Ok(token) => token,
+                        Err(_) => continue,
+                    };
+                    let agent = ureq::AgentBuilder::new()
+                        .timeout_connect(Duration::from_secs(10))
+                        .timeout_read(Duration::from_secs(20))
+                        .build();
+                    let url = format!(
+                        "https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin={}&timeMax={}&maxResults=1&singleEvents=true",
+                        urlencoding::encode(&start),
+                        urlencoding::encode(&end)
+                    );
+                    let resp = agent
+                        .get(&url)
+                        .set("authorization", &format!("Bearer {}", token))
+                        .call();
+                    let payload = match resp {
+                        Ok(resp) => resp.into_json::<serde_json::Value>().unwrap_or_default(),
+                        Err(_) => continue,
+                    };
+                    let has_events = payload
+                        .get("items")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| !arr.is_empty())
+                        .unwrap_or(false);
+                    if !has_events {
+                        let fired_today = trigger
+                            .last_fired
+                            .as_deref()
+                            .and_then(|v| v.split('T').next())
+                            .map(|d| d == now.date_naive().to_string())
+                            .unwrap_or(false);
+                        if !fired_today {
+                            trigger.last_fired = Some(now.to_rfc3339());
+                            updated = true;
+                            let mut prompt = trigger
+                                .prompt
+                                .clone()
+                                .unwrap_or_else(|| "Calendar is free in the requested window. Schedule task.".to_string());
+                            prompt.push_str(&format!("\n\nWindow: {start} → {end}\nNo events detected."));
+                            if let Some(ws) = &workspace {
+                                prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
+                            }
+                            let session = format!("trigger:calendar:{}", trigger.id);
+                            let _ = run_agent_for_bridge(&agent_config, &prompt, session, None, None);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if updated {
+            let _ = save_triggers(&mut mem, &triggers);
+        }
+        thread::sleep(Duration::from_secs(poll_seconds));
     }
 }
 
@@ -7664,6 +8519,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_steps,
             log,
             log_commit_interval,
+        ),
+
+        Command::Watch {
+            mv2,
+            workspace,
+            timezone,
+            model_hook,
+            max_steps,
+            log,
+            log_commit_interval,
+            poll_seconds,
+        } => run_watch_loop(
+            mv2,
+            workspace,
+            timezone,
+            model_hook,
+            max_steps,
+            log,
+            log_commit_interval,
+            poll_seconds,
         ),
 
         Command::Connect {

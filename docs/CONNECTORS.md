@@ -79,6 +79,49 @@ After authorization, the following tools are available:
 - `ms_mail_list`, `ms_mail_read`
 - `ms_calendar_list`, `ms_calendar_create`
 
+## Browser automation (brokered)
+
+For SOTA browser control, run a local browser broker (Stagehand / CUA / Anthropic computer-use) and point the agent at it:
+
+```bash
+export AETHERVAULT_BROWSER_ENDPOINT=http://127.0.0.1:4040
+```
+
+Then use the `browser_request` tool to drive actions (`open`, `click`, `type`, `extract`, etc).
+
+## Generic HTTP tool
+
+`http_request` provides a generic API surface for any REST endpoint. For non-`GET` methods, enable approval mode.
+
+## Approval mode (human-in-the-loop)
+
+Set `AETHERVAULT_APPROVAL_MODE=1`. Sensitive tools will return an approval request and no action will be taken until approved.
+
+Tools:
+- `approval_list`
+- `approval_approve`
+- `approval_reject`
+
+## Event triggers
+
+Use the trigger tools plus the `watch` command for event-driven automation:
+
+```bash
+./target/release/aethervault watch ./data/knowledge.mv2 --poll-seconds 60
+```
+
+Triggers:
+- `trigger_add` with `kind=email` (uses Gmail OAuth)
+- `trigger_add` with `kind=calendar_free` (Google Calendar free/busy window)
+
+## File system tools
+
+`fs_list`, `fs_read`, and `fs_write` operate within allowed roots.
+
+```bash
+export AETHERVAULT_FS_ROOTS="/home/user:/data"
+```
+
 ## WhatsApp (Twilio webhook)
 
 1. Create a Twilio WhatsApp sender and note your webhook URL.
