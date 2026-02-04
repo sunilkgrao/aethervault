@@ -444,6 +444,20 @@ enum Command {
         provider: HookCommand,
     },
 
+    /// Bootstrap local workspace (soul + memory) and write default config.
+    Bootstrap {
+        mv2: PathBuf,
+        /// Workspace folder (default: ./assistant or AETHERVAULT_WORKSPACE)
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Timezone offset (e.g. -05:00)
+        #[arg(long)]
+        timezone: Option<String>,
+        /// Overwrite existing workspace files
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Rust-native chat connectors (Telegram + WhatsApp).
     Bridge {
         #[command(subcommand)]
@@ -820,6 +834,12 @@ struct AgentConfig {
     #[serde(default)]
     system: Option<String>,
     #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    onboarding_complete: Option<bool>,
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
     context_query: Option<String>,
     #[serde(default)]
     max_context_bytes: Option<usize>,
@@ -1008,6 +1028,7 @@ struct ToolExecution {
 
 const TOOL_DETAILS_MAX_CHARS: usize = 4_000;
 const TOOL_OUTPUT_MAX_FOR_DETAILS: usize = 2_000;
+const DEFAULT_WORKSPACE_DIR: &str = "./assistant";
 
 fn format_tool_message_content(name: &str, output: &str, details: &serde_json::Value) -> String {
     if output.is_empty() {
@@ -1097,6 +1118,69 @@ struct ToolQueryArgs {
     after: Option<String>,
     #[serde(default)]
     feedback_weight: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolMemoryAppendArgs {
+    text: String,
+    #[serde(default)]
+    date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolMemoryRememberArgs {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolEmailListArgs {
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolEmailReadArgs {
+    id: String,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolEmailSendArgs {
+    to: String,
+    #[serde(default)]
+    cc: Option<String>,
+    #[serde(default)]
+    bcc: Option<String>,
+    subject: String,
+    body: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    in_reply_to: Option<String>,
+    #[serde(default)]
+    references: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolEmailArchiveArgs {
+    id: String,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolConfigSetArgs {
+    key: String,
+    json: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2615,6 +2699,97 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
                 },
                 "required": ["uri", "score"]
             }
+        }),
+        serde_json::json!({
+            "name": "config.set",
+            "description": "Set a config JSON document at aethervault://config/<key>.json.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string" },
+                    "json": { "type": "object" }
+                },
+                "required": ["key", "json"]
+            }
+        }),
+        serde_json::json!({
+            "name": "memory.append_daily",
+            "description": "Append a line to the daily memory log (workspace).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" },
+                    "date": { "type": "string" }
+                },
+                "required": ["text"]
+            }
+        }),
+        serde_json::json!({
+            "name": "memory.remember",
+            "description": "Append a line to MEMORY.md (workspace).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                },
+                "required": ["text"]
+            }
+        }),
+        serde_json::json!({
+            "name": "email.list",
+            "description": "List email envelopes via Himalaya.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string" },
+                    "folder": { "type": "string" },
+                    "limit": { "type": "number" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "email.read",
+            "description": "Read a full message via Himalaya.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "account": { "type": "string" },
+                    "folder": { "type": "string" }
+                },
+                "required": ["id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "email.send",
+            "description": "Send an email via Himalaya template.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string" },
+                    "cc": { "type": "string" },
+                    "bcc": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "body": { "type": "string" },
+                    "from": { "type": "string" },
+                    "in_reply_to": { "type": "string" },
+                    "references": { "type": "string" }
+                },
+                "required": ["to", "subject", "body"]
+            }
+        }),
+        serde_json::json!({
+            "name": "email.archive",
+            "description": "Archive an email (move to Archive) via Himalaya.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "account": { "type": "string" },
+                    "folder": { "type": "string" }
+                },
+                "required": ["id"]
+            }
         })
     ]
 }
@@ -2639,10 +2814,11 @@ fn execute_tool_with_handles(
     mem_read: &mut Option<Vault>,
     mem_write: &mut Option<Vault>,
 ) -> Result<ToolExecution, String> {
-    let is_write = matches!(name, "put" | "log" | "feedback");
+    let is_write = matches!(name, "put" | "log" | "feedback" | "config.set");
     if read_only && is_write {
         return Err("tool disabled in read-only mode".into());
     }
+    let workspace_override = env_optional("AETHERVAULT_WORKSPACE").map(PathBuf::from);
 
     match name {
         "query" => {
@@ -2880,6 +3056,196 @@ fn execute_tool_with_handles(
             })?;
             *mem_read = None;
             Ok(result)
+        }
+        "config.set" => {
+            let parsed: ToolConfigSetArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let payload = serde_json::to_vec(&parsed.json).map_err(|e| format!("json: {e}"))?;
+            let result = with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+                let id = save_config_entry(mem, &parsed.key, &payload)
+                    .map_err(|e| e.to_string())?;
+                Ok(ToolExecution {
+                    output: format!("Config saved ({})", parsed.key),
+                    details: serde_json::json!({ "frame_id": id }),
+                    is_error: false,
+                })
+            })?;
+            *mem_read = None;
+            Ok(result)
+        }
+        "memory.append_daily" => {
+            let parsed: ToolMemoryAppendArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let workspace = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let date = parsed
+                .date
+                .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+            let dir = workspace.join("memory");
+            fs::create_dir_all(&dir).map_err(|e| format!("workspace: {e}"))?;
+            let path = dir.join(format!("{date}.md"));
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| format!("memory open: {e}"))?;
+            writeln!(file, "{}", parsed.text).map_err(|e| format!("memory write: {e}"))?;
+            Ok(ToolExecution {
+                output: format!("Appended to {}", path.display()),
+                details: serde_json::json!({ "path": path.display().to_string() }),
+                is_error: false,
+            })
+        }
+        "memory.remember" => {
+            let parsed: ToolMemoryRememberArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let workspace = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            fs::create_dir_all(&workspace).map_err(|e| format!("workspace: {e}"))?;
+            let path = workspace.join("MEMORY.md");
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| format!("memory open: {e}"))?;
+            writeln!(file, "{}", parsed.text).map_err(|e| format!("memory write: {e}"))?;
+            Ok(ToolExecution {
+                output: format!("Appended to {}", path.display()),
+                details: serde_json::json!({ "path": path.display().to_string() }),
+                is_error: false,
+            })
+        }
+        "email.list" => {
+            let parsed: ToolEmailListArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let mut cmd = ProcessCommand::new("himalaya");
+            cmd.arg("envelope").arg("list").arg("--output").arg("json");
+            if let Some(limit) = parsed.limit {
+                cmd.arg("--limit").arg(limit.to_string());
+            }
+            if let Some(folder) = parsed.folder {
+                cmd.arg("--folder").arg(folder);
+            }
+            if let Some(account) = parsed.account {
+                cmd.arg("--account").arg(account);
+            }
+            let output = cmd.output().map_err(|e| format!("himalaya: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(format!("himalaya error: {stderr}"));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let details =
+                serde_json::from_str(&stdout).unwrap_or_else(|_| serde_json::json!({ "raw": stdout }));
+            Ok(ToolExecution {
+                output: "Listed envelopes.".to_string(),
+                details,
+                is_error: false,
+            })
+        }
+        "email.read" => {
+            let parsed: ToolEmailReadArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let mut cmd = ProcessCommand::new("himalaya");
+            cmd.arg("message")
+                .arg("read")
+                .arg(parsed.id)
+                .arg("--output")
+                .arg("json");
+            if let Some(folder) = parsed.folder {
+                cmd.arg("--folder").arg(folder);
+            }
+            if let Some(account) = parsed.account {
+                cmd.arg("--account").arg(account);
+            }
+            let output = cmd.output().map_err(|e| format!("himalaya: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(format!("himalaya error: {stderr}"));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let details =
+                serde_json::from_str(&stdout).unwrap_or_else(|_| serde_json::json!({ "raw": stdout }));
+            Ok(ToolExecution {
+                output: "Read message.".to_string(),
+                details,
+                is_error: false,
+            })
+        }
+        "email.send" => {
+            let parsed: ToolEmailSendArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let mut template = String::new();
+            if let Some(from) = parsed.from {
+                template.push_str(&format!("From: {from}\n"));
+            }
+            template.push_str(&format!("To: {}\n", parsed.to));
+            if let Some(cc) = parsed.cc {
+                template.push_str(&format!("Cc: {cc}\n"));
+            }
+            if let Some(bcc) = parsed.bcc {
+                template.push_str(&format!("Bcc: {bcc}\n"));
+            }
+            if let Some(in_reply_to) = parsed.in_reply_to {
+                template.push_str(&format!("In-Reply-To: {in_reply_to}\n"));
+            }
+            if let Some(references) = parsed.references {
+                template.push_str(&format!("References: {references}\n"));
+            }
+            template.push_str(&format!("Subject: {}\n", parsed.subject));
+            template.push_str("\n");
+            template.push_str(&parsed.body);
+            template.push('\n');
+
+            let mut cmd = ProcessCommand::new("himalaya");
+            cmd.arg("template").arg("send");
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("himalaya: {e}"))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(template.as_bytes())
+                    .map_err(|e| format!("send stdin: {e}"))?;
+            }
+            let output = child
+                .wait_with_output()
+                .map_err(|e| format!("send output: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(format!("himalaya error: {stderr}"));
+            }
+            Ok(ToolExecution {
+                output: "Sent email.".to_string(),
+                details: serde_json::json!({ "status": "sent" }),
+                is_error: false,
+            })
+        }
+        "email.archive" => {
+            let parsed: ToolEmailArchiveArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let mut cmd = ProcessCommand::new("himalaya");
+            cmd.arg("message").arg("move").arg(parsed.id).arg("Archive");
+            if let Some(folder) = parsed.folder {
+                cmd.arg("--folder").arg(folder);
+            }
+            if let Some(account) = parsed.account {
+                cmd.arg("--account").arg(account);
+            }
+            let output = cmd.output().map_err(|e| format!("himalaya: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(format!("himalaya error: {stderr}"));
+            }
+            Ok(ToolExecution {
+                output: "Archived email.".to_string(),
+                details: serde_json::json!({ "status": "archived" }),
+                is_error: false,
+            })
         }
         _ => Err("unknown tool".into()),
     }
@@ -3133,6 +3499,108 @@ fn jitter_ratio() -> f64 {
 fn parse_retry_after(resp: &ureq::Response) -> Option<f64> {
     resp.header("retry-after")
         .and_then(|v| v.trim().parse::<f64>().ok())
+}
+
+fn resolve_workspace(
+    cli: Option<PathBuf>,
+    agent_cfg: &AgentConfig,
+) -> Option<PathBuf> {
+    if let Some(path) = cli {
+        return Some(path);
+    }
+    if let Some(value) = env_optional("AETHERVAULT_WORKSPACE") {
+        if !value.trim().is_empty() {
+            return Some(PathBuf::from(value));
+        }
+    }
+    if let Some(value) = &agent_cfg.workspace {
+        if !value.trim().is_empty() {
+            return Some(PathBuf::from(value));
+        }
+    }
+    Some(PathBuf::from(DEFAULT_WORKSPACE_DIR))
+}
+
+fn read_optional_file(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok().and_then(|text| {
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    })
+}
+
+fn daily_memory_path(workspace: &Path) -> PathBuf {
+    let date = Utc::now().format("%Y-%m-%d").to_string();
+    workspace.join("memory").join(format!("{date}.md"))
+}
+
+fn load_workspace_context(workspace: &Path) -> String {
+    let mut sections = Vec::new();
+    let soul = workspace.join("SOUL.md");
+    let user = workspace.join("USER.md");
+    let memory = workspace.join("MEMORY.md");
+    if let Some(text) = read_optional_file(&soul) {
+        sections.push(format!("# Soul\n{text}"));
+    }
+    if let Some(text) = read_optional_file(&user) {
+        sections.push(format!("# User\n{text}"));
+    }
+    if let Some(text) = read_optional_file(&memory) {
+        sections.push(format!("# Memory\n{text}"));
+    }
+    let daily = daily_memory_path(workspace);
+    if let Some(text) = read_optional_file(&daily) {
+        sections.push(format!("# Daily Log\n{text}"));
+    }
+    sections.join("\n\n")
+}
+
+fn bootstrap_workspace(
+    mv2: &Path,
+    workspace: &Path,
+    timezone: Option<String>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(workspace)?;
+    fs::create_dir_all(workspace.join("memory"))?;
+
+    let soul_path = workspace.join("SOUL.md");
+    let user_path = workspace.join("USER.md");
+    let memory_path = workspace.join("MEMORY.md");
+    let daily_path = daily_memory_path(workspace);
+
+    let create_file = |path: &Path, contents: &str| -> Result<(), Box<dyn std::error::Error>> {
+        if path.exists() && !force {
+            return Err(format!("File already exists: {}", path.display()).into());
+        }
+        fs::write(path, contents)?;
+        Ok(())
+    };
+
+    let soul_template = "# Executive Assistant Soul\n\n- Act as a proactive executive assistant.\n- Be concise, direct, and high‑leverage.\n- Prefer action over explanation.\n- Ask for approval before external sends unless policy allows.\n";
+    let user_template = "# User Profile\n\n- Name: Sunil Rao\n- Role: Executive\n- Preferences:\n  - Daily Overview at 8:30 AM\n  - Daily Recap at 3:30 PM\n  - Weekly Overview Monday 8:15 AM\n  - Weekly Recap Friday 3:15 PM\n";
+    let memory_template = "# Long‑term Memory\n\n- Important contacts, preferences, and policies go here.\n";
+    let daily_template = "# Daily Log\n\n- Created by bootstrap.\n";
+
+    create_file(&soul_path, soul_template)?;
+    create_file(&user_path, user_template)?;
+    create_file(&memory_path, memory_template)?;
+    create_file(&daily_path, daily_template)?;
+
+    let mut mem = open_or_create(mv2)?;
+    let mut config = load_capsule_config(&mut mem).unwrap_or_default();
+    let mut agent_cfg = config.agent.unwrap_or_default();
+    agent_cfg.workspace = Some(workspace.display().to_string());
+    agent_cfg.onboarding_complete = Some(false);
+    if timezone.is_some() {
+        agent_cfg.timezone = timezone;
+    }
+    config.agent = Some(agent_cfg);
+    let bytes = serde_json::to_vec_pretty(&config)?;
+    let _ = save_config_entry(&mut mem, "index", &bytes)?;
+    Ok(())
 }
 
 fn merge_system_messages(messages: &[AgentMessage]) -> String {
@@ -3548,18 +4016,34 @@ fn run_agent_with_prompt(
     let model_spec = resolve_hook_spec(
         model_hook,
         60000,
-        agent_cfg.model_hook.or(hook_cfg.llm),
+        agent_cfg.model_hook.clone().or(hook_cfg.llm),
         None,
     )
     .ok_or("agent requires --model-hook or config.agent.model_hook or config.hooks.llm")?;
 
     let mut system_prompt = if let Some(system) = system_override {
         system
-    } else if let Some(system) = agent_cfg.system {
+    } else if let Some(system) = agent_cfg.system.clone() {
         system
     } else {
         "You are a concise, high-performance personal assistant. Use tools when needed. Avoid plans and TODO lists unless asked.".to_string()
     };
+
+    if agent_cfg.onboarding_complete == Some(false) {
+        system_prompt.push_str(
+            "\n\n# Onboarding\nYou are in onboarding mode. Guide the user to connect email, calendar, and messaging integrations. Verify tool access. When complete, append a note to MEMORY.md and ask the user to run `aethervault config set --key index` to set `agent.onboarding_complete=true`.",
+        );
+    }
+
+    if let Some(workspace) = resolve_workspace(None, &agent_cfg) {
+        if workspace.exists() {
+            let workspace_context = load_workspace_context(&workspace);
+            if !workspace_context.trim().is_empty() {
+                system_prompt.push_str("\n\n# Workspace Context\n");
+                system_prompt.push_str(&workspace_context);
+            }
+        }
+    }
 
     if let Some(global_context) = config.context {
         if !global_context.trim().is_empty() {
@@ -5282,6 +5766,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Hook { provider } => match provider {
             HookCommand::Claude => run_claude_hook(),
         },
+
+        Command::Bootstrap {
+            mv2,
+            workspace,
+            timezone,
+            force,
+        } => {
+            let workspace = workspace
+                .or_else(|| env_optional("AETHERVAULT_WORKSPACE").map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            bootstrap_workspace(&mv2, &workspace, timezone, force)?;
+            println!(
+                "bootstrapped workspace at {} (mv2: {})",
+                workspace.display(),
+                mv2.display()
+            );
+            Ok(())
+        }
 
         Command::Bridge { command } => run_bridge(command),
 

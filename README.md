@@ -47,6 +47,7 @@ flowchart TB
 cargo build --locked
 
 ./target/debug/aethervault init knowledge.mv2
+./target/debug/aethervault bootstrap knowledge.mv2 --workspace ./assistant
 ./target/debug/aethervault ingest knowledge.mv2 -c notes -r ~/notes
 ./target/debug/aethervault search knowledge.mv2 "project timeline" -c notes -n 10
 ./target/debug/aethervault query knowledge.mv2 "quarterly planning process" -c notes -n 10 --plan
@@ -75,6 +76,7 @@ cargo build --locked
 - `mcp` starts a stdio tool server.
 - `agent` runs a minimal hook‑based assistant loop.
 - `bridge` runs Rust‑native Telegram/WhatsApp connectors.
+- `bootstrap` scaffolds soul + memory workspace and writes default agent config.
 - `compact` runs vacuum compaction + index rebuilds (SOTA maintenance).
 - `doctor` exposes full repair/verify controls.
 
@@ -83,6 +85,7 @@ cargo build --locked
 - `docs/DEPLOYMENT.md` for local, Docker, and cloud deployment.
 - `docs/CONNECTORS.md` for Telegram + WhatsApp bridges and subagent fan‑out.
 - Rust‑native connectors are built in (`bridge`). Legacy Python scripts live in `examples/bridge`.
+ - Optional: Himalaya integration enables `email.*` tools for Gmail IMAP workflows.
 
 ## Maintenance (SOTA compaction)
 
@@ -122,6 +125,17 @@ Tune performance with `embed --batch N` and query flags like `--embed-cache`.
 ```
 
 `builtin:claude` runs the Rust hook in‑process (no subprocess).
+
+## Workspace (Soul + Memory)
+
+The agent can optionally read `SOUL.md`, `USER.md`, `MEMORY.md`, and a daily log in `memory/YYYY-MM-DD.md`
+from a workspace directory (default `./assistant` or `AETHERVAULT_WORKSPACE`).
+
+Bootstrap creates templates and writes config:
+
+```bash
+./target/release/aethervault bootstrap knowledge.mv2 --workspace ./assistant
+```
 
 For longer tool‑using sessions, raise the step budget:
 

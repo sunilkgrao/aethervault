@@ -7,6 +7,7 @@ This document covers local, Docker, and cloud deployments (including DigitalOcea
 ```bash
 cargo build --release
 ./target/release/aethervault init ./data/knowledge.mv2
+./target/release/aethervault bootstrap ./data/knowledge.mv2 --workspace ./assistant
 ./target/release/aethervault mcp ./data/knowledge.mv2
 ```
 

@@ -18,6 +18,21 @@ export ANTHROPIC_MODEL=claude-<model>
 
 Messages now route into `aethervault agent` and back to Telegram.
 
+## Gmail via Himalaya (fast path)
+
+Install Himalaya and add your Gmail account (IMAP + App Password).
+
+Example:
+
+```bash
+himalaya --version
+himalaya account add
+```
+
+Once configured, the agent can use `email.list`, `email.read`, `email.send`, and `email.archive`.
+
+Note: Calendar access still requires OAuth for Google Calendar or Microsoft 365.
+
 ## WhatsApp (Twilio webhook)
 
 1. Create a Twilio WhatsApp sender and note your webhook URL.
