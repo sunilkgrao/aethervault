@@ -156,11 +156,6 @@ Outputs are appended to the main response.
 
 ## Useful env vars
 
-- `AETHERVAULT_MODEL_HOOK` (override model hook; defaults to `builtin:claude` if ANTHROPIC env vars are set)
-- `AETHERVAULT_LOG` (`1` to log turns, default enabled for bridges)
-- `AETHERVAULT_LOG_COMMIT_INTERVAL` (set to `1` for audit‑grade durability)
-- `AETHERVAULT_AGENT_TIMEOUT` (seconds)
-- `AETHERVAULT_SESSION_PREFIX` (prefix for all sessions)
 - `ANTHROPIC_PROMPT_CACHE` / `ANTHROPIC_PROMPT_CACHE_TTL`
 - `ANTHROPIC_TOKEN_EFFICIENT` (token‑efficient tools beta)
 - `AETHERVAULT_COMMAND_WRAPPER` (optional command prefix for sandboxing external tools)

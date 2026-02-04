@@ -474,7 +474,7 @@ enum Command {
         /// Telegram chat id (env: AETHERVAULT_TELEGRAM_CHAT_ID)
         #[arg(long)]
         telegram_chat_id: Option<String>,
-        /// Override model hook command (env: AETHERVAULT_MODEL_HOOK)
+        /// Override model hook command
         #[arg(long)]
         model_hook: Option<String>,
         /// Max tool/LLM steps
@@ -497,7 +497,7 @@ enum Command {
         /// Timezone offset (e.g. -05:00)
         #[arg(long)]
         timezone: Option<String>,
-        /// Override model hook command (env: AETHERVAULT_MODEL_HOOK)
+        /// Override model hook command
         #[arg(long)]
         model_hook: Option<String>,
         /// Max tool/LLM steps
@@ -599,7 +599,7 @@ enum BridgeCommand {
         /// Max updates per poll
         #[arg(long, default_value_t = 50)]
         poll_limit: usize,
-        /// Override model hook command (env: AETHERVAULT_MODEL_HOOK)
+        /// Override model hook command
         #[arg(long)]
         model_hook: Option<String>,
         /// Override system prompt
@@ -638,7 +638,7 @@ enum BridgeCommand {
         /// Bind port
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        /// Override model hook command (env: AETHERVAULT_MODEL_HOOK)
+        /// Override model hook command
         #[arg(long)]
         model_hook: Option<String>,
         /// Override system prompt
@@ -6080,9 +6080,7 @@ fn parse_timezone_offset(value: &str) -> Result<chrono::FixedOffset, Box<dyn std
 }
 
 fn resolve_timezone(agent_cfg: &AgentConfig, override_value: Option<String>) -> chrono::FixedOffset {
-    let raw = override_value
-        .or_else(|| agent_cfg.timezone.clone())
-        .or_else(|| env_optional("AETHERVAULT_TIMEZONE"));
+    let raw = override_value.or_else(|| agent_cfg.timezone.clone());
     raw.and_then(|v| parse_timezone_offset(&v).ok())
         .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap())
 }
@@ -7050,9 +7048,6 @@ fn resolve_bridge_model_hook(cli: Option<String>) -> Option<String> {
     if cli.is_some() {
         return cli;
     }
-    if let Some(cmd) = env_optional("AETHERVAULT_MODEL_HOOK") {
-        return Some(cmd);
-    }
     if env_optional("ANTHROPIC_API_KEY").is_some() && env_optional("ANTHROPIC_MODEL").is_some() {
         return Some("builtin:claude".to_string());
     }
@@ -7072,30 +7067,16 @@ fn build_bridge_agent_config(
     log_commit_interval: usize,
 ) -> Result<BridgeAgentConfig, Box<dyn std::error::Error>> {
     let model_hook = resolve_bridge_model_hook(model_hook);
-    let system = system.or_else(|| env_optional("AETHERVAULT_SYSTEM"));
-    let no_memory = no_memory || env_bool("AETHERVAULT_NO_MEMORY", false);
-    let context_query = context_query.or_else(|| env_optional("AETHERVAULT_CONTEXT_QUERY"));
-    let context_results = env_optional("AETHERVAULT_CONTEXT_RESULTS")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(context_results);
-    let context_max_bytes = env_optional("AETHERVAULT_CONTEXT_MAX_BYTES")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(context_max_bytes);
-    let max_steps = env_optional("AETHERVAULT_MAX_STEPS")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(max_steps);
-    let log_commit_interval = env_optional("AETHERVAULT_LOG_COMMIT_INTERVAL")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(log_commit_interval)
-        .max(1);
-    let log = if log {
-        true
-    } else {
-        env_bool("AETHERVAULT_LOG", true)
-    };
-    let session_prefix = env_optional("AETHERVAULT_SESSION_PREFIX").unwrap_or_default();
-    let timeout_secs = env_f64("AETHERVAULT_AGENT_TIMEOUT", 120.0)?;
-    let timeout = Duration::from_secs_f64(timeout_secs.max(1.0));
+    let system = system;
+    let no_memory = no_memory;
+    let context_query = context_query;
+    let context_results = context_results;
+    let context_max_bytes = context_max_bytes;
+    let max_steps = max_steps;
+    let log_commit_interval = log_commit_interval.max(1);
+    let log = log;
+    let session_prefix = String::new();
+    let timeout = Duration::from_secs(120);
 
     Ok(BridgeAgentConfig {
         mv2,
