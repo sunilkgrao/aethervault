@@ -245,6 +245,7 @@ impl Vault {
                 bytes_length: 0,
                 checksum: empty_checksum,
                 compression_mode: vault.vec_compression.clone(),
+                model: None,
             });
         }
 

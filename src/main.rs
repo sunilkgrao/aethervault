@@ -1294,6 +1294,58 @@ struct TriggerEntry {
     last_fired: Option<String>,
 }
 
+// === Session Context Buffer ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionTurn {
+    role: String,
+    content: String,
+    timestamp: i64,
+}
+
+fn session_file_path(session_id: &str) -> PathBuf {
+    let safe_id = session_id.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
+    PathBuf::from("/root/.aethervault/workspace/sessions").join(format!("{safe_id}.json"))
+}
+
+fn load_session_turns(session_id: &str, max_turns: usize) -> Vec<SessionTurn> {
+    let path = session_file_path(session_id);
+    match std::fs::read_to_string(&path) {
+        Ok(data) => {
+            match serde_json::from_str::<Vec<SessionTurn>>(&data) {
+                Ok(mut turns) => {
+                    let keep = max_turns * 2;
+                    if turns.len() > keep {
+                        turns.drain(..turns.len() - keep);
+                    }
+                    turns
+                }
+                Err(_) => Vec::new(),
+            }
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_session_turns(session_id: &str, turns: &[SessionTurn], max_turns: usize) {
+    let path = session_file_path(session_id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let keep = max_turns * 2;
+    let to_save: Vec<&SessionTurn> = if turns.len() > keep {
+        turns[turns.len() - keep..].iter().collect()
+    } else {
+        turns.iter().collect()
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&to_save) {
+        let tmp_path = path.with_extension("json.tmp");
+        if std::fs::write(&tmp_path, &json).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &path);
+        }
+    }
+}
+
 const TOOL_DETAILS_MAX_CHARS: usize = 4_000;
 const TOOL_OUTPUT_MAX_FOR_DETAILS: usize = 2_000;
 const DEFAULT_WORKSPACE_DIR: &str = "./assistant";
@@ -6090,6 +6142,105 @@ fn get_oauth_token(mv2: &Path, provider: &str) -> Result<String, Box<dyn std::er
     Ok(access.to_string())
 }
 
+// === Knowledge Graph Auto-Injection ===
+
+#[derive(Debug, Deserialize)]
+struct KgGraph {
+    nodes: Vec<KgNode>,
+    #[serde(default)]
+    edges: Vec<KgEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KgNode {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(rename = "type", default)]
+    node_type: Option<String>,
+    #[serde(default)]
+    properties: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KgEdge {
+    source: String,
+    target: String,
+    #[serde(default)]
+    relation: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    confidence: Option<f64>,
+}
+
+fn load_kg_graph(path: &std::path::Path) -> Option<KgGraph> {
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn find_kg_entities(text: &str, graph: &KgGraph) -> Vec<String> {
+    let text_lower = text.to_lowercase();
+    let mut matched = Vec::new();
+    for node in &graph.nodes {
+        let name = node.name.as_deref().unwrap_or(&node.id);
+        // Skip very short names to avoid false positives
+        if name.len() < 3 { continue; }
+        let name_lower = name.to_lowercase();
+        // For short names (3-5 chars), require word boundary
+        if name.len() <= 5 {
+            if let Some(pos) = text_lower.find(&name_lower) {
+                let before_ok = pos == 0 || !text_lower.as_bytes()[pos - 1].is_ascii_alphanumeric();
+                let after_pos = pos + name_lower.len();
+                let after_ok = after_pos >= text_lower.len() || !text_lower.as_bytes()[after_pos].is_ascii_alphanumeric();
+                if before_ok && after_ok {
+                    matched.push(name.to_string());
+                }
+            }
+        } else if text_lower.contains(&name_lower) {
+            matched.push(name.to_string());
+        }
+    }
+    // Cap at 5 entities to avoid prompt bloat
+    matched.truncate(5);
+    matched
+}
+
+fn build_kg_context(entity_names: &[String], graph: &KgGraph) -> String {
+    let mut ctx = String::new();
+    for name in entity_names {
+        let node = graph.nodes.iter().find(|n| {
+            n.name.as_deref().unwrap_or(&n.id) == name
+        });
+        if let Some(node) = node {
+            let node_type = node.node_type.as_deref().unwrap_or("unknown");
+            ctx.push_str(&format!("## {} ({})\n", name, node_type));
+            if let Some(ref props) = node.properties {
+                if !props.is_empty() {
+                    let props_str: Vec<String> = props.iter()
+                        .filter(|(k, _)| *k != "name" && *k != "type")
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect();
+                    if !props_str.is_empty() {
+                        ctx.push_str(&format!("Properties: {}\n", props_str.join(", ")));
+                    }
+                }
+            }
+            for edge in &graph.edges {
+                if edge.source == node.id {
+                    let rel = edge.relation.as_deref().unwrap_or("related-to");
+                    ctx.push_str(&format!("  -> {} -> {}\n", rel, edge.target));
+                }
+                if edge.target == node.id {
+                    let rel = edge.relation.as_deref().unwrap_or("related-to");
+                    ctx.push_str(&format!("  <- {} <- {}\n", rel, edge.source));
+                }
+            }
+            ctx.push('\n');
+        }
+    }
+    ctx
+}
+
 fn load_workspace_context(workspace: &Path) -> String {
     let mut sections = Vec::new();
     let soul = workspace.join("SOUL.md");
@@ -7042,6 +7193,41 @@ fn run_agent_with_prompt(
         }
     }
 
+
+    // Knowledge Graph entity auto-injection
+    let kg_path = std::path::PathBuf::from("/root/.aethervault/data/knowledge-graph.json");
+    if kg_path.exists() {
+        if let Some(kg) = load_kg_graph(&kg_path) {
+            let matched = find_kg_entities(&prompt_text, &kg);
+            if !matched.is_empty() {
+                let kg_context = build_kg_context(&matched, &kg);
+                if !kg_context.trim().is_empty() {
+                    system_prompt.push_str("\n\n# Knowledge Graph Context\n");
+                    system_prompt.push_str("(Automatically matched entities from the knowledge graph)\n\n");
+                    system_prompt.push_str(&kg_context);
+                }
+            }
+        }
+    }
+
+    // Session conversation history (last 8 turns for continuity)
+    if let Some(ref sess_id) = session {
+        let session_turns = load_session_turns(sess_id, 8);
+        if !session_turns.is_empty() {
+            system_prompt.push_str("\n\n# Recent Conversation History\n");
+            system_prompt.push_str("(Previous messages in this conversation for context)\n\n");
+            for turn in &session_turns {
+                let role_label = if turn.role == "user" { "User" } else { "Assistant" };
+                let content_preview = if turn.content.len() > 500 {
+                    format!("{}...", &turn.content[..500])
+                } else {
+                    turn.content.clone()
+                };
+                system_prompt.push_str(&format!("**{}**: {}\n\n", role_label, content_preview));
+            }
+        }
+    }
+
     let mut messages = Vec::new();
     messages.push(AgentMessage {
         role: "system".to_string(),
@@ -7973,6 +8159,7 @@ fn run_telegram_bridge(
             telegram_send_typing(&agent, &base_url, chat_id);
 
             let session = format!("{}telegram:{chat_id}", agent_config.session_prefix);
+            let session_id_clone = session.clone();
 
             // Refresh typing every 4 seconds during long operations
             let typing_agent = agent.clone();
@@ -8025,6 +8212,27 @@ fn run_telegram_bridge(
                     }
                 }
             };
+
+                    // Save conversation turns for session continuity
+                    {
+                        let mut turns = load_session_turns(&session_id_clone, 8);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        turns.push(SessionTurn {
+                            role: "user".to_string(),
+                            content: user_text.clone(),
+                            timestamp: now,
+                        });
+                        turns.push(SessionTurn {
+                            role: "assistant".to_string(),
+                            content: output.clone(),
+                            timestamp: now,
+                        });
+                        save_session_turns(&session_id_clone, &turns, 8);
+                    }
+
             if let Err(err) = telegram_send_message_ext(&agent, &base_url, chat_id, &output, reply_to_id) {
                 eprintln!("Telegram send failed: {err}");
             }

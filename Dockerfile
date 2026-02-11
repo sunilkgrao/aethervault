@@ -2,7 +2,7 @@
 FROM rust:1.85-bookworm AS builder
 WORKDIR /app
 COPY . .
-RUN cargo build --locked --release
+RUN cargo build --locked --release --features vec
 
 FROM debian:bookworm-slim
 ARG WITH_PYTHON=0
