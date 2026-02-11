@@ -2643,12 +2643,24 @@ impl Vault {
     }
 
     pub(crate) fn capacity_limit(&self) -> u64 {
-        if self.toc.ticket_ref.capacity_bytes != 0 {
+        // For free-tier capsules, always use the current tier capacity.
+        // This ensures binary upgrades that change Tier::Free capacity
+        // take effect on existing capsules without re-creation.
+        if self.toc.ticket_ref.issuer == "free-tier" {
+            self.tier().capacity_bytes()
+        } else if self.toc.ticket_ref.capacity_bytes != 0 {
             self.toc.ticket_ref.capacity_bytes
         } else {
             self.tier().capacity_bytes()
         }
     }
+
+
+
+
+
+
+
 
     /// Get current storage capacity in bytes.
     ///
