@@ -1836,7 +1836,7 @@ fn normalize_collection(name: &str) -> String {
 }
 
 fn scope_prefix(collection: &str) -> String {
-    format!("aether://{}/", normalize_collection(collection))
+    format!("aethervault://{}/", normalize_collection(collection))
 }
 
 fn uri_for_path(collection: &str, relative: &Path) -> String {
@@ -1845,7 +1845,7 @@ fn uri_for_path(collection: &str, relative: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/");
-    format!("aether://{}/{rel}", normalize_collection(collection))
+    format!("aethervault://{}/{rel}", normalize_collection(collection))
 }
 
 fn infer_title(path: &Path, bytes: &[u8]) -> String {
@@ -5855,6 +5855,14 @@ fn save_approvals(mem: &mut Vault, approvals: &[ApprovalEntry]) -> Result<(), St
 }
 
 fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
+    // In bridge mode (env AETHERVAULT_BRIDGE_AUTO_APPROVE=1), auto-approve ALL tools.
+    // The user explicitly opted in to full agency — no approval gates.
+    let bridge_auto = std::env::var("AETHERVAULT_BRIDGE_AUTO_APPROVE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    if bridge_auto {
+        return false;
+    }
     match name {
         "exec"
         | "email_send"
@@ -6284,7 +6292,10 @@ fn run_schedule_loop(
                             .timeout_write(Duration::from_secs(10))
                             .timeout_read(Duration::from_secs(20))
                             .build();
-                        let base_url = format!("https://api.telegram.org/bot{token}");
+                        let base_url = match std::env::var("TELEGRAM_API_BASE") {
+        Ok(base) => format!("{base}/bot{token}"),
+        Err(_) => format!("https://api.telegram.org/bot{token}"),
+    };
                         if let Ok(chat_id) = chat_id.parse::<i64>() {
                             let _ = telegram_send_message(&agent, &base_url, chat_id, &text);
                         }
@@ -6475,10 +6486,51 @@ fn to_anthropic_messages(messages: &[AgentMessage]) -> Vec<serde_json::Value> {
             "system" => continue,
             "user" => {
                 let content = msg.content.clone().unwrap_or_default();
-                out.push(serde_json::json!({
-                    "role": "user",
-                    "content": [{"type": "text", "text": content}]
-                }));
+                // Check for embedded image markers: [AV_IMAGE:media_type:base64data]
+                if content.contains("[AV_IMAGE:") {
+                    let mut blocks: Vec<serde_json::Value> = Vec::new();
+                    let mut remaining = content.as_str();
+                    while let Some(start) = remaining.find("[AV_IMAGE:") {
+                        // Text before the marker
+                        let before = &remaining[..start];
+                        if !before.trim().is_empty() {
+                            blocks.push(serde_json::json!({"type": "text", "text": before.trim()}));
+                        }
+                        let after_prefix = &remaining[start + 10..]; // skip "[AV_IMAGE:"
+                        if let Some(end) = after_prefix.find(']') {
+                            let marker_content = &after_prefix[..end];
+                            // marker_content = "media_type:base64data"
+                            if let Some(colon) = marker_content.find(':') {
+                                let media_type = &marker_content[..colon];
+                                let b64_data = &marker_content[colon + 1..];
+                                blocks.push(serde_json::json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": b64_data
+                                    }
+                                }));
+                            }
+                            remaining = &after_prefix[end + 1..];
+                        } else {
+                            remaining = after_prefix;
+                            break;
+                        }
+                    }
+                    if !remaining.trim().is_empty() {
+                        blocks.push(serde_json::json!({"type": "text", "text": remaining.trim()}));
+                    }
+                    if blocks.is_empty() {
+                        blocks.push(serde_json::json!({"type": "text", "text": ""}));
+                    }
+                    out.push(serde_json::json!({"role": "user", "content": blocks}));
+                } else {
+                    out.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{"type": "text", "text": content}]
+                    }));
+                }
             }
             "assistant" => {
                 let mut blocks = Vec::new();
@@ -6737,6 +6789,43 @@ fn call_claude(request: &AgentHookRequest) -> Result<AgentHookResponse, Box<dyn 
         }
     }
 
+    // If primary model failed, try fallback model
+    if body.is_none() {
+        if let Ok(fallback_model) = std::env::var("ANTHROPIC_FALLBACK_MODEL") {
+            eprintln!("Primary model failed, trying fallback: {fallback_model}");
+            payload["model"] = serde_json::json!(fallback_model);
+            for attempt in 0..=1 {
+                let mut request = agent
+                    .post(&base_url)
+                    .set("content-type", "application/json")
+                    .set("x-api-key", &api_key)
+                    .set("anthropic-version", &version);
+                if !beta_values.is_empty() {
+                    request = request.set("anthropic-beta", &beta_values.join(","));
+                }
+                match request.send_json(payload.clone()) {
+                    Ok(resp) => {
+                        body = Some(resp.into_string()?);
+                        break;
+                    }
+                    Err(ureq::Error::Status(code, resp)) => {
+                        let text = resp.into_string().unwrap_or_default();
+                        if attempt == 1 {
+                            return Err(format!("Fallback model also failed: {code} {text}").into());
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                    Err(ureq::Error::Transport(err)) => {
+                        if attempt == 1 {
+                            return Err(format!("Fallback model transport error: {err}").into());
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            }
+        }
+    }
+
     let body = body.ok_or("Anthropic API request failed without a response")?;
     let payload: serde_json::Value = serde_json::from_str(&body)?;
     parse_claude_response(&payload)
@@ -6915,7 +7004,7 @@ fn run_agent_with_prompt(
             .unwrap_or_else(|| prompt_text.clone());
         let qargs = QueryArgs {
             raw_query: query,
-            collection: None,
+            collection: session.as_ref().map(|s| format!("agent-log/{s}")),
             limit: agent_cfg.max_context_results.unwrap_or(context_results),
             snippet_chars: 300,
             no_expand: false,
@@ -6991,6 +7080,7 @@ fn run_agent_with_prompt(
         Ok(())
     };
     if should_log {
+        mem_read = None;
         mem_write = Some(Vault::open(&mv2)?);
         let entry = AgentLogEntry {
             session: session.clone(),
@@ -7322,13 +7412,126 @@ struct TelegramUpdate {
     edited_message: Option<TelegramMessage>,
     #[serde(default)]
     channel_post: Option<TelegramMessage>,
+    #[serde(default)]
+    callback_query: Option<TelegramCallbackQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramUser {
+    id: i64,
+    #[serde(default)]
+    is_bot: Option<bool>,
+    #[serde(default)]
+    first_name: Option<String>,
+    #[serde(default)]
+    last_name: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramSticker {
+    #[serde(default)]
+    emoji: Option<String>,
+    #[serde(default)]
+    set_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramContact {
+    phone_number: String,
+    #[serde(default)]
+    first_name: Option<String>,
+    #[serde(default)]
+    last_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramLocation {
+    longitude: f64,
+    latitude: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramCallbackQuery {
+    id: String,
+    #[serde(default)]
+    from: Option<TelegramUser>,
+    #[serde(default)]
+    message: Option<Box<TelegramMessage>>,
+    #[serde(default)]
+    data: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramPhotoSize {
+    file_id: String,
+    #[serde(default)]
+    file_size: Option<i64>,
+    #[serde(default)]
+    width: Option<i64>,
+    #[serde(default)]
+    height: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVoice {
+    file_id: String,
+    #[serde(default)]
+    duration: Option<i64>,
+    #[serde(default)]
+    mime_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramAudio {
+    file_id: String,
+    #[serde(default)]
+    duration: Option<i64>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramDocument {
+    file_id: String,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TelegramMessage {
     chat: TelegramChat,
     #[serde(default)]
+    message_id: Option<i64>,
+    #[serde(default)]
+    from: Option<TelegramUser>,
+    #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    caption: Option<String>,
+    #[serde(default)]
+    photo: Option<Vec<TelegramPhotoSize>>,
+    #[serde(default)]
+    voice: Option<TelegramVoice>,
+    #[serde(default)]
+    audio: Option<TelegramAudio>,
+    #[serde(default)]
+    document: Option<TelegramDocument>,
+    #[serde(default)]
+    sticker: Option<TelegramSticker>,
+    #[serde(default)]
+    contact: Option<TelegramContact>,
+    #[serde(default)]
+    location: Option<TelegramLocation>,
+    #[serde(default)]
+    forward_from: Option<TelegramUser>,
+    #[serde(default)]
+    forward_from_chat: Option<TelegramChat>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7336,17 +7539,233 @@ struct TelegramChat {
     id: i64,
 }
 
-fn extract_telegram_text(update: &TelegramUpdate) -> Option<(i64, String)> {
+fn telegram_download_file_bytes(agent: &ureq::Agent, base_url: &str, file_id: &str) -> Option<(Vec<u8>, String)> {
+    let url = format!("{base_url}/getFile");
+    let payload = serde_json::json!({"file_id": file_id});
+    let resp = agent.post(&url)
+        .set("content-type", "application/json")
+        .send_json(payload).ok()?;
+    let data: serde_json::Value = resp.into_json().ok()?;
+    let file_path = data["result"]["file_path"].as_str()?;
+    // Build download URL: need token from base_url and correct API base
+    let token_part = base_url.split("/bot").last()?;
+    let api_base = if let Ok(base) = std::env::var("TELEGRAM_API_BASE") {
+        base
+    } else {
+        "https://api.telegram.org".to_string()
+    };
+    let download_url = format!("{api_base}/file/bot{token_part}/{file_path}");
+    let dl_resp = agent.get(&download_url).call().ok()?;
+    let content_type = dl_resp.header("content-type")
+        .unwrap_or("application/octet-stream").to_string();
+    let mut bytes = Vec::new();
+    dl_resp.into_reader().take(20_000_000).read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() { return None; }
+    Some((bytes, content_type))
+}
+
+fn transcribe_audio_deepgram(audio_bytes: &[u8], mime_type: &str) -> Option<String> {
+    let api_key = std::env::var("DEEPGRAM_API_KEY").ok()?;
+    if api_key.trim().is_empty() { return None; }
+    let agent = ureq::AgentBuilder::new()
+        .timeout_read(Duration::from_secs(60))
+        .timeout_connect(Duration::from_secs(10))
+        .build();
+    let resp = agent.post("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true")
+        .set("Authorization", &format!("Token {api_key}"))
+        .set("Content-Type", mime_type)
+        .send_bytes(audio_bytes).ok()?;
+    let data: serde_json::Value = resp.into_json().ok()?;
+    let transcript = data["results"]["channels"][0]["alternatives"][0]["transcript"]
+        .as_str()
+        .map(|s| s.to_string())?;
+    if transcript.trim().is_empty() { return None; }
+    Some(transcript)
+}
+
+fn guess_image_media_type(ct: &str, file_path: &str) -> String {
+    if ct.starts_with("image/") { return ct.to_string(); }
+    if file_path.ends_with(".jpg") || file_path.ends_with(".jpeg") { return "image/jpeg".to_string(); }
+    if file_path.ends_with(".png") { return "image/png".to_string(); }
+    if file_path.ends_with(".webp") { return "image/webp".to_string(); }
+    if file_path.ends_with(".gif") { return "image/gif".to_string(); }
+    "image/jpeg".to_string()
+}
+
+/// Extract content from a Telegram update. Returns (chat_id, message_id, text).
+/// For photos, the text will contain an [AV_IMAGE:base64:media_type:DATA] marker.
+/// For voice/audio, the transcription is prepended to any caption/text.
+fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Agent, base_url: &str) -> Option<(i64, Option<i64>, String)> {
+    // Handle callback queries (inline keyboard presses)
+    if let Some(cb) = &update.callback_query {
+        if let Some(data) = &cb.data {
+            let chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(0);
+            let user_name = cb.from.as_ref()
+                .and_then(|u| u.first_name.clone())
+                .unwrap_or_else(|| "User".to_string());
+            let msg_id = cb.message.as_ref().and_then(|m| m.message_id);
+            return Some((chat_id, msg_id, format!("[Callback button pressed by {user_name}]: {data}")));
+        }
+    }
+
     let msg = update
         .message
         .as_ref()
         .or(update.edited_message.as_ref())
         .or(update.channel_post.as_ref())?;
-    let text = msg.text.clone()?;
-    if text.trim().is_empty() {
+    let chat_id = msg.chat.id;
+    let msg_id = msg.message_id;
+    let base_text = msg.text.clone()
+        .or_else(|| msg.caption.clone())
+        .unwrap_or_default();
+    let user_name = msg.from.as_ref()
+        .and_then(|u| u.first_name.clone())
+        .unwrap_or_else(|| "User".to_string());
+
+    // Handle forwarded messages
+    if let Some(fwd) = &msg.forward_from {
+        let fwd_name = fwd.first_name.clone().unwrap_or_else(|| "someone".to_string());
+        let fwd_text = if base_text.trim().is_empty() {
+            format!("[Forwarded message from {fwd_name} — no text content]")
+        } else {
+            format!("[Forwarded message from {fwd_name}]:\n{base_text}")
+        };
+        return Some((chat_id, msg_id, fwd_text));
+    }
+    if let Some(fwd_chat) = &msg.forward_from_chat {
+        let fwd_text = format!("[Forwarded from chat {}]:\n{base_text}", fwd_chat.id);
+        return Some((chat_id, msg_id, fwd_text));
+    }
+
+    // Handle stickers
+    if let Some(sticker) = &msg.sticker {
+        let emoji = sticker.emoji.clone().unwrap_or_else(|| "unknown".to_string());
+        let set_name = sticker.set_name.clone().unwrap_or_default();
+        let sticker_text = format!("[{user_name} sent a sticker: {emoji} from set '{set_name}']");
+        return Some((chat_id, msg_id, sticker_text));
+    }
+
+    // Handle contacts
+    if let Some(contact) = &msg.contact {
+        let name = contact.first_name.clone().unwrap_or_else(|| "Unknown".to_string());
+        let last = contact.last_name.clone().unwrap_or_default();
+        let phone = &contact.phone_number;
+        let contact_text = format!("[{user_name} shared a contact: {name} {last}, phone: {phone}]");
+        return Some((chat_id, msg_id, contact_text));
+    }
+
+    // Handle locations
+    if let Some(loc) = &msg.location {
+        let loc_text = format!(
+            "[{user_name} shared a location: latitude {:.6}, longitude {:.6}]\nPlease describe this location or look it up.",
+            loc.latitude, loc.longitude
+        );
+        return Some((chat_id, msg_id, loc_text));
+    }
+
+    // Handle photos: download largest, base64 encode, create image marker
+    if let Some(photos) = &msg.photo {
+        if !photos.is_empty() {
+            // Telegram sends multiple sizes; pick the largest (last in array)
+            let best = photos.iter().max_by_key(|p| p.file_size.unwrap_or(0))?;
+            if let Some((bytes, ct)) = telegram_download_file_bytes(agent, base_url, &best.file_id) {
+                let media_type = guess_image_media_type(&ct, &best.file_id);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let marker = format!("[AV_IMAGE:{}:{}]", media_type, b64);
+                let text = if base_text.trim().is_empty() {
+                    format!("{marker}
+Describe what you see in this image.")
+                } else {
+                    format!("{marker}
+{base_text}")
+                };
+                return Some((chat_id, msg_id, text));
+            }
+            // Download failed, fall through to caption/text
+            let text = if base_text.trim().is_empty() {
+                "[User sent a photo but it could not be downloaded]".to_string()
+            } else {
+                format!("[User sent a photo but it could not be downloaded]
+{base_text}")
+            };
+            return Some((chat_id, msg_id, text));
+        }
+    }
+
+    // Handle voice messages
+    if let Some(voice) = &msg.voice {
+        let mime = voice.mime_type.clone().unwrap_or_else(|| "audio/ogg".to_string());
+        if let Some((bytes, _ct)) = telegram_download_file_bytes(agent, base_url, &voice.file_id) {
+            if let Some(transcript) = transcribe_audio_deepgram(&bytes, &mime) {
+                let text = if base_text.trim().is_empty() {
+                    format!("[Voice message transcription]: {transcript}")
+                } else {
+                    format!("[Voice message transcription]: {transcript}
+
+User also wrote: {base_text}")
+                };
+                return Some((chat_id, msg_id, text));
+            }
+            return Some((chat_id, msg_id, "[User sent a voice message but transcription failed]".to_string()));
+        }
+        return Some((chat_id, msg_id, "[User sent a voice message but it could not be downloaded]".to_string()));
+    }
+
+    // Handle audio files
+    if let Some(audio) = &msg.audio {
+        let mime = audio.mime_type.clone().unwrap_or_else(|| "audio/mpeg".to_string());
+        let title_note = audio.title.as_deref().map(|t| format!(" (title: {t})")).unwrap_or_default();
+        if let Some((bytes, _ct)) = telegram_download_file_bytes(agent, base_url, &audio.file_id) {
+            if let Some(transcript) = transcribe_audio_deepgram(&bytes, &mime) {
+                let text = format!("[Audio{title_note} transcription]: {transcript}");
+                return Some((chat_id, msg_id, text));
+            }
+            return Some((chat_id, msg_id, format!("[User sent an audio file{title_note} but transcription failed]")));
+        }
+        return Some((chat_id, msg_id, format!("[User sent an audio file{title_note} but it could not be downloaded]")));
+    }
+
+    // Handle documents (text-based ones)
+    if let Some(doc) = &msg.document {
+        let fname = doc.file_name.clone().unwrap_or_else(|| "unknown".to_string());
+        let mime = doc.mime_type.clone().unwrap_or_default();
+        let is_text = mime.starts_with("text/")
+            || mime == "application/json"
+            || mime == "application/xml"
+            || fname.ends_with(".txt") || fname.ends_with(".md")
+            || fname.ends_with(".json") || fname.ends_with(".csv")
+            || fname.ends_with(".py") || fname.ends_with(".rs")
+            || fname.ends_with(".js") || fname.ends_with(".ts")
+            || fname.ends_with(".sh") || fname.ends_with(".yaml")
+            || fname.ends_with(".yml") || fname.ends_with(".toml");
+        if is_text {
+            if let Some((bytes, _ct)) = telegram_download_file_bytes(agent, base_url, &doc.file_id) {
+                if let Ok(text_content) = String::from_utf8(bytes) {
+                    let truncated = if text_content.len() > 50000 {
+                        format!("{}\n... (truncated, {} total chars)", &text_content[..50000], text_content.len())
+                    } else {
+                        text_content
+                    };
+                    let text = format!("[Document: {fname}]\n```\n{truncated}\n```\n\n{base_text}");
+                    return Some((chat_id, msg_id, text));
+                }
+            }
+        }
+        // Non-text document or download failed
+        let text = if base_text.trim().is_empty() {
+            format!("[User sent a document: {fname} ({mime}). This file type is not supported for direct reading.]")
+        } else {
+            format!("[User sent a document: {fname} ({mime})]
+{base_text}")
+        };
+        return Some((chat_id, msg_id, text));
+    }
+
+    // Plain text message
+    if base_text.trim().is_empty() {
         return None;
     }
-    Some((msg.chat.id, text))
+    Some((chat_id, msg_id, base_text))
 }
 
 fn split_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
@@ -7374,25 +7793,109 @@ fn split_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+fn telegram_send_typing(agent: &ureq::Agent, base_url: &str, chat_id: i64) {
+    let url = format!("{base_url}/sendChatAction");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "action": "typing"
+    });
+    let _ = agent.post(&url)
+        .set("content-type", "application/json")
+        .send_json(payload);
+}
+
+fn telegram_answer_callback(agent: &ureq::Agent, base_url: &str, callback_id: &str, text: Option<&str>) {
+    let url = format!("{base_url}/answerCallbackQuery");
+    let mut payload = serde_json::json!({"callback_query_id": callback_id});
+    if let Some(t) = text {
+        payload["text"] = serde_json::json!(t);
+    }
+    let _ = agent.post(&url)
+        .set("content-type", "application/json")
+        .send_json(payload);
+}
+
+fn escape_markdown_v2(text: &str) -> String {
+    let special = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+    let mut out = String::with_capacity(text.len() * 2);
+    let mut in_code_block = false;
+    let mut in_inline_code = false;
+    for ch in text.chars() {
+        if ch == '`' {
+            in_inline_code = !in_inline_code;
+            out.push(ch);
+            continue;
+        }
+        if in_inline_code || in_code_block {
+            out.push(ch);
+            continue;
+        }
+        if special.contains(&ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn telegram_send_message(
     agent: &ureq::Agent,
     base_url: &str,
     chat_id: i64,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    telegram_send_message_ext(agent, base_url, chat_id, text, None)
+}
+
+fn telegram_send_message_ext(
+    agent: &ureq::Agent,
+    base_url: &str,
+    chat_id: i64,
+    text: &str,
+    reply_to: Option<i64>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("{base_url}/sendMessage");
     let chunks = split_text_chunks(text, 3900);
-    for chunk in chunks {
-        let payload = serde_json::json!({
+    for (i, chunk) in chunks.iter().enumerate() {
+        // Try Markdown first, fall back to plain text
+        let mut payload = serde_json::json!({
             "chat_id": chat_id,
-            "text": chunk
+            "text": chunk,
+            "parse_mode": "Markdown"
         });
+        // Only reply to original on first chunk
+        if i == 0 {
+            if let Some(mid) = reply_to {
+                payload["reply_to_message_id"] = serde_json::json!(mid);
+                payload["allow_sending_without_reply"] = serde_json::json!(true);
+            }
+        }
         let response = agent
             .post(&url)
             .set("content-type", "application/json")
             .send_json(payload);
-        if let Err(err) = response {
-            return Err(format!("Telegram send error: {err}").into());
+        match response {
+            Ok(_) => {},
+            Err(_) => {
+                // Markdown failed, retry as plain text
+                let mut plain_payload = serde_json::json!({
+                    "chat_id": chat_id,
+                    "text": chunk
+                });
+                if i == 0 {
+                    if let Some(mid) = reply_to {
+                        plain_payload["reply_to_message_id"] = serde_json::json!(mid);
+                        plain_payload["allow_sending_without_reply"] = serde_json::json!(true);
+                    }
+                }
+                let fallback = agent
+                    .post(&url)
+                    .set("content-type", "application/json")
+                    .send_json(plain_payload);
+                if let Err(err) = fallback {
+                    return Err(format!("Telegram send error: {err}").into());
+                }
+            }
         }
     }
     Ok(())
@@ -7404,10 +7907,16 @@ fn run_telegram_bridge(
     poll_limit: usize,
     agent_config: BridgeAgentConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let base_url = format!("https://api.telegram.org/bot{token}");
-    let mut mem = Vault::open_read_only(&agent_config.mv2)?;
-    let config = load_capsule_config(&mut mem).unwrap_or_default();
-    let subagent_specs = load_subagents_from_config(&config);
+    let base_url = match std::env::var("TELEGRAM_API_BASE") {
+        Ok(base) => format!("{base}/bot{token}"),
+        Err(_) => format!("https://api.telegram.org/bot{token}"),
+    };
+    let (config, subagent_specs) = {
+        let mut mem = Vault::open_read_only(&agent_config.mv2)?;
+        let config = load_capsule_config(&mut mem).unwrap_or_default();
+        let subagent_specs = load_subagents_from_config(&config);
+        (config, subagent_specs)
+    };
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_write(Duration::from_secs(10))
@@ -7450,11 +7959,41 @@ fn run_telegram_bridge(
 
         for entry in update.result {
             offset = Some(entry.update_id);
-            let Some((chat_id, user_text)) = extract_telegram_text(&entry) else {
+
+            // Handle callback queries (inline keyboard presses)
+            if let Some(cb) = &entry.callback_query {
+                telegram_answer_callback(&agent, &base_url, &cb.id, Some("Processing..."));
+            }
+
+            let Some((chat_id, reply_to_id, user_text)) = extract_telegram_content(&entry, &agent, &base_url) else {
                 continue;
             };
+
+            // Send typing indicator immediately
+            telegram_send_typing(&agent, &base_url, chat_id);
+
             let session = format!("{}telegram:{chat_id}", agent_config.session_prefix);
+
+            // Refresh typing every 4 seconds during long operations
+            let typing_agent = agent.clone();
+            let typing_url = base_url.clone();
+            let typing_chat = chat_id;
+            let typing_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let typing_flag = typing_active.clone();
+            let typing_thread = thread::spawn(move || {
+                while typing_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    thread::sleep(Duration::from_secs(4));
+                    if !typing_flag.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                    telegram_send_typing(&typing_agent, &typing_url, typing_chat);
+                }
+            });
+
             let response = run_agent_for_bridge(&agent_config, &user_text, session, None, None);
+
+            // Stop typing indicator
+            typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = typing_thread.join();
+
             let output = match response {
                 Ok(result) => {
                     let mut text = result.final_text.unwrap_or_default();
@@ -7472,9 +8011,21 @@ fn run_telegram_bridge(
                     }
                     text
                 }
-                Err(err) => format!("Agent error: {err}"),
+                Err(err) => {
+                    // User-friendly error messages
+                    let err_str = err.to_string();
+                    if err_str.contains("lock") {
+                        "I'm momentarily busy with another request. Please try again in a few seconds.".to_string()
+                    } else if err_str.contains("timeout") || err_str.contains("Timeout") {
+                        "That took too long to process. Could you try a simpler request?".to_string()
+                    } else if err_str.contains("API error") || err_str.contains("overloaded") {
+                        "The AI service is temporarily overloaded. Retrying...".to_string()
+                    } else {
+                        format!("Something went wrong: {}", err_str.chars().take(200).collect::<String>())
+                    }
+                }
             };
-            if let Err(err) = telegram_send_message(&agent, &base_url, chat_id, &output) {
+            if let Err(err) = telegram_send_message_ext(&agent, &base_url, chat_id, &output, reply_to_id) {
                 eprintln!("Telegram send failed: {err}");
             }
         }
@@ -7505,9 +8056,12 @@ fn run_whatsapp_bridge(
     let server = Server::http(&addr)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("server: {e}")))?;
     eprintln!("WhatsApp bridge listening on http://{addr}");
-    let mut mem = Vault::open_read_only(&agent_config.mv2)?;
-    let config = load_capsule_config(&mut mem).unwrap_or_default();
-    let subagent_specs = load_subagents_from_config(&config);
+    let (config, subagent_specs) = {
+        let mut mem = Vault::open_read_only(&agent_config.mv2)?;
+        let config = load_capsule_config(&mut mem).unwrap_or_default();
+        let subagent_specs = load_subagents_from_config(&config);
+        (config, subagent_specs)
+    };
 
     for mut request in server.incoming_requests() {
         if *request.method() != Method::Post {
