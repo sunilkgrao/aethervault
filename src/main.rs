@@ -7684,24 +7684,29 @@ fn run_agent_with_prompt(
     let should_log = log || agent_cfg.log.unwrap_or(false);
     let mut final_text = None;
 
+    // Buffer log entries in memory and batch-flush them. This avoids holding an exclusive
+    // lock on the capsule for the entire agent session, which would block all concurrent
+    // subagents. The Vault is opened exclusively only during flush (milliseconds), then
+    // immediately dropped to release the lock.
+    let mut log_buffer: Vec<AgentLogEntry> = Vec::new();
     let mut mem_write: Option<Vault> = None;
-    let mut pending_log_writes = 0usize;
 
-    let flush_logs =
-        |mem_read: &mut Option<Vault>, mem_write: &mut Option<Vault>, pending: &mut usize| {
-            if *pending == 0 {
-                return Ok(()) as Result<(), Box<dyn std::error::Error>>;
-            }
-            if let Some(mem) = mem_write.as_mut() {
-                mem.commit()?;
-                *pending = 0;
-                *mem_read = None;
-            }
-            Ok(())
-        };
+    let flush_log_buffer = |mv2: &Path, buffer: &mut Vec<AgentLogEntry>, mem_read: &mut Option<Vault>| {
+        if buffer.is_empty() {
+            return Ok(()) as Result<(), Box<dyn std::error::Error>>;
+        }
+        // Drop any read handle so we can acquire exclusive.
+        *mem_read = None;
+        let mut mem = Vault::open(mv2)?;
+        for entry in buffer.drain(..) {
+            let _ = append_agent_log_uncommitted(&mut mem, &entry);
+        }
+        mem.commit()?;
+        // `mem` is dropped here, releasing the exclusive lock immediately.
+        Ok(())
+    };
+
     if should_log {
-        mem_read = None;
-        mem_write = Some(Vault::open(&mv2)?);
         let entry = AgentLogEntry {
             session: session.clone(),
             role: "user".to_string(),
@@ -7709,12 +7714,9 @@ fn run_agent_with_prompt(
             meta: None,
             ts_utc: Some(Utc::now().timestamp()),
         };
-        if let Some(mem) = mem_write.as_mut() {
-            let _ = append_agent_log_uncommitted(mem, &entry)?;
-            pending_log_writes += 1;
-            if pending_log_writes >= effective_log_commit_interval {
-                flush_logs(&mut mem_read, &mut mem_write, &mut pending_log_writes)?;
-            }
+        log_buffer.push(entry);
+        if log_buffer.len() >= effective_log_commit_interval {
+            flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
         }
     }
 
@@ -7736,12 +7738,9 @@ fn run_agent_with_prompt(
                     meta: None,
                     ts_utc: Some(Utc::now().timestamp()),
                 };
-                if let Some(mem) = mem_write.as_mut() {
-                    let _ = append_agent_log_uncommitted(mem, &entry)?;
-                    pending_log_writes += 1;
-                    if pending_log_writes >= effective_log_commit_interval {
-                        flush_logs(&mut mem_read, &mut mem_write, &mut pending_log_writes)?;
-                    }
+                log_buffer.push(entry);
+                if log_buffer.len() >= effective_log_commit_interval {
+                    flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
                 }
             }
         }
@@ -7821,23 +7820,21 @@ fn run_agent_with_prompt(
                     meta: Some(result.details),
                     ts_utc: Some(Utc::now().timestamp()),
                 };
-                if let Some(mem) = mem_write.as_mut() {
-                    let _ = append_agent_log_uncommitted(mem, &entry)?;
-                    pending_log_writes += 1;
-                    if pending_log_writes >= effective_log_commit_interval {
-                        flush_logs(&mut mem_read, &mut mem_write, &mut pending_log_writes)?;
-                    }
+                log_buffer.push(entry);
+                if log_buffer.len() >= effective_log_commit_interval {
+                    flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
                 }
             }
 
             if matches!(call.name.as_str(), "put" | "log" | "feedback") && !result.is_error {
-                pending_log_writes = 0;
+                // These tools already committed; flush our buffer too to stay in sync.
+                flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
             }
         }
     }
 
     if should_log {
-        flush_logs(&mut mem_read, &mut mem_write, &mut pending_log_writes)?;
+        flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
     }
 
     if !completed {
