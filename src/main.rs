@@ -1351,41 +1351,9 @@ fn save_session_turns(session_id: &str, turns: &[SessionTurn], max_turns: usize)
 
 
 // === Capsule File Locking ===
-// Advisory flock() to prevent concurrent WAL corruption on .mv2 files.
-
-struct CapsuleLock {
-    _file: std::fs::File,
-}
-
-fn acquire_capsule_lock(mv2_path: &std::path::Path) -> Result<CapsuleLock, Box<dyn std::error::Error>> {
-    let lock_path = mv2_path.with_extension("mv2.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| format!("capsule lock create {}: {e}", lock_path.display()))?;
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-    let mut attempt = 0u32;
-    loop {
-        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            break;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::WouldBlock {
-            return Err(format!("flock({}) failed: {err}", lock_path.display()).into());
-        }
-        attempt += 1;
-        if attempt > 15 {
-            return Err(format!("capsule lock timeout after 30s: {} held by another process", lock_path.display()).into());
-        }
-        let wait_ms = std::cmp::min(100 * (1u64 << (attempt - 1)), 2000);
-        eprintln!("[lock] waiting for capsule lock ({attempt}/15, {wait_ms}ms)...");
-        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-    }
-    Ok(CapsuleLock { _file: file })
-}
+// The Vault itself manages shared (read) and exclusive (write) flock() on the .mv2
+// file directly. Readers can operate concurrently; writers upgrade to exclusive only
+// during commit and immediately downgrade back. No external sidecar lock is needed.
 
 const TOOL_DETAILS_MAX_CHARS: usize = 4_000;
 const TOOL_OUTPUT_MAX_FOR_DETAILS: usize = 2_000;
@@ -1451,7 +1419,12 @@ where
         };
         *mem_write = Some(opened);
     }
-    f(mem_write.as_mut().unwrap())
+    let result = f(mem_write.as_mut().unwrap());
+    // After writing, downgrade back to shared so concurrent readers aren't blocked.
+    if let Some(mem) = mem_write.as_mut() {
+        let _ = mem.downgrade_to_shared();
+    }
+    result
 }
 
 #[derive(Debug, Deserialize)]
@@ -6617,7 +6590,8 @@ fn run_schedule_loop(
     log: bool,
     log_commit_interval: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _capsule_lock = acquire_capsule_lock(&mv2)?;
+    // No external lock — Vault::open_read_only acquires a shared flock() on the .mv2
+    // which allows concurrent readers. Writes upgrade to exclusive automatically.
     let mut mem_read = Some(Vault::open_read_only(&mv2)?);
     let config = load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default();
     let agent_cfg = config.agent.clone().unwrap_or_default();
@@ -7377,7 +7351,7 @@ fn run_agent_with_prompt(
         return Err("agent prompt is empty".into());
     }
 
-    let _capsule_lock = acquire_capsule_lock(&mv2)?;
+    // No external lock — Vault handles shared/exclusive internally.
     let mut mem_read = Some(Vault::open_read_only(&mv2)?);
     let config = load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default();
     let agent_cfg = config.agent.clone().unwrap_or_default();
