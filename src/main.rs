@@ -1761,6 +1761,12 @@ struct ToolSubagentInvokeArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct ToolSubagentBatchArgs {
+    /// Array of subagent invocations to run concurrently.
+    invocations: Vec<ToolSubagentInvokeArgs>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ToolContextArgs {
     query: String,
     #[serde(default)]
@@ -3694,6 +3700,29 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "subagent_batch",
+            "description": "Invoke multiple subagents concurrently. Each invocation runs in its own thread with independent capsule access. Returns all results once every subagent completes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "invocations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "prompt": { "type": "string" },
+                                "system": { "type": "string" },
+                                "model_hook": { "type": "string" }
+                            },
+                            "required": ["name", "prompt"]
+                        }
+                    }
+                },
+                "required": ["invocations"]
+            }
+        }),
+        serde_json::json!({
             "name": "gmail_list",
             "description": "List Gmail messages (OAuth).",
             "inputSchema": {
@@ -5053,6 +5082,102 @@ fn execute_tool_with_handles(
                 is_error: false,
             })
         }
+        "subagent_batch" => {
+            let parsed: ToolSubagentBatchArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            if parsed.invocations.is_empty() {
+                return Err("subagent_batch requires at least one invocation".into());
+            }
+            let config_snapshot = with_read_mem(mem_read, mem_write, mv2, |mem| {
+                Ok(load_capsule_config(mem).unwrap_or_default())
+            })?;
+            let subagents = load_subagents_from_config(&config_snapshot);
+            let ts = Utc::now().timestamp();
+
+            // Build configs for each invocation and spawn threads.
+            let mut handles: Vec<(String, std::thread::JoinHandle<Result<AgentRunOutput, String>>)> = Vec::new();
+            for (i, inv) in parsed.invocations.into_iter().enumerate() {
+                let mut system = inv.system.clone();
+                let mut model_hook = inv.model_hook.clone();
+                if let Some(spec) = subagents.iter().find(|s| s.name == inv.name) {
+                    if system.is_none() {
+                        system = spec.system.clone();
+                    }
+                    if model_hook.is_none() {
+                        model_hook = spec.model_hook.clone();
+                    }
+                } else if system.is_none() && model_hook.is_none() {
+                    handles.push((inv.name.clone(), thread::spawn(move || {
+                        Err(format!("unknown subagent: {}", inv.name))
+                    })));
+                    continue;
+                }
+                let cfg = build_bridge_agent_config(
+                    mv2.to_path_buf(),
+                    model_hook,
+                    system,
+                    false,
+                    None,
+                    8,
+                    12_000,
+                    64,
+                    true,
+                    8,
+                )
+                .map_err(|e| e.to_string())?;
+                let session = format!("subagent:{}:{}:{}", inv.name, ts, i);
+                let prompt = inv.prompt.clone();
+                let name = inv.name.clone();
+                handles.push((name, thread::spawn(move || {
+                    run_agent_for_bridge(&cfg, &prompt, session, None, None)
+                })));
+            }
+
+            // Collect results from all threads.
+            let mut results = Vec::new();
+            let mut all_ok = true;
+            for (name, handle) in handles {
+                match handle.join() {
+                    Ok(Ok(output)) => {
+                        results.push(serde_json::json!({
+                            "name": name,
+                            "status": "ok",
+                            "output": output.final_text.unwrap_or_default(),
+                            "session": output.session,
+                            "messages": output.messages.len(),
+                        }));
+                    }
+                    Ok(Err(err)) => {
+                        all_ok = false;
+                        results.push(serde_json::json!({
+                            "name": name,
+                            "status": "error",
+                            "error": err,
+                        }));
+                    }
+                    Err(_) => {
+                        all_ok = false;
+                        results.push(serde_json::json!({
+                            "name": name,
+                            "status": "error",
+                            "error": "subagent thread panicked",
+                        }));
+                    }
+                }
+            }
+            let summary = if all_ok {
+                format!("{} subagents completed successfully.", results.len())
+            } else {
+                let ok_count = results.iter().filter(|r| r["status"] == "ok").count();
+                let err_count = results.len() - ok_count;
+                format!("{} subagents completed, {} failed.", ok_count, err_count)
+            };
+            Ok(ToolExecution {
+                output: summary,
+                details: serde_json::json!({ "results": results }),
+                is_error: !all_ok,
+            })
+        }
         "gmail_list" => {
             let parsed: ToolGmailListArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
@@ -6201,6 +6326,7 @@ fn base_tool_names() -> HashSet<String> {
         "trigger_remove",
         "subagent_list",
         "subagent_invoke",
+        "subagent_batch",
         "approval_list",
     ]
     .into_iter()
