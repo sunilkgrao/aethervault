@@ -7330,7 +7330,50 @@ fn call_claude(
         }
     }
 
-    let body = body.ok_or("Anthropic API request failed without a response")?;
+    // If both primary and fallback model failed, try Vertex proxy as last resort.
+    if body.is_none() {
+        let vertex_url = env_optional("VERTEX_FALLBACK_URL")
+            .unwrap_or_else(|| "http://localhost:11436/v1/messages".to_string());
+        let vertex_enabled = env_optional("VERTEX_FALLBACK").unwrap_or_else(|| "1".to_string()) == "1";
+        if vertex_enabled {
+            eprintln!("Anthropic direct failed, falling back to Vertex proxy at {vertex_url}");
+            payload["model"] = serde_json::json!(model);
+            let vertex_key = env_optional("VERTEX_API_KEY").unwrap_or_else(|| api_key.clone());
+            for attempt in 0..=max_retries {
+                let mut request = agent
+                    .post(&vertex_url)
+                    .set("content-type", "application/json")
+                    .set("x-api-key", &vertex_key)
+                    .set("anthropic-version", &version);
+                if !beta_values.is_empty() {
+                    request = request.set("anthropic-beta", &beta_values.join(","));
+                }
+                match request.send_json(payload.clone()) {
+                    Ok(resp) => {
+                        body = Some(resp.into_string()?);
+                        break;
+                    }
+                    Err(ureq::Error::Status(code, resp)) => {
+                        let text = resp.into_string().unwrap_or_default();
+                        if attempt == max_retries {
+                            return Err(format!("Vertex fallback also failed: {code} {text}").into());
+                        }
+                        let delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
+                        thread::sleep(Duration::from_secs_f64(delay));
+                    }
+                    Err(ureq::Error::Transport(err)) => {
+                        if attempt == max_retries {
+                            return Err(format!("Vertex fallback transport error: {err}").into());
+                        }
+                        let delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
+                        thread::sleep(Duration::from_secs_f64(delay));
+                    }
+                }
+            }
+        }
+    }
+
+    let body = body.ok_or("All API endpoints failed (Anthropic direct + Vertex fallback)")?;
     let payload: serde_json::Value = serde_json::from_str(&body)?;
     parse_claude_response(&payload)
 }

@@ -114,6 +114,37 @@ def _parse_response(payload):
     }
     return {"message": message}
 
+def _call_api(url, data, headers, timeout, max_retries, retry_base, retry_max):
+    """Make an API call with retries. Returns (body_str, None) on success or (None, error_str) on failure."""
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8"), None
+        except urllib.error.HTTPError as err:
+            status = err.code
+            retryable = status in (429, 500, 502, 503, 504, 529)
+            err_body = err.read().decode("utf-8") if err.fp else str(err)
+            if attempt < max_retries and retryable:
+                wait = min(retry_max, retry_base * (2 ** attempt))
+                retry_after = err.headers.get("retry-after") if err.headers else None
+                if retry_after:
+                    try:
+                        wait = max(wait, float(retry_after))
+                    except ValueError:
+                        pass
+                time.sleep(wait)
+                continue
+            return None, f"API error: {status} {err_body}"
+        except (urllib.error.URLError, OSError) as err:
+            if attempt < max_retries:
+                wait = min(retry_max, retry_base * (2 ** attempt))
+                time.sleep(wait)
+                continue
+            return None, f"API request failed: {err}"
+    return None, "API request failed without a response"
+
+
 def main():
     req = _read_input()
     messages = req.get("messages") or []
@@ -136,6 +167,10 @@ def main():
     max_retries = int(_env("ANTHROPIC_MAX_RETRIES", "2"))
     retry_base = float(_env("ANTHROPIC_RETRY_BASE", "0.5"))
     retry_max = float(_env("ANTHROPIC_RETRY_MAX", "4"))
+
+    # Vertex proxy as automatic fallback when Anthropic direct fails.
+    vertex_fallback_url = _env("VERTEX_FALLBACK_URL", "http://localhost:11436/v1/messages")
+    vertex_fallback_enabled = _env("VERTEX_FALLBACK", "1") == "1"
 
     system = _merge_system(messages)
     payload = {
@@ -165,46 +200,31 @@ def main():
         headers["anthropic-beta"] = beta
 
     data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(base_url, data=data, headers=headers, method="POST")
 
-    body = None
-    for attempt in range(max_retries + 1):
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                body = response.read().decode("utf-8")
-            break
-        except urllib.error.HTTPError as err:
-            status = err.code
-            retryable = status in (429, 500, 502, 503, 504, 529)
-            body = err.read().decode("utf-8") if err.fp else str(err)
-            if attempt < max_retries and retryable:
-                wait = min(retry_max, retry_base * (2 ** attempt))
-                retry_after = err.headers.get("retry-after") if err.headers else None
-                if retry_after:
-                    try:
-                        wait = max(wait, float(retry_after))
-                    except ValueError:
-                        pass
-                time.sleep(wait)
-                continue
-            sys.stderr.write(f"Anthropic API error: {status} {body}\n")
-            return 1
-        except urllib.error.URLError as err:
-            if attempt < max_retries:
-                wait = min(retry_max, retry_base * (2 ** attempt))
-                time.sleep(wait)
-                continue
-            sys.stderr.write(f"Anthropic API request failed: {err}\n")
+    # Primary: Anthropic direct API.
+    body, err = _call_api(base_url, data, headers, timeout, max_retries, retry_base, retry_max)
+
+    # Fallback: Vertex proxy if primary failed.
+    if body is None and vertex_fallback_enabled:
+        sys.stderr.write(f"Anthropic primary failed ({err}), falling back to Vertex proxy\n")
+        vertex_headers = dict(headers)
+        vertex_headers["x-api-key"] = _env("VERTEX_API_KEY", api_key)
+        body, vertex_err = _call_api(
+            vertex_fallback_url, data, vertex_headers, timeout, max_retries, retry_base, retry_max
+        )
+        if body is None:
+            sys.stderr.write(f"Vertex fallback also failed: {vertex_err}\n")
+            sys.stderr.write(f"Primary error was: {err}\n")
             return 1
 
     if body is None:
-        sys.stderr.write("Anthropic API request failed without a response\n")
+        sys.stderr.write(f"Anthropic API failed: {err}\n")
         return 1
 
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
-        sys.stderr.write("Invalid JSON from Anthropic API\n")
+        sys.stderr.write("Invalid JSON from API\n")
         return 1
 
     out = _parse_response(payload)
