@@ -9,12 +9,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use blake3::Hash;
-use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc, Timelike, Datelike};
-use base64::Engine;
-use clap::{Parser, Subcommand};
 use aether_core::types::{Frame, FrameStatus, SearchHit, SearchRequest, TemporalFilter};
 use aether_core::{DoctorOptions, DoctorReport, PutOptions, Vault, VaultError};
+use base64::Engine;
+use blake3::Hash;
+use chrono::{Datelike, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Response, Server};
 use url::form_urlencoded;
@@ -37,9 +37,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Create a new empty MV2 capsule.
-    Init {
-        mv2: PathBuf,
-    },
+    Init { mv2: PathBuf },
 
     /// Ingest a folder of Markdown into the capsule (append-only, versioned by URI).
     Ingest {
@@ -435,7 +433,7 @@ enum Command {
         #[arg(long)]
         log: bool,
         /// Commit agent logs every N entries (1 = fsync each log)
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
     },
 
@@ -484,7 +482,7 @@ enum Command {
         #[arg(long)]
         log: bool,
         /// Commit agent logs every N entries (1 = fsync each log)
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
     },
 
@@ -507,7 +505,7 @@ enum Command {
         #[arg(long)]
         log: bool,
         /// Commit agent logs every N entries (1 = fsync each log)
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
         /// Poll interval in seconds
         #[arg(long, default_value_t = 60)]
@@ -529,6 +527,18 @@ enum Command {
         #[arg(long)]
         redirect_base: Option<String>,
     },
+
+    /// Approve a pending tool execution (human-in-the-loop).
+    Approve {
+        mv2: PathBuf,
+        id: String,
+        /// Execute the approved tool immediately.
+        #[arg(long)]
+        execute: bool,
+    },
+
+    /// Reject a pending tool execution.
+    Reject { mv2: PathBuf, id: String },
 
     /// Rust-native chat connectors (Telegram + WhatsApp).
     Bridge {
@@ -624,7 +634,7 @@ enum BridgeCommand {
         #[arg(long)]
         log: bool,
         /// Commit agent logs every N entries (1 = fsync each log)
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
     },
     /// WhatsApp (Twilio) webhook bridge.
@@ -663,7 +673,7 @@ enum BridgeCommand {
         #[arg(long)]
         log: bool,
         /// Commit agent logs every N entries (1 = fsync each log)
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
     },
     /// Slack events bridge (webhook receiver).
@@ -690,7 +700,7 @@ enum BridgeCommand {
         max_steps: usize,
         #[arg(long)]
         log: bool,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
     },
     /// Discord bridge (webhook receiver).
@@ -717,7 +727,7 @@ enum BridgeCommand {
         max_steps: usize,
         #[arg(long)]
         log: bool,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
     },
     /// Teams bridge (webhook receiver).
@@ -744,7 +754,7 @@ enum BridgeCommand {
         max_steps: usize,
         #[arg(long)]
         log: bool,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
     },
     /// Signal bridge (requires signal-cli).
@@ -773,7 +783,7 @@ enum BridgeCommand {
         max_steps: usize,
         #[arg(long)]
         log: bool,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
     },
     /// Matrix bridge (webhook receiver).
@@ -802,7 +812,7 @@ enum BridgeCommand {
         max_steps: usize,
         #[arg(long)]
         log: bool,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
     },
     /// iMessage bridge (macOS only).
@@ -829,7 +839,7 @@ enum BridgeCommand {
         max_steps: usize,
         #[arg(long)]
         log: bool,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
     },
 }
@@ -1254,13 +1264,6 @@ struct SubagentSpec {
     system: Option<String>,
     #[serde(default)]
     model_hook: Option<String>,
-}
-
-#[derive(Debug)]
-struct SubagentResult {
-    name: String,
-    text: String,
-    is_error: bool,
 }
 
 #[derive(Debug)]
@@ -1710,11 +1713,6 @@ struct ToolFsWriteArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct ToolApprovalApproveArgs {
-    id: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct ToolTriggerAddArgs {
     kind: String,
     #[serde(default)]
@@ -2036,10 +2034,41 @@ fn parse_query_markup(raw: &str) -> (String, ParsedMarkup) {
 fn is_stopword(token: &str) -> bool {
     matches!(
         token,
-        "a" | "an" | "and" | "are" | "as" | "at" | "be" | "but" | "by" | "for" | "from"
-            | "has" | "have" | "if" | "in" | "into" | "is" | "it" | "its" | "of" | "on"
-            | "or" | "that" | "the" | "their" | "then" | "there" | "these" | "they"
-            | "this" | "to" | "was" | "were" | "with" | "you" | "your"
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "but"
+            | "by"
+            | "for"
+            | "from"
+            | "has"
+            | "have"
+            | "if"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "its"
+            | "of"
+            | "on"
+            | "or"
+            | "that"
+            | "the"
+            | "their"
+            | "then"
+            | "there"
+            | "these"
+            | "they"
+            | "this"
+            | "to"
+            | "was"
+            | "were"
+            | "with"
+            | "you"
+            | "your"
     )
 }
 
@@ -2070,11 +2099,7 @@ fn build_expansions(base: &str, max: usize) -> Vec<String> {
 
     let mut expansions = vec![base.trim().to_string()];
 
-    let reduced_tokens: Vec<String> = tokens
-        .iter()
-        .filter(|t| !is_stopword(t))
-        .cloned()
-        .collect();
+    let reduced_tokens: Vec<String> = tokens.iter().filter(|t| !is_stopword(t)).cloned().collect();
     let reduced = reduced_tokens.join(" ");
     if !reduced.is_empty() && reduced != base {
         expansions.push(reduced);
@@ -2108,11 +2133,7 @@ fn config_uri_to_key(uri: &str) -> Option<String> {
     if key.ends_with(".json") {
         key.truncate(key.len().saturating_sub(5));
     }
-    if key.is_empty() {
-        None
-    } else {
-        Some(key)
-    }
+    if key.is_empty() { None } else { Some(key) }
 }
 
 fn load_config_entry(mem: &mut Vault, key: &str) -> Option<Vec<u8>> {
@@ -2126,7 +2147,11 @@ fn load_capsule_config(mem: &mut Vault) -> Option<CapsuleConfig> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn save_config_entry(mem: &mut Vault, key: &str, bytes: &[u8]) -> Result<u64, Box<dyn std::error::Error>> {
+fn save_config_entry(
+    mem: &mut Vault,
+    key: &str,
+    bytes: &[u8],
+) -> Result<u64, Box<dyn std::error::Error>> {
     let mut options = PutOptions::default();
     options.uri = Some(config_key_to_uri(key));
     options.title = Some(format!("config:{key}"));
@@ -2194,8 +2219,7 @@ fn run_hook_command(
         return Err("hook command is empty".into());
     }
     let mut cmd = build_external_command(&command[0], &command[1..]);
-    cmd
-        .stdin(Stdio::piped())
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("KAIROS_HOOK", kind);
@@ -2281,10 +2305,7 @@ fn run_expansion_hook(
     Ok(output)
 }
 
-fn run_rerank_hook(
-    hook: &HookSpec,
-    input: &RerankHookInput,
-) -> Result<RerankHookOutput, String> {
+fn run_rerank_hook(hook: &HookSpec, input: &RerankHookInput) -> Result<RerankHookOutput, String> {
     let cmd = command_spec_to_vec(&hook.command);
     let timeout = hook.timeout_ms.unwrap_or(6000);
     let value = serde_json::to_value(input).map_err(|e| format!("hook input: {e}"))?;
@@ -2322,10 +2343,7 @@ fn frame_to_summary(frame: &Frame) -> Option<FrameSummary> {
     })
 }
 
-fn collect_latest_frames(
-    mem: &mut Vault,
-    include_inactive: bool,
-) -> HashMap<String, FrameSummary> {
+fn collect_latest_frames(mem: &mut Vault, include_inactive: bool) -> HashMap<String, FrameSummary> {
     let mut out = HashMap::new();
     let total = mem.frame_count() as i64;
     for idx in (0..total).rev() {
@@ -2349,7 +2367,7 @@ fn collect_latest_frames(
 }
 
 fn has_strong_signal(hits: &[SearchHit]) -> bool {
-    let s1 = hits.get(0).and_then(|h| h.score).unwrap_or(0.0);
+    let s1 = hits.first().and_then(|h| h.score).unwrap_or(0.0);
     let s2 = hits.get(1).and_then(|h| h.score).unwrap_or(0.0);
     if s1 <= 0.0 {
         return false;
@@ -2362,12 +2380,7 @@ fn has_strong_signal(hits: &[SearchHit]) -> bool {
     }
 }
 
-fn build_ranked_list(
-    lane: LaneKind,
-    query: &str,
-    is_base: bool,
-    hits: &[SearchHit],
-) -> RankedList {
+fn build_ranked_list(lane: LaneKind, query: &str, is_base: bool, hits: &[SearchHit]) -> RankedList {
     let items = hits
         .iter()
         .enumerate()
@@ -2501,7 +2514,11 @@ fn rerank_score(query: &str, chunk: &str) -> f32 {
         freq += chunk_lower.matches(term).count();
     }
     let coverage = matched as f32 / terms.len() as f32;
-    let phrase_bonus = if chunk_lower.contains(&query_lower) { 0.2 } else { 0.0 };
+    let phrase_bonus = if chunk_lower.contains(&query_lower) {
+        0.2
+    } else {
+        0.0
+    };
     let freq_bonus = (freq as f32).ln_1p() * 0.05;
     let raw = coverage + phrase_bonus + freq_bonus;
     raw / (1.0 + raw)
@@ -2521,7 +2538,11 @@ fn print_plan(plan: &QueryPlan) {
     }
     if !plan.vec_queries.is_empty() {
         for (i, q) in plan.vec_queries.iter().enumerate() {
-            let prefix = if i == plan.vec_queries.len() - 1 { "└─" } else { "├─" };
+            let prefix = if i == plan.vec_queries.len() - 1 {
+                "└─"
+            } else {
+                "├─"
+            };
             eprintln!("{prefix} vec: {q}");
         }
     }
@@ -2568,7 +2589,10 @@ fn load_feedback_scores(
     scores
 }
 
-fn execute_query(mem: &mut Vault, args: QueryArgs) -> Result<QueryResponse, Box<dyn std::error::Error>> {
+fn execute_query(
+    mem: &mut Vault,
+    args: QueryArgs,
+) -> Result<QueryResponse, Box<dyn std::error::Error>> {
     let mut warnings = Vec::new();
 
     let (cleaned_query, parsed) = parse_query_markup(&args.raw_query);
@@ -2591,7 +2615,11 @@ fn execute_query(mem: &mut Vault, args: QueryArgs) -> Result<QueryResponse, Box<
         args.rerank_hook.clone(),
         args.rerank_hook_timeout_ms,
         hook_config.as_ref().and_then(|h| h.rerank.clone()),
-        if args.rerank_hook_full_text { Some(true) } else { None },
+        if args.rerank_hook_full_text {
+            Some(true)
+        } else {
+            None
+        },
     );
 
     let scope_collection = args.collection.or(parsed.collection);
@@ -2969,11 +2997,9 @@ fn execute_query(mem: &mut Vault, args: QueryArgs) -> Result<QueryResponse, Box<
         };
 
         let mut snippet = cand.snippet.clone();
-        if let Some((_, override_snippet)) = rerank_scores.get(&cand.key) {
-            if let Some(override_snippet) = override_snippet {
-                if !override_snippet.trim().is_empty() {
-                    snippet = override_snippet.clone();
-                }
+        if let Some((_, Some(override_snippet))) = rerank_scores.get(&cand.key) {
+            if !override_snippet.trim().is_empty() {
+                snippet = override_snippet.clone();
             }
         }
 
@@ -3031,7 +3057,8 @@ fn build_context_pack(
             r.title.clone().unwrap_or_default()
         );
         let mut body = if full {
-            mem.frame_text_by_id(r.frame_id).unwrap_or_else(|_| r.snippet.clone())
+            mem.frame_text_by_id(r.frame_id)
+                .unwrap_or_else(|_| r.snippet.clone())
         } else {
             r.snippet.clone()
         };
@@ -3064,7 +3091,10 @@ fn build_context_pack(
     })
 }
 
-fn append_agent_log(mem: &mut Vault, entry: &AgentLogEntry) -> Result<String, Box<dyn std::error::Error>> {
+fn append_agent_log(
+    mem: &mut Vault,
+    entry: &AgentLogEntry,
+) -> Result<String, Box<dyn std::error::Error>> {
     append_agent_log_with_commit(mem, entry, true)
 }
 
@@ -3087,7 +3117,10 @@ fn append_agent_log_with_commit(
         .session
         .clone()
         .unwrap_or_else(|| "default".to_string());
-    let uri = format!("aethervault://agent-log/{session_slug}/{ts}-{}", hash.to_hex());
+    let uri = format!(
+        "aethervault://agent-log/{session_slug}/{ts}-{}",
+        hash.to_hex()
+    );
 
     let mut options = PutOptions::default();
     options.uri = Some(uri.clone());
@@ -3109,7 +3142,10 @@ fn append_agent_log_with_commit(
     Ok(uri)
 }
 
-fn append_feedback(mem: &mut Vault, event: &FeedbackEvent) -> Result<String, Box<dyn std::error::Error>> {
+fn append_feedback(
+    mem: &mut Vault,
+    event: &FeedbackEvent,
+) -> Result<String, Box<dyn std::error::Error>> {
     let bytes = serde_json::to_vec(event)?;
     let ts = Utc::now().timestamp();
     let hash = blake3_hash(&bytes);
@@ -3152,7 +3188,12 @@ fn merge_capsule_into(
             continue;
         }
         let uri = frame.uri.clone().unwrap_or_default();
-        let key = format!("{}|{}|{}", uri, checksum_hex(&frame.checksum), frame.timestamp);
+        let key = format!(
+            "{}|{}|{}",
+            uri,
+            checksum_hex(&frame.checksum),
+            frame.timestamp
+        );
         if dedup {
             if let Some(existing) = dedup_map.get(&key).copied() {
                 id_map.insert(frame_id, existing);
@@ -3564,28 +3605,6 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             "inputSchema": { "type": "object", "properties": {} }
         }),
         serde_json::json!({
-            "name": "approval_approve",
-            "description": "Approve a pending request by id.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" }
-                },
-                "required": ["id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "approval_reject",
-            "description": "Reject a pending request by id.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" }
-                },
-                "required": ["id"]
-            }
-        }),
-        serde_json::json!({
             "name": "trigger_add",
             "description": "Add an event trigger (email or calendar_free).",
             "inputSchema": {
@@ -3794,7 +3813,7 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
                 },
                 "required": ["subject", "start", "end"]
             }
-        })
+        }),
     ]
 }
 
@@ -3826,8 +3845,6 @@ fn execute_tool_with_handles(
             | "config_set"
             | "memory_append_daily"
             | "memory_remember"
-            | "approval_approve"
-            | "approval_reject"
             | "trigger_add"
             | "trigger_remove"
             | "reflect"
@@ -3846,18 +3863,20 @@ fn execute_tool_with_handles(
         let mut approved = false;
         with_write_mem(mem_read, mem_write, mv2, true, |mem| {
             let mut approvals = load_approvals(mem);
-            if let Some(pos) = approvals.iter().position(|e| {
-                e.tool == name && e.args_hash == args_hash && e.status == "approved"
-            }) {
+            if let Some(pos) = approvals
+                .iter()
+                .position(|e| e.tool == name && e.args_hash == args_hash && e.status == "approved")
+            {
                 approval_id = Some(approvals[pos].id.clone());
                 approvals.remove(pos);
                 save_approvals(mem, &approvals)?;
                 approved = true;
                 return Ok(());
             }
-            if let Some(existing) = approvals.iter().find(|e| {
-                e.tool == name && e.args_hash == args_hash && e.status == "pending"
-            }) {
+            if let Some(existing) = approvals
+                .iter()
+                .find(|e| e.tool == name && e.args_hash == args_hash && e.status == "pending")
+            {
                 approval_id = Some(existing.id.clone());
                 return Ok(());
             }
@@ -3876,8 +3895,9 @@ fn execute_tool_with_handles(
             Ok(())
         })?;
         if !approved {
+            let id = approval_id.clone().unwrap_or_else(|| "unknown".to_string());
             return Ok(ToolExecution {
-                output: "approval required".to_string(),
+                output: format!("approval required: {id}\nReply `approve {id}` or `reject {id}`."),
                 details: serde_json::json!({
                     "approval_id": approval_id,
                     "tool": name,
@@ -4130,8 +4150,8 @@ fn execute_tool_with_handles(
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let payload = serde_json::to_vec(&parsed.json).map_err(|e| format!("json: {e}"))?;
             let result = with_write_mem(mem_read, mem_write, mv2, true, |mem| {
-                let id = save_config_entry(mem, &parsed.key, &payload)
-                    .map_err(|e| e.to_string())?;
+                let id =
+                    save_config_entry(mem, &parsed.key, &payload).map_err(|e| e.to_string())?;
                 Ok(ToolExecution {
                     output: format!("Config saved ({})", parsed.key),
                     details: serde_json::json!({ "frame_id": id }),
@@ -4150,8 +4170,8 @@ fn execute_tool_with_handles(
                 .or_else(|| workspace_override.clone())
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
             let include_daily = parsed.include_daily.unwrap_or(true);
-            let ids = sync_workspace_memory(mv2, &workspace, include_daily)
-                .map_err(|e| e.to_string())?;
+            let ids =
+                sync_workspace_memory(mv2, &workspace, include_daily).map_err(|e| e.to_string())?;
             *mem_read = None;
             Ok(ToolExecution {
                 output: format!("Synced {} memory files.", ids.len()),
@@ -4168,8 +4188,8 @@ fn execute_tool_with_handles(
                 .or_else(|| workspace_override.clone())
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
             let include_daily = parsed.include_daily.unwrap_or(true);
-            let paths = export_capsule_memory(mv2, &workspace, include_daily)
-                .map_err(|e| e.to_string())?;
+            let paths =
+                export_capsule_memory(mv2, &workspace, include_daily).map_err(|e| e.to_string())?;
             Ok(ToolExecution {
                 output: format!("Exported {} files.", paths.len()),
                 details: serde_json::json!({ "paths": paths }),
@@ -4313,8 +4333,8 @@ fn execute_tool_with_handles(
                 return Err(format!("himalaya error: {stderr}"));
             }
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let details =
-                serde_json::from_str(&stdout).unwrap_or_else(|_| serde_json::json!({ "raw": stdout }));
+            let details = serde_json::from_str(&stdout)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": stdout }));
             Ok(ToolExecution {
                 output: "Listed envelopes.".to_string(),
                 details,
@@ -4342,8 +4362,8 @@ fn execute_tool_with_handles(
                 return Err(format!("himalaya error: {stderr}"));
             }
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let details =
-                serde_json::from_str(&stdout).unwrap_or_else(|_| serde_json::json!({ "raw": stdout }));
+            let details = serde_json::from_str(&stdout)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": stdout }));
             Ok(ToolExecution {
                 output: "Read message.".to_string(),
                 details,
@@ -4371,7 +4391,7 @@ fn execute_tool_with_handles(
                 template.push_str(&format!("References: {references}\n"));
             }
             template.push_str(&format!("Subject: {}\n", parsed.subject));
-            template.push_str("\n");
+            template.push('\n');
             template.push_str(&parsed.body);
             template.push('\n');
 
@@ -4591,7 +4611,8 @@ fn execute_tool_with_handles(
             }
             let resp = if let Some(body) = parsed.body {
                 if parsed.json.unwrap_or(false) {
-                    req.set("content-type", "application/json").send_string(&body)
+                    req.set("content-type", "application/json")
+                        .send_string(&body)
                 } else {
                     req.send_string(&body)
                 }
@@ -4627,8 +4648,8 @@ fn execute_tool_with_handles(
         "browser_request" => {
             let parsed: ToolBrowserRequestArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let endpoint =
-                env_optional("AETHERVAULT_BROWSER_ENDPOINT").unwrap_or_else(|| "http://127.0.0.1:4040".to_string());
+            let endpoint = env_optional("AETHERVAULT_BROWSER_ENDPOINT")
+                .unwrap_or_else(|| "http://127.0.0.1:4040".to_string());
             let payload = serde_json::json!({
                 "action": parsed.action,
                 "url": parsed.url,
@@ -4648,7 +4669,9 @@ fn execute_tool_with_handles(
             match resp {
                 Ok(resp) => Ok(ToolExecution {
                     output: "browser_request completed.".to_string(),
-                    details: resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                    details: resp
+                        .into_json::<serde_json::Value>()
+                        .map_err(|e| e.to_string())?,
                     is_error: false,
                 }),
                 Err(ureq::Error::Status(code, resp)) => {
@@ -4733,54 +4756,18 @@ fn execute_tool_with_handles(
                 is_error: false,
             })
         }
-        "approval_list" => with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+        "approval_list" => with_read_mem(mem_read, mem_write, mv2, |mem| {
             let approvals = load_approvals(mem);
+            let pending: Vec<ApprovalEntry> = approvals
+                .into_iter()
+                .filter(|a| a.status == "pending")
+                .collect();
             Ok(ToolExecution {
-                output: format!("{} approvals.", approvals.len()),
-                details: serde_json::json!({ "approvals": approvals }),
+                output: format!("{} pending approvals.", pending.len()),
+                details: serde_json::json!({ "approvals": pending }),
                 is_error: false,
             })
         }),
-        "approval_approve" => {
-            let parsed: ToolApprovalApproveArgs =
-                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
-                let mut approvals = load_approvals(mem);
-                let mut updated = false;
-                for entry in approvals.iter_mut() {
-                    if entry.id == parsed.id {
-                        entry.status = "approved".to_string();
-                        updated = true;
-                    }
-                }
-                if updated {
-                    save_approvals(mem, &approvals)?;
-                }
-                Ok(ToolExecution {
-                    output: if updated { "Approval granted.".to_string() } else { "Approval not found.".to_string() },
-                    details: serde_json::json!({ "id": parsed.id, "updated": updated }),
-                    is_error: !updated,
-                })
-            })
-        }
-        "approval_reject" => {
-            let parsed: ToolApprovalApproveArgs =
-                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
-                let mut approvals = load_approvals(mem);
-                let before = approvals.len();
-                approvals.retain(|e| e.id != parsed.id);
-                let updated = approvals.len() != before;
-                if updated {
-                    save_approvals(mem, &approvals)?;
-                }
-                Ok(ToolExecution {
-                    output: if updated { "Approval rejected.".to_string() } else { "Approval not found.".to_string() },
-                    details: serde_json::json!({ "id": parsed.id, "updated": updated }),
-                    is_error: !updated,
-                })
-            })
-        }
         "trigger_add" => {
             let parsed: ToolTriggerAddArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
@@ -4832,7 +4819,11 @@ fn execute_tool_with_handles(
                     save_triggers(mem, &triggers)?;
                 }
                 Ok(ToolExecution {
-                    output: if updated { "Trigger removed.".to_string() } else { "Trigger not found.".to_string() },
+                    output: if updated {
+                        "Trigger removed.".to_string()
+                    } else {
+                        "Trigger not found.".to_string()
+                    },
                     details: serde_json::json!({ "id": parsed.id, "updated": updated }),
                     is_error: !updated,
                 })
@@ -4945,7 +4936,12 @@ fn execute_tool_with_handles(
             });
             let bytes = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
             let hash = blake3_hash(&bytes);
-            let uri = format!("aethervault://memory/reflection/{}/{}-{}", session, ts, hash.to_hex());
+            let uri = format!(
+                "aethervault://memory/reflection/{}/{}-{}",
+                session,
+                ts,
+                hash.to_hex()
+            );
             with_write_mem(mem_read, mem_write, mv2, true, |mem| {
                 let mut options = PutOptions::default();
                 options.uri = Some(uri.clone());
@@ -5088,7 +5084,9 @@ fn execute_tool_with_handles(
             let parsed: ToolGmailListArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
-            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(20))
+                .build();
             let mut url = format!(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={}",
                 parsed.max_results.unwrap_or(10)
@@ -5097,9 +5095,14 @@ fn execute_tool_with_handles(
                 url.push_str("&q=");
                 url.push_str(&urlencoding::encode(&q));
             }
-            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let resp = agent
+                .get(&url)
+                .set("authorization", &format!("Bearer {}", token))
+                .call();
             let payload = match resp {
-                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Ok(resp) => resp
+                    .into_json::<serde_json::Value>()
+                    .map_err(|e| e.to_string())?,
                 Err(ureq::Error::Status(code, resp)) => {
                     let text = resp.into_string().unwrap_or_default();
                     return Err(format!("gmail_list error {code}: {text}").into());
@@ -5116,14 +5119,21 @@ fn execute_tool_with_handles(
             let parsed: ToolGmailReadArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
-            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(20))
+                .build();
             let url = format!(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=full",
                 parsed.id
             );
-            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let resp = agent
+                .get(&url)
+                .set("authorization", &format!("Bearer {}", token))
+                .call();
             let payload = match resp {
-                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Ok(resp) => resp
+                    .into_json::<serde_json::Value>()
+                    .map_err(|e| e.to_string())?,
                 Err(ureq::Error::Status(code, resp)) => {
                     let text = resp.into_string().unwrap_or_default();
                     return Err(format!("gmail_read error {code}: {text}").into());
@@ -5151,7 +5161,9 @@ fn execute_tool_with_handles(
                 .trim_end_matches('=')
                 .to_string();
             let payload = serde_json::json!({ "raw": encoded });
-            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(20))
+                .build();
             let resp = agent
                 .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
                 .set("authorization", &format!("Bearer {}", token))
@@ -5160,7 +5172,9 @@ fn execute_tool_with_handles(
             match resp {
                 Ok(resp) => Ok(ToolExecution {
                     output: "Gmail message sent.".to_string(),
-                    details: resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                    details: resp
+                        .into_json::<serde_json::Value>()
+                        .map_err(|e| e.to_string())?,
                     is_error: false,
                 }),
                 Err(ureq::Error::Status(code, resp)) => {
@@ -5174,14 +5188,21 @@ fn execute_tool_with_handles(
             let parsed: ToolGCalListArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
-            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(20))
+                .build();
             let url = format!(
                 "https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults={}",
                 parsed.max_results.unwrap_or(10)
             );
-            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let resp = agent
+                .get(&url)
+                .set("authorization", &format!("Bearer {}", token))
+                .call();
             let payload = match resp {
-                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Ok(resp) => resp
+                    .into_json::<serde_json::Value>()
+                    .map_err(|e| e.to_string())?,
                 Err(ureq::Error::Status(code, resp)) => {
                     let text = resp.into_string().unwrap_or_default();
                     return Err(format!("gcal_list error {code}: {text}").into());
@@ -5204,7 +5225,9 @@ fn execute_tool_with_handles(
                 "start": { "dateTime": parsed.start },
                 "end": { "dateTime": parsed.end }
             });
-            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(20))
+                .build();
             let resp = agent
                 .post("https://www.googleapis.com/calendar/v3/calendars/primary/events")
                 .set("authorization", &format!("Bearer {}", token))
@@ -5213,7 +5236,9 @@ fn execute_tool_with_handles(
             match resp {
                 Ok(resp) => Ok(ToolExecution {
                     output: "Calendar event created.".to_string(),
-                    details: resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                    details: resp
+                        .into_json::<serde_json::Value>()
+                        .map_err(|e| e.to_string())?,
                     is_error: false,
                 }),
                 Err(ureq::Error::Status(code, resp)) => {
@@ -5231,10 +5256,17 @@ fn execute_tool_with_handles(
                 "https://graph.microsoft.com/v1.0/me/messages?$top={}",
                 parsed.top.unwrap_or(10)
             );
-            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
-            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(20))
+                .build();
+            let resp = agent
+                .get(&url)
+                .set("authorization", &format!("Bearer {}", token))
+                .call();
             let payload = match resp {
-                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Ok(resp) => resp
+                    .into_json::<serde_json::Value>()
+                    .map_err(|e| e.to_string())?,
                 Err(ureq::Error::Status(code, resp)) => {
                     let text = resp.into_string().unwrap_or_default();
                     return Err(format!("ms_mail_list error {code}: {text}").into());
@@ -5252,10 +5284,17 @@ fn execute_tool_with_handles(
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let token = get_oauth_token(mv2, "microsoft").map_err(|e| e.to_string())?;
             let url = format!("https://graph.microsoft.com/v1.0/me/messages/{}", parsed.id);
-            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
-            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(20))
+                .build();
+            let resp = agent
+                .get(&url)
+                .set("authorization", &format!("Bearer {}", token))
+                .call();
             let payload = match resp {
-                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Ok(resp) => resp
+                    .into_json::<serde_json::Value>()
+                    .map_err(|e| e.to_string())?,
                 Err(ureq::Error::Status(code, resp)) => {
                     let text = resp.into_string().unwrap_or_default();
                     return Err(format!("ms_mail_read error {code}: {text}").into());
@@ -5276,10 +5315,17 @@ fn execute_tool_with_handles(
                 "https://graph.microsoft.com/v1.0/me/events?$top={}",
                 parsed.top.unwrap_or(10)
             );
-            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
-            let resp = agent.get(&url).set("authorization", &format!("Bearer {}", token)).call();
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(20))
+                .build();
+            let resp = agent
+                .get(&url)
+                .set("authorization", &format!("Bearer {}", token))
+                .call();
             let payload = match resp {
-                Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                Ok(resp) => resp
+                    .into_json::<serde_json::Value>()
+                    .map_err(|e| e.to_string())?,
                 Err(ureq::Error::Status(code, resp)) => {
                     let text = resp.into_string().unwrap_or_default();
                     return Err(format!("ms_calendar_list error {code}: {text}").into());
@@ -5305,7 +5351,9 @@ fn execute_tool_with_handles(
                 "start": { "dateTime": parsed.start, "timeZone": "UTC" },
                 "end": { "dateTime": parsed.end, "timeZone": "UTC" }
             });
-            let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(20))
+                .build();
             let resp = agent
                 .post("https://graph.microsoft.com/v1.0/me/events")
                 .set("authorization", &format!("Bearer {}", token))
@@ -5314,7 +5362,9 @@ fn execute_tool_with_handles(
             match resp {
                 Ok(resp) => Ok(ToolExecution {
                     output: "Microsoft calendar event created.".to_string(),
-                    details: resp.into_json::<serde_json::Value>().map_err(|e| e.to_string())?,
+                    details: resp
+                        .into_json::<serde_json::Value>()
+                        .map_err(|e| e.to_string())?,
                     is_error: false,
                 }),
                 Err(ureq::Error::Status(code, resp)) => {
@@ -5337,7 +5387,10 @@ fn read_mcp_message(reader: &mut BufReader<impl Read>) -> io::Result<Option<serd
         return Ok(None);
     }
 
-    if first_line.to_ascii_lowercase().starts_with("content-length:") {
+    if first_line
+        .to_ascii_lowercase()
+        .starts_with("content-length:")
+    {
         let mut content_length = first_line
             .split(':')
             .nth(1)
@@ -5381,8 +5434,7 @@ fn print_doctor_report(report: &DoctorReport) {
     println!("status: {:?}", report.status);
     println!(
         "actions: executed={} skipped={}",
-        report.metrics.actions_completed,
-        report.metrics.actions_skipped
+        report.metrics.actions_completed, report.metrics.actions_skipped
     );
     println!("duration_ms: {}", report.metrics.total_duration_ms);
     if let Some(verification) = &report.verification {
@@ -5423,7 +5475,10 @@ fn run_mcp_server(mv2: PathBuf, read_only: bool) -> Result<(), Box<dyn std::erro
         let id = msg.get("id").cloned();
         let has_id = id.as_ref().is_some_and(|v| !v.is_null());
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let params = msg.get("params").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let params = msg
+            .get("params")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
 
         let response = match method {
             "initialize" => {
@@ -5455,11 +5510,11 @@ fn run_mcp_server(mv2: PathBuf, read_only: bool) -> Result<(), Box<dyn std::erro
                 "result": { "tools": tools }
             }),
             "tools/call" => {
-                let name = params
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let arguments = params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
                 match execute_tool_with_handles(
                     name,
                     arguments,
@@ -5518,8 +5573,7 @@ fn run_mcp_server(mv2: PathBuf, read_only: bool) -> Result<(), Box<dyn std::erro
 fn env_required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     let value = env::var(name).unwrap_or_default();
     if value.trim().is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Missing {name}"))
-            .into());
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Missing {name}")).into());
     }
     Ok(value)
 }
@@ -5530,27 +5584,27 @@ fn env_optional(name: &str) -> Option<String> {
 
 fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error>> {
     match env_optional(name) {
-        Some(value) => Ok(value.parse::<u64>().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid {name}"))
-        })?),
+        Some(value) => Ok(value
+            .parse::<u64>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid {name}")))?),
         None => Ok(default),
     }
 }
 
 fn env_usize(name: &str, default: usize) -> Result<usize, Box<dyn std::error::Error>> {
     match env_optional(name) {
-        Some(value) => Ok(value.parse::<usize>().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid {name}"))
-        })?),
+        Some(value) => Ok(value
+            .parse::<usize>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid {name}")))?),
         None => Ok(default),
     }
 }
 
 fn env_f64(name: &str, default: f64) -> Result<f64, Box<dyn std::error::Error>> {
     match env_optional(name) {
-        Some(value) => Ok(value.parse::<f64>().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid {name}"))
-        })?),
+        Some(value) => Ok(value
+            .parse::<f64>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid {name}")))?),
         None => Ok(default),
     }
 }
@@ -5597,10 +5651,7 @@ fn build_external_command(program: &str, args: &[String]) -> ProcessCommand {
     cmd
 }
 
-fn resolve_workspace(
-    cli: Option<PathBuf>,
-    agent_cfg: &AgentConfig,
-) -> Option<PathBuf> {
+fn resolve_workspace(cli: Option<PathBuf>, agent_cfg: &AgentConfig) -> Option<PathBuf> {
     if let Some(path) = cli {
         return Some(path);
     }
@@ -5794,7 +5845,12 @@ fn build_google_auth_url(client_id: &str, redirect_uri: &str, scope: &str, state
     )
 }
 
-fn build_microsoft_auth_url(client_id: &str, redirect_uri: &str, scope: &str, state: &str) -> String {
+fn build_microsoft_auth_url(
+    client_id: &str,
+    redirect_uri: &str,
+    scope: &str,
+    state: &str,
+) -> String {
     format!(
         "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&response_mode=query&state={}",
         urlencoding::encode(client_id),
@@ -5845,8 +5901,7 @@ fn run_oauth_broker(
     redirect_base: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let provider = provider.to_ascii_lowercase();
-    let redirect_base =
-        redirect_base.unwrap_or_else(|| format!("http://{}:{}", bind, port));
+    let redirect_base = redirect_base.unwrap_or_else(|| format!("http://{}:{}", bind, port));
     let redirect_uri = build_oauth_redirect(&redirect_base, &provider);
     let state = "aethervault";
 
@@ -5898,8 +5953,9 @@ fn run_oauth_broker(
             continue;
         }
         let query = url.splitn(2, '?').nth(1).unwrap_or("");
-        let params: HashMap<String, String> =
-            form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+        let params: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
         let code = match params.get("code") {
             Some(c) => c.to_string(),
             None => {
@@ -5908,13 +5964,8 @@ fn run_oauth_broker(
                 continue;
             }
         };
-        let token = exchange_oauth_code(
-            &token_url,
-            &client_id,
-            &client_secret,
-            &redirect_uri,
-            &code,
-        )?;
+        let token =
+            exchange_oauth_code(&token_url, &client_id, &client_secret, &redirect_uri, &code)?;
         let key = format!("oauth.{provider}");
         let payload = serde_json::to_vec_pretty(&token)?;
         let mut mem = open_or_create(&mv2)?;
@@ -5951,6 +6002,81 @@ fn save_approvals(mem: &mut Vault, approvals: &[ApprovalEntry]) -> Result<(), St
     Ok(())
 }
 
+enum ApprovalChatCommand {
+    Approve(String),
+    Reject(String),
+}
+
+fn parse_approval_chat_command(text: &str) -> Option<ApprovalChatCommand> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.split_whitespace();
+    let cmd = parts.next()?.to_ascii_lowercase();
+    let id = parts.next()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    match cmd.as_str() {
+        "approve" => Some(ApprovalChatCommand::Approve(id.to_string())),
+        "reject" => Some(ApprovalChatCommand::Reject(id.to_string())),
+        _ => None,
+    }
+}
+
+fn approve_and_maybe_execute(mv2: &Path, id: &str, execute: bool) -> Result<String, String> {
+    let mut mem = open_or_create(mv2).map_err(|e| e.to_string())?;
+    let mut approvals = load_approvals(&mut mem);
+    let mut entry: Option<ApprovalEntry> = None;
+    for a in approvals.iter_mut() {
+        if a.id == id {
+            a.status = "approved".to_string();
+            entry = Some(a.clone());
+            break;
+        }
+    }
+    if entry.is_none() {
+        return Ok("Approval id not found.".to_string());
+    }
+    save_approvals(&mut mem, &approvals)?;
+    mem.commit().map_err(|e| e.to_string())?;
+
+    if !execute {
+        return Ok("Approved.".to_string());
+    }
+    let entry = entry.unwrap();
+    let result = execute_tool(&entry.tool, entry.args, mv2, false);
+    match result {
+        Ok(exec) => Ok(exec.output),
+        Err(err) => Ok(format!("Execution error: {err}")),
+    }
+}
+
+fn reject_approval(mv2: &Path, id: &str) -> Result<String, String> {
+    let mut mem = open_or_create(mv2).map_err(|e| e.to_string())?;
+    let mut approvals = load_approvals(&mut mem);
+    let before = approvals.len();
+    approvals.retain(|a| a.id != id);
+    let updated = approvals.len() != before;
+    if updated {
+        save_approvals(&mut mem, &approvals)?;
+        mem.commit().map_err(|e| e.to_string())?;
+        Ok("Rejected.".to_string())
+    } else {
+        Ok("Approval id not found.".to_string())
+    }
+}
+
+fn try_handle_approval_chat(mv2: &Path, text: &str) -> Option<String> {
+    let cmd = parse_approval_chat_command(text)?;
+    let result = match cmd {
+        ApprovalChatCommand::Approve(id) => approve_and_maybe_execute(mv2, &id, true),
+        ApprovalChatCommand::Reject(id) => reject_approval(mv2, &id),
+    };
+    Some(result.unwrap_or_else(|e| format!("Approval error: {e}")))
+}
+
 fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
     // In bridge mode (env AETHERVAULT_BRIDGE_AUTO_APPROVE=1), auto-approve ALL tools.
     // The user explicitly opted in to full agency — no approval gates.
@@ -5961,17 +6087,9 @@ fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
         return false;
     }
     match name {
-        "exec"
-        | "email_send"
-        | "email_archive"
-        | "gmail_send"
-        | "gcal_create"
-        | "ms_calendar_create"
-        | "notify"
-        | "signal_send"
-        | "imessage_send"
-        | "fs_write"
-        | "browser_request" => true,
+        "exec" | "email_send" | "email_archive" | "config_set" | "gmail_send" | "gcal_create"
+        | "ms_calendar_create" | "trigger_add" | "trigger_remove" | "notify" | "signal_send"
+        | "imessage_send" | "memory_export" | "fs_write" | "browser_request" => true,
         "http_request" => {
             let method = args
                 .get("method")
@@ -6078,7 +6196,67 @@ fn load_subagents_from_config(config: &CapsuleConfig) -> Vec<SubagentSpec> {
         .collect()
 }
 
-fn refresh_google_token(mv2: &Path, token: &serde_json::Value) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+fn tool_catalog_map(catalog: &[serde_json::Value]) -> HashMap<String, serde_json::Value> {
+    let mut map = HashMap::new();
+    for tool in catalog {
+        if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
+            map.insert(name.to_string(), tool.clone());
+        }
+    }
+    map
+}
+
+fn base_tool_names() -> HashSet<String> {
+    [
+        "tool_search",
+        "query",
+        "context",
+        "search",
+        "get",
+        "session_context",
+        "config_set",
+        "memory_append_daily",
+        "memory_remember",
+        "memory_search",
+        "memory_sync",
+        "memory_export",
+        "reflect",
+        "skill_store",
+        "skill_search",
+        "trigger_add",
+        "trigger_list",
+        "trigger_remove",
+        "subagent_list",
+        "subagent_invoke",
+        "approval_list",
+    ]
+    .into_iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn tools_from_active(
+    map: &HashMap<String, serde_json::Value>,
+    active: &HashSet<String>,
+) -> Vec<serde_json::Value> {
+    let mut tools = Vec::new();
+    for name in active {
+        if let Some(tool) = map.get(name) {
+            tools.push(tool.clone());
+        }
+    }
+    tools.sort_by(|a, b| {
+        a.get("name")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("name").and_then(|v| v.as_str()))
+    });
+    tools
+}
+
+fn refresh_google_token(
+    mv2: &Path,
+    token: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let refresh_token = token
         .get("refresh_token")
         .and_then(|v| v.as_str())
@@ -6120,7 +6298,10 @@ fn refresh_google_token(mv2: &Path, token: &serde_json::Value) -> Result<serde_j
     Ok(new_token)
 }
 
-fn refresh_microsoft_token(mv2: &Path, token: &serde_json::Value) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+fn refresh_microsoft_token(
+    mv2: &Path,
+    token: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let refresh_token = token
         .get("refresh_token")
         .and_then(|v| v.as_str())
@@ -6331,7 +6512,8 @@ fn bootstrap_workspace(
 
     let soul_template = "# Executive Assistant Soul\n\n- Act as a proactive executive assistant.\n- Be concise, direct, and high‑leverage.\n- Prefer action over explanation.\n- Ask for approval before external sends unless policy allows.\n";
     let user_template = "# User Profile\n\n- Name: Sunil Rao\n- Role: Executive\n- Preferences:\n  - Daily Overview at 8:30 AM\n  - Daily Recap at 3:30 PM\n  - Weekly Overview Monday 8:15 AM\n  - Weekly Recap Friday 3:15 PM\n";
-    let memory_template = "# Long‑term Memory\n\n- Important contacts, preferences, and policies go here.\n";
+    let memory_template =
+        "# Long‑term Memory\n\n- Important contacts, preferences, and policies go here.\n";
     let daily_template = "# Daily Log\n\n- Created by bootstrap.\n";
 
     create_file(&soul_path, soul_template)?;
@@ -6375,13 +6557,21 @@ fn parse_timezone_offset(value: &str) -> Result<chrono::FixedOffset, Box<dyn std
     chrono::FixedOffset::east_opt(total).ok_or_else(|| "timezone offset".into())
 }
 
-fn resolve_timezone(agent_cfg: &AgentConfig, override_value: Option<String>) -> chrono::FixedOffset {
+fn resolve_timezone(
+    agent_cfg: &AgentConfig,
+    override_value: Option<String>,
+) -> chrono::FixedOffset {
     let raw = override_value.or_else(|| agent_cfg.timezone.clone());
     raw.and_then(|v| parse_timezone_offset(&v).ok())
         .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap())
 }
 
-fn should_run_daily(last: &mut Option<chrono::NaiveDate>, now: chrono::DateTime<chrono::FixedOffset>, hour: u32, minute: u32) -> bool {
+fn should_run_daily(
+    last: &mut Option<chrono::NaiveDate>,
+    now: chrono::DateTime<chrono::FixedOffset>,
+    hour: u32,
+    minute: u32,
+) -> bool {
     let date = now.date_naive();
     if now.time().hour() != hour || now.time().minute() != minute {
         return false;
@@ -6483,7 +6673,9 @@ fn run_schedule_loop(
             let result = run_agent_for_bridge(&agent_config, &prompt, session, None, None);
             if let Ok(output) = result {
                 if let Some(text) = output.final_text {
-                    if let (Some(token), Some(chat_id)) = (telegram_token.as_ref(), telegram_chat_id.as_ref()) {
+                    if let (Some(token), Some(chat_id)) =
+                        (telegram_token.as_ref(), telegram_chat_id.as_ref())
+                    {
                         let agent = ureq::AgentBuilder::new()
                             .timeout_connect(Duration::from_secs(10))
                             .timeout_write(Duration::from_secs(10))
@@ -6557,7 +6749,9 @@ fn run_watch_loop(
                         .timeout_connect(Duration::from_secs(10))
                         .timeout_read(Duration::from_secs(20))
                         .build();
-                    let mut url = "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=1".to_string();
+                    let mut url =
+                        "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=1"
+                            .to_string();
                     url.push_str("&q=");
                     url.push_str(&urlencoding::encode(&query));
                     let resp = agent
@@ -6580,16 +6774,18 @@ fn run_watch_loop(
                             trigger.last_seen = Some(id.clone());
                             trigger.last_fired = Some(now.to_rfc3339());
                             updated = true;
-                            let mut prompt = trigger
-                                .prompt
-                                .clone()
-                                .unwrap_or_else(|| "New email received. Review and take action.".to_string());
-                            prompt.push_str(&format!("\n\nQuery: {query}\nMessage ID: {id}\nUse gmail_read to inspect."));
+                            let mut prompt = trigger.prompt.clone().unwrap_or_else(|| {
+                                "New email received. Review and take action.".to_string()
+                            });
+                            prompt.push_str(&format!(
+                                "\n\nQuery: {query}\nMessage ID: {id}\nUse gmail_read to inspect."
+                            ));
                             if let Some(ws) = &workspace {
                                 prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
                             }
                             let session = format!("trigger:email:{}", trigger.id);
-                            let _ = run_agent_for_bridge(&agent_config, &prompt, session, None, None);
+                            let _ =
+                                run_agent_for_bridge(&agent_config, &prompt, session, None, None);
                         }
                     }
                 }
@@ -6638,16 +6834,19 @@ fn run_watch_loop(
                         if !fired_today {
                             trigger.last_fired = Some(now.to_rfc3339());
                             updated = true;
-                            let mut prompt = trigger
-                                .prompt
-                                .clone()
-                                .unwrap_or_else(|| "Calendar is free in the requested window. Schedule task.".to_string());
-                            prompt.push_str(&format!("\n\nWindow: {start} → {end}\nNo events detected."));
+                            let mut prompt = trigger.prompt.clone().unwrap_or_else(|| {
+                                "Calendar is free in the requested window. Schedule task."
+                                    .to_string()
+                            });
+                            prompt.push_str(&format!(
+                                "\n\nWindow: {start} → {end}\nNo events detected."
+                            ));
                             if let Some(ws) = &workspace {
                                 prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
                             }
                             let session = format!("trigger:calendar:{}", trigger.id);
-                            let _ = run_agent_for_bridge(&agent_config, &prompt, session, None, None);
+                            let _ =
+                                run_agent_for_bridge(&agent_config, &prompt, session, None, None);
                         }
                     }
                 }
@@ -6802,7 +7001,9 @@ fn to_anthropic_tools(
     out
 }
 
-fn parse_claude_response(payload: &serde_json::Value) -> Result<AgentHookResponse, Box<dyn std::error::Error>> {
+fn parse_claude_response(
+    payload: &serde_json::Value,
+) -> Result<AgentHookResponse, Box<dyn std::error::Error>> {
     let content = payload
         .get("content")
         .and_then(|v| v.as_array())
@@ -6831,7 +7032,10 @@ fn parse_claude_response(payload: &serde_json::Value) -> Result<AgentHookRespons
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let args = block.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let args = block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
                 tool_calls.push(AgentToolCall { id, name, args });
             }
             _ => {}
@@ -6856,7 +7060,9 @@ fn parse_claude_response(payload: &serde_json::Value) -> Result<AgentHookRespons
     })
 }
 
-fn call_claude(request: &AgentHookRequest) -> Result<AgentHookResponse, Box<dyn std::error::Error>> {
+fn call_claude(
+    request: &AgentHookRequest,
+) -> Result<AgentHookResponse, Box<dyn std::error::Error>> {
     let api_key = env_required("ANTHROPIC_API_KEY")?;
     let model = env_required("ANTHROPIC_MODEL")?;
     let base_url = env_optional("ANTHROPIC_BASE_URL")
@@ -6865,7 +7071,9 @@ fn call_claude(request: &AgentHookRequest) -> Result<AgentHookResponse, Box<dyn 
     let temperature = env_optional("ANTHROPIC_TEMPERATURE")
         .map(|v| v.parse::<f64>())
         .transpose()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid ANTHROPIC_TEMPERATURE"))?;
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Invalid ANTHROPIC_TEMPERATURE")
+        })?;
     let top_p = env_optional("ANTHROPIC_TOP_P")
         .map(|v| v.parse::<f64>())
         .transpose()
@@ -6874,8 +7082,7 @@ fn call_claude(request: &AgentHookRequest) -> Result<AgentHookResponse, Box<dyn 
     let max_retries = env_usize("ANTHROPIC_MAX_RETRIES", 2)?;
     let retry_base = env_f64("ANTHROPIC_RETRY_BASE", 0.5)?;
     let retry_max = env_f64("ANTHROPIC_RETRY_MAX", 4.0)?;
-    let version = env_optional("ANTHROPIC_VERSION")
-        .unwrap_or_else(|| "2023-06-01".to_string());
+    let version = env_optional("ANTHROPIC_VERSION").unwrap_or_else(|| "2023-06-01".to_string());
     let beta = env_optional("ANTHROPIC_BETA");
     let token_efficient = env_bool("ANTHROPIC_TOKEN_EFFICIENT", false);
     let mut beta_values: Vec<String> = Vec::new();
@@ -7188,7 +7395,16 @@ fn run_agent_with_prompt(
     } else if let Some(system) = agent_cfg.system.clone() {
         system
     } else {
-        "You are a concise, high-performance personal assistant. Use tools when needed. Avoid plans and TODO lists unless asked.".to_string()
+        [
+            "You are a high-performance executive assistant.",
+            "Be proactive, concrete, and concise.",
+            "Use tools to take actions when appropriate.",
+            "Tools are loaded dynamically: call tool_search when you need a capability that is not currently available.",
+            "Sensitive actions require approval. If a tool returns `approval required: <id>`, ask the user to reply `approve <id>` or `reject <id>`.",
+            "Use subagent_invoke for specialist help when it will improve quality or speed.",
+            "When something fails, store a short reflection via reflect and then retry with a corrected approach.",
+        ]
+        .join("\n")
     };
 
     if agent_cfg.onboarding_complete == Some(false) {
@@ -7317,7 +7533,10 @@ fn run_agent_with_prompt(
         is_error: None,
     });
 
-    let tools = tool_definitions_json();
+    let tool_catalog = tool_definitions_json();
+    let tool_map = tool_catalog_map(&tool_catalog);
+    let mut active_tools = base_tool_names();
+    let mut tools = tools_from_active(&tool_map, &active_tools);
     let mut tool_results: Vec<AgentToolResult> = Vec::new();
     let should_log = log || agent_cfg.log.unwrap_or(false);
     let mut final_text = None;
@@ -7325,17 +7544,18 @@ fn run_agent_with_prompt(
     let mut mem_write: Option<Vault> = None;
     let mut pending_log_writes = 0usize;
 
-    let flush_logs = |mem_read: &mut Option<Vault>, mem_write: &mut Option<Vault>, pending: &mut usize| {
-        if *pending == 0 {
-            return Ok(()) as Result<(), Box<dyn std::error::Error>>;
-        }
-        if let Some(mem) = mem_write.as_mut() {
-            mem.commit()?;
-            *pending = 0;
-            *mem_read = None;
-        }
-        Ok(())
-    };
+    let flush_logs =
+        |mem_read: &mut Option<Vault>, mem_write: &mut Option<Vault>, pending: &mut usize| {
+            if *pending == 0 {
+                return Ok(()) as Result<(), Box<dyn std::error::Error>>;
+            }
+            if let Some(mem) = mem_write.as_mut() {
+                mem.commit()?;
+                *pending = 0;
+                *mem_read = None;
+            }
+            Ok(())
+        };
     if should_log {
         mem_read = None;
         mem_write = Some(Vault::open(&mv2)?);
@@ -7411,7 +7631,8 @@ fn run_agent_with_prompt(
                     is_error: true,
                 },
             };
-            let tool_content = format_tool_message_content(&call.name, &result.output, &result.details);
+            let tool_content =
+                format_tool_message_content(&call.name, &result.output, &result.details);
             tool_results.push(AgentToolResult {
                 id: call.id.clone(),
                 name: call.name.clone(),
@@ -7421,13 +7642,33 @@ fn run_agent_with_prompt(
             });
             let tool_message = AgentMessage {
                 role: "tool".to_string(),
-                content: if tool_content.is_empty() { None } else { Some(tool_content) },
+                content: if tool_content.is_empty() {
+                    None
+                } else {
+                    Some(tool_content)
+                },
                 tool_calls: Vec::new(),
                 name: Some(call.name.clone()),
                 tool_call_id: Some(call.id.clone()),
                 is_error: Some(result.is_error),
             };
             messages.push(tool_message);
+
+            if call.name == "tool_search" && !result.is_error {
+                if let Some(results) = result.details.get("results").and_then(|v| v.as_array()) {
+                    let mut changed = false;
+                    for item in results {
+                        if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                            if active_tools.insert(name.to_string()) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        tools = tools_from_active(&tool_map, &active_tools);
+                    }
+                }
+            }
 
             if should_log {
                 let entry = AgentLogEntry {
@@ -7533,7 +7774,6 @@ fn build_bridge_agent_config(
     })
 }
 
-
 fn run_agent_for_bridge(
     config: &BridgeAgentConfig,
     prompt: &str,
@@ -7578,79 +7818,6 @@ fn run_agent_for_bridge(
         Err(mpsc::RecvTimeoutError::Timeout) => Err("Agent timeout".into()),
         Err(err) => Err(format!("Agent channel error: {err}")),
     }
-}
-
-fn run_subagents_with_specs(
-    config: &BridgeAgentConfig,
-    prompt: &str,
-    base_session: &str,
-    specs: &[SubagentSpec],
-) -> Result<Vec<SubagentResult>, String> {
-    if specs.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut handles = Vec::new();
-    for spec in specs.iter().cloned() {
-        let cfg = config.clone();
-        let prompt_text = prompt.to_string();
-        let SubagentSpec {
-            name,
-            system,
-            model_hook,
-        } = spec;
-        let session = format!("{base_session}/{name}");
-        handles.push(thread::spawn(move || {
-            let result =
-                run_agent_for_bridge(&cfg, &prompt_text, session, system, model_hook);
-            match result {
-                Ok(output) => SubagentResult {
-                    name,
-                    text: output.final_text.unwrap_or_default(),
-                    is_error: false,
-                },
-                Err(err) => SubagentResult {
-                    name,
-                    text: err,
-                    is_error: true,
-                },
-            }
-        }));
-    }
-
-    let mut results = Vec::new();
-    for handle in handles {
-        match handle.join() {
-            Ok(result) => results.push(result),
-            Err(_) => results.push(SubagentResult {
-                name: "subagent".to_string(),
-                text: "Subagent panic".to_string(),
-                is_error: true,
-            }),
-        }
-    }
-    Ok(results)
-}
-
-fn append_subagent_results(main_text: String, results: &[SubagentResult]) -> String {
-    if results.is_empty() {
-        return main_text;
-    }
-    let mut out = String::new();
-    if !main_text.trim().is_empty() {
-        out.push_str(main_text.trim());
-        out.push_str("\n\n");
-    }
-    out.push_str("Subagents:\n");
-    for result in results {
-        let label = result.name.trim();
-        if result.is_error {
-            out.push_str(&format!("- {label}: {text}\n", text = result.text.trim()));
-        } else {
-            out.push_str(&format!("- {label}: {text}\n", text = result.text.trim()));
-        }
-    }
-    out.trim_end().to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -8225,6 +8392,12 @@ fn run_telegram_bridge(
             let Some((chat_id, reply_to_id, user_text)) = extract_telegram_content(&entry, &agent, &base_url) else {
                 continue;
             };
+            if let Some(output) = try_handle_approval_chat(&agent_config.mv2, &user_text) {
+                if let Err(err) = telegram_send_message(&agent, &base_url, chat_id, &output) {
+                    eprintln!("Telegram send failed: {err}");
+                }
+                continue;
+            }
 
             // Send typing indicator immediately
             telegram_send_typing(&agent, &base_url, chat_id);
@@ -8257,15 +8430,6 @@ fn run_telegram_bridge(
                     let mut text = result.final_text.unwrap_or_default();
                     if text.trim().is_empty() {
                         text = "Done.".to_string();
-                    }
-                    if let Ok(subagents) = run_subagents_with_specs(
-                        &agent_config,
-                        &user_text,
-                        &format!("{}telegram:{chat_id}", agent_config.session_prefix),
-                        &subagent_specs,
-                    )
-                    {
-                        text = append_subagent_results(text, &subagents);
                     }
                     text
                 }
@@ -8363,6 +8527,19 @@ fn run_whatsapp_bridge(
             continue;
         }
 
+        if let Some(output) = try_handle_approval_chat(&agent_config.mv2, &text) {
+            let twiml = format!(
+                "<Response><Message>{}</Message></Response>",
+                escape_xml(&output)
+            );
+            let mut response = Response::from_string(twiml);
+            let header = Header::from_bytes("Content-Type", "text/xml; charset=utf-8")
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "invalid header"))?;
+            response.add_header(header);
+            let _ = request.respond(response);
+            continue;
+        }
+
         let session = format!("{}whatsapp:{from}", agent_config.session_prefix);
         let response = run_agent_for_bridge(&agent_config, &text, session, None, None);
         let mut output = match response {
@@ -8371,15 +8548,6 @@ fn run_whatsapp_bridge(
         };
         if output.trim().is_empty() {
             output = "Done.".to_string();
-        }
-        if let Ok(subagents) = run_subagents_with_specs(
-            &agent_config,
-            &text,
-            &format!("{}whatsapp:{from}", agent_config.session_prefix),
-            &subagent_specs,
-        )
-        {
-            output = append_subagent_results(output, &subagents);
         }
 
         let twiml = format!(
@@ -8412,7 +8580,7 @@ fn run_webhook_bridge(
     bind: String,
     port: u16,
     agent_config: BridgeAgentConfig,
-    extract_text: fn(&serde_json::Value) -> Option<String>,
+    extract_event: fn(&serde_json::Value) -> Option<(String, String)>,
     reply: fn(&BridgeAgentConfig, &str) -> Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("{bind}:{port}");
@@ -8432,12 +8600,22 @@ fn run_webhook_bridge(
             let _ = request.respond(response);
             continue;
         }
-        let Some(text) = extract_text(&payload) else {
+        let Some((session_key, text)) = extract_event(&payload) else {
             let response = Response::from_string("ok");
             let _ = request.respond(response);
             continue;
         };
-        let session = format!("{}:{name}", agent_config.session_prefix);
+        if let Some(output) = try_handle_approval_chat(&agent_config.mv2, &text) {
+            if let Some(response_text) = reply(&agent_config, &output) {
+                let response = Response::from_string(response_text);
+                let _ = request.respond(response);
+            } else {
+                let response = Response::from_string("ok");
+                let _ = request.respond(response);
+            }
+            continue;
+        }
+        let session = format!("{}{}", agent_config.session_prefix, session_key);
         let result = run_agent_for_bridge(&agent_config, &text, session, None, None);
         let output = match result {
             Ok(output) => output.final_text.unwrap_or_else(|| "Done.".to_string()),
@@ -8454,40 +8632,136 @@ fn run_webhook_bridge(
     Ok(())
 }
 
-fn extract_slack_text(payload: &serde_json::Value) -> Option<String> {
-    payload
+fn payload_session_fallback(prefix: &str, payload: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(payload).unwrap_or_default();
+    format!("{prefix}:{}", blake3_hash(&bytes).to_hex())
+}
+
+fn extract_slack_event(payload: &serde_json::Value) -> Option<(String, String)> {
+    let text = payload
         .get("event")
         .and_then(|v| v.get("text"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| payload.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
-}
-
-fn extract_discord_text(payload: &serde_json::Value) -> Option<String> {
-    payload
-        .get("content")
+        .or_else(|| {
+            payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })?;
+    let channel = payload
+        .get("event")
+        .and_then(|v| v.get("channel"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .unwrap_or("unknown");
+    let user = payload
+        .get("event")
+        .and_then(|v| v.get("user"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let session = if channel != "unknown" || user != "unknown" {
+        format!("slack:{channel}:{user}")
+    } else {
+        payload_session_fallback("slack", payload)
+    };
+    Some((session, text))
 }
 
-fn extract_teams_text(payload: &serde_json::Value) -> Option<String> {
-    payload
+fn extract_discord_event(payload: &serde_json::Value) -> Option<(String, String)> {
+    let text = payload.get("content").and_then(|v| v.as_str())?.to_string();
+    let channel = payload
+        .get("channel_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let user = payload
+        .get("author")
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let session = if channel != "unknown" || user != "unknown" {
+        format!("discord:{channel}:{user}")
+    } else {
+        payload_session_fallback("discord", payload)
+    };
+    Some((session, text))
+}
+
+fn extract_teams_event(payload: &serde_json::Value) -> Option<(String, String)> {
+    let text = payload
         .get("text")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| payload.get("body").and_then(|v| v.get("content")).and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .or_else(|| {
+            payload
+                .get("body")
+                .and_then(|v| v.get("content"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })?;
+    let convo = payload
+        .get("conversation")
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let from = payload
+        .get("from")
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let session = if convo != "unknown" || from != "unknown" {
+        format!("teams:{convo}:{from}")
+    } else {
+        payload_session_fallback("teams", payload)
+    };
+    Some((session, text))
 }
 
-fn extract_signal_text(payload: &serde_json::Value) -> Option<String> {
-    payload.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+fn extract_signal_event(payload: &serde_json::Value) -> Option<(String, String)> {
+    let text = payload.get("text").and_then(|v| v.as_str())?.to_string();
+    let source = payload
+        .get("source")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("from").and_then(|v| v.as_str()))
+        .unwrap_or("unknown");
+    let session = if source != "unknown" {
+        format!("signal:{source}")
+    } else {
+        payload_session_fallback("signal", payload)
+    };
+    Some((session, text))
 }
 
-fn extract_matrix_text(payload: &serde_json::Value) -> Option<String> {
-    payload.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+fn extract_matrix_event(payload: &serde_json::Value) -> Option<(String, String)> {
+    let text = payload.get("text").and_then(|v| v.as_str())?.to_string();
+    let room = payload
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("room").and_then(|v| v.as_str()))
+        .unwrap_or("unknown");
+    let sender = payload
+        .get("sender")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let session = if room != "unknown" || sender != "unknown" {
+        format!("matrix:{room}:{sender}")
+    } else {
+        payload_session_fallback("matrix", payload)
+    };
+    Some((session, text))
 }
 
-fn extract_imessage_text(payload: &serde_json::Value) -> Option<String> {
-    payload.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+fn extract_imessage_event(payload: &serde_json::Value) -> Option<(String, String)> {
+    let text = payload.get("text").and_then(|v| v.as_str())?.to_string();
+    let from = payload
+        .get("from")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let session = if from != "unknown" {
+        format!("imessage:{from}")
+    } else {
+        payload_session_fallback("imessage", payload)
+    };
+    Some((session, text))
 }
 
 fn reply_none(_: &BridgeAgentConfig, _: &str) -> Option<String> {
@@ -8589,7 +8863,14 @@ fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::error::Error>> 
                 log,
                 log_commit_interval,
             )?;
-            run_webhook_bridge("slack", bind, port, config, extract_slack_text, reply_slack)
+            run_webhook_bridge(
+                "slack",
+                bind,
+                port,
+                config,
+                extract_slack_event,
+                reply_slack,
+            )
         }
         BridgeCommand::Discord {
             mv2,
@@ -8618,7 +8899,14 @@ fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::error::Error>> 
                 log,
                 log_commit_interval,
             )?;
-            run_webhook_bridge("discord", bind, port, config, extract_discord_text, reply_none)
+            run_webhook_bridge(
+                "discord",
+                bind,
+                port,
+                config,
+                extract_discord_event,
+                reply_none,
+            )
         }
         BridgeCommand::Teams {
             mv2,
@@ -8647,7 +8935,7 @@ fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::error::Error>> 
                 log,
                 log_commit_interval,
             )?;
-            run_webhook_bridge("teams", bind, port, config, extract_teams_text, reply_none)
+            run_webhook_bridge("teams", bind, port, config, extract_teams_event, reply_none)
         }
         BridgeCommand::Signal {
             mv2,
@@ -8677,7 +8965,14 @@ fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::error::Error>> 
                 log,
                 log_commit_interval,
             )?;
-            run_webhook_bridge("signal", bind, port, config, extract_signal_text, reply_none)
+            run_webhook_bridge(
+                "signal",
+                bind,
+                port,
+                config,
+                extract_signal_event,
+                reply_none,
+            )
         }
         BridgeCommand::Matrix {
             mv2,
@@ -8707,7 +9002,14 @@ fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::error::Error>> 
                 log,
                 log_commit_interval,
             )?;
-            run_webhook_bridge("matrix", bind, port, config, extract_matrix_text, reply_none)
+            run_webhook_bridge(
+                "matrix",
+                bind,
+                port,
+                config,
+                extract_matrix_event,
+                reply_none,
+            )
         }
         BridgeCommand::IMessage {
             mv2,
@@ -8736,7 +9038,14 @@ fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::error::Error>> 
                 log,
                 log_commit_interval,
             )?;
-            run_webhook_bridge("imessage", bind, port, config, extract_imessage_text, reply_none)
+            run_webhook_bridge(
+                "imessage",
+                bind,
+                port,
+                config,
+                extract_imessage_event,
+                reply_none,
+            )
         }
     }
 }
@@ -8859,10 +9168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let uri = uri_for_path(&collection, relative);
                 let title = infer_title(path, &bytes);
 
-                let existing_checksum = mem
-                    .frame_by_uri(&uri)
-                    .ok()
-                    .map(|frame| frame.checksum);
+                let existing_checksum = mem.frame_by_uri(&uri).ok().map(|frame| frame.checksum);
 
                 if existing_checksum.is_some_and(|c| c == *file_hash.as_bytes()) {
                     skipped += 1;
@@ -8906,7 +9212,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     options.extra_metadata.insert("mtime_ms".into(), mtime_ms);
                 }
                 if !size_bytes.is_empty() {
-                    options.extra_metadata.insert("size_bytes".into(), size_bytes);
+                    options
+                        .extra_metadata
+                        .insert("size_bytes".into(), size_bytes);
                 }
 
                 mem.put_bytes_with_options(&bytes, options)?;
@@ -8960,7 +9268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let inferred_title = uri
                 .split('/')
-                .last()
+                .next_back()
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&uri)
                 .to_string();
@@ -9035,7 +9343,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             Ok(())
         }
-
 
         Command::Query {
             mv2,
@@ -9290,7 +9597,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Embed {
-
             mv2,
             collection,
             limit,
@@ -9390,7 +9696,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         options.extract_triplets = false;
                         options.instant_index = false;
                         options.enable_embedding = false;
-                        if mem.update_frame(frame_id, None, options, Some(embedding)).is_ok() {
+                        if mem
+                            .update_frame(frame_id, None, options, Some(embedding))
+                            .is_ok()
+                        {
                             embedded += 1;
                         } else {
                             failed += 1;
@@ -9772,6 +10081,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
             redirect_base,
         } => run_oauth_broker(mv2, provider, bind, port, redirect_base),
+
+        Command::Approve { mv2, id, execute } => {
+            let output = approve_and_maybe_execute(&mv2, &id, execute)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            println!("{output}");
+            Ok(())
+        }
+
+        Command::Reject { mv2, id } => {
+            let output =
+                reject_approval(&mv2, &id).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            println!("{output}");
+            Ok(())
+        }
 
         Command::Bridge { command } => run_bridge(command),
 

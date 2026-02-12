@@ -82,10 +82,10 @@ cargo build --locked
 - `exec` tool executes host commands (host mode default; wrap with `AETHERVAULT_COMMAND_WRAPPER` for sandboxing).
 - `connect` runs a built-in OAuth broker for Google/Microsoft tokens.
 - Gmail/Calendar and Microsoft mail/calendar tools are available after OAuth (`gmail_*`, `gcal_*`, `ms_*`).
-- `http_request` provides a generic API surface (approval mode recommended for non-GET).
+- `http_request` provides a generic API surface (non-GET requires approval).
 - `browser_request` proxies automation to a local browser broker (Stagehand/CUA/etc).
 - `fs_list`, `fs_read`, `fs_write` give controlled filesystem access within allowed roots.
-- `approval_*` tools provide human-in-the-loop gating for sensitive actions.
+- Sensitive tools require approval; reply `approve <id>` or `reject <id>` when prompted.
 - `tool_search` enables dynamic tool lookup (no bloated prompt).
 - `session_context` fetches recent session logs efficiently.
 - `reflect` stores self-critique in the capsule for iterative improvement.
@@ -200,13 +200,12 @@ Optional: persist the hook in the capsule config so you can omit `--model-hook`:
     "model_hook": { "command": "builtin:claude", "timeout_ms": 60000 },
     "log": true,
     "max_steps": 128,
-    "log_commit_interval": 8
+    "log_commit_interval": 1
   }
 }'
 ```
 
-Note: lower `log_commit_interval` improves durability (set to 1 for audit‑grade logging).
-Batched commits can lose the last `log_commit_interval` log entries on a crash.
+Note: `log_commit_interval=1` fsyncs each log entry (best durability). Increasing it improves throughput but can lose the last N log entries on a crash.
 
 ## Docker deploy (minimal)
 

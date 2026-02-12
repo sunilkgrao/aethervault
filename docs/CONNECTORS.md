@@ -91,16 +91,22 @@ Then use the `browser_request` tool to drive actions (`open`, `click`, `type`, `
 
 ## Generic HTTP tool
 
-`http_request` provides a generic API surface for any REST endpoint. For non-`GET` methods, enable approval mode.
+`http_request` provides a generic API surface for any REST endpoint. Non-`GET` methods require approval.
 
 ## Approval mode (human-in-the-loop)
 
-Sensitive tools always return an approval request and no action will be taken until approved.
+Sensitive tools return an approval request and no action will be taken until approved.
 
-Tools:
-- `approval_list`
-- `approval_approve`
-- `approval_reject`
+Approve or reject from chat by replying:
+- `approve <id>`
+- `reject <id>`
+
+Or via CLI:
+
+```bash
+./target/release/aethervault approve ./data/knowledge.mv2 <id> --execute
+./target/release/aethervault reject ./data/knowledge.mv2 <id>
+```
 
 ## Event triggers
 
@@ -139,7 +145,7 @@ export ANTHROPIC_MODEL=claude-<model>
 
 ## Subagents / multi-session orchestration
 
-Subagents are configured in the capsule (`agent.subagents`) and can be invoked automatically or via the `subagent_invoke` tool.
+Subagents are configured in the capsule (`agent.subagents`) and invoked via the `subagent_invoke` tool.
 
 ## Useful env vars
 
