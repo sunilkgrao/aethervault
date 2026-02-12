@@ -1346,6 +1346,44 @@ fn save_session_turns(session_id: &str, turns: &[SessionTurn], max_turns: usize)
     }
 }
 
+
+// === Capsule File Locking ===
+// Advisory flock() to prevent concurrent WAL corruption on .mv2 files.
+
+struct CapsuleLock {
+    _file: std::fs::File,
+}
+
+fn acquire_capsule_lock(mv2_path: &std::path::Path) -> Result<CapsuleLock, Box<dyn std::error::Error>> {
+    let lock_path = mv2_path.with_extension("mv2.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("capsule lock create {}: {e}", lock_path.display()))?;
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let mut attempt = 0u32;
+    loop {
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(format!("flock({}) failed: {err}", lock_path.display()).into());
+        }
+        attempt += 1;
+        if attempt > 15 {
+            return Err(format!("capsule lock timeout after 30s: {} held by another process", lock_path.display()).into());
+        }
+        let wait_ms = std::cmp::min(100 * (1u64 << (attempt - 1)), 2000);
+        eprintln!("[lock] waiting for capsule lock ({attempt}/15, {wait_ms}ms)...");
+        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+    }
+    Ok(CapsuleLock { _file: file })
+}
+
 const TOOL_DETAILS_MAX_CHARS: usize = 4_000;
 const TOOL_OUTPUT_MAX_FOR_DETAILS: usize = 2_000;
 const DEFAULT_WORKSPACE_DIR: &str = "./assistant";
@@ -3123,7 +3161,14 @@ fn merge_capsule_into(
             }
         }
 
-        let payload = src.frame_canonical_payload(frame_id)?;
+        let payload = match src.frame_canonical_payload(frame_id) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("merge: skipping corrupt frame {} ({})", frame_id, e);
+                deduped += 1;  // count as skipped
+                continue;
+            }
+        };
         let mut options = PutOptions::default();
         options.timestamp = Some(frame.timestamp);
         options.track = frame.track.clone();
@@ -6382,6 +6427,7 @@ fn run_schedule_loop(
     log: bool,
     log_commit_interval: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _capsule_lock = acquire_capsule_lock(&mv2)?;
     let mut mem_read = Some(Vault::open_read_only(&mv2)?);
     let config = load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default();
     let agent_cfg = config.agent.clone().unwrap_or_default();
@@ -6815,7 +6861,7 @@ fn call_claude(request: &AgentHookRequest) -> Result<AgentHookResponse, Box<dyn 
     let model = env_required("ANTHROPIC_MODEL")?;
     let base_url = env_optional("ANTHROPIC_BASE_URL")
         .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".to_string());
-    let max_tokens = env_u64("ANTHROPIC_MAX_TOKENS", 1024)?;
+    let max_tokens = env_u64("ANTHROPIC_MAX_TOKENS", 8192)?;
     let temperature = env_optional("ANTHROPIC_TEMPERATURE")
         .map(|v| v.parse::<f64>())
         .transpose()
@@ -7013,7 +7059,7 @@ fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Result<AgentM
     }
 
     let cmd = command_spec_to_vec(&hook.command);
-    let timeout = hook.timeout_ms.unwrap_or(60000);
+    let timeout = hook.timeout_ms.unwrap_or(300000);
     let value = serde_json::to_value(request).map_err(|e| format!("hook input: {e}"))?;
     let raw = run_hook_command(&cmd, &value, timeout, "agent")?;
     let response: AgentHookResponse =
@@ -7053,6 +7099,8 @@ fn run_agent(
         system
     };
 
+    let prompt_for_session = prompt_text.clone();
+    let session_for_save = session.clone();
     let output = run_agent_with_prompt(
         mv2,
         prompt_text,
@@ -7067,6 +7115,28 @@ fn run_agent(
         log_commit_interval,
         log,
     )?;
+
+    // Save session turns for CLI agent continuity (mirrors Telegram bridge behaviour)
+    if let Some(ref sess_id) = session_for_save {
+        let mut turns = load_session_turns(sess_id, 8);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        turns.push(SessionTurn {
+            role: "user".to_string(),
+            content: prompt_for_session,
+            timestamp: now,
+        });
+        if let Some(ref reply) = output.final_text {
+            turns.push(SessionTurn {
+                role: "assistant".to_string(),
+                content: reply.clone(),
+                timestamp: now,
+            });
+        }
+        save_session_turns(sess_id, &turns, 8);
+    }
 
     if json {
         let payload = AgentSession {
@@ -7100,13 +7170,14 @@ fn run_agent_with_prompt(
         return Err("agent prompt is empty".into());
     }
 
+    let _capsule_lock = acquire_capsule_lock(&mv2)?;
     let mut mem_read = Some(Vault::open_read_only(&mv2)?);
     let config = load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default();
     let agent_cfg = config.agent.clone().unwrap_or_default();
     let hook_cfg = config.hooks.clone().unwrap_or_default();
     let model_spec = resolve_hook_spec(
         model_hook,
-        60000,
+        300000,
         agent_cfg.model_hook.clone().or(hook_cfg.llm),
         None,
     )
@@ -7444,7 +7515,7 @@ fn build_bridge_agent_config(
     let log_commit_interval = log_commit_interval.max(1);
     let log = log;
     let session_prefix = String::new();
-    let timeout = Duration::from_secs(120);
+    let timeout = Duration::from_secs(900);
 
     Ok(BridgeAgentConfig {
         mv2,
