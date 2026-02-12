@@ -1,0 +1,157 @@
+name: Telegram Auto-Start Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        required: true
+      droplet_id:
+        required: true
+      anthropic_key:
+        required: true
+      telegram_token:
+        required: true
+      phone:
+        required: true
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Droplet IP
+        id: ip
+        run: |
+          IP=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          echo "Droplet IP: $IP"
+
+      - name: Rebuild with Telegram auto-start
+        run: |
+          USER_DATA='#!/bin/bash
+          exec > /var/log/aethervault-setup.log 2>&1
+          set -x
+
+          echo "=== Starting Setup ==="
+
+          apt-get update
+          apt-get install -y curl
+
+          # Install Node.js 22
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs
+
+          # Install aethervault
+          npm install -g aethervault@latest
+
+          # Create directories
+          mkdir -p /root/.aethervault /root/aethervault-workspace
+
+          # Create config - TELEGRAM ONLY
+          cat > /root/.aethervault/aethervault.json << CONFIGEND
+          {
+            "agent": {
+              "model": "anthropic/claude-sonnet-4"
+            },
+            "gateway": {
+              "port": 18789,
+              "host": "0.0.0.0"
+            },
+            "security": {
+              "dm_policy": "allowlist",
+              "allowlist": ["${{ inputs.phone }}"]
+            },
+            "channels": {
+              "telegram": {
+                "enabled": true
+              }
+            }
+          }
+          CONFIGEND
+
+          # Create env file
+          cat > /root/.aethervault/.env << ENVEND
+          ANTHROPIC_API_KEY=${{ inputs.anthropic_key }}
+          TELEGRAM_BOT_TOKEN=${{ inputs.telegram_token }}
+          ENVEND
+
+          # Create systemd service that auto-starts
+          cat > /etc/systemd/system/aethervault.service << SVCEND
+          [Unit]
+          Description=AetherVault Gateway
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/root/aethervault-workspace
+          Environment=HOME=/root
+          Environment=NODE_ENV=production
+          Environment=ANTHROPIC_API_KEY=${{ inputs.anthropic_key }}
+          Environment=TELEGRAM_BOT_TOKEN=${{ inputs.telegram_token }}
+          ExecStartPre=/bin/sleep 10
+          ExecStart=/usr/bin/aethervault gateway --port 18789 --verbose
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEND
+
+          # Enable and start service
+          systemctl daemon-reload
+          systemctl enable aethervault
+          systemctl start aethervault
+
+          # Also start manually as backup
+          cd /root/aethervault-workspace
+          export ANTHROPIC_API_KEY=${{ inputs.anthropic_key }}
+          export TELEGRAM_BOT_TOKEN=${{ inputs.telegram_token }}
+
+          echo "=== Setup Complete ==="
+          echo "READY" > /root/setup-complete
+          '
+
+          # Rebuild droplet
+          RESPONSE=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}/actions" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\": \"rebuild\", \"image\": \"ubuntu-24-04-x64\", \"user_data\": $(echo "$USER_DATA" | jq -Rs .)}")
+
+          echo "Rebuild response: $RESPONSE"
+          ACTION_ID=$(echo "$RESPONSE" | jq -r '.action.id')
+
+          # Wait for rebuild
+          for i in {1..50}; do
+            sleep 12
+            STATUS=$(curl -s "https://api.digitalocean.com/v2/actions/$ACTION_ID" \
+              -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.action.status')
+            echo "[$i/50] Rebuild: $STATUS"
+            if [ "$STATUS" = "completed" ]; then break; fi
+            if [ "$STATUS" = "errored" ]; then exit 1; fi
+          done
+
+          echo "Waiting for cloud-init to complete (4 min)..."
+          sleep 240
+
+      - name: Verify bot is responding
+        run: |
+          echo "Testing if aethervault is processing messages..."
+
+          # Get any pending updates
+          UPDATES=$(curl -s "https://api.telegram.org/bot${{ inputs.telegram_token }}/getUpdates?limit=1")
+          echo "Updates: $UPDATES"
+
+          # Send a verification message
+          CHAT_ID=$(echo "$UPDATES" | jq -r '.result[-1].message.chat.id // empty')
+          if [ -n "$CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${{ inputs.telegram_token }}/sendMessage" \
+              -d "chat_id=$CHAT_ID" \
+              -d "text=✅ AetherVault service started! Try sending a message now."
+          fi
+
+          echo ""
+          echo "=== DONE ==="
+          echo "Droplet IP: ${{ steps.ip.outputs.ip }}"
+          echo "Telegram bot should be responding now!"

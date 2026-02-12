@@ -1,0 +1,63 @@
+name: Check Server Status
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        required: true
+      gh_token:
+        required: true
+      droplet_id:
+        required: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate SSH Key
+        run: ssh-keygen -t ed25519 -f /tmp/key -N "" -C "check"
+
+      - name: Get Droplet IP
+        id: ip
+        run: |
+          IP=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          echo "Droplet IP: $IP"
+
+      - name: Check Telegram Bot API directly
+        run: |
+          echo "=== Testing Telegram Bot API ==="
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/getMe" | jq .
+
+          echo ""
+          echo "=== Recent Updates (messages to bot) ==="
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/getUpdates" | jq '.result[-5:]'
+
+      - name: Check if gateway port is open
+        run: |
+          IP="${{ steps.ip.outputs.ip }}"
+          echo "=== Checking if port 18789 is open ==="
+          nc -zv $IP 18789 2>&1 || echo "Port 18789 not responding"
+
+          echo ""
+          echo "=== Trying to reach gateway ==="
+          curl -s --connect-timeout 10 "http://$IP:18789" 2>&1 || echo "Gateway not responding"
+
+      - name: Post diagnostic info
+        run: |
+          # Get bot info
+          BOT_INFO=$(curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/getMe")
+          BOT_OK=$(echo "$BOT_INFO" | jq -r '.ok')
+
+          # Get recent messages
+          UPDATES=$(curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/getUpdates?limit=5")
+          UPDATE_COUNT=$(echo "$UPDATES" | jq '.result | length')
+
+          curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -H "Authorization: token ${{ inputs.gh_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"title\": \"🔍 Server Diagnostic Report\",
+              \"body\": \"## Diagnostic Results\\n\\n### Telegram Bot API\\n- Bot API working: $BOT_OK\\n- Recent messages in queue: $UPDATE_COUNT\\n\\n### Server\\n- Droplet IP: ${{ steps.ip.outputs.ip }}\\n\\n### Raw Bot Info\\n\\\`\\\`\\\`json\\n$(echo $BOT_INFO | jq -c .)\\n\\\`\\\`\\\`\\n\\n### Recent Updates\\n\\\`\\\`\\\`json\\n$(echo $UPDATES | jq -c '.result[-3:]')\\n\\\`\\\`\\\`\\n\\n### Likely Issues\\n1. AetherVault service may not be running\\n2. Telegram webhook may not be set\\n3. Service may have crashed on startup\\n\\n### To Fix\\nSSH in and check:\\n\\\`\\\`\\\`bash\\nssh root@${{ steps.ip.outputs.ip }}\\nsystemctl status aethervault\\njournalctl -u aethervault -n 50\\naethervault gateway --verbose\\n\\\`\\\`\\\`\"
+            }"

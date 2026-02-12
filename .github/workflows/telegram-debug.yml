@@ -1,0 +1,28 @@
+name: Telegram Debug
+
+on:
+  workflow_dispatch:
+    inputs:
+      gh_token:
+        required: true
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test and Report
+        run: |
+          BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          
+          BOT_INFO=$(curl -s "https://api.telegram.org/bot$BOT_TOKEN/getMe")
+          WEBHOOK_INFO=$(curl -s "https://api.telegram.org/bot$BOT_TOKEN/getWebhookInfo")
+          UPDATES=$(curl -s "https://api.telegram.org/bot$BOT_TOKEN/getUpdates?limit=5")
+          
+          # Create issue with results
+          curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -H "Authorization: token ${{ inputs.gh_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"title\": \"🔧 Telegram Debug Results\",
+              \"body\": \"## Bot Info\\n\\\`\\\`\\\`json\\n$(echo $BOT_INFO | jq -c .)\\n\\\`\\\`\\\`\\n\\n## Webhook Info\\n\\\`\\\`\\\`json\\n$(echo $WEBHOOK_INFO | jq -c .)\\n\\\`\\\`\\\`\\n\\n## Recent Updates (messages)\\n\\\`\\\`\\\`json\\n$(echo $UPDATES | jq -c .)\\n\\\`\\\`\\\`\\n\\n## Analysis\\n- If webhook URL is empty: aethervault service isn't running or didn't set webhook\\n- If updates show messages: bot is receiving but not processing\\n- Need to SSH in and start aethervault manually\"
+            }"

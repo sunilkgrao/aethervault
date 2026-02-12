@@ -1,0 +1,18 @@
+[Unit]
+Description=AetherVault Gateway Service (AetherVault runtime)
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.aethervault
+EnvironmentFile=/root/.aethervault/.env
+# Apply patches before starting (survives npm updates)
+ExecStartPre=/root/.aethervault/patches/apply-patches.sh
+ExecStart=/usr/bin/aethervault gateway --verbose
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,112 @@
+name: Configure AetherVault Security
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        required: true
+      gh_token:
+        required: true
+      anthropic_key:
+        required: true
+      droplet_id:
+        required: true
+      your_phone:
+        description: 'Your phone number (with country code, e.g., +1234567890)'
+        required: true
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate SSH Key
+        run: |
+          ssh-keygen -t ed25519 -f /tmp/key -N "" -C "config"
+          
+      - name: Get Droplet IP
+        id: ip
+        run: |
+          IP=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+
+      - name: Rebuild with secure config
+        run: |
+          SSH_PUB=$(cat /tmp/key.pub)
+          
+          USER_DATA=$(cat << USERDATA
+          #!/bin/bash
+          exec > /var/log/setup.log 2>&1
+          
+          mkdir -p /root/.ssh
+          echo "$SSH_PUB" >> /root/.ssh/authorized_keys
+          chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+          
+          apt-get update
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs
+          npm install -g aethervault@latest
+          
+          mkdir -p /root/.aethervault /root/aethervault-workspace
+          
+          # SECURE CONFIG - only responds to allowlisted numbers
+          cat > /root/.aethervault/aethervault.json << 'CONFIG'
+          {
+            "agent": {
+              "model": "anthropic/claude-sonnet-4"
+            },
+            "gateway": {
+              "port": 18789,
+              "host": "0.0.0.0"
+            },
+            "security": {
+              "dm_policy": "allowlist",
+              "allowlist": ["${{ inputs.your_phone }}"]
+            },
+            "channels": {
+              "whatsapp": {
+                "enabled": true,
+                "respond_to_self": true,
+                "respond_to_groups": false
+              }
+            }
+          }
+          CONFIG
+          
+          echo "ANTHROPIC_API_KEY=${{ inputs.anthropic_key }}" > /root/.aethervault/.env
+          
+          ufw allow 22 && ufw allow 18789 && ufw --force enable
+          
+          cat > /etc/systemd/system/aethervault.service << 'SVC'
+          [Unit]
+          Description=AetherVault
+          After=network.target
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/root/aethervault-workspace
+          EnvironmentFile=/root/.aethervault/.env
+          ExecStart=/usr/bin/aethervault gateway --port 18789
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+          SVC
+          
+          systemctl daemon-reload
+          echo "READY" > /root/ready
+          USERDATA
+          )
+          
+          curl -s -X POST "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}/actions" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\": \"rebuild\", \"image\": \"ubuntu-24-04-x64\", \"user_data\": $(echo "$USER_DATA" | jq -Rs .)}"
+          
+          echo "Rebuilding with secure config..."
+          sleep 300
+
+      - name: Post instructions
+        run: |
+          curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -H "Authorization: token ${{ inputs.gh_token }}" \
+            -d "{\"title\": \"✅ AetherVault configured for YOU only\", \"body\": \"AetherVault will now ONLY respond to messages from: ${{ inputs.your_phone }}\\n\\nSSH in and scan QR:\\n\\\`\\\`\\\`\\nssh root@${{ steps.ip.outputs.ip }}\\naethervault gateway --verbose\\n\\\`\\\`\\\`\"}"

@@ -1,0 +1,56 @@
+name: Check Server Logs
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        required: true
+      gh_token:
+        required: true
+      droplet_id:
+        required: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get IP
+        id: ip
+        run: |
+          IP=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+
+      - name: Check via Droplet Console API
+        run: |
+          # Try to get console output
+          echo "=== Checking droplet status ==="
+          curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" | jq '{status: .droplet.status, memory: .droplet.memory, vcpus: .droplet.vcpus}'
+
+      - name: Check if port 18789 is responding
+        run: |
+          IP="${{ steps.ip.outputs.ip }}"
+          echo "=== Testing gateway port ==="
+          curl -s --connect-timeout 10 "http://$IP:18789" || echo "Gateway not responding on port 18789"
+          
+          echo ""
+          echo "=== Testing with nc ==="
+          nc -zv -w 5 $IP 18789 2>&1 || echo "Port 18789 closed"
+
+      - name: Post findings
+        run: |
+          IP="${{ steps.ip.outputs.ip }}"
+          
+          # Check port
+          PORT_STATUS="closed"
+          if nc -zv -w 5 $IP 18789 2>&1 | grep -q "succeeded"; then
+            PORT_STATUS="open"
+          fi
+          
+          curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -H "Authorization: token ${{ inputs.gh_token }}" \
+            -d "{
+              \"title\": \"📊 Server Status Check\",
+              \"body\": \"## Server Status\\n\\n- **IP:** $IP\\n- **Port 18789:** $PORT_STATUS\\n\\n### Diagnosis\\nIf port is closed, aethervault service is not running.\\n\\nThe service may have failed to start due to:\\n1. Missing dependencies\\n2. Config error\\n3. API key issue\\n\\n### Logs location\\n\\\`/var/log/aethervault-setup.log\\\` - setup log\\n\\\`/var/log/aethervault.log\\\` - runtime log\\n\\\`journalctl -u aethervault\\\` - systemd log\"
+            }"

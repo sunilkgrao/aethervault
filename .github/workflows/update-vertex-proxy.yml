@@ -1,0 +1,70 @@
+name: Update Vertex Proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        required: true
+        description: "DigitalOcean API token"
+      droplet_id:
+        required: true
+        description: "Droplet ID"
+      ssh_key:
+        required: true
+        description: "Base64-encoded SSH private key"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get Droplet IP
+        id: ip
+        run: |
+          IP=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          echo "Droplet IP: $IP"
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ inputs.ssh_key }}" | base64 -d > ~/.ssh/do_key
+          chmod 600 ~/.ssh/do_key
+          ssh-keyscan -H ${{ steps.ip.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Deploy vertex proxy
+        run: |
+          # Copy the updated proxy
+          scp -i ~/.ssh/do_key -o StrictHostKeyChecking=no \
+            vertex_proxy.py root@${{ steps.ip.outputs.ip }}:/root/vertex_proxy.py
+
+          # Restart the proxy service if running
+          ssh -i ~/.ssh/do_key -o StrictHostKeyChecking=no root@${{ steps.ip.outputs.ip }} '
+            # Find and kill existing proxy
+            pkill -f "python.*vertex_proxy" || true
+
+            # Start the new proxy in the background
+            cd /root
+            nohup python3 vertex_proxy.py > /var/log/vertex-proxy.log 2>&1 &
+
+            sleep 2
+
+            # Verify it started
+            if pgrep -f "python.*vertex_proxy" > /dev/null; then
+              echo "✅ Vertex proxy restarted successfully"
+              tail -5 /var/log/vertex-proxy.log
+            else
+              echo "❌ Failed to start proxy"
+              cat /var/log/vertex-proxy.log
+              exit 1
+            fi
+          '
+
+      - name: Verify proxy
+        run: |
+          echo "Proxy deployment complete!"
+          echo "Droplet IP: ${{ steps.ip.outputs.ip }}"
+          echo "The proxy should now be running with token tracking fixes."

@@ -1,5 +1,50 @@
+# Rust
 /target
-/.tmp
 *.mv2
 *.mv2e
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.ruff_cache/
+test_vertex_*.py
+
+# Runtime data
+workspace/
+*.sqlite
+*.sqlite3
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+!config/env.example
+.secrets/
+vertex-credentials.json
+*-credentials.json
+*.pem
+*.key
+
+# Private agent data
+docs/SOUL.md
+docs/SOUL-enriched.md
+docs/MEMORY-enriched.md
 AGENTS.local.md
+
+# Django
+staticfiles/
+media/
+node_modules/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Editor/temp
+/.tmp

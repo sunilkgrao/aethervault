@@ -1,0 +1,71 @@
+name: Check Kimi K2.5 Download Status
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        required: true
+      gh_token:
+        required: true
+      droplet_id:
+        required: true
+      pc_ssh_key:
+        required: true
+        description: "SSH private key for Windows PC"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Droplet IP
+        id: ip
+        run: |
+          IP=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          echo "Droplet IP: $IP"
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ inputs.pc_ssh_key }}" > ~/.ssh/pc_key
+          chmod 600 ~/.ssh/pc_key
+          ssh-keygen -t ed25519 -f ~/.ssh/do_key -N "" -C "check"
+
+      - name: Add DO SSH Key
+        run: |
+          KEY=$(cat ~/.ssh/do_key.pub)
+          curl -s -X POST "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}/actions" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\": \"add_ssh_key\", \"ssh_key\": \"$KEY\"}"
+          sleep 10
+
+      - name: Check download status via DO -> Windows
+        run: |
+          IP="${{ steps.ip.outputs.ip }}"
+
+          # First copy the PC key to DO server
+          scp -o StrictHostKeyChecking=no -i ~/.ssh/do_key ~/.ssh/pc_key root@$IP:/tmp/pc_key
+
+          # Then SSH to DO, then to Windows, check files
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/do_key root@$IP << 'DOSSH'
+          chmod 600 /tmp/pc_key
+
+          echo "=== Checking Kimi K2.5 model files ==="
+          ssh -o StrictHostKeyChecking=no -i /tmp/pc_key windows-pc 'wsl bash -c "ls -lh /mnt/a/llm-models/Kimi-K2.5-GGUF/UD-TQ1_0/ 2>/dev/null || echo No model directory found"'
+
+          echo ""
+          echo "=== Checking llama.cpp files ==="
+          ssh -o StrictHostKeyChecking=no -i /tmp/pc_key windows-pc 'wsl bash -c "ls -lh /mnt/a/llm-models/llama.cpp/ 2>/dev/null || echo No llama.cpp directory found"'
+
+          echo ""
+          echo "=== Checking running curl processes ==="
+          ssh -o StrictHostKeyChecking=no -i /tmp/pc_key windows-pc 'wsl bash -c "ps aux | grep curl | grep -v grep || echo No curl processes running"'
+
+          rm -f /tmp/pc_key
+          DOSSH
+
+      - name: Post status to issue
+        run: |
+          echo "Status check complete - see output above"

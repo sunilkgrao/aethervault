@@ -1,0 +1,44 @@
+[Unit]
+Description=AetherVault Gateway - Personal AI Assistant (aethervault runtime)
+Documentation=https://github.com/aethervault/aethervault
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aethervault
+Group=aethervault
+WorkingDirectory=/home/aethervault/aethervault-workspace
+
+# Environment
+Environment=NODE_ENV=production
+Environment=HOME=/home/aethervault
+
+# Main process
+ExecStart=/usr/bin/aethervault gateway --port 18789 --verbose
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=65535
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/aethervault/.aethervault /home/aethervault/aethervault-workspace
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aethervault
+
+[Install]
+WantedBy=multi-user.target

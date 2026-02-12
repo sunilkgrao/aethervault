@@ -1,0 +1,12 @@
+# AetherVault intelligence layer dependencies
+# Install with: pip install -r requirements-core.txt
+#
+# These are the Python packages required by the knowledge graph,
+# daily lifecycle scripts, proxy servers, and test runner.
+# For the Django superclustered app, see requirements.txt instead.
+
+# Knowledge graph
+networkx>=3.1
+
+# Battle test runner (also used in morning briefing for potential extensions)
+requests>=2.31

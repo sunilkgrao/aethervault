@@ -1,0 +1,21 @@
+name: Test Telegram
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test Bot
+        run: |
+          echo "=== Bot Info ==="
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/getMe" | jq .
+          
+          echo ""
+          echo "=== Webhook Info ==="
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/getWebhookInfo" | jq .
+          
+          echo ""
+          echo "=== Recent Updates ==="
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/getUpdates?limit=3" | jq .

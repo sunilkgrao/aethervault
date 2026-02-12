@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "profiles": {
+    "ollama-local": {
+      "type": "api_key",
+      "provider": "ollama",
+      "key": "ollama"
+    }
+  },
+  "order": {
+    "ollama": ["ollama-local"]
+  }
+}

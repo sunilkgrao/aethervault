@@ -1,0 +1,115 @@
+name: Provision DigitalOcean Droplet
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        description: 'DigitalOcean API Token'
+        required: true
+        type: string
+      droplet_name:
+        description: 'Droplet name'
+        required: false
+        default: 'aethervault'
+        type: string
+      region:
+        description: 'Region'
+        required: false
+        default: 'nyc1'
+        type: string
+      size:
+        description: 'Droplet size'
+        required: false
+        default: 's-1vcpu-2gb'
+        type: string
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Droplet
+        id: create
+        run: |
+          # Create user-data script
+          USER_DATA=$(cat << 'EOF'
+          #!/bin/bash
+          apt-get update && apt-get install -y curl ufw
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs
+          npm install -g aethervault@latest
+          mkdir -p /root/.aethervault /root/aethervault-workspace
+          ufw allow 22
+          ufw allow 18789
+          ufw --force enable
+          echo '{"agent":{"model":"anthropic/claude-sonnet-4"},"gateway":{"port":18789,"host":"0.0.0.0"},"channels":{}}' > /root/.aethervault/aethervault.json
+          EOF
+          )
+
+          # Create droplet
+          RESPONSE=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"name\": \"${{ inputs.droplet_name }}\",
+              \"region\": \"${{ inputs.region }}\",
+              \"size\": \"${{ inputs.size }}\",
+              \"image\": \"ubuntu-24-04-x64\",
+              \"user_data\": $(echo "$USER_DATA" | jq -Rs .),
+              \"tags\": [\"aethervault\"]
+            }")
+
+          echo "Response: $RESPONSE"
+
+          DROPLET_ID=$(echo "$RESPONSE" | jq -r '.droplet.id')
+          echo "droplet_id=$DROPLET_ID" >> $GITHUB_OUTPUT
+
+          if [ "$DROPLET_ID" == "null" ] || [ -z "$DROPLET_ID" ]; then
+            echo "ERROR: Failed to create droplet"
+            echo "$RESPONSE" | jq .
+            exit 1
+          fi
+
+          echo "Droplet ID: $DROPLET_ID"
+
+      - name: Wait for Droplet
+        id: wait
+        run: |
+          DROPLET_ID="${{ steps.create.outputs.droplet_id }}"
+          echo "Waiting for droplet $DROPLET_ID to be ready..."
+
+          for i in {1..30}; do
+            RESPONSE=$(curl -s "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
+              -H "Authorization: Bearer ${{ inputs.do_token }}")
+
+            STATUS=$(echo "$RESPONSE" | jq -r '.droplet.status')
+            IP=$(echo "$RESPONSE" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address' | head -1)
+
+            echo "Status: $STATUS, IP: $IP"
+
+            if [ "$STATUS" == "active" ] && [ -n "$IP" ] && [ "$IP" != "null" ]; then
+              echo "ip_address=$IP" >> $GITHUB_OUTPUT
+              echo "status=success" >> $GITHUB_OUTPUT
+              break
+            fi
+
+            sleep 10
+          done
+
+      - name: Output Results
+        run: |
+          echo "=========================================="
+          echo "  DROPLET PROVISIONED SUCCESSFULLY"
+          echo "=========================================="
+          echo ""
+          echo "Droplet ID: ${{ steps.create.outputs.droplet_id }}"
+          echo "IP Address: ${{ steps.wait.outputs.ip_address }}"
+          echo ""
+          echo "SSH Command:"
+          echo "  ssh root@${{ steps.wait.outputs.ip_address }}"
+          echo ""
+          echo "Next steps:"
+          echo "  1. Wait 2-3 minutes for cloud-init to complete"
+          echo "  2. SSH into the droplet"
+          echo "  3. Add your ANTHROPIC_API_KEY to ~/.aethervault/.env"
+          echo "  4. Run: aethervault gateway --port 18789 --verbose"
+          echo ""

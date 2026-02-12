@@ -1,14 +1,14 @@
 # AetherVault
 
-**AetherVault** is a **single‑file, append‑only memory capsule** plus a **hybrid retrieval engine** for agents.  
+**AetherVault** is a **single‑file, append‑only memory capsule** plus a **hybrid retrieval engine** for agents.
 All content, indexes, embeddings, queries, and feedback live inside one `.mv2` archive.
 
-## Why it’s novel
+## Why it's novel
 
 - **Memory is portable, auditable, and mergeable**: everything (content + indexes + query/feedback traces) lives in one capsule you can diff/merge like a repo.
 - **Queries are first‑class memory**: searches, expansions, reranks, and feedback are stored as frames, so the system improves while staying explainable.
 - **Hybrid retrieval by design**: expansion → lex + vec lanes → fusion → rerank → blend, with hook points for local or remote models.
-- **Time‑travel retrieval**: “what did the agent know at time T?” is a built‑in query mode.
+- **Time‑travel retrieval**: "what did the agent know at time T?" is a built‑in query mode.
 - **Agent‑ready surface**: MCP server compatibility, context packs, and a minimal hook‑based agent loop.
 
 ## System at a glance
@@ -131,7 +131,7 @@ Build with vector support and provide local embedding models:
 cargo build --locked --features vec
 ```
 
-The embed backend prints a download command if the ONNX model/tokenizer is missing.  
+The embed backend prints a download command if the ONNX model/tokenizer is missing.
 Tune performance with `embed --batch N` and query flags like `--embed-cache`.
 
 ## Agent hook (minimal harness)
@@ -244,3 +244,109 @@ docker run --rm -it \
 - MCP‑compatible tool server backed by the capsule.
 - Portable capsule config stored at `aethervault://config/...`.
 - Capsule diff + merge tooling (git‑like for memory).
+
+---
+
+## Intelligence Layer (Python)
+
+The intelligence layer adds autonomous lifecycle automation, a knowledge graph, model proxy routing, and session management on top of the Rust capsule binary.
+
+### Architecture
+
+```
+Telegram / WhatsApp
+        |
+   AetherVault Gateway (port 18789)
+        |
+   Capsule Memory (MV2 append-only store)
+        |
+   Intelligence Layer (Python)
+   |- Knowledge Graph (NetworkX, JSON-backed)
+   |- Morning Briefing Generator
+   |- Nightly Consolidation (summarize + extract facts)
+   |- Evening Check-In
+   |- Session Manager (spawn/list/check/kill background agents)
+   |- Capabilities Registry (auto-discover hooks, crons, services)
+        |
+   Model Proxy Layer
+   |- Vertex AI Proxy  (port 11436) -- Claude on GCP with token tracking
+   |- Moonshot Proxy   (port 11435) -- Kimi K2.5 via OpenAI-compat API
+   |- llama.cpp Proxy  (port 11434) -- local models via SSH tunnel
+```
+
+### Key Components
+
+**Knowledge Graph** -- `knowledge-graph.py`
+NetworkX-based directed graph stored as JSON. Supports entity/relation CRUD, NLP-based
+text ingestion, context summaries, and atomic file-locked transactions.
+
+**Model Proxy Layer** -- `vertex_proxy.py`, `moonshot_proxy.py`, `llama_proxy.py`
+Lightweight HTTP proxies that translate between the Anthropic Messages API and various
+backends. The Vertex proxy handles SSE token tracking fixes; the Moonshot proxy rewrites
+model names; the llama proxy tunnels requests over SSH to a local GPU machine.
+
+**Daily Lifecycle**
+- `scripts/morning-briefing.py` -- Gathers weather, email, calendar, knowledge graph projects, and yesterday's summary. Sends via Telegram.
+- `scripts/nightly-consolidation.py` -- Reads agent logs from the capsule, uses Claude to extract facts/entities/relations, updates MEMORY.md and the knowledge graph.
+- `scripts/proactive-checkin.py` -- Evening nudge surfacing unaddressed items.
+
+**Session Manager** -- `scripts/session-manager.py`
+Spawns named background agent sessions with per-session capsules to avoid lock contention.
+
+**Capabilities Registry** -- `scripts/capabilities.py`
+Auto-discovers hooks, cron jobs, and systemd services. The agent queries it before attempting to use any capability.
+
+### Intelligence Layer Quick Start
+
+```bash
+# Install Python dependencies
+pip install -r requirements-core.txt
+
+# Start proxy services
+bash start_services.sh
+
+# Set up cron jobs for daily lifecycle
+# 0 8 * * 1-5 ~/.aethervault/hooks/morning-briefing.sh
+# 0 23 * * *  ~/.aethervault/hooks/nightly-consolidation.sh
+```
+
+### Configuration
+
+Copy `config/env.example` to `~/.aethervault/.env` and edit it. The runtime config lives in `config/aethervault.json`.
+
+See `config/env.example` for the complete list of environment variables with defaults and comments.
+
+### DigitalOcean Deployment
+
+```bash
+export DO_TOKEN="your-digitalocean-api-token"
+bash deploy/digitalocean/provision.sh
+```
+
+See `deploy/digitalocean/README.md` for the full deployment guide.
+
+### Project Structure (Intelligence Layer)
+
+```
+.
+├── knowledge-graph.py          # Knowledge graph engine (NetworkX)
+├── vertex_proxy.py             # Vertex AI Claude proxy with token tracking
+├── moonshot_proxy.py           # Moonshot/Kimi proxy
+├── llama_proxy.py              # llama.cpp proxy via SSH tunnel
+├── start_services.sh           # Start all proxy services
+├── scripts/                    # Lifecycle scripts (briefing, consolidation, etc.)
+├── config/
+│   ├── env.example             # Environment variable template
+│   ├── aethervault.json        # Runtime configuration
+│   └── auth-profiles.json      # Provider auth profiles
+├── deploy/
+│   ├── digitalocean/           # DO provisioning scripts
+│   └── systemd/                # Systemd service files
+├── superclustered/             # Django community app
+├── requirements.txt            # Django app dependencies
+└── requirements-core.txt       # Intelligence layer dependencies
+```
+
+## License
+
+MIT License. See [LICENSE](LICENSE).

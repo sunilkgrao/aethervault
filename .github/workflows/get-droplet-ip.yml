@@ -1,0 +1,57 @@
+name: Get Droplet IP
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        description: 'DigitalOcean API Token'
+        required: true
+        type: string
+      gh_token:
+        description: 'GitHub Token for creating issue'
+        required: true
+        type: string
+
+jobs:
+  get-ip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Droplet Info
+        id: droplet
+        run: |
+          RESPONSE=$(curl -s "https://api.digitalocean.com/v2/droplets?tag_name=aethervault" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}")
+
+          IP=$(echo "$RESPONSE" | jq -r '.droplets[0].networks.v4[] | select(.type=="public") | .ip_address')
+          DROPLET_ID=$(echo "$RESPONSE" | jq -r '.droplets[0].id')
+          NAME=$(echo "$RESPONSE" | jq -r '.droplets[0].name')
+          STATUS=$(echo "$RESPONSE" | jq -r '.droplets[0].status')
+
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          echo "droplet_id=$DROPLET_ID" >> $GITHUB_OUTPUT
+
+          echo "## Droplet Info" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **IP Address** | \`$IP\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Droplet ID** | $DROPLET_ID |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Name** | $NAME |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | $STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Connection" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "ssh root@$IP" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create Issue with IP
+        run: |
+          curl -s -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -H "Authorization: token ${{ inputs.gh_token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d '{
+              "title": "AetherVault Droplet Info",
+              "body": "## Your Droplet is Ready!\n\n**IP Address:** `${{ steps.droplet.outputs.ip }}`\n\n**Droplet ID:** ${{ steps.droplet.outputs.droplet_id }}\n\n### Connect via SSH\n```bash\nssh root@${{ steps.droplet.outputs.ip }}\n```\n\n### Gateway URL\nhttp://${{ steps.droplet.outputs.ip }}:18789\n\n### Next Steps\n1. SSH into the droplet\n2. Add your API keys to `~/.aethervault/.env`\n3. Run `aethervault gateway --verbose`",
+              "labels": ["droplet-info"]
+            }'

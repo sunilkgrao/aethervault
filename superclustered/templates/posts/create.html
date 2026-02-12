@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}New post — c/{{ community.slug }}{% endblock %}
+
+{% block content %}
+  <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
+    <div>
+      <h1 class="h3 mb-1">New post</h1>
+      <div class="sc-meta">c/{{ community.slug }}</div>
+    </div>
+    <a class="btn btn-outline-dark" href="/c/{{ community.slug }}/">Back</a>
+  </div>
+
+  <form method="post" enctype="multipart/form-data" novalidate>
+    {% csrf_token %}
+    {% if form.non_field_errors %}
+      <div class="alert alert-danger">{{ form.non_field_errors }}</div>
+    {% endif %}
+
+    <div class="mb-3">
+      <label class="form-label" for="{{ form.title.id_for_label }}">Title</label>
+      {{ form.title }}
+      {% if form.title.errors %}
+        <div class="text-danger small mt-1">{{ form.title.errors }}</div>
+      {% endif %}
+    </div>
+
+    <div class="mb-3">
+      <label class="form-label" for="{{ form.topic.id_for_label }}">Topic (optional)</label>
+      {{ form.topic }}
+      {% if form.topic.errors %}
+        <div class="text-danger small mt-1">{{ form.topic.errors }}</div>
+      {% endif %}
+    </div>
+
+    <div class="mb-3">
+      <label class="form-label" for="{{ form.body.id_for_label }}">Body (Markdown supported)</label>
+      {{ form.body }}
+      {% if form.body.errors %}
+        <div class="text-danger small mt-1">{{ form.body.errors }}</div>
+      {% endif %}
+    </div>
+
+    <div class="mb-4">
+      <label class="form-label" for="{{ form.attachments.id_for_label }}">Attachments (optional)</label>
+      {{ form.attachments }}
+      <div class="sc-meta mt-1">Uploads are public within the community’s visibility.</div>
+      {% if form.attachments.errors %}
+        <div class="text-danger small mt-1">{{ form.attachments.errors }}</div>
+      {% endif %}
+    </div>
+
+    <div class="d-flex gap-2">
+      <button class="btn btn-primary" type="submit">Post</button>
+      <a class="btn btn-outline-dark" href="/c/{{ community.slug }}/">Cancel</a>
+    </div>
+  </form>
+{% endblock %}
+

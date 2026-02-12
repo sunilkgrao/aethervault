@@ -1,0 +1,147 @@
+name: Add Telegram Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        required: true
+      gh_token:
+        required: true
+      anthropic_key:
+        required: true
+      droplet_id:
+        required: true
+      your_phone:
+        required: true
+      telegram_token:
+        description: 'Telegram Bot Token'
+        required: true
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate SSH Key
+        run: ssh-keygen -t ed25519 -f /tmp/key -N "" -C "config"
+
+      - name: Get Droplet IP
+        id: ip
+        run: |
+          IP=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+
+      - name: Rebuild with WhatsApp + Telegram
+        run: |
+          SSH_PUB=$(cat /tmp/key.pub)
+
+          USER_DATA=$(cat << 'USERDATA'
+          #!/bin/bash
+          exec > /var/log/setup.log 2>&1
+
+          mkdir -p /root/.ssh
+          echo "SSH_PUB_PLACEHOLDER" >> /root/.ssh/authorized_keys
+          chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+
+          apt-get update
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs
+          npm install -g aethervault@latest
+
+          mkdir -p /root/.aethervault /root/aethervault-workspace
+
+          cat > /root/.aethervault/aethervault.json << 'CONFIG'
+          {
+            "agent": {
+              "model": "anthropic/claude-sonnet-4"
+            },
+            "gateway": {
+              "port": 18789,
+              "host": "0.0.0.0"
+            },
+            "security": {
+              "dm_policy": "allowlist",
+              "allowlist": ["PHONE_PLACEHOLDER"]
+            },
+            "channels": {
+              "whatsapp": {
+                "enabled": true,
+                "respond_to_self": true,
+                "respond_to_groups": false
+              },
+              "telegram": {
+                "enabled": true
+              }
+            }
+          }
+          CONFIG
+
+          cat > /root/.aethervault/.env << 'ENVFILE'
+          ANTHROPIC_API_KEY=ANTHROPIC_PLACEHOLDER
+          TELEGRAM_BOT_TOKEN=TELEGRAM_PLACEHOLDER
+          ENVFILE
+
+          ufw allow 22 && ufw allow 18789 && ufw --force enable
+
+          cat > /etc/systemd/system/aethervault.service << 'SVC'
+          [Unit]
+          Description=AetherVault
+          After=network.target
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/root/aethervault-workspace
+          EnvironmentFile=/root/.aethervault/.env
+          ExecStart=/usr/bin/aethervault gateway --port 18789 --verbose
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+          SVC
+
+          systemctl daemon-reload
+          systemctl enable aethervault
+          echo "READY" > /root/ready
+          USERDATA
+          )
+
+          # Replace placeholders
+          USER_DATA=$(echo "$USER_DATA" | sed "s|SSH_PUB_PLACEHOLDER|$SSH_PUB|g")
+          USER_DATA=$(echo "$USER_DATA" | sed "s|PHONE_PLACEHOLDER|${{ inputs.your_phone }}|g")
+          USER_DATA=$(echo "$USER_DATA" | sed "s|ANTHROPIC_PLACEHOLDER|${{ inputs.anthropic_key }}|g")
+          USER_DATA=$(echo "$USER_DATA" | sed "s|TELEGRAM_PLACEHOLDER|${{ inputs.telegram_token }}|g")
+
+          # Rebuild
+          RESPONSE=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}/actions" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\": \"rebuild\", \"image\": \"ubuntu-24-04-x64\", \"user_data\": $(echo "$USER_DATA" | jq -Rs .)}")
+
+          ACTION_ID=$(echo "$RESPONSE" | jq -r '.action.id')
+          echo "Rebuild action: $ACTION_ID"
+
+          for i in {1..40}; do
+            sleep 15
+            STATUS=$(curl -s "https://api.digitalocean.com/v2/actions/$ACTION_ID" \
+              -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.action.status')
+            echo "[$i] $STATUS"
+            if [ "$STATUS" = "completed" ]; then break; fi
+          done
+
+          echo "Waiting for boot..."
+          sleep 180
+
+      - name: Test Telegram connection
+        run: |
+          # Verify bot token works
+          RESULT=$(curl -s "https://api.telegram.org/bot${{ inputs.telegram_token }}/getMe")
+          echo "Telegram bot info:"
+          echo "$RESULT" | jq .
+
+      - name: Post success
+        run: |
+          curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -H "Authorization: token ${{ inputs.gh_token }}" \
+            -d "{
+              \"title\": \"🎉 AetherVault Ready - WhatsApp + Telegram\",
+              \"body\": \"## Your AetherVault is LIVE!\\n\\n### Telegram\\n**Bot:** [@YourBot](https://t.me/YourBot)\\n\\nJust message the bot on Telegram - it works immediately!\\n\\n### WhatsApp\\nSSH in once to scan QR code:\\n\\\`\\\`\\\`bash\\nssh root@${{ steps.ip.outputs.ip }}\\naethervault gateway --verbose\\n\\\`\\\`\\\`\\nScan QR with WhatsApp → Linked Devices\\n\\n### Security\\n- Only responds to: ${{ inputs.your_phone }}\\n- Groups: disabled\\n\\n**Droplet IP:** ${{ steps.ip.outputs.ip }}\"
+            }"
