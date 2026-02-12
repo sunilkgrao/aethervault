@@ -9,7 +9,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 MOONSHOT_API = os.environ.get("MOONSHOT_API_URL", "https://api.moonshot.ai/v1")
 API_KEY = os.environ.get("MOONSHOT_API_KEY", "")
 TARGET_MODEL = os.environ.get("MOONSHOT_MODEL", "kimi-k2.5")
-MOONSHOT_PORT = int(os.environ.get("MOONSHOT_PROXY_PORT", "11435"))
+MOONSHOT_PORT = int(os.environ.get("MOONSHOT_PROXY_PORT", "11437"))
 MOONSHOT_BIND = os.environ.get("MOONSHOT_BIND_ADDR", "127.0.0.1")
 
 if not API_KEY:

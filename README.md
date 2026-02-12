@@ -270,7 +270,7 @@ Telegram / WhatsApp
         |
    Model Proxy Layer
    |- Vertex AI Proxy  (port 11436) -- Claude on GCP with token tracking
-   |- Moonshot Proxy   (port 11435) -- Kimi K2.5 via OpenAI-compat API
+   |- Moonshot Proxy   (port 11437) -- Kimi K2.5 via OpenAI-compat API
    |- llama.cpp Proxy  (port 11434) -- local models via SSH tunnel
 ```
 

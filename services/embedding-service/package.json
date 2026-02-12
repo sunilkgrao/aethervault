@@ -1,0 +1,27 @@
+{
+  "name": "embedding-service",
+  "version": "1.0.0",
+  "description": "Standalone embedding service using node-llama-cpp",
+  "main": "dist/server.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts"
+  },
+  "keywords": ["embeddings", "llama-cpp", "openai-api"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "node-llama-cpp": "^3.5.0",
+    "express": "^4.21.2",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/express": "^5.0.0",
+    "@types/cors": "^2.8.17",
+    "typescript": "^5.7.3",
+    "tsx": "^4.19.2"
+  }
+}
