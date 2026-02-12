@@ -3,7 +3,7 @@
 Native Anthropic proxy for Vertex AI Claude with proper token tracking.
 
 This proxy ensures SSE events from Vertex AI are in the exact format
-that aethervault's pi-ai library expects for token tracking.
+that the agent framework expects for token tracking.
 
 Key features:
 1. Parses SSE events from Vertex
@@ -89,7 +89,10 @@ class Proxy(BaseHTTPRequestHandler):
         # Model map: configurable via VERTEX_MODEL_MAP env var (JSON), with sensible defaults
         default_map = {
             "claude-opus-4-5": "claude-opus-4-5@20251101",
+            "claude-opus-4-6": "claude-opus-4-5@20251101",
             "claude-sonnet-4-5": "claude-sonnet-4-5@20250929",
+            "claude-sonnet-4-5-20250929": "claude-sonnet-4-5@20250929",
+            "claude-sonnet-4-5-20250514": "claude-sonnet-4-5@20250514",
         }
         model_map_env = os.environ.get("VERTEX_MODEL_MAP")
         model_map = json.loads(model_map_env) if model_map_env else default_map
@@ -320,7 +323,7 @@ class Proxy(BaseHTTPRequestHandler):
         This is critical for context overflow errors - the Anthropic SDK expects
         SSE format for streaming requests. Without this, the SDK throws a generic
         'request ended without sending any chunks' error instead of propagating
-        the actual error message that AetherVault's isContextOverflowError can detect.
+        the actual error message that the isContextOverflowError handler can detect.
         """
         self.send_response(200)  # SSE requires 200 to start streaming
         self.send_header("Content-Type", "text/event-stream")
