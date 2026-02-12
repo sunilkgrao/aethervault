@@ -1,0 +1,23 @@
+[Unit]
+Description=Embedding Service (node-llama-cpp)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/aethervault-workspace/embedding-service
+ExecStart=/usr/bin/node /root/aethervault-workspace/embedding-service/dist/server.js
+Restart=always
+RestartSec=10
+Environment="NODE_ENV=production"
+Environment="HOST=127.0.0.1"
+Environment="PORT=11435"
+Environment="MODEL_CACHE_DIR=/root/.cache/embedding-service/models"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=embedding-service
+
+[Install]
+WantedBy=multi-user.target

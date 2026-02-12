@@ -1,0 +1,38 @@
+name: Send Telegram Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Test Message
+        run: |
+          BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          
+          # First get bot info
+          echo "=== Bot Info ==="
+          curl -s "https://api.telegram.org/bot$BOT_TOKEN/getMe"
+          
+          echo ""
+          echo "=== Webhook Status ==="
+          curl -s "https://api.telegram.org/bot$BOT_TOKEN/getWebhookInfo"
+          
+          echo ""
+          echo "=== Get Updates (pending messages) ==="
+          UPDATES=$(curl -s "https://api.telegram.org/bot$BOT_TOKEN/getUpdates?limit=5")
+          echo "$UPDATES"
+          
+          # Extract chat_id from updates if available
+          CHAT_ID=$(echo "$UPDATES" | jq -r '.result[-1].message.chat.id // empty')
+          
+          if [ -n "$CHAT_ID" ]; then
+            echo ""
+            echo "=== Sending test message to chat $CHAT_ID ==="
+            curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+              -d "chat_id=$CHAT_ID" \
+              -d "text=🤖 AetherVault test - Bot is working! The server can reach Telegram API."
+          else
+            echo "No chat_id found in updates - need someone to message the bot first"
+          fi

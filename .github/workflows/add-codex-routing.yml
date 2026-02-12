@@ -1,0 +1,146 @@
+name: Add Codex Routing
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        required: true
+      gh_token:
+        required: true
+      anthropic_key:
+        required: true
+      droplet_id:
+        required: true
+      your_phone:
+        required: true
+      telegram_token:
+        required: true
+      openai_key:
+        description: 'OpenAI API Key (for Codex)'
+        required: true
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate SSH Key
+        run: ssh-keygen -t ed25519 -f /tmp/key -N "" -C "config"
+
+      - name: Get Droplet IP
+        id: ip
+        run: |
+          IP=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+
+      - name: Rebuild with Codex routing
+        run: |
+          SSH_PUB=$(cat /tmp/key.pub)
+
+          USER_DATA=$(cat << 'USERDATA'
+          #!/bin/bash
+          exec > /var/log/setup.log 2>&1
+
+          mkdir -p /root/.ssh
+          echo "SSH_PUB_PLACEHOLDER" >> /root/.ssh/authorized_keys
+          chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+
+          apt-get update
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs git
+
+          npm install -g aethervault@latest
+          npm install -g @openai/codex
+
+          mkdir -p /root/.aethervault /root/aethervault-workspace /root/Coding
+
+          # Config with Codex routing for coding tasks
+          cat > /root/.aethervault/aethervault.json << 'CONFIG'
+          {
+            "agent": {
+              "model": "anthropic/claude-sonnet-4",
+              "system_prompt_additions": "## ⚠️ CRITICAL: Coding Sub-Agents\n\n**ALWAYS use Codex CLI directly for coding tasks. NEVER use sessions_spawn with model override.**\n\nFor ANY coding task (writing code, fixing bugs, creating files, git operations):\n\n```bash\ncd ~/Coding\ncodex --yolo exec 'Task description here'\n```\n\nWhen the coding task is complete, report back with a summary.\n\nUse Codex for:\n- Writing new code\n- Fixing bugs\n- Refactoring\n- Creating/editing files\n- Git operations\n- Running tests\n- Any development work\n\nUse your own capabilities for:\n- Answering questions\n- Explanations\n- Planning\n- Non-coding tasks"
+            },
+            "gateway": {
+              "port": 18789,
+              "host": "0.0.0.0"
+            },
+            "security": {
+              "dm_policy": "allowlist",
+              "allowlist": ["PHONE_PLACEHOLDER"]
+            },
+            "channels": {
+              "whatsapp": {
+                "enabled": true,
+                "respond_to_self": true,
+                "respond_to_groups": false
+              },
+              "telegram": {
+                "enabled": true
+              }
+            }
+          }
+          CONFIG
+
+          cat > /root/.aethervault/.env << 'ENVFILE'
+          ANTHROPIC_API_KEY=ANTHROPIC_PLACEHOLDER
+          TELEGRAM_BOT_TOKEN=TELEGRAM_PLACEHOLDER
+          OPENAI_API_KEY=OPENAI_PLACEHOLDER
+          ENVFILE
+
+          ufw allow 22 && ufw allow 18789 && ufw --force enable
+
+          cat > /etc/systemd/system/aethervault.service << 'SVC'
+          [Unit]
+          Description=AetherVault
+          After=network.target
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/root/aethervault-workspace
+          EnvironmentFile=/root/.aethervault/.env
+          ExecStart=/usr/bin/aethervault gateway --port 18789 --verbose
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+          SVC
+
+          systemctl daemon-reload
+          systemctl enable aethervault
+          echo "READY" > /root/ready
+          USERDATA
+          )
+
+          # Replace placeholders
+          USER_DATA=$(echo "$USER_DATA" | sed "s|SSH_PUB_PLACEHOLDER|$SSH_PUB|g")
+          USER_DATA=$(echo "$USER_DATA" | sed "s|PHONE_PLACEHOLDER|${{ inputs.your_phone }}|g")
+          USER_DATA=$(echo "$USER_DATA" | sed "s|ANTHROPIC_PLACEHOLDER|${{ inputs.anthropic_key }}|g")
+          USER_DATA=$(echo "$USER_DATA" | sed "s|TELEGRAM_PLACEHOLDER|${{ inputs.telegram_token }}|g")
+          USER_DATA=$(echo "$USER_DATA" | sed "s|OPENAI_PLACEHOLDER|${{ inputs.openai_key }}|g")
+
+          RESPONSE=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}/actions" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\": \"rebuild\", \"image\": \"ubuntu-24-04-x64\", \"user_data\": $(echo "$USER_DATA" | jq -Rs .)}")
+
+          ACTION_ID=$(echo "$RESPONSE" | jq -r '.action.id')
+          echo "Rebuild action: $ACTION_ID"
+
+          for i in {1..40}; do
+            sleep 15
+            STATUS=$(curl -s "https://api.digitalocean.com/v2/actions/$ACTION_ID" \
+              -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.action.status')
+            echo "[$i] $STATUS"
+            if [ "$STATUS" = "completed" ]; then break; fi
+          done
+
+          sleep 180
+
+      - name: Post success
+        run: |
+          curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -H "Authorization: token ${{ inputs.gh_token }}" \
+            -d "{
+              \"title\": \"🚀 AetherVault + Codex Ready\",
+              \"body\": \"## Your AetherVault is configured!\\n\\n### Features\\n- ✅ WhatsApp (scan QR to activate)\\n- ✅ Telegram: [@YourBot](https://t.me/YourBot)\\n- ✅ Codex routing for coding tasks\\n- ✅ Security: Only responds to ${{ inputs.your_phone }}\\n\\n### How it works\\n- **Coding tasks** → Routed to Codex CLI\\n- **Everything else** → Claude Sonnet 4\\n\\n### WhatsApp Setup\\n\\\`\\\`\\\`bash\\nssh root@${{ steps.ip.outputs.ip }}\\naethervault gateway --verbose\\n\\\`\\\`\\\`\\nScan the QR code with WhatsApp\\n\\n**IP:** ${{ steps.ip.outputs.ip }}\"
+            }"

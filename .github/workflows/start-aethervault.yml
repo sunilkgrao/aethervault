@@ -1,0 +1,77 @@
+name: Start AetherVault Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        required: true
+      droplet_id:
+        required: true
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate SSH Key
+        run: ssh-keygen -t ed25519 -f /tmp/key -N "" -C "start"
+
+      - name: Get IP and add SSH key via rebuild
+        run: |
+          # Get current IP
+          IP=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "IP: $IP"
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          
+          SSH_PUB=$(cat /tmp/key.pub)
+          
+          # Create minimal user-data that adds SSH key and starts service
+          USER_DATA=$(cat << USERDATA
+          #!/bin/bash
+          mkdir -p /root/.ssh
+          echo "$SSH_PUB" >> /root/.ssh/authorized_keys
+          chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+          
+          # Start aethervault if installed
+          if command -v aethervault &> /dev/null; then
+            cd /root/aethervault-workspace
+            nohup aethervault gateway --port 18789 --verbose > /var/log/aethervault.log 2>&1 &
+            echo "AetherVault started"
+          fi
+          USERDATA
+          )
+          
+          # Use droplet console/user-data won't work on running droplet
+          # Try power cycle with user-data
+          echo "Note: user-data only runs on first boot. Will try SSH after key injection via another method."
+        id: info
+
+      - name: Try direct SSH (if key was previously added)
+        continue-on-error: true
+        run: |
+          chmod 600 /tmp/key
+          
+          # Try SSH with various potential keys that may have been added in previous rebuilds
+          for i in {1..3}; do
+            echo "SSH attempt $i..."
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i /tmp/key root@${{ steps.info.outputs.ip }} "
+              echo 'Connected!'
+              
+              # Check if aethervault is running
+              if pgrep -f 'aethervault gateway' > /dev/null; then
+                echo 'AetherVault already running'
+              else
+                echo 'Starting aethervault...'
+                cd /root/aethervault-workspace
+                source /root/.aethervault/.env
+                nohup aethervault gateway --port 18789 --verbose > /var/log/aethervault.log 2>&1 &
+                sleep 5
+                echo 'AetherVault started!'
+              fi
+              
+              # Show status
+              ps aux | grep aethervault | grep -v grep || echo 'No aethervault process found'
+            " 2>&1 && break
+            
+            sleep 10
+          done

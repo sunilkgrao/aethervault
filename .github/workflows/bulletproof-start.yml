@@ -1,0 +1,95 @@
+name: Bulletproof Telegram Start
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        required: true
+      droplet_id:
+        required: true
+      anthropic_key:
+        required: true
+      telegram_token:
+        required: true
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebuild with inline startup
+        run: |
+          USER_DATA='#!/bin/bash
+          LOG=/var/log/setup.log
+          exec > $LOG 2>&1
+          
+          echo "Starting setup at $(date)"
+          
+          # Install Node 22
+          apt-get update
+          apt-get install -y curl
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs
+          
+          echo "Node version: $(node -v)"
+          
+          # Install aethervault
+          npm install -g aethervault@latest
+          echo "AetherVault installed: $(which aethervault)"
+          
+          # Setup config
+          mkdir -p /root/.aethervault /root/aethervault-workspace
+          
+          echo "{\"agent\":{\"model\":\"anthropic/claude-sonnet-4\"},\"gateway\":{\"port\":18789},\"channels\":{\"telegram\":{\"enabled\":true}}}" > /root/.aethervault/aethervault.json
+          
+          # Set env vars globally
+          echo "export ANTHROPIC_API_KEY=${{ inputs.anthropic_key }}" >> /root/.bashrc
+          echo "export TELEGRAM_BOT_TOKEN=${{ inputs.telegram_token }}" >> /root/.bashrc
+          
+          export ANTHROPIC_API_KEY=${{ inputs.anthropic_key }}
+          export TELEGRAM_BOT_TOKEN=${{ inputs.telegram_token }}
+          
+          # Start aethervault with restart loop
+          cd /root/aethervault-workspace
+          
+          while true; do
+            echo "Starting aethervault at $(date)" >> /var/log/aethervault.log
+            ANTHROPIC_API_KEY=${{ inputs.anthropic_key }} TELEGRAM_BOT_TOKEN=${{ inputs.telegram_token }} aethervault gateway --port 18789 --verbose >> /var/log/aethervault.log 2>&1
+            echo "AetherVault exited, restarting in 10s..." >> /var/log/aethervault.log
+            sleep 10
+          done &
+          
+          echo "Setup complete at $(date)"
+          '
+          
+          RESPONSE=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}/actions" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\": \"rebuild\", \"image\": \"ubuntu-24-04-x64\", \"user_data\": $(echo "$USER_DATA" | jq -Rs .)}")
+          
+          ACTION_ID=$(echo "$RESPONSE" | jq -r '.action.id')
+          echo "Rebuild started: $ACTION_ID"
+          
+          for i in {1..45}; do
+            sleep 12
+            STATUS=$(curl -s "https://api.digitalocean.com/v2/actions/$ACTION_ID" \
+              -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.action.status')
+            echo "[$i] $STATUS"
+            if [ "$STATUS" = "completed" ]; then break; fi
+          done
+          
+          echo "Waiting 5 min for cloud-init + aethervault startup..."
+          sleep 300
+          
+      - name: Send test message
+        run: |
+          echo "Sending test message..."
+          UPDATES=$(curl -s "https://api.telegram.org/bot${{ inputs.telegram_token }}/getUpdates?limit=1")
+          CHAT_ID=$(echo "$UPDATES" | jq -r '.result[-1].message.chat.id // empty')
+          
+          if [ -n "$CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${{ inputs.telegram_token }}/sendMessage" \
+              -d "chat_id=$CHAT_ID" \
+              -d "text=🚀 AetherVault should be running now! Try sending a message."
+          fi
+          
+          echo "Done! Test the bot."

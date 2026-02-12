@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block title %}{{ topic.name }} — c/{{ community.slug }}{% endblock %}
+
+{% block content %}
+  <div class="d-flex align-items-start justify-content-between flex-wrap gap-3 mb-3">
+    <div>
+      <h1 class="h3 mb-1">{{ topic.name }}</h1>
+      <div class="sc-meta">
+        <a href="/c/{{ community.slug }}/">c/{{ community.slug }}</a> • topic/{{ topic.slug }}
+      </div>
+      {% if topic.description %}
+        <div class="sc-prose mt-2">{{ topic.description|linebreaksbr }}</div>
+      {% endif %}
+    </div>
+    {% if user.is_authenticated %}
+      <a class="btn btn-primary" href="/posts/new/{{ community.slug }}/">New post</a>
+    {% endif %}
+  </div>
+
+  <h2 class="h5 mb-2">Posts</h2>
+  {% if posts %}
+    <div class="list-group">
+      {% for post in posts %}
+        <a class="list-group-item list-group-item-action" href="{{ post.get_absolute_url }}">
+          <div class="d-flex w-100 justify-content-between">
+            <div class="fw-semibold">{{ post.title }}</div>
+            <small class="sc-meta">{{ post.created_at|date:"Y-m-d H:i" }}</small>
+          </div>
+          <small class="sc-meta">by {{ post.author.username }}</small>
+        </a>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="alert alert-secondary">No posts yet.</div>
+  {% endif %}
+{% endblock %}
+

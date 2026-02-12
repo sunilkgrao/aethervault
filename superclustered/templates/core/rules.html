@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block title %}Rules — TachyonGrid{% endblock %}
+
+{% block content %}
+  <h1 class="h3 mb-3">Rules of Engagement</h1>
+  <div class="sc-prose">
+    <ol>
+      <li><strong>Permission first.</strong> Only run workloads you are explicitly authorized to run.</li>
+      <li><strong>No scraping / no spam.</strong> Outreach must be opt-in and platform-compliant.</li>
+      <li><strong>No secrets.</strong> Do not post credentials, private keys, or proprietary information.</li>
+      <li><strong>Licensed inputs only.</strong> Use datasets/weights you’re allowed to use and redistribute.</li>
+      <li><strong>Reproducible by default.</strong> Include commit hashes, configs, and environments with results.</li>
+      <li><strong>Safety gates.</strong> Jobs that require network egress, high cost, or unusual access must be reviewed.</li>
+    </ol>
+    <p class="sc-meta mb-0">
+      If you see a policy gap or unsafe request, create a safety issue thread and tag moderators.
+    </p>
+  </div>
+{% endblock %}

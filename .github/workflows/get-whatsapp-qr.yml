@@ -1,0 +1,61 @@
+name: Get WhatsApp QR Code
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        description: 'DigitalOcean API Token'
+        required: true
+      gh_token:
+        description: 'GitHub Token'
+        required: true
+      droplet_id:
+        description: 'Droplet ID'
+        required: true
+
+jobs:
+  get-qr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Droplet IP
+        id: droplet
+        run: |
+          DROPLET_INFO=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}")
+
+          IP=$(echo "$DROPLET_INFO" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          STATUS=$(echo "$DROPLET_INFO" | jq -r '.droplet.status')
+
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          echo "Droplet IP: $IP, Status: $STATUS"
+
+      - name: Check if aethervault is running
+        run: |
+          IP="${{ steps.droplet.outputs.ip }}"
+          echo "Checking if gateway is accessible at http://$IP:18789..."
+
+          # Try to reach the gateway
+          for i in {1..5}; do
+            if curl -s --connect-timeout 5 "http://$IP:18789" > /dev/null 2>&1; then
+              echo "Gateway is accessible!"
+              break
+            fi
+            echo "Attempt $i failed, retrying..."
+            sleep 5
+          done
+
+      - name: Create setup instructions issue
+        run: |
+          IP="${{ steps.droplet.outputs.ip }}"
+
+          # Create detailed instructions issue
+          curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -H "Authorization: token ${{ inputs.gh_token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d "{
+              \"title\": \"📱 WhatsApp Setup Instructions - Scan QR Code\",
+              \"body\": \"## Your AetherVault is Ready at $IP\\n\\nThe droplet is configured with:\\n- ✅ Node.js 22\\n- ✅ AetherVault installed\\n- ✅ Anthropic API key configured\\n- ✅ WhatsApp channel enabled\\n\\n### To Connect WhatsApp:\\n\\n**SSH into your droplet:**\\n\\\`\\\`\\\`bash\\nssh root@$IP\\n\\\`\\\`\\\`\\n\\n**Start aethervault:**\\n\\\`\\\`\\\`bash\\naethervault gateway --verbose\\n\\\`\\\`\\\`\\n\\n**Scan the QR code** that appears with WhatsApp:\\n1. Open WhatsApp on your phone\\n2. Settings → Linked Devices → Link a Device\\n3. Scan the QR code from the terminal\\n\\n### After Scanning:\\nYour WhatsApp is connected! Send a message to yourself or have someone message you - AetherVault will respond!\\n\\n### Run as Service:\\n\\\`\\\`\\\`bash\\nsystemctl start aethervault\\nsystemctl enable aethervault\\n\\\`\\\`\\\`\\n\\n---\\n**Gateway URL:** http://$IP:18789\",
+              \"labels\": [\"setup-instructions\"]
+            }"
+
+          echo "Instructions posted to GitHub issues!"

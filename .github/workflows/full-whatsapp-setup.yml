@@ -1,0 +1,172 @@
+name: Full WhatsApp Setup (Automated)
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        description: 'DigitalOcean API Token'
+        required: true
+      gh_token:
+        description: 'GitHub Token'
+        required: true
+      anthropic_key:
+        description: 'Anthropic API Key'
+        required: true
+      droplet_id:
+        description: 'Droplet ID'
+        required: true
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate SSH Key
+        run: |
+          ssh-keygen -t ed25519 -f /tmp/aethervault_key -N "" -C "aethervault-setup"
+          echo "SSH key generated"
+          cat /tmp/aethervault_key.pub
+
+      - name: Get Droplet IP
+        id: droplet
+        run: |
+          DROPLET_INFO=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}")
+          IP=$(echo "$DROPLET_INFO" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          echo "Droplet IP: $IP"
+
+      - name: Create user-data with SSH key and auto QR posting
+        run: |
+          SSH_PUB_KEY=$(cat /tmp/aethervault_key.pub)
+
+          cat > /tmp/user-data.sh << USERDATA
+          #!/bin/bash
+          exec > /var/log/aethervault-setup.log 2>&1
+          set -e
+
+          echo "=== AetherVault Full Setup ==="
+
+          # Setup SSH
+          mkdir -p /root/.ssh
+          echo "$SSH_PUB_KEY" >> /root/.ssh/authorized_keys
+          chmod 700 /root/.ssh
+          chmod 600 /root/.ssh/authorized_keys
+
+          # Install packages
+          apt-get update
+          apt-get install -y curl wget git build-essential jq nodejs npm
+
+          # Install Node.js 22
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs
+
+          # Install aethervault
+          npm install -g aethervault@latest
+
+          # Create directories
+          mkdir -p /root/.aethervault /root/aethervault-workspace
+
+          # Configure aethervault
+          cat > /root/.aethervault/aethervault.json << 'CONFIG'
+          {
+            "agent": {"model": "anthropic/claude-sonnet-4"},
+            "gateway": {"port": 18789, "host": "0.0.0.0"},
+            "channels": {"whatsapp": {"enabled": true}}
+          }
+          CONFIG
+
+          # Set API key
+          echo "ANTHROPIC_API_KEY=${{ inputs.anthropic_key }}" > /root/.aethervault/.env
+
+          # Firewall
+          ufw allow 22
+          ufw allow 18789
+          ufw --force enable
+
+          echo "READY" > /root/setup-complete
+          USERDATA
+
+      - name: Rebuild Droplet
+        run: |
+          USER_DATA=$(cat /tmp/user-data.sh | jq -Rs .)
+
+          REBUILD=$(curl -s -X POST \
+            "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}/actions" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\": \"rebuild\", \"image\": \"ubuntu-24-04-x64\", \"user_data\": $USER_DATA}")
+
+          ACTION_ID=$(echo "$REBUILD" | jq -r '.action.id')
+          echo "Rebuild action: $ACTION_ID"
+
+          # Wait for rebuild
+          for i in {1..40}; do
+            sleep 15
+            STATUS=$(curl -s "https://api.digitalocean.com/v2/actions/$ACTION_ID" \
+              -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.action.status')
+            echo "[$i] Rebuild status: $STATUS"
+            if [ "$STATUS" = "completed" ]; then break; fi
+            if [ "$STATUS" = "errored" ]; then exit 1; fi
+          done
+
+      - name: Wait for droplet boot
+        run: |
+          echo "Waiting for droplet to boot (3 min)..."
+          sleep 180
+
+      - name: SSH and get WhatsApp QR
+        run: |
+          IP="${{ steps.droplet.outputs.ip }}"
+          chmod 600 /tmp/aethervault_key
+
+          echo "Attempting SSH connection..."
+
+          # Test SSH connection
+          for i in {1..10}; do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i /tmp/aethervault_key root@$IP "echo connected" 2>/dev/null; then
+              echo "SSH connected!"
+              break
+            fi
+            echo "SSH attempt $i failed, retrying..."
+            sleep 15
+          done
+
+          # Check setup status
+          ssh -o StrictHostKeyChecking=no -i /tmp/aethervault_key root@$IP "cat /root/setup-complete 2>/dev/null || echo 'still setting up'"
+
+          # Start aethervault and capture QR code
+          echo "Starting aethervault to capture QR code..."
+
+          ssh -o StrictHostKeyChecking=no -i /tmp/aethervault_key root@$IP << 'REMOTE'
+          cd /root/aethervault-workspace
+
+          # Run aethervault and capture output
+          timeout 90 aethervault gateway --verbose 2>&1 | tee /tmp/output.log &
+          PID=$!
+
+          # Wait for QR or connection
+          for i in {1..45}; do
+            if grep -q "QR" /tmp/output.log 2>/dev/null; then
+              echo "=== QR CODE FOUND ==="
+              # Extract QR section from output
+              grep -A 50 "QR" /tmp/output.log | head -60
+              break
+            fi
+            sleep 2
+          done
+
+          cat /tmp/output.log
+          REMOTE
+
+      - name: Post QR to GitHub Issue
+        if: always()
+        run: |
+          IP="${{ steps.droplet.outputs.ip }}"
+
+          curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -H "Authorization: token ${{ inputs.gh_token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d "{
+              \"title\": \"🟢 AetherVault WhatsApp Ready - SSH In to Scan QR\",
+              \"body\": \"## AetherVault is fully configured!\\n\\n**IP:** \`$IP\`\\n\\nSSH in and start the gateway to see your WhatsApp QR code:\\n\\n\\\`\\\`\\\`bash\\nssh root@$IP\\naethervault gateway --verbose\\n\\\`\\\`\\\`\\n\\nScan the QR code with WhatsApp → Settings → Linked Devices → Link a Device\\n\\n**Your phone number becomes the AetherVault number!**\\n\\nAnyone who texts your WhatsApp will get AI responses.\"
+            }"

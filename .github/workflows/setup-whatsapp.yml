@@ -1,0 +1,237 @@
+name: Setup AetherVault WhatsApp
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_token:
+        description: 'DigitalOcean API Token'
+        required: true
+      gh_token:
+        description: 'GitHub Token'
+        required: true
+      anthropic_key:
+        description: 'Anthropic API Key'
+        required: true
+      droplet_id:
+        description: 'Droplet ID'
+        required: true
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create user-data script
+        run: |
+          cat > /tmp/user-data.sh << 'USERDATA'
+          #!/bin/bash
+          set -e
+          exec > /var/log/aethervault-setup.log 2>&1
+
+          echo "=== Starting AetherVault Setup ==="
+
+          # Install essentials
+          apt-get update
+          apt-get install -y curl wget git build-essential jq qrencode
+
+          # Install Node.js 22
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs
+
+          # Install aethervault
+          npm install -g aethervault@latest
+
+          # Create directories
+          mkdir -p /root/.aethervault /root/aethervault-workspace
+
+          # Configure aethervault
+          cat > /root/.aethervault/aethervault.json << 'CONFIG'
+          {
+            "agent": {
+              "model": "anthropic/claude-sonnet-4"
+            },
+            "gateway": {
+              "port": 18789,
+              "host": "0.0.0.0"
+            },
+            "channels": {
+              "whatsapp": {
+                "enabled": true
+              }
+            }
+          }
+          CONFIG
+
+          # Set API key
+          echo "ANTHROPIC_API_KEY=__ANTHROPIC_KEY__" > /root/.aethervault/.env
+
+          # Configure firewall
+          ufw allow 22
+          ufw allow 18789
+          ufw --force enable
+
+          # Create QR capture script
+          cat > /root/capture-qr.sh << 'QRSCRIPT'
+          #!/bin/bash
+          GH_TOKEN="__GH_TOKEN__"
+          REPO="__GH_REPO__"
+
+          echo "Starting aethervault to get WhatsApp QR code..."
+          cd /root/aethervault-workspace
+
+          # Start aethervault and capture output
+          timeout 120 aethervault gateway --verbose 2>&1 | tee /tmp/aethervault-output.log &
+          AETHERVAULT_PID=$!
+
+          # Wait for QR code to appear in output
+          for i in {1..60}; do
+            if grep -q "qr:" /tmp/aethervault-output.log 2>/dev/null; then
+              echo "QR code found!"
+              break
+            fi
+            sleep 2
+          done
+
+          # Extract QR data and create image
+          QR_DATA=$(grep -oP 'qr:\K[^\s]+' /tmp/aethervault-output.log | head -1)
+
+          if [ -n "$QR_DATA" ]; then
+            # Generate QR code image
+            echo "$QR_DATA" | qrencode -o /tmp/whatsapp-qr.png -s 10
+
+            # Upload to GitHub and create issue
+            # Base64 encode the image
+            QR_BASE64=$(base64 -w 0 /tmp/whatsapp-qr.png)
+
+            # Create a gist with the QR code
+            GIST_RESPONSE=$(curl -s -X POST "https://api.github.com/gists" \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -d "{
+                \"description\": \"WhatsApp QR Code for AetherVault\",
+                \"public\": false,
+                \"files\": {
+                  \"qr-code.txt\": {
+                    \"content\": \"Scan this QR code with WhatsApp:\\n\\nQR Data: $QR_DATA\\n\\nOr visit the raw URL of qr.png\"
+                  }
+                }
+              }")
+
+            # Create issue with instructions
+            curl -s -X POST "https://api.github.com/repos/$REPO/issues" \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -d "{
+                \"title\": \"📱 Scan WhatsApp QR Code\",
+                \"body\": \"## Your AetherVault WhatsApp is Ready!\\n\\nScan this QR code with your WhatsApp app:\\n\\n1. Open WhatsApp on your phone\\n2. Go to Settings → Linked Devices\\n3. Tap 'Link a Device'\\n4. Scan the QR code below\\n\\n### QR Code\\n\\n\\\`\\\`\\\`\\n$QR_DATA\\n\\\`\\\`\\\`\\n\\nIf the QR code above doesn't render, SSH into your droplet and run:\\n\\\`\\\`\\\`bash\\nssh root@__DROPLET_IP__\\naethervault gateway --verbose\\n\\\`\\\`\\\`\\n\\nThe QR will display in the terminal for you to scan.\\n\\n---\\n**Droplet IP:** __DROPLET_IP__\",
+                \"labels\": [\"whatsapp-qr\"]
+              }"
+
+            echo "QR code posted to GitHub!"
+          else
+            # No QR data found, post instructions
+            curl -s -X POST "https://api.github.com/repos/$REPO/issues" \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -d "{
+                \"title\": \"📱 WhatsApp Setup - Manual QR Scan Needed\",
+                \"body\": \"## AetherVault is Ready!\\n\\nSSH into your droplet to scan the WhatsApp QR code:\\n\\n\\\`\\\`\\\`bash\\nssh root@__DROPLET_IP__\\naethervault gateway --verbose\\n\\\`\\\`\\\`\\n\\nThe QR code will display in the terminal. Scan it with WhatsApp:\\n\\n1. Open WhatsApp on your phone\\n2. Go to Settings → Linked Devices\\n3. Tap 'Link a Device'\\n4. Scan the QR code from the terminal\\n\\n---\\n**Droplet IP:** __DROPLET_IP__\",
+                \"labels\": [\"whatsapp-setup\"]
+              }"
+          fi
+
+          # Keep aethervault running
+          wait $AETHERVAULT_PID 2>/dev/null || true
+          QRSCRIPT
+
+          chmod +x /root/capture-qr.sh
+
+          # Create systemd service
+          cat > /etc/systemd/system/aethervault.service << 'SERVICE'
+          [Unit]
+          Description=AetherVault Gateway
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/root/aethervault-workspace
+          Environment=NODE_ENV=production
+          EnvironmentFile=/root/.aethervault/.env
+          ExecStart=/usr/bin/aethervault gateway --port 18789 --verbose
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          systemctl daemon-reload
+
+          # Run QR capture script
+          /root/capture-qr.sh &
+
+          echo "=== AetherVault Setup Complete ==="
+          USERDATA
+
+      - name: Rebuild Droplet
+        run: |
+          # Get current droplet IP
+          DROPLET_INFO=$(curl -s "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}")
+
+          DROPLET_IP=$(echo "$DROPLET_INFO" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "Droplet IP: $DROPLET_IP"
+
+          # Update user-data with actual values
+          sed -i "s|__ANTHROPIC_KEY__|${{ inputs.anthropic_key }}|g" /tmp/user-data.sh
+          sed -i "s|__GH_TOKEN__|${{ inputs.gh_token }}|g" /tmp/user-data.sh
+          sed -i "s|__DROPLET_IP__|$DROPLET_IP|g" /tmp/user-data.sh
+          sed -i "s|__GH_REPO__|${{ github.repository }}|g" /tmp/user-data.sh
+
+          # Encode user-data
+          USER_DATA_ENCODED=$(cat /tmp/user-data.sh | jq -Rs .)
+
+          # Rebuild droplet
+          echo "Rebuilding droplet with new configuration..."
+          REBUILD_RESPONSE=$(curl -s -X POST \
+            "https://api.digitalocean.com/v2/droplets/${{ inputs.droplet_id }}/actions" \
+            -H "Authorization: Bearer ${{ inputs.do_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"type\": \"rebuild\",
+              \"image\": \"ubuntu-24-04-x64\",
+              \"user_data\": $USER_DATA_ENCODED
+            }")
+
+          echo "Rebuild response:"
+          echo "$REBUILD_RESPONSE" | jq .
+
+          ACTION_ID=$(echo "$REBUILD_RESPONSE" | jq -r '.action.id')
+          echo "Action ID: $ACTION_ID"
+
+          # Wait for rebuild to complete
+          echo "Waiting for rebuild..."
+          for i in {1..60}; do
+            sleep 10
+            STATUS=$(curl -s "https://api.digitalocean.com/v2/actions/$ACTION_ID" \
+              -H "Authorization: Bearer ${{ inputs.do_token }}" | jq -r '.action.status')
+            echo "[$i/60] Status: $STATUS"
+            if [ "$STATUS" = "completed" ]; then
+              echo "Rebuild complete!"
+              break
+            fi
+            if [ "$STATUS" = "errored" ]; then
+              echo "Rebuild failed!"
+              exit 1
+            fi
+          done
+
+          # Wait for droplet to be accessible and run setup
+          echo "Waiting for droplet to boot and configure (this takes 2-3 minutes)..."
+          sleep 180
+
+          echo "=========================================="
+          echo "AetherVault should be starting now!"
+          echo "Check GitHub issues for WhatsApp QR code"
+          echo "Droplet IP: $DROPLET_IP"
+          echo "=========================================="

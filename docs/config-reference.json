@@ -1,0 +1,256 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.1.24-3",
+    "lastTouchedAt": "2026-02-01T15:25:35.247Z"
+  },
+  "wizard": {
+    "lastRunAt": "2026-01-30T21:06:31.446Z",
+    "lastRunVersion": "2026.1.24-3",
+    "lastRunCommand": "doctor",
+    "lastRunMode": "local"
+  },
+  "models": {
+    "providers": {
+      "openrouter": {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "api": "openai-responses",
+        "models": [
+          {
+            "id": "moonshotai/kimi-k2.5",
+            "name": "Kimi K2.5",
+            "reasoning": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 262144,
+            "maxTokens": 8192
+          }
+        ]
+      },
+      "anthropic-vertex": {
+        "baseUrl": "http://127.0.0.1:11436/v1",
+        "apiKey": "vertex-proxy",
+        "api": "anthropic-messages",
+        "models": [
+          {
+            "id": "claude-opus-4-5",
+            "name": "Claude Opus 4.5 (Vertex)",
+            "reasoning": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 120000,
+            "maxTokens": 8192
+          },
+          {
+            "id": "claude-sonnet-4-5",
+            "name": "Claude Sonnet 4.5 (Vertex)",
+            "reasoning": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 120000,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "anthropic-vertex/claude-opus-4-5",
+        "fallbacks": [
+          "openrouter/google/gemini-2.5-pro",
+          "moonshot/kimi-k2-0905-preview"
+        ]
+      },
+      "models": {
+        "ollama/qwen2.5:32b": {
+          "alias": "Qwen 32B (GPU)"
+        },
+        "openrouter/z-ai/glm-4.7-flash": {
+          "alias": "GLM Flash"
+        },
+        "anthropic/claude-sonnet-4-5": {
+          "alias": "Sonnet"
+        },
+        "anthropic/claude-opus-4-5": {
+          "alias": "Opus"
+        },
+        "openrouter/google/gemini-2.5-pro": {
+          "alias": "Gemini Pro"
+        },
+        "openrouter/deepseek/deepseek-r1": {
+          "alias": "DeepSeek R1"
+        },
+        "openai/kimi-k2-turbo-preview": {
+          "alias": "Kimi K2 Turbo"
+        },
+        "moonshot/kimi-k2.5": {
+          "alias": "Kimi K2.5"
+        },
+        "moonshot/kimi-k2-0905-preview": {
+          "alias": "Kimi K2 Preview"
+        },
+        "anthropic-vertex/claude-opus-4-5": {
+          "alias": "Opus (Vertex)",
+          "params": {
+            "cacheControlTtl": "1h"
+          }
+        },
+        "anthropic-vertex/claude-sonnet-4-5": {
+          "alias": "Sonnet (Vertex)",
+          "params": {
+            "cacheControlTtl": "1h"
+          }
+        }
+      },
+      "workspace": "/root/aethervault-workspace",
+      "memorySearch": {
+        "enabled": true,
+        "sources": [
+          "memory",
+          "sessions"
+        ],
+        "provider": "local",
+        "remote": {
+          "baseUrl": "http://localhost:11434/v1",
+          "apiKey": "ollama",
+          "batch": {
+            "enabled": false
+          }
+        },
+        "fallback": "none",
+        "model": "nomic-embed-text",
+        "local": {
+          "modelCacheDir": "/root/.cache/aethervault-models"
+        },
+        "query": {
+          "hybrid": {
+            "enabled": true,
+            "vectorWeight": 0.7,
+            "textWeight": 0.3
+          }
+        }
+      },
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "1h"
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8
+      }
+    }
+  },
+  "tools": {
+    "profile": "full"
+  },
+  "messages": {
+    "ackReactionScope": "group-mentions"
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto"
+  },
+  "channels": {
+    "whatsapp": {
+      "sendReadReceipts": true,
+      "dmPolicy": "pairing",
+      "groupPolicy": "allowlist",
+      "textChunkLimit": 4000,
+      "mediaMaxMb": 50,
+      "debounceMs": 0
+    },
+    "telegram": {
+      "dmPolicy": "pairing",
+      "botToken": "REDACTED-SEE-ENV",
+      "groupPolicy": "allowlist",
+      "streamMode": "block"
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "controlUi": {
+      "allowInsecureAuth": false
+    },
+    "auth": {
+      "mode": "token",
+      "token": "REDACTED-SEE-ENV"
+    }
+  },
+  "skills": {
+    "load": {
+      "watch": true,
+      "watchDebounceMs": 250
+    },
+    "entries": {
+      "coding-agent": {
+        "enabled": true
+      },
+      "github": {
+        "enabled": true
+      },
+      "skill-creator": {
+        "enabled": true
+      },
+      "clawdhub": {
+        "enabled": true
+      },
+      "weather": {
+        "enabled": true
+      },
+      "summarize": {
+        "enabled": true
+      },
+      "nano-pdf": {
+        "enabled": true
+      },
+      "session-logs": {
+        "enabled": true
+      },
+      "model-usage": {
+        "enabled": true
+      },
+      "himalaya": {
+        "enabled": true
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "telegram": {
+        "enabled": true
+      },
+      "whatsapp": {
+        "enabled": true
+      }
+    }
+  }
+}

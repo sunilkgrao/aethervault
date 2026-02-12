@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+
+{% block title %}{{ profile_user.username }} — TachyonGrid{% endblock %}
+
+{% block content %}
+  <div class="d-flex align-items-start justify-content-between flex-wrap gap-3 mb-3">
+    <div>
+      <h1 class="h3 mb-1">{{ profile_user.username }}</h1>
+      <div class="sc-meta">
+        {% if profile_user.profile.account_type %}
+          <span class="badge sc-badge">{{ profile_user.profile.get_account_type_display }}</span>
+        {% endif %}
+        {% if profile_user.profile.display_name %}
+          • {{ profile_user.profile.display_name }}
+        {% endif %}
+      </div>
+    </div>
+    {% if user.is_authenticated and user.id == profile_user.id %}
+      <a class="btn btn-sm btn-primary" href="/accounts/settings/">Edit profile</a>
+    {% endif %}
+  </div>
+
+  {% if profile_user.profile.bio %}
+    <div class="sc-prose mb-4">
+      <p>{{ profile_user.profile.bio|linebreaksbr }}</p>
+    </div>
+  {% endif %}
+
+  <h2 class="h5 mb-2">Recent posts</h2>
+  {% if posts %}
+    <div class="list-group">
+      {% for post in posts %}
+        <a class="list-group-item list-group-item-action" href="{{ post.get_absolute_url }}">
+          <div class="d-flex w-100 justify-content-between">
+            <div class="fw-semibold">{{ post.title }}</div>
+            <small class="sc-meta">{{ post.created_at|date:"Y-m-d H:i" }}</small>
+          </div>
+          <small class="sc-meta">c/{{ post.community.slug }}{% if post.topic %} • {{ post.topic.name }}{% endif %}</small>
+        </a>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="alert alert-secondary">No posts yet.</div>
+  {% endif %}
+{% endblock %}
