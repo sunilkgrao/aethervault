@@ -5073,6 +5073,10 @@ fn execute_tool_with_handles(
                 8,
             )
             .map_err(|e| e.to_string())?;
+            // Release all capsule handles before spawning the subagent so it can
+            // acquire its own locks without contending with the parent session.
+            *mem_read = None;
+            *mem_write = None;
             let session = format!("subagent:{}:{}", parsed.name, Utc::now().timestamp());
             let result = run_agent_for_bridge(&cfg, &parsed.prompt, session, None, None)
                 .map_err(|e| e.to_string())?;
@@ -5093,6 +5097,11 @@ fn execute_tool_with_handles(
             })?;
             let subagents = load_subagents_from_config(&config_snapshot);
             let ts = Utc::now().timestamp();
+
+            // Release all capsule handles before spawning subagent threads so they can
+            // each acquire their own locks without contending with the parent session.
+            *mem_read = None;
+            *mem_write = None;
 
             // Build configs for each invocation and spawn threads.
             let mut handles: Vec<(String, std::thread::JoinHandle<Result<AgentRunOutput, String>>)> = Vec::new();
