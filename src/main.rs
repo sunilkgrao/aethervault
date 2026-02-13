@@ -1394,10 +1394,13 @@ where
     if let Some(mem) = mem_write.as_mut() {
         return f(mem);
     }
-    if mem_read.is_none() {
-        *mem_read = Some(Vault::open_read_only(mv2).map_err(|e| e.to_string())?);
-    }
-    f(mem_read.as_mut().unwrap())
+    // Open fresh each time — don't hold a shared lock between tool calls.
+    // This allows concurrent subagents to acquire exclusive locks for writes.
+    let mut mem = Vault::open_read_only(mv2).map_err(|e| e.to_string())?;
+    let result = f(&mut mem);
+    // `mem` is dropped here, releasing the shared lock immediately.
+    *mem_read = None;
+    result
 }
 
 fn with_write_mem<F, R>(
@@ -1410,20 +1413,19 @@ fn with_write_mem<F, R>(
 where
     F: FnOnce(&mut Vault) -> Result<R, String>,
 {
-    if mem_write.is_none() {
-        *mem_read = None;
-        let opened = if allow_create {
-            open_or_create(mv2).map_err(|e| e.to_string())?
-        } else {
-            Vault::open(mv2).map_err(|e| e.to_string())?
-        };
-        *mem_write = Some(opened);
-    }
+    // Always open fresh — don't reuse a stale handle that holds a lock.
+    *mem_read = None;
+    *mem_write = None;
+    let opened = if allow_create {
+        open_or_create(mv2).map_err(|e| e.to_string())?
+    } else {
+        Vault::open(mv2).map_err(|e| e.to_string())?
+    };
+    *mem_write = Some(opened);
     let result = f(mem_write.as_mut().unwrap());
-    // After writing, downgrade back to shared so concurrent readers aren't blocked.
-    if let Some(mem) = mem_write.as_mut() {
-        let _ = mem.downgrade_to_shared();
-    }
+    // Drop the handle entirely so no lock (shared or exclusive) persists between calls.
+    // This allows concurrent subagents to acquire exclusive access for their own writes.
+    *mem_write = None;
     result
 }
 
@@ -7632,6 +7634,11 @@ fn run_agent_with_prompt(
         }
     }
 
+
+    // Release the read handle after initialization. Tool calls re-open on demand via
+    // with_read_mem/with_write_mem. This prevents a long-lived shared flock from blocking
+    // sibling subagents that need exclusive access for writes.
+    mem_read = None;
 
     // Knowledge Graph entity auto-injection
     let kg_path = std::path::PathBuf::from("/root/.aethervault/data/knowledge-graph.json");
