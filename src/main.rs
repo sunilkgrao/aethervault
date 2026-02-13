@@ -8122,9 +8122,15 @@ fn run_agent_with_prompt(
     }
 
     if !completed {
+        // Extract the last assistant message for context on what was in progress
+        let last_action = messages.iter().rev()
+            .find(|m| m.role == "assistant")
+            .and_then(|m| m.content.as_ref())
+            .map(|c| c.chars().take(200).collect::<String>())
+            .unwrap_or_else(|| "(no context available)".to_string());
         return Err(format!(
-            "agent exceeded {} steps without completing",
-            effective_max_steps
+            "Agent used all {effective_max_steps} steps without finishing. \
+            Last action: {last_action}"
         )
         .into());
     }
@@ -8239,7 +8245,10 @@ fn run_agent_for_bridge(
 
     match rx.recv_timeout(config.timeout) {
         Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err("Agent timeout".into()),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "Agent timed out after {}s. The operation was still running when the deadline hit.",
+            config.timeout.as_secs()
+        ).into()),
         Err(err) => Err(format!("Agent channel error: {err}")),
     }
 }
@@ -8858,17 +8867,16 @@ fn run_telegram_bridge(
                     text
                 }
                 Err(err) => {
-                    // User-friendly error messages
+                    // Transparent error reporting — no canned heuristic messages.
+                    // Tell the user exactly what happened so they can decide what to do.
                     let err_str = err.to_string();
-                    if err_str.contains("lock") {
-                        "I'm momentarily busy with another request. Please try again in a few seconds.".to_string()
-                    } else if err_str.contains("timeout") || err_str.contains("Timeout") {
-                        "That took too long to process. Could you try a simpler request?".to_string()
-                    } else if err_str.contains("API error") || err_str.contains("overloaded") {
-                        "The AI service is temporarily overloaded. Retrying...".to_string()
-                    } else {
-                        format!("Something went wrong: {}", err_str.chars().take(200).collect::<String>())
-                    }
+                    let detail = err_str.chars().take(500).collect::<String>();
+                    format!(
+                        "Something went wrong while processing your request.\n\n\
+                        Error: {detail}\n\n\
+                        This wasn't your fault. I can retry if you send the message again, \
+                        or you can rephrase if you'd like to try a different approach."
+                    )
                 }
             };
 
