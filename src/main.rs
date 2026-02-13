@@ -7513,6 +7513,119 @@ fn run_agent(
     Ok(())
 }
 
+fn default_system_prompt() -> String {
+    [
+        "You are AetherVault, a high-performance personal AI assistant.",
+        "Be proactive, concrete, and concise. Prefer action over discussion.",
+        "",
+        "## Action Protocol",
+        "For routine actions (reading, searching): execute immediately, summarize after.",
+        "For significant actions (writing, creating): state your plan in one sentence, then execute.",
+        "For complex multi-step tasks: outline 2-3 bullet points, then execute step by step.",
+        "For irreversible actions (deleting, sending, deploying): describe consequences, wait for confirmation.",
+        "",
+        "## Tools",
+        "Tools load dynamically — call tool_search when you need a capability not currently available.",
+        "When multiple independent tool calls are needed, request them all at once for parallel execution.",
+        "Sensitive actions require approval. If a tool returns `approval required: <id>`, ask the user to approve or reject.",
+        "Use subagent_invoke or subagent_batch for specialist work when it improves quality or speed.",
+        "",
+        "## Error Recovery",
+        "When a tool fails, use reflect to record what went wrong, then retry differently.",
+        "Never retry the same failing call. If stuck after 2 attempts, ask the user for guidance.",
+        "",
+        "## Critical Reminders",
+        "Investigate before answering — search memory before making claims.",
+        "Match the user's energy. Be concise when they're concise, detailed when they need detail.",
+        "For irreversible actions, always confirm first.",
+    ]
+    .join("\n")
+}
+
+/// Estimate token count for messages (rough: chars / 4).
+fn estimate_tokens(messages: &[AgentMessage]) -> usize {
+    messages.iter().map(|m| {
+        m.content.as_ref().map(|c| c.len()).unwrap_or(0) / 4
+    }).sum()
+}
+
+/// Compact messages when context is getting large.
+/// Keeps the system message (index 0) and last `keep_recent` messages verbatim.
+/// Summarizes everything in between into a single system message.
+fn compact_messages(
+    messages: &mut Vec<AgentMessage>,
+    hook: &HookSpec,
+    keep_recent: usize,
+) -> Result<(), String> {
+    if messages.len() <= keep_recent + 2 {
+        return Ok(()); // Nothing to compact
+    }
+    let system_msg = messages[0].clone();
+    let to_summarize: Vec<_> = messages[1..messages.len() - keep_recent].to_vec();
+    let recent: Vec<_> = messages[messages.len() - keep_recent..].to_vec();
+
+    // Build a summary request
+    let summary_text: String = to_summarize.iter().filter_map(|m| {
+        let role = &m.role;
+        m.content.as_ref().map(|c| {
+            let preview = if c.len() > 300 { &c[..300] } else { c.as_str() };
+            format!("[{role}] {preview}")
+        })
+    }).collect::<Vec<_>>().join("\n");
+
+    let summary_prompt = format!(
+        "Summarize this conversation concisely. Preserve: key decisions, file paths, unresolved issues, user preferences. Discard: verbose tool outputs, redundant context.\n\n{summary_text}"
+    );
+
+    let summary_request = AgentHookRequest {
+        messages: vec![
+            AgentMessage {
+                role: "system".to_string(),
+                content: Some("You are a conversation summarizer. Output only the summary, nothing else. Be concise — use bullet points.".to_string()),
+                tool_calls: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                is_error: None,
+            },
+            AgentMessage {
+                role: "user".to_string(),
+                content: Some(summary_prompt),
+                tool_calls: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                is_error: None,
+            },
+        ],
+        tools: Vec::new(),
+        session: None,
+    };
+
+    let summary_response = call_agent_hook(hook, &summary_request)?;
+    let summary = summary_response.content.unwrap_or_else(|| "(compaction failed)".to_string());
+
+    // Rebuild messages: system + compaction notice + recent
+    *messages = Vec::new();
+    messages.push(system_msg);
+    messages.push(AgentMessage {
+        role: "user".to_string(),
+        content: Some(format!("[Context compacted. Summary of prior conversation:]\n{summary}")),
+        tool_calls: Vec::new(),
+        name: None,
+        tool_call_id: None,
+        is_error: None,
+    });
+    messages.push(AgentMessage {
+        role: "assistant".to_string(),
+        content: Some("Understood. I have the context from the summary above. Continuing.".to_string()),
+        tool_calls: Vec::new(),
+        name: None,
+        tool_call_id: None,
+        is_error: None,
+    });
+    messages.extend(recent);
+    Ok(())
+}
+
 fn run_agent_with_prompt(
     mv2: PathBuf,
     prompt_text: String,
@@ -7549,16 +7662,15 @@ fn run_agent_with_prompt(
     } else if let Some(system) = agent_cfg.system.clone() {
         system
     } else {
-        [
-            "You are a high-performance executive assistant.",
-            "Be proactive, concrete, and concise.",
-            "Use tools to take actions when appropriate.",
-            "Tools are loaded dynamically: call tool_search when you need a capability that is not currently available.",
-            "Sensitive actions require approval. If a tool returns `approval required: <id>`, ask the user to reply `approve <id>` or `reject <id>`.",
-            "Use subagent_invoke for specialist help when it will improve quality or speed.",
-            "When something fails, store a short reflection via reflect and then retry with a corrected approach.",
-        ]
-        .join("\n")
+        // Load from workspace SYSTEM.md, fall back to inline default
+        let system_path = resolve_workspace(None, &agent_cfg)
+            .map(|ws| ws.join("SYSTEM.md"))
+            .filter(|p| p.exists());
+        if let Some(path) = system_path {
+            fs::read_to_string(&path).unwrap_or_else(|_| default_system_prompt())
+        } else {
+            default_system_prompt()
+        }
     };
 
     if agent_cfg.onboarding_complete == Some(false) {
@@ -7583,6 +7695,10 @@ fn run_agent_with_prompt(
             system_prompt.push_str(&global_context);
         }
     }
+
+    // --- KV-Cache Breakpoint ---
+    // Everything above is stable within a session (identity, tools, workspace, global context).
+    // Everything below is dynamic per-turn (memory, KG, session, reminders).
 
     let mut context_pack = None;
     let effective_max_steps = agent_cfg.max_steps.unwrap_or(max_steps);
@@ -7656,24 +7772,6 @@ fn run_agent_with_prompt(
         }
     }
 
-    // Session conversation history (last 8 turns for continuity)
-    if let Some(ref sess_id) = session {
-        let session_turns = load_session_turns(sess_id, 8);
-        if !session_turns.is_empty() {
-            system_prompt.push_str("\n\n# Recent Conversation History\n");
-            system_prompt.push_str("(Previous messages in this conversation for context)\n\n");
-            for turn in &session_turns {
-                let role_label = if turn.role == "user" { "User" } else { "Assistant" };
-                let content_preview = if turn.content.len() > 500 {
-                    format!("{}...", &turn.content[..500])
-                } else {
-                    turn.content.clone()
-                };
-                system_prompt.push_str(&format!("**{}**: {}\n\n", role_label, content_preview));
-            }
-        }
-    }
-
     let mut messages = Vec::new();
     messages.push(AgentMessage {
         role: "system".to_string(),
@@ -7683,6 +7781,26 @@ fn run_agent_with_prompt(
         tool_call_id: None,
         is_error: None,
     });
+
+    // Insert session history as proper user/assistant messages (not in system prompt)
+    if let Some(ref sess_id) = session {
+        let session_turns = load_session_turns(sess_id, 8);
+        for turn in &session_turns {
+            messages.push(AgentMessage {
+                role: turn.role.clone(),
+                content: Some(if turn.content.len() > 500 {
+                    format!("{}...", &turn.content[..500])
+                } else {
+                    turn.content.clone()
+                }),
+                tool_calls: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                is_error: None,
+            });
+        }
+    }
+
     messages.push(AgentMessage {
         role: "user".to_string(),
         content: Some(prompt_text.clone()),
@@ -7738,6 +7856,15 @@ fn run_agent_with_prompt(
 
     let mut completed = false;
     for _ in 0..effective_max_steps {
+        // Auto-compact when context exceeds threshold (80% of ~128K token window)
+        let token_estimate = estimate_tokens(&messages);
+        if token_estimate > 100_000 {
+            eprintln!("[harness] context at ~{token_estimate} tokens, compacting...");
+            if let Err(e) = compact_messages(&mut messages, &model_spec, 6) {
+                eprintln!("[harness] compaction failed: {e}");
+            }
+        }
+
         let request = AgentHookRequest {
             messages: messages.clone(),
             tools: tools.clone(),
@@ -7767,13 +7894,21 @@ fn run_agent_with_prompt(
             break;
         }
 
-        for call in tool_calls {
+        // Validate all tool calls before execution
+        for call in &tool_calls {
             if call.id.trim().is_empty() {
                 return Err("tool call is missing an id".into());
             }
             if call.name.trim().is_empty() {
                 return Err("tool call is missing a name".into());
             }
+        }
+
+        let max_tool_output = 8000; // chars (~2000 tokens)
+
+        if tool_calls.len() == 1 {
+            // Single tool call — execute directly (no thread overhead)
+            let call = &tool_calls[0];
             let result = match execute_tool_with_handles(
                 &call.name,
                 call.args.clone(),
@@ -7789,6 +7924,23 @@ fn run_agent_with_prompt(
                     is_error: true,
                 },
             };
+
+            // Truncate large tool outputs to prevent context blowout
+            let result = if result.output.len() > max_tool_output && !result.is_error {
+                ToolExecution {
+                    output: format!(
+                        "{}\n\n[Output truncated: {} chars total, showing first {}. Use a more specific query for full results.]",
+                        &result.output[..max_tool_output],
+                        result.output.len(),
+                        max_tool_output
+                    ),
+                    details: result.details,
+                    is_error: result.is_error,
+                }
+            } else {
+                result
+            };
+
             let tool_content =
                 format_tool_message_content(&call.name, &result.output, &result.details);
             tool_results.push(AgentToolResult {
@@ -7798,24 +7950,19 @@ fn run_agent_with_prompt(
                 details: result.details.clone(),
                 is_error: result.is_error,
             });
-            let tool_message = AgentMessage {
+            messages.push(AgentMessage {
                 role: "tool".to_string(),
-                content: if tool_content.is_empty() {
-                    None
-                } else {
-                    Some(tool_content)
-                },
+                content: if tool_content.is_empty() { None } else { Some(tool_content) },
                 tool_calls: Vec::new(),
                 name: Some(call.name.clone()),
                 tool_call_id: Some(call.id.clone()),
                 is_error: Some(result.is_error),
-            };
-            messages.push(tool_message);
+            });
 
             if call.name == "tool_search" && !result.is_error {
-                if let Some(results) = result.details.get("results").and_then(|v| v.as_array()) {
+                if let Some(results_arr) = result.details.get("results").and_then(|v| v.as_array()) {
                     let mut changed = false;
-                    for item in results {
+                    for item in results_arr {
                         if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
                             if active_tools.insert(name.to_string()) {
                                 changed = true;
@@ -7829,23 +7976,144 @@ fn run_agent_with_prompt(
             }
 
             if should_log {
-                let entry = AgentLogEntry {
+                log_buffer.push(AgentLogEntry {
                     session: session.clone(),
                     role: "tool".to_string(),
                     text: result.output,
                     meta: Some(result.details),
                     ts_utc: Some(Utc::now().timestamp()),
-                };
-                log_buffer.push(entry);
+                });
                 if log_buffer.len() >= effective_log_commit_interval {
                     flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
                 }
             }
 
             if matches!(call.name.as_str(), "put" | "log" | "feedback") && !result.is_error {
-                // These tools already committed; flush our buffer too to stay in sync.
                 flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
             }
+        } else {
+            // Multiple tool calls — execute in parallel
+            let results: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = tool_calls.iter().map(|call| {
+                    let mv2 = &mv2;
+                    s.spawn(move || {
+                        let mut local_mem_read: Option<Vault> = None;
+                        let mut local_mem_write: Option<Vault> = None;
+                        let result = match execute_tool_with_handles(
+                            &call.name,
+                            call.args.clone(),
+                            mv2,
+                            false,
+                            &mut local_mem_read,
+                            &mut local_mem_write,
+                        ) {
+                            Ok(r) => r,
+                            Err(err) => ToolExecution {
+                                output: format!("Tool error: {err}"),
+                                details: serde_json::json!({ "error": err }),
+                                is_error: true,
+                            },
+                        };
+                        (call, result)
+                    })
+                }).collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            for (call, result) in results {
+                // Truncate large tool outputs to prevent context blowout
+                let result = if result.output.len() > max_tool_output && !result.is_error {
+                    ToolExecution {
+                        output: format!(
+                            "{}\n\n[Output truncated: {} chars total, showing first {}.]",
+                            &result.output[..max_tool_output],
+                            result.output.len(),
+                            max_tool_output
+                        ),
+                        details: result.details,
+                        is_error: result.is_error,
+                    }
+                } else {
+                    result
+                };
+
+                let tool_content = format_tool_message_content(&call.name, &result.output, &result.details);
+                tool_results.push(AgentToolResult {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    output: result.output.clone(),
+                    details: result.details.clone(),
+                    is_error: result.is_error,
+                });
+                messages.push(AgentMessage {
+                    role: "tool".to_string(),
+                    content: if tool_content.is_empty() { None } else { Some(tool_content) },
+                    tool_calls: Vec::new(),
+                    name: Some(call.name.clone()),
+                    tool_call_id: Some(call.id.clone()),
+                    is_error: Some(result.is_error),
+                });
+
+                if call.name == "tool_search" && !result.is_error {
+                    if let Some(results_arr) = result.details.get("results").and_then(|v| v.as_array()) {
+                        let mut changed = false;
+                        for item in results_arr {
+                            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                                if active_tools.insert(name.to_string()) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if changed {
+                            tools = tools_from_active(&tool_map, &active_tools);
+                        }
+                    }
+                }
+
+                if should_log {
+                    log_buffer.push(AgentLogEntry {
+                        session: session.clone(),
+                        role: "tool".to_string(),
+                        text: result.output,
+                        meta: Some(result.details),
+                        ts_utc: Some(Utc::now().timestamp()),
+                    });
+                    if log_buffer.len() >= effective_log_commit_interval {
+                        flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
+                    }
+                }
+
+                if matches!(call.name.as_str(), "put" | "log" | "feedback") && !result.is_error {
+                    flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
+                }
+            }
+        }
+
+        // Mid-loop system reminders
+        let step_num = messages.iter().filter(|m| m.role == "assistant").count();
+        let token_est = estimate_tokens(&messages);
+        let mut reminders = Vec::new();
+
+        if token_est > 80_000 {
+            reminders.push("Context is large. Be concise in your responses and tool calls.");
+        }
+        if step_num > effective_max_steps * 3 / 4 {
+            reminders.push("You are approaching the step limit. Focus on completing the current task.");
+        }
+        // Check if the last tool result was an error
+        if messages.last().map(|m| m.is_error == Some(true)).unwrap_or(false) {
+            reminders.push("The previous tool call failed. Use reflect to analyze what went wrong, then try a different approach. Do not retry the same call.");
+        }
+
+        if !reminders.is_empty() {
+            messages.push(AgentMessage {
+                role: "user".to_string(),
+                content: Some(format!("[System Reminder] {}", reminders.join(" "))),
+                tool_calls: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                is_error: None,
+            });
         }
     }
 
