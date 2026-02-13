@@ -1849,6 +1849,13 @@ struct ToolFeedbackArgs {
     session: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ToolScaleArgs {
+    action: String,
+    #[serde(default)]
+    size: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 enum LaneKind {
@@ -3818,6 +3825,24 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
                 "required": ["subject", "start", "end"]
             }
         }),
+        serde_json::json!({
+            "name": "scale",
+            "description": "Monitor and scale infrastructure resources. Actions: 'status' (CPU/RAM/disk/load), 'sizes' (list available DigitalOcean droplet sizes with pricing), 'resize' (scale droplet up/down, requires size param and approval).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "resize", "sizes"]
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "Target droplet size slug (e.g. s-2vcpu-4gb). Required for resize."
+                    }
+                },
+                "required": ["action"]
+            }
+        }),
     ]
 }
 
@@ -5483,6 +5508,227 @@ fn execute_tool_with_handles(
                 Err(err) => Err(format!("ms_calendar_create failed: {err}").into()),
             }
         }
+        "scale" => {
+            let parsed: ToolScaleArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            match parsed.action.as_str() {
+                "status" => {
+                    // Pure local: read /proc files + df for system stats
+                    let cpu_count = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1);
+                    let (load_1m, load_5m) =
+                        std::fs::read_to_string("/proc/loadavg")
+                            .ok()
+                            .and_then(|s| {
+                                let parts: Vec<&str> = s.split_whitespace().collect();
+                                if parts.len() >= 2 {
+                                    Some((
+                                        parts[0].parse::<f64>().unwrap_or(0.0),
+                                        parts[1].parse::<f64>().unwrap_or(0.0),
+                                    ))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or((0.0, 0.0));
+                    let (mem_total_mb, mem_avail_mb) =
+                        std::fs::read_to_string("/proc/meminfo")
+                            .ok()
+                            .map(|s| {
+                                let mut total: u64 = 0;
+                                let mut avail: u64 = 0;
+                                for line in s.lines() {
+                                    if line.starts_with("MemTotal:") {
+                                        total = line
+                                            .split_whitespace()
+                                            .nth(1)
+                                            .and_then(|v| v.parse::<u64>().ok())
+                                            .unwrap_or(0)
+                                            / 1024;
+                                    } else if line.starts_with("MemAvailable:") {
+                                        avail = line
+                                            .split_whitespace()
+                                            .nth(1)
+                                            .and_then(|v| v.parse::<u64>().ok())
+                                            .unwrap_or(0)
+                                            / 1024;
+                                    }
+                                }
+                                (total, avail)
+                            })
+                            .unwrap_or((0, 0));
+                    let mem_used_pct = if mem_total_mb > 0 {
+                        ((mem_total_mb - mem_avail_mb) as f64 / mem_total_mb as f64 * 100.0)
+                            .round()
+                    } else {
+                        0.0
+                    };
+                    // Disk via df
+                    let (disk_total_gb, disk_used_gb, disk_used_pct) = std::process::Command::new("df")
+                        .args(["-BG", "/"])
+                        .output()
+                        .ok()
+                        .and_then(|out| {
+                            let text = String::from_utf8_lossy(&out.stdout);
+                            let line = text.lines().nth(1)?;
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if parts.len() >= 5 {
+                                let total = parts[1]
+                                    .trim_end_matches('G')
+                                    .parse::<f64>()
+                                    .unwrap_or(0.0);
+                                let used = parts[2]
+                                    .trim_end_matches('G')
+                                    .parse::<f64>()
+                                    .unwrap_or(0.0);
+                                let pct = parts[4]
+                                    .trim_end_matches('%')
+                                    .parse::<f64>()
+                                    .unwrap_or(0.0);
+                                Some((total, used, pct))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or((0.0, 0.0, 0.0));
+                    let details = serde_json::json!({
+                        "cpu_count": cpu_count,
+                        "load_1m": load_1m,
+                        "load_5m": load_5m,
+                        "mem_total_mb": mem_total_mb,
+                        "mem_avail_mb": mem_avail_mb,
+                        "mem_used_pct": mem_used_pct,
+                        "disk_total_gb": disk_total_gb,
+                        "disk_used_gb": disk_used_gb,
+                        "disk_used_pct": disk_used_pct,
+                    });
+                    Ok(ToolExecution {
+                        output: format!(
+                            "CPU: {} cores, load {:.1}/{:.1} | RAM: {}MB/{} MB ({:.0}% used) | Disk: {:.0}G/{:.0}G ({:.0}% used)",
+                            cpu_count, load_1m, load_5m, mem_total_mb - mem_avail_mb, mem_total_mb, mem_used_pct,
+                            disk_used_gb, disk_total_gb, disk_used_pct,
+                        ),
+                        details,
+                        is_error: false,
+                    })
+                }
+                "sizes" => {
+                    let do_token = env_optional("DO_TOKEN")
+                        .ok_or_else(|| "DO_TOKEN not set — cannot query DigitalOcean API".to_string())?;
+                    let out = std::process::Command::new("curl")
+                        .args([
+                            "-s",
+                            "-X", "GET",
+                            "https://api.digitalocean.com/v2/sizes",
+                            "-H", &format!("Authorization: Bearer {}", do_token),
+                        ])
+                        .output()
+                        .map_err(|e| format!("curl failed: {e}"))?;
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&out.stdout)
+                            .map_err(|e| format!("invalid JSON from DO API: {e}"))?;
+                    let sizes = body
+                        .get("sizes")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    // Filter to ≤8 vCPU / ≤32GB to prevent cost overruns
+                    let filtered: Vec<serde_json::Value> = sizes
+                        .into_iter()
+                        .filter(|s| {
+                            let vcpus = s.get("vcpus").and_then(|v| v.as_u64()).unwrap_or(99);
+                            let mem = s.get("memory").and_then(|v| v.as_u64()).unwrap_or(999999);
+                            let available = s.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
+                            vcpus <= 8 && mem <= 32768 && available
+                        })
+                        .map(|s| {
+                            serde_json::json!({
+                                "slug": s.get("slug").and_then(|v| v.as_str()).unwrap_or(""),
+                                "vcpus": s.get("vcpus").and_then(|v| v.as_u64()).unwrap_or(0),
+                                "memory_mb": s.get("memory").and_then(|v| v.as_u64()).unwrap_or(0),
+                                "disk_gb": s.get("disk").and_then(|v| v.as_u64()).unwrap_or(0),
+                                "price_monthly": s.get("price_monthly").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                            })
+                        })
+                        .collect();
+                    let details = serde_json::json!({ "sizes": filtered });
+                    Ok(ToolExecution {
+                        output: format!("{} available sizes (≤8 vCPU, ≤32GB).", filtered.len()),
+                        details,
+                        is_error: false,
+                    })
+                }
+                "resize" => {
+                    let target_size = parsed
+                        .size
+                        .ok_or_else(|| "size parameter is required for resize".to_string())?;
+                    let do_token = env_optional("DO_TOKEN")
+                        .ok_or_else(|| "DO_TOKEN not set — cannot call DigitalOcean API".to_string())?;
+                    // Get droplet ID: env var or auto-detect via DO metadata
+                    let droplet_id = env_optional("DO_DROPLET_ID").or_else(|| {
+                        std::process::Command::new("curl")
+                            .args(["-s", "http://169.254.169.254/metadata/v1/id"])
+                            .output()
+                            .ok()
+                            .and_then(|o| {
+                                let id = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
+                                    Some(id)
+                                } else {
+                                    None
+                                }
+                            })
+                    }).ok_or_else(|| "DO_DROPLET_ID not set and metadata API unreachable".to_string())?;
+                    let url = format!(
+                        "https://api.digitalocean.com/v2/droplets/{}/actions",
+                        droplet_id
+                    );
+                    let payload = serde_json::json!({
+                        "type": "resize",
+                        "disk": false,
+                        "size": target_size,
+                    });
+                    let out = std::process::Command::new("curl")
+                        .args([
+                            "-s",
+                            "-X", "POST",
+                            &url,
+                            "-H", &format!("Authorization: Bearer {}", do_token),
+                            "-H", "Content-Type: application/json",
+                            "-d", &payload.to_string(),
+                        ])
+                        .output()
+                        .map_err(|e| format!("curl failed: {e}"))?;
+                    let resp: serde_json::Value =
+                        serde_json::from_slice(&out.stdout)
+                            .map_err(|e| format!("invalid JSON from DO API: {e}"))?;
+                    let action_status = resp
+                        .get("action")
+                        .and_then(|a| a.get("status"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let action_id = resp
+                        .get("action")
+                        .and_then(|a| a.get("id"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if action_status == "errored" || resp.get("id").is_some_and(|v| v.as_str() == Some("not_found")) {
+                        let msg = resp.get("message").and_then(|v| v.as_str()).unwrap_or("resize failed");
+                        return Err(format!("DO resize error: {msg}"));
+                    }
+                    Ok(ToolExecution {
+                        output: format!(
+                            "Resize to {} initiated (action {}, status: {}). Note: CPU resizes require a power cycle to take effect.",
+                            target_size, action_id, action_status
+                        ),
+                        details: resp,
+                        is_error: false,
+                    })
+                }
+                other => Err(format!("unknown scale action: {other} (use status, sizes, or resize)")),
+            }
+        }
         _ => Err("unknown tool".into()),
     }
 }
@@ -6207,6 +6453,9 @@ fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
                 .to_ascii_uppercase();
             method != "GET"
         }
+        "scale" => {
+            args.get("action").and_then(|v| v.as_str()) == Some("resize")
+        }
         _ => false,
     }
 }
@@ -6339,6 +6588,7 @@ fn base_tool_names() -> HashSet<String> {
         "subagent_invoke",
         "subagent_batch",
         "approval_list",
+        "scale",
     ]
     .into_iter()
     .map(|s| s.to_string())
