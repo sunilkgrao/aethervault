@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1241,6 +1241,25 @@ struct AgentRunOutput {
     final_text: Option<String>,
 }
 
+struct AgentProgress {
+    step: usize,
+    max_steps: usize,
+    phase: String,
+    text_preview: Option<String>,
+    started_at: std::time::Instant,
+}
+
+struct CompletionEvent {
+    chat_id: i64,
+    reply_to_id: Option<i64>,
+    result: Result<AgentRunOutput, String>,
+}
+
+struct ActiveRun {
+    progress: Arc<Mutex<AgentProgress>>,
+    queued_messages: Vec<(String, Option<i64>)>,
+}
+
 #[derive(Clone)]
 struct BridgeAgentConfig {
     mv2: PathBuf,
@@ -1254,7 +1273,6 @@ struct BridgeAgentConfig {
     log: bool,
     log_commit_interval: usize,
     session_prefix: String,
-    timeout: Duration,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -5105,7 +5123,7 @@ fn execute_tool_with_handles(
             *mem_read = None;
             *mem_write = None;
             let session = format!("subagent:{}:{}", parsed.name, Utc::now().timestamp());
-            let result = run_agent_for_bridge(&cfg, &parsed.prompt, session, None, None)
+            let result = run_agent_for_bridge(&cfg, &parsed.prompt, session, None, None, None)
                 .map_err(|e| e.to_string())?;
             Ok(ToolExecution {
                 output: result.final_text.unwrap_or_default(),
@@ -5165,7 +5183,7 @@ fn execute_tool_with_handles(
                 let prompt = inv.prompt.clone();
                 let name = inv.name.clone();
                 handles.push((name, thread::spawn(move || {
-                    run_agent_for_bridge(&cfg, &prompt, session, None, None)
+                    run_agent_for_bridge(&cfg, &prompt, session, None, None, None)
                 })));
             }
 
@@ -7031,7 +7049,7 @@ fn run_schedule_loop(
                 prompt.push_str(&format!("\n\nWorkspace: {}", ws.display()));
             }
             let session = format!("schedule:{task}");
-            let result = run_agent_for_bridge(&agent_config, &prompt, session, None, None);
+            let result = run_agent_for_bridge(&agent_config, &prompt, session, None, None, None);
             if let Ok(output) = result {
                 if let Some(text) = output.final_text {
                     if let (Some(token), Some(chat_id)) =
@@ -7146,7 +7164,7 @@ fn run_watch_loop(
                             }
                             let session = format!("trigger:email:{}", trigger.id);
                             let _ =
-                                run_agent_for_bridge(&agent_config, &prompt, session, None, None);
+                                run_agent_for_bridge(&agent_config, &prompt, session, None, None, None);
                         }
                     }
                 }
@@ -7207,7 +7225,7 @@ fn run_watch_loop(
                             }
                             let session = format!("trigger:calendar:{}", trigger.id);
                             let _ =
-                                run_agent_for_bridge(&agent_config, &prompt, session, None, None);
+                                run_agent_for_bridge(&agent_config, &prompt, session, None, None, None);
                         }
                     }
                 }
@@ -7725,6 +7743,7 @@ fn run_agent(
         max_steps,
         log_commit_interval,
         log,
+        None,
     )?;
 
     // Save session turns for CLI agent continuity (mirrors Telegram bridge behaviour)
@@ -7889,6 +7908,7 @@ fn run_agent_with_prompt(
     max_steps: usize,
     log_commit_interval: usize,
     log: bool,
+    progress: Option<Arc<Mutex<AgentProgress>>>,
 ) -> Result<AgentRunOutput, Box<dyn std::error::Error>> {
     if prompt_text.trim().is_empty() {
         return Err("agent prompt is empty".into());
@@ -8105,7 +8125,15 @@ fn run_agent_with_prompt(
     }
 
     let mut completed = false;
-    for _ in 0..effective_max_steps {
+    for step in 0..effective_max_steps {
+        // Update progress: thinking phase
+        if let Some(ref prog) = progress {
+            if let Ok(mut p) = prog.lock() {
+                p.step = step;
+                p.phase = "thinking".to_string();
+            }
+        }
+
         // Auto-compact when context exceeds threshold (80% of ~128K token window)
         let token_estimate = estimate_tokens(&messages);
         if token_estimate > 100_000 {
@@ -8123,6 +8151,12 @@ fn run_agent_with_prompt(
         let message = call_agent_hook(&model_spec, &request)?;
         if let Some(content) = message.content.clone() {
             final_text = Some(content.clone());
+            // Update progress: text preview
+            if let Some(ref prog) = progress {
+                if let Ok(mut p) = prog.lock() {
+                    p.text_preview = Some(content.chars().take(100).collect());
+                }
+            }
             if should_log {
                 let entry = AgentLogEntry {
                     session: session.clone(),
@@ -8155,6 +8189,14 @@ fn run_agent_with_prompt(
         }
 
         let max_tool_output = 8000; // chars (~2000 tokens)
+
+        // Update progress: tool execution phase
+        if let Some(ref prog) = progress {
+            if let Ok(mut p) = prog.lock() {
+                let names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
+                p.phase = format!("tool:{}", names.join(","));
+            }
+        }
 
         if tool_calls.len() == 1 {
             // Single tool call — execute directly (no thread overhead)
@@ -8436,7 +8478,6 @@ fn build_bridge_agent_config(
     let log_commit_interval = log_commit_interval.max(1);
     let log = log;
     let session_prefix = String::new();
-    let timeout = Duration::from_secs(900);
 
     Ok(BridgeAgentConfig {
         mv2,
@@ -8450,7 +8491,6 @@ fn build_bridge_agent_config(
         log,
         log_commit_interval,
         session_prefix,
-        timeout,
     })
 }
 
@@ -8460,6 +8500,7 @@ fn run_agent_for_bridge(
     session: String,
     system_override: Option<String>,
     model_hook_override: Option<String>,
+    progress: Option<Arc<Mutex<AgentProgress>>>,
 ) -> Result<AgentRunOutput, String> {
     let (tx, rx) = mpsc::channel();
     let prompt_text = prompt.to_string();
@@ -8488,19 +8529,16 @@ fn run_agent_for_bridge(
             max_steps,
             log_commit_interval,
             log,
+            progress,
         )
         .map_err(|e| e.to_string());
         let _ = tx.send(result);
     });
 
-    match rx.recv_timeout(config.timeout) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "Agent timed out after {}s. The operation was still running when the deadline hit.",
-            config.timeout.as_secs()
-        ).into()),
-        Err(err) => Err(format!("Agent channel error: {err}")),
-    }
+    // No timeout — let the agent run as long as it needs.
+    // The agent is bounded by max_steps, not wall-clock time.
+    // Long-running tasks (dev work, swarms, batch processing) can take hours.
+    rx.recv().map_err(|err| format!("Agent channel error: {err}"))?.map_err(|e| e)
 }
 
 #[derive(Debug, Deserialize)]
@@ -8900,6 +8938,56 @@ fn split_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+fn telegram_send_message_returning_id(
+    agent: &ureq::Agent,
+    base_url: &str,
+    chat_id: i64,
+    text: &str,
+) -> Option<i64> {
+    let url = format!("{base_url}/sendMessage");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+    });
+    match agent.post(&url).set("content-type", "application/json").send_json(payload) {
+        Ok(resp) => {
+            if let Ok(body) = resp.into_json::<serde_json::Value>() {
+                body.get("result")
+                    .and_then(|r| r.get("message_id"))
+                    .and_then(|v| v.as_i64())
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+fn telegram_edit_message(
+    agent: &ureq::Agent,
+    base_url: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) {
+    let url = format!("{base_url}/editMessageText");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    });
+    let _ = agent.post(&url).set("content-type", "application/json").send_json(payload);
+}
+
+fn telegram_delete_message(agent: &ureq::Agent, base_url: &str, chat_id: i64, message_id: i64) {
+    let url = format!("{base_url}/deleteMessage");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+    });
+    let _ = agent.post(&url).set("content-type", "application/json").send_json(payload);
+}
+
 fn telegram_send_typing(agent: &ureq::Agent, base_url: &str, chat_id: i64) {
     let url = format!("{base_url}/sendChatAction");
     let payload = serde_json::json!({
@@ -9008,6 +9096,212 @@ fn telegram_send_message_ext(
     Ok(())
 }
 
+fn spawn_agent_run(
+    agent_config: &BridgeAgentConfig,
+    chat_id: i64,
+    reply_to_id: Option<i64>,
+    user_text: &str,
+    session: String,
+    completion_tx: &mpsc::Sender<CompletionEvent>,
+    http_agent: &ureq::Agent,
+    base_url: &str,
+) -> Arc<Mutex<AgentProgress>> {
+    let progress = Arc::new(Mutex::new(AgentProgress {
+        step: 0,
+        max_steps: agent_config.max_steps,
+        phase: "starting".to_string(),
+        text_preview: None,
+        started_at: std::time::Instant::now(),
+    }));
+
+    // Worker thread
+    let worker_progress = progress.clone();
+    let worker_config = agent_config.clone();
+    let worker_prompt = user_text.to_string();
+    let worker_session = session;
+    let worker_tx = completion_tx.clone();
+    thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_agent_for_bridge(
+                &worker_config,
+                &worker_prompt,
+                worker_session,
+                None,
+                None,
+                Some(worker_progress.clone()),
+            )
+        }));
+        // Mark done
+        if let Ok(mut p) = worker_progress.lock() {
+            p.phase = "done".to_string();
+        }
+        let event = match result {
+            Ok(agent_result) => CompletionEvent {
+                chat_id,
+                reply_to_id,
+                result: agent_result.map_err(|e| e.to_string()),
+            },
+            Err(panic_info) => {
+                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "agent panicked".to_string()
+                };
+                CompletionEvent {
+                    chat_id,
+                    reply_to_id,
+                    result: Err(format!("Agent crashed: {msg}")),
+                }
+            }
+        };
+        let _ = worker_tx.send(event);
+    });
+
+    // Progress reporter thread
+    let prog_ref = progress.clone();
+    let prog_agent = http_agent.clone();
+    let prog_url = base_url.to_string();
+    thread::spawn(move || {
+        let mut progress_msg_id: Option<i64> = None;
+        loop {
+            thread::sleep(Duration::from_secs(30));
+            let (phase, step, max_steps, elapsed, done) = {
+                match prog_ref.lock() {
+                    Ok(p) => (
+                        p.phase.clone(),
+                        p.step,
+                        p.max_steps,
+                        p.started_at.elapsed().as_secs(),
+                        p.phase == "done",
+                    ),
+                    Err(_) => break,
+                }
+            };
+            if done {
+                // Clean up progress message
+                if let Some(mid) = progress_msg_id {
+                    telegram_delete_message(&prog_agent, &prog_url, chat_id, mid);
+                }
+                break;
+            }
+            let status = format!(
+                "Working... step {}/{}, {} ({}s elapsed)",
+                step + 1,
+                max_steps,
+                phase,
+                elapsed
+            );
+            match progress_msg_id {
+                Some(mid) => {
+                    telegram_edit_message(&prog_agent, &prog_url, chat_id, mid, &status);
+                }
+                None => {
+                    progress_msg_id =
+                        telegram_send_message_returning_id(&prog_agent, &prog_url, chat_id, &status);
+                    // Fall back to typing indicator if send fails
+                    if progress_msg_id.is_none() {
+                        telegram_send_typing(&prog_agent, &prog_url, chat_id);
+                    }
+                }
+            }
+        }
+    });
+
+    progress
+}
+
+fn handle_telegram_completion(
+    event: CompletionEvent,
+    http_agent: &ureq::Agent,
+    base_url: &str,
+    agent_config: &BridgeAgentConfig,
+    active_runs: &mut HashMap<i64, ActiveRun>,
+    completion_tx: &mpsc::Sender<CompletionEvent>,
+) {
+    let chat_id = event.chat_id;
+    let reply_to_id = event.reply_to_id;
+
+    let output = match event.result {
+        Ok(result) => {
+            let mut text = result.final_text.unwrap_or_default();
+            if text.trim().is_empty() {
+                text = "Done.".to_string();
+            }
+            text
+        }
+        Err(err) => {
+            let detail = err.chars().take(500).collect::<String>();
+            format!(
+                "Something went wrong while processing your request.\n\n\
+                Error: {detail}\n\n\
+                This wasn't your fault. I can retry if you send the message again, \
+                or you can rephrase if you'd like to try a different approach."
+            )
+        }
+    };
+
+    // Save conversation turns for session continuity
+    let session_id = format!("{}telegram:{chat_id}", agent_config.session_prefix);
+    {
+        let mut turns = load_session_turns(&session_id, 8);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // We don't have the original user_text here in the completion event,
+        // but session turns were already saved by the agent run itself via the session.
+        turns.push(SessionTurn {
+            role: "assistant".to_string(),
+            content: output.clone(),
+            timestamp: now,
+        });
+        save_session_turns(&session_id, &turns, 8);
+    }
+
+    if let Err(err) = telegram_send_message_ext(http_agent, base_url, chat_id, &output, reply_to_id) {
+        eprintln!("Telegram send failed: {err}");
+    }
+
+    // Check for queued messages
+    if let Some(run) = active_runs.get_mut(&chat_id) {
+        if let Some((queued_text, queued_reply_id)) = run.queued_messages.first().cloned() {
+            run.queued_messages.remove(0);
+            let session = format!("{}telegram:{chat_id}", agent_config.session_prefix);
+
+            // Save the queued user message to session turns
+            {
+                let mut turns = load_session_turns(&session, 8);
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                turns.push(SessionTurn {
+                    role: "user".to_string(),
+                    content: queued_text.clone(),
+                    timestamp: now,
+                });
+                save_session_turns(&session, &turns, 8);
+            }
+
+            let progress = spawn_agent_run(
+                agent_config,
+                chat_id,
+                queued_reply_id,
+                &queued_text,
+                session,
+                completion_tx,
+                http_agent,
+                base_url,
+            );
+            run.progress = progress;
+        } else {
+            active_runs.remove(&chat_id);
+        }
+    }
+}
+
 fn run_telegram_bridge(
     token: String,
     poll_timeout: u64,
@@ -9018,21 +9312,37 @@ fn run_telegram_bridge(
         Ok(base) => format!("{base}/bot{token}"),
         Err(_) => format!("https://api.telegram.org/bot{token}"),
     };
-    let (config, subagent_specs) = {
+    let (_config, _subagent_specs) = {
         let mut mem = Vault::open_read_only(&agent_config.mv2)?;
         let config = load_capsule_config(&mut mem).unwrap_or_default();
         let subagent_specs = load_subagents_from_config(&config);
         (config, subagent_specs)
     };
-    let agent = ureq::AgentBuilder::new()
+    let http_agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_write(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(poll_timeout.saturating_add(10)))
         .build();
 
+    let mut active_runs: HashMap<i64, ActiveRun> = HashMap::new();
+    let (completion_tx, completion_rx) = mpsc::channel::<CompletionEvent>();
+
     let mut offset: Option<i64> = None;
     loop {
-        let mut request = agent
+        // 1. Drain completions (non-blocking)
+        while let Ok(event) = completion_rx.try_recv() {
+            handle_telegram_completion(
+                event,
+                &http_agent,
+                &base_url,
+                &agent_config,
+                &mut active_runs,
+                &completion_tx,
+            );
+        }
+
+        // 2. Long-poll getUpdates
+        let mut request = http_agent
             .get(&format!("{base_url}/getUpdates"))
             .query("timeout", &poll_timeout.to_string())
             .query("limit", &poll_limit.to_string());
@@ -9064,95 +9374,76 @@ fn run_telegram_bridge(
             continue;
         }
 
+        // 3. Process updates
         for entry in update.result {
             offset = Some(entry.update_id);
 
             // Handle callback queries (inline keyboard presses)
             if let Some(cb) = &entry.callback_query {
-                telegram_answer_callback(&agent, &base_url, &cb.id, Some("Processing..."));
+                telegram_answer_callback(&http_agent, &base_url, &cb.id, Some("Processing..."));
             }
 
-            let Some((chat_id, reply_to_id, user_text)) = extract_telegram_content(&entry, &agent, &base_url) else {
+            let Some((chat_id, reply_to_id, user_text)) = extract_telegram_content(&entry, &http_agent, &base_url) else {
                 continue;
             };
             if let Some(output) = try_handle_approval_chat(&agent_config.mv2, &user_text) {
-                if let Err(err) = telegram_send_message(&agent, &base_url, chat_id, &output) {
+                if let Err(err) = telegram_send_message(&http_agent, &base_url, chat_id, &output) {
                     eprintln!("Telegram send failed: {err}");
                 }
                 continue;
             }
 
-            // Send typing indicator immediately
-            telegram_send_typing(&agent, &base_url, chat_id);
+            // Check if there's already an active run for this chat
+            if let Some(run) = active_runs.get_mut(&chat_id) {
+                // Queue the message and acknowledge
+                run.queued_messages.push((user_text, reply_to_id));
+                let ack = format!(
+                    "Still working on your previous request. Queued \u{2014} I'll handle it next. \
+                    ({} message{} waiting)",
+                    run.queued_messages.len(),
+                    if run.queued_messages.len() == 1 { "" } else { "s" }
+                );
+                if let Err(err) = telegram_send_message(&http_agent, &base_url, chat_id, &ack) {
+                    eprintln!("Telegram ack send failed: {err}");
+                }
+                continue;
+            }
+
+            // No active run — spawn a new one
+            telegram_send_typing(&http_agent, &base_url, chat_id);
 
             let session = format!("{}telegram:{chat_id}", agent_config.session_prefix);
-            let session_id_clone = session.clone();
 
-            // Refresh typing every 4 seconds during long operations
-            let typing_agent = agent.clone();
-            let typing_url = base_url.clone();
-            let typing_chat = chat_id;
-            let typing_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let typing_flag = typing_active.clone();
-            let typing_thread = thread::spawn(move || {
-                while typing_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    thread::sleep(Duration::from_secs(4));
-                    if !typing_flag.load(std::sync::atomic::Ordering::Relaxed) { break; }
-                    telegram_send_typing(&typing_agent, &typing_url, typing_chat);
-                }
-            });
-
-            let response = run_agent_for_bridge(&agent_config, &user_text, session, None, None);
-
-            // Stop typing indicator
-            typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
-            let _ = typing_thread.join();
-
-            let output = match response {
-                Ok(result) => {
-                    let mut text = result.final_text.unwrap_or_default();
-                    if text.trim().is_empty() {
-                        text = "Done.".to_string();
-                    }
-                    text
-                }
-                Err(err) => {
-                    // Transparent error reporting — no canned heuristic messages.
-                    // Tell the user exactly what happened so they can decide what to do.
-                    let err_str = err.to_string();
-                    let detail = err_str.chars().take(500).collect::<String>();
-                    format!(
-                        "Something went wrong while processing your request.\n\n\
-                        Error: {detail}\n\n\
-                        This wasn't your fault. I can retry if you send the message again, \
-                        or you can rephrase if you'd like to try a different approach."
-                    )
-                }
-            };
-
-                    // Save conversation turns for session continuity
-                    {
-                        let mut turns = load_session_turns(&session_id_clone, 8);
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        turns.push(SessionTurn {
-                            role: "user".to_string(),
-                            content: user_text.clone(),
-                            timestamp: now,
-                        });
-                        turns.push(SessionTurn {
-                            role: "assistant".to_string(),
-                            content: output.clone(),
-                            timestamp: now,
-                        });
-                        save_session_turns(&session_id_clone, &turns, 8);
-                    }
-
-            if let Err(err) = telegram_send_message_ext(&agent, &base_url, chat_id, &output, reply_to_id) {
-                eprintln!("Telegram send failed: {err}");
+            // Save user message to session turns
+            {
+                let mut turns = load_session_turns(&session, 8);
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                turns.push(SessionTurn {
+                    role: "user".to_string(),
+                    content: user_text.clone(),
+                    timestamp: now,
+                });
+                save_session_turns(&session, &turns, 8);
             }
+
+            let progress = spawn_agent_run(
+                &agent_config,
+                chat_id,
+                reply_to_id,
+                &user_text,
+                session,
+                &completion_tx,
+                &http_agent,
+                &base_url,
+            );
+
+            active_runs.insert(chat_id, ActiveRun {
+                progress,
+                queued_messages: Vec::new(),
+            });
         }
     }
 }
@@ -9223,7 +9514,7 @@ fn run_whatsapp_bridge(
         }
 
         let session = format!("{}whatsapp:{from}", agent_config.session_prefix);
-        let response = run_agent_for_bridge(&agent_config, &text, session, None, None);
+        let response = run_agent_for_bridge(&agent_config, &text, session, None, None, None);
         let mut output = match response {
             Ok(result) => result.final_text.unwrap_or_default(),
             Err(err) => format!("Agent error: {err}"),
@@ -9298,7 +9589,7 @@ fn run_webhook_bridge(
             continue;
         }
         let session = format!("{}{}", agent_config.session_prefix, session_key);
-        let result = run_agent_for_bridge(&agent_config, &text, session, None, None);
+        let result = run_agent_for_bridge(&agent_config, &text, session, None, None, None);
         let output = match result {
             Ok(output) => output.final_text.unwrap_or_else(|| "Done.".to_string()),
             Err(err) => format!("Agent error: {err}"),
