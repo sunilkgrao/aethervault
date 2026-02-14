@@ -4679,7 +4679,8 @@ fn execute_tool_with_handles(
                 Err(err) => return Err(format!("http_request failed: {err}")),
             };
             let truncated = if text.len() > 20_000 {
-                format!("{}...[truncated]", &text[..20_000])
+                let safe: String = text.chars().take(20_000).collect();
+                format!("{safe}...[truncated]")
             } else {
                 text
             };
@@ -7837,7 +7838,7 @@ fn compact_messages(
     let summary_text: String = to_summarize.iter().filter_map(|m| {
         let role = &m.role;
         m.content.as_ref().map(|c| {
-            let preview = if c.len() > 300 { &c[..300] } else { c.as_str() };
+            let preview: String = c.chars().take(300).collect();
             format!("[{role}] {preview}")
         })
     }).collect::<Vec<_>>().join("\n");
@@ -8059,7 +8060,8 @@ fn run_agent_with_prompt(
             messages.push(AgentMessage {
                 role: turn.role.clone(),
                 content: Some(if turn.content.len() > 500 {
-                    format!("{}...", &turn.content[..500])
+                    let safe: String = turn.content.chars().take(500).collect();
+                    format!("{safe}...")
                 } else {
                     turn.content.clone()
                 }),
@@ -8219,11 +8221,11 @@ fn run_agent_with_prompt(
 
             // Truncate large tool outputs to prevent context blowout
             let result = if result.output.len() > max_tool_output && !result.is_error {
+                let truncated: String = result.output.chars().take(max_tool_output).collect();
                 ToolExecution {
                     output: format!(
-                        "{}\n\n[Output truncated: {} chars total, showing first {}. Use a more specific query for full results.]",
-                        &result.output[..max_tool_output],
-                        result.output.len(),
+                        "{truncated}\n\n[Output truncated: {} chars total, showing first {}. Use a more specific query for full results.]",
+                        result.output.chars().count(),
                         max_tool_output
                     ),
                     details: result.details,
@@ -8309,17 +8311,22 @@ fn run_agent_with_prompt(
                         (call, result)
                     })
                 }).collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
+                handles.into_iter().filter_map(|h| {
+                    match h.join() {
+                        Ok(r) => Some(r),
+                        Err(_) => None, // Tool thread panicked — skip this result
+                    }
+                }).collect()
             });
 
             for (call, result) in results {
                 // Truncate large tool outputs to prevent context blowout
                 let result = if result.output.len() > max_tool_output && !result.is_error {
+                    let truncated: String = result.output.chars().take(max_tool_output).collect();
                     ToolExecution {
                         output: format!(
-                            "{}\n\n[Output truncated: {} chars total, showing first {}.]",
-                            &result.output[..max_tool_output],
-                            result.output.len(),
+                            "{truncated}\n\n[Output truncated: {} chars total, showing first {}.]",
+                            result.output.chars().count(),
                             max_tool_output
                         ),
                         details: result.details,
@@ -8887,7 +8894,8 @@ User also wrote: {base_text}")
             if let Some((bytes, _ct)) = telegram_download_file_bytes(agent, base_url, &doc.file_id) {
                 if let Ok(text_content) = String::from_utf8(bytes) {
                     let truncated = if text_content.len() > 50000 {
-                        format!("{}\n... (truncated, {} total chars)", &text_content[..50000], text_content.len())
+                        let safe: String = text_content.chars().take(50000).collect();
+                        format!("{safe}\n... (truncated, {} total chars)", text_content.chars().count())
                     } else {
                         text_content
                     };
@@ -9114,31 +9122,49 @@ fn spawn_agent_run(
         started_at: std::time::Instant::now(),
     }));
 
-    // Worker thread
+    // Worker thread — calls run_agent_with_prompt directly (no middle thread)
     let worker_progress = progress.clone();
-    let worker_config = agent_config.clone();
+    let mv2 = agent_config.mv2.clone();
+    let model_hook = agent_config.model_hook.clone();
+    let system_text = agent_config.system.clone();
+    let no_memory = agent_config.no_memory;
+    let context_query = agent_config.context_query.clone();
+    let context_results = agent_config.context_results;
+    let context_max_bytes = agent_config.context_max_bytes;
+    let max_steps = agent_config.max_steps;
+    let log_commit_interval = agent_config.log_commit_interval;
+    let log = agent_config.log;
     let worker_prompt = user_text.to_string();
     let worker_session = session;
     let worker_tx = completion_tx.clone();
     thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_agent_for_bridge(
-                &worker_config,
-                &worker_prompt,
-                worker_session,
-                None,
-                None,
+            run_agent_with_prompt(
+                mv2,
+                worker_prompt,
+                Some(worker_session),
+                model_hook,
+                system_text,
+                no_memory,
+                context_query,
+                context_results,
+                context_max_bytes,
+                max_steps,
+                log_commit_interval,
+                log,
                 Some(worker_progress.clone()),
             )
+            .map_err(|e| e.to_string())
         }));
         // Mark done — recover from poison so progress thread always sees completion
         let mut p = worker_progress.lock().unwrap_or_else(|e| e.into_inner());
         p.phase = "done".to_string();
+        drop(p);
         let event = match result {
             Ok(agent_result) => CompletionEvent {
                 chat_id,
                 reply_to_id,
-                result: agent_result.map_err(|e| e.to_string()),
+                result: agent_result,
             },
             Err(panic_info) => {
                 let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {

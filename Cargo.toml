@@ -26,4 +26,4 @@ vec = ["aether-core/vec"]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+panic = "unwind"  # Required for catch_unwind crash safety in bridge
