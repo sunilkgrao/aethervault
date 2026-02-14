@@ -8375,7 +8375,7 @@ fn run_agent_with_prompt(
                             messages: vec![
                                 AgentMessage {
                                     role: "system".to_string(),
-                                    content: Some("You are a fact extractor. Return 3-8 durable, stable facts from the conversation. One fact per line. Only output facts, nothing else.".to_string()),
+                                    content: Some("You are a fact extractor. Return 3-8 durable, stable facts from the conversation. One fact per line. Only output facts, nothing else. IMPORTANT: Never include passwords, API keys, tokens, private keys, credit card numbers, SSNs, or other sensitive credentials in your output. Redact any PII to general descriptions.".to_string()),
                                     tool_calls: Vec::new(),
                                     name: None,
                                     tool_call_id: None,
@@ -8540,6 +8540,10 @@ fn run_agent_with_prompt(
                 reminder_state.last_tool_failed = true;
                 reminder_state.same_tool_fail_streak += 1;
                 reminder_state.no_progress_streak += 1;
+                // If reminders were given and model still failed, that's a violation
+                if drift_state.turns > 0 && drift_state.last_score < 80.0 {
+                    drift_state.reminder_violations += 1;
+                }
             } else {
                 reminder_state.last_tool_failed = false;
                 reminder_state.same_tool_fail_streak = 0;
@@ -8660,6 +8664,9 @@ fn run_agent_with_prompt(
                     reminder_state.last_tool_failed = true;
                     reminder_state.same_tool_fail_streak += 1;
                     reminder_state.no_progress_streak += 1;
+                    if drift_state.turns > 0 && drift_state.last_score < 80.0 {
+                        drift_state.reminder_violations += 1;
+                    }
                 } else {
                     reminder_state.no_progress_streak = 0;
                 }
