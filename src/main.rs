@@ -4818,6 +4818,9 @@ fn execute_tool_with_handles(
             let mut cmd_args: Vec<String> = vec!["--session".to_string(), session, "--".to_string()];
             let parts = shlex::split(&parsed.command)
                 .ok_or_else(|| "browser: malformed command (unmatched quotes)".to_string())?;
+            if parts.is_empty() {
+                return Err("browser: command is empty".into());
+            }
             cmd_args.extend(parts);
 
             let mut cmd = build_external_command("agent-browser", &cmd_args);
@@ -4933,6 +4936,9 @@ fn execute_tool_with_handles(
                         // ignore other headers (Content-Type, etc.)
                     }
                     let len = content_length.ok_or("excalidraw: missing Content-Length header")?;
+                    if len > 10 * 1024 * 1024 {
+                        return Err(format!("excalidraw: response too large ({len} bytes)"));
+                    }
                     let mut body = vec![0u8; len];
                     io::Read::read_exact(reader, &mut body)
                         .map_err(|e| format!("excalidraw read body: {e}"))?;
@@ -4949,7 +4955,11 @@ fn execute_tool_with_handles(
                             "clientInfo": { "name": "aethervault", "version": "0.1" }
                         }
                     }))?;
-                    let _init_resp = read_msg(&mut reader)?;
+                    let init_resp = read_msg(&mut reader)?;
+                    if let Some(err) = init_resp.get("error") {
+                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+                        return Err(format!("excalidraw: MCP initialize failed: {msg}"));
+                    }
 
                     // 2. Send initialized notification
                     send_msg(&mut stdin, &serde_json::json!({
@@ -4984,10 +4994,15 @@ fn execute_tool_with_handles(
                 }
             };
 
-            // Extract result
+            // Check for JSON-RPC error
+            if let Some(err) = tool_resp.get("error") {
+                let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+                let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+                return Err(format!("excalidraw: MCP error {code}: {msg}"));
+            }
             let result = tool_resp.get("result")
                 .cloned()
-                .unwrap_or_else(|| tool_resp.clone());
+                .ok_or("excalidraw: MCP response missing 'result' field")?;
             let content_text = result.get("content")
                 .and_then(|c| c.as_array())
                 .and_then(|arr| arr.first())
