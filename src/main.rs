@@ -1260,6 +1260,52 @@ struct ActiveRun {
     queued_messages: Vec<(String, Option<i64>)>,
 }
 
+#[derive(Default)]
+struct ReminderState {
+    last_tool_failed: bool,
+    same_tool_fail_streak: usize,
+    approval_required_count: usize,
+    sequential_read_ops: usize,
+    last_tool_was_irreversible: bool,
+    user_confirmed: bool,
+    no_progress_streak: usize,
+    reminder_ignored_count: usize,
+}
+
+#[derive(Default)]
+struct DriftState {
+    ema: f32,
+    turns: usize,
+    violations: HashMap<String, usize>,
+    reminder_violations: usize,
+    last_score: f32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ToolAutonomyLevel {
+    SuggestOnly,
+    Confirm,
+    Autonomous,
+    Background,
+}
+
+impl Default for ToolAutonomyLevel {
+    fn default() -> Self {
+        ToolAutonomyLevel::Confirm
+    }
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+struct ToolAutonomyConfig {
+    #[serde(default)]
+    default_level: ToolAutonomyLevel,
+    #[serde(default)]
+    by_tool: HashMap<String, ToolAutonomyLevel>,
+    #[serde(default)]
+    by_prefix: Option<HashMap<String, ToolAutonomyLevel>>,
+}
+
 #[derive(Clone)]
 struct BridgeAgentConfig {
     mv2: PathBuf,
@@ -6460,6 +6506,12 @@ fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
     if bridge_auto {
         return false;
     }
+    // Per-tool autonomy override via env (e.g. TOOL_AUTONOMY_EXEC=autonomous)
+    match tool_autonomy_for(name) {
+        ToolAutonomyLevel::Autonomous | ToolAutonomyLevel::Background => return false,
+        ToolAutonomyLevel::SuggestOnly => return true,
+        ToolAutonomyLevel::Confirm => {} // fall through to default logic
+    }
     match name {
         "exec" | "email_send" | "email_archive" | "config_set" | "gmail_send" | "gcal_create"
         | "ms_calendar_create" | "trigger_add" | "trigger_remove" | "notify" | "signal_send"
@@ -6541,23 +6593,105 @@ fn parse_log_ts_from_uri(uri: &str) -> Option<i64> {
     ts_str.parse::<i64>().ok()
 }
 
+fn collect_mid_loop_reminders(
+    reminder_state: &ReminderState,
+    step: usize,
+    max_steps: usize,
+    token_est: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if token_est > 60_000 {
+        out.push("Context is growing. Switch to compact summaries and avoid verbose raw tool output.".to_string());
+    }
+    if token_est > 80_000 {
+        out.push("Context is high. Keep tool calls minimal and summarize before next major step.".to_string());
+    }
+    if step > max_steps * 3 / 4 {
+        out.push("Approaching step budget. Finish current objective with the smallest safe completion path.".to_string());
+    }
+    if reminder_state.last_tool_failed {
+        out.push("Previous tool call failed. Reflect on what went wrong, then try a different approach.".to_string());
+    }
+    if reminder_state.same_tool_fail_streak >= 2 {
+        out.push("You are retrying the same failing pattern. Try a different tool or different scope.".to_string());
+    }
+    if reminder_state.approval_required_count >= 2 {
+        out.push("Multiple approval-required calls. Combine or batch work, then ask for one concise approval.".to_string());
+    }
+    if reminder_state.sequential_read_ops >= 2 {
+        out.push("Independent read-only calls available; prefer batched parallel execution instead of sequential loops.".to_string());
+    }
+    if reminder_state.no_progress_streak >= 3 {
+        out.push("No observable progress for several turns. Re-state your hypothesis, then pick one high-confidence next step.".to_string());
+    }
+    if reminder_state.reminder_ignored_count >= 1 {
+        out.push("A prior system reminder was not followed. Treat the next instruction as hard constraint.".to_string());
+    }
+    out
+}
+
+fn compute_drift_score(
+    drift: &DriftState,
+    reminder_state: &ReminderState,
+    _tool_calls: &[AgentToolCall],
+) -> f32 {
+    let mut score: f32 = 100.0;
+    if reminder_state.same_tool_fail_streak >= 2 {
+        score -= 12.0;
+    }
+    if reminder_state.no_progress_streak >= 3 {
+        score -= 12.0;
+    }
+    if reminder_state.last_tool_failed {
+        score -= 5.0;
+    }
+    if drift.reminder_violations >= 1 {
+        score -= 10.0;
+    }
+    if drift.reminder_violations >= 3 {
+        score -= 8.0;
+    }
+    if reminder_state.approval_required_count >= 3 {
+        score -= 6.0;
+    }
+    score.max(0.0)
+}
+
+fn tool_autonomy_for(tool_name: &str) -> ToolAutonomyLevel {
+    if let Ok(level_str) = std::env::var(format!("TOOL_AUTONOMY_{}", tool_name.to_ascii_uppercase())) {
+        match level_str.as_str() {
+            "autonomous" => return ToolAutonomyLevel::Autonomous,
+            "suggest_only" => return ToolAutonomyLevel::SuggestOnly,
+            "background" => return ToolAutonomyLevel::Background,
+            _ => return ToolAutonomyLevel::Confirm,
+        }
+    }
+    ToolAutonomyLevel::Confirm
+}
+
 fn tool_score(query_tokens: &[String], name: &str, description: &str) -> i32 {
     let mut score = 0;
     let name_lc = name.to_ascii_lowercase();
     let desc_lc = description.to_ascii_lowercase();
+    let query_joined = query_tokens.join(" ");
     for token in query_tokens {
         if token.is_empty() {
             continue;
         }
-        if name_lc.contains(token) {
+        if name_lc == *token {
+            score += 6;
+        } else if name_lc.contains(token) {
             score += 3;
         }
         if desc_lc.contains(token) {
             score += 1;
         }
     }
-    if name_lc.contains(&query_tokens.join(" ")) {
+    if name_lc.contains(&query_joined) {
         score += 4;
+    }
+    if desc_lc.contains(&query_joined) {
+        score += 2;
     }
     score
 }
@@ -7241,18 +7375,18 @@ fn run_watch_loop(
     }
 }
 
-fn merge_system_messages(messages: &[AgentMessage]) -> String {
-    let mut parts = Vec::new();
+fn collect_system_blocks(messages: &[AgentMessage]) -> Vec<String> {
+    let mut blocks = Vec::new();
     for msg in messages {
         if msg.role == "system" {
             if let Some(content) = &msg.content {
                 if !content.trim().is_empty() {
-                    parts.push(content.trim().to_string());
+                    blocks.push(content.trim().to_string());
                 }
             }
         }
     }
-    parts.join("\n\n")
+    blocks
 }
 
 fn to_anthropic_messages(messages: &[AgentMessage]) -> Vec<serde_json::Value> {
@@ -7478,7 +7612,7 @@ fn call_claude(
         beta_values.push("token-efficient-tools-2025-02-19".to_string());
     }
 
-    let system = merge_system_messages(&request.messages);
+    let system_blocks = collect_system_blocks(&request.messages);
     let use_prompt_cache = env_bool("ANTHROPIC_PROMPT_CACHE", false);
     let cache_ttl = env_optional("ANTHROPIC_PROMPT_CACHE_TTL");
     let cache_control = if use_prompt_cache {
@@ -7498,15 +7632,18 @@ fn call_claude(
         "max_tokens": max_tokens,
         "messages": to_anthropic_messages(&request.messages),
     });
-    if !system.is_empty() {
+    if !system_blocks.is_empty() {
         if let Some(cache) = cache_control.clone() {
-            payload["system"] = serde_json::json!([{
-                "type": "text",
-                "text": system,
-                "cache_control": cache
-            }]);
+            let blocks: Vec<serde_json::Value> = system_blocks.iter().enumerate().map(|(i, text)| {
+                let mut block = serde_json::json!({"type": "text", "text": text});
+                if i == 0 {
+                    block.as_object_mut().unwrap().insert("cache_control".to_string(), cache.clone());
+                }
+                block
+            }).collect();
+            payload["system"] = serde_json::json!(blocks);
         } else {
-            payload["system"] = serde_json::json!(system);
+            payload["system"] = serde_json::json!(system_blocks.join("\n\n"));
         }
     }
     let tools = to_anthropic_tools(&request.tools, cache_control.clone());
@@ -7819,9 +7956,25 @@ fn estimate_tokens(messages: &[AgentMessage]) -> usize {
     }).sum()
 }
 
+fn compaction_budget_tokens() -> usize {
+    let window: usize = env_optional("ANTHROPIC_CONTEXT_WINDOW_TOKENS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120_000);
+    let ratio: f64 = env_optional("ANTHROPIC_COMPACT_RATIO")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.82);
+    ((window as f64) * ratio) as usize
+}
+
+fn keep_recent_turns() -> usize {
+    env_optional("ANTHROPIC_COMPACT_KEEP_RECENT")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6)
+}
+
 /// Compact messages when context is getting large.
-/// Keeps the system message (index 0) and last `keep_recent` messages verbatim.
-/// Summarizes everything in between into a single system message.
+/// Preserves all leading system blocks and last `keep_recent` messages verbatim.
+/// Summarizes everything in between into a compaction notice.
 fn compact_messages(
     messages: &mut Vec<AgentMessage>,
     hook: &HookSpec,
@@ -7830,8 +7983,10 @@ fn compact_messages(
     if messages.len() <= keep_recent + 2 {
         return Ok(()); // Nothing to compact
     }
-    let system_msg = messages[0].clone();
-    let to_summarize: Vec<_> = messages[1..messages.len() - keep_recent].to_vec();
+    // Preserve all leading system blocks (supports cache-split: stable prefix + dynamic suffix)
+    let system_end = messages.iter().take_while(|m| m.role == "system").count().max(1);
+    let system_msgs: Vec<_> = messages[..system_end].to_vec();
+    let to_summarize: Vec<_> = messages[system_end..messages.len() - keep_recent].to_vec();
     let recent: Vec<_> = messages[messages.len() - keep_recent..].to_vec();
 
     // Build a summary request
@@ -7873,9 +8028,8 @@ fn compact_messages(
     let summary_response = call_agent_hook(hook, &summary_request)?;
     let summary = summary_response.content.unwrap_or_else(|| "(compaction failed)".to_string());
 
-    // Rebuild messages: system + compaction notice + recent
-    *messages = Vec::new();
-    messages.push(system_msg);
+    // Rebuild messages: system blocks + compaction notice + recent
+    *messages = system_msgs;
     messages.push(AgentMessage {
         role: "user".to_string(),
         content: Some(format!("[Context compacted. Summary of prior conversation:]\n{summary}")),
@@ -7968,8 +8122,10 @@ fn run_agent_with_prompt(
     }
 
     // --- KV-Cache Breakpoint ---
-    // Everything above is stable within a session (identity, tools, workspace, global context).
-    // Everything below is dynamic per-turn (memory, KG, session, reminders).
+    // Everything above (system_prompt) is stable within a session.
+    // Everything below (system_dynamic) churns per-turn (memory, KG).
+    // Splitting them enables Anthropic prompt cache reuse on the stable prefix.
+    let mut system_dynamic = String::new();
 
     let mut context_pack = None;
     let effective_max_steps = agent_cfg.max_steps.unwrap_or(max_steps);
@@ -8014,8 +8170,8 @@ fn run_agent_with_prompt(
             false,
         ) {
             if !pack.context.trim().is_empty() {
-                system_prompt.push_str("\n\n# Memory Context\n");
-                system_prompt.push_str(&pack.context);
+                system_dynamic.push_str("\n\n# Memory Context\n");
+                system_dynamic.push_str(&pack.context);
                 context_pack = Some(pack);
             }
         }
@@ -8035,9 +8191,9 @@ fn run_agent_with_prompt(
             if !matched.is_empty() {
                 let kg_context = build_kg_context(&matched, &kg);
                 if !kg_context.trim().is_empty() {
-                    system_prompt.push_str("\n\n# Knowledge Graph Context\n");
-                    system_prompt.push_str("(Automatically matched entities from the knowledge graph)\n\n");
-                    system_prompt.push_str(&kg_context);
+                    system_dynamic.push_str("\n\n# Knowledge Graph Context\n");
+                    system_dynamic.push_str("(Automatically matched entities from the knowledge graph)\n\n");
+                    system_dynamic.push_str(&kg_context);
                 }
             }
         }
@@ -8052,6 +8208,16 @@ fn run_agent_with_prompt(
         tool_call_id: None,
         is_error: None,
     });
+    if !system_dynamic.trim().is_empty() {
+        messages.push(AgentMessage {
+            role: "system".to_string(),
+            content: Some(system_dynamic),
+            tool_calls: Vec::new(),
+            name: None,
+            tool_call_id: None,
+            is_error: None,
+        });
+    }
 
     // Insert session history as proper user/assistant messages (not in system prompt)
     if let Some(ref sess_id) = session {
@@ -8126,6 +8292,13 @@ fn run_agent_with_prompt(
         }
     }
 
+    let mut reminder_state = ReminderState::default();
+    let mut drift_state = DriftState::default();
+    let mut turns_since_fact_extract: usize = 0;
+    let fact_extract_interval: usize = env_optional("AGENT_FACT_TURNS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+
     let mut completed = false;
     for step in 0..effective_max_steps {
         // Update progress: thinking phase
@@ -8136,11 +8309,13 @@ fn run_agent_with_prompt(
             }
         }
 
-        // Auto-compact when context exceeds threshold (80% of ~128K token window)
+        // Auto-compact when context exceeds configurable budget
         let token_estimate = estimate_tokens(&messages);
-        if token_estimate > 100_000 {
-            eprintln!("[harness] context at ~{token_estimate} tokens, compacting...");
-            if let Err(e) = compact_messages(&mut messages, &model_spec, 6) {
+        let compact_at = compaction_budget_tokens();
+        let compact_keep = keep_recent_turns().max(2);
+        if token_estimate > compact_at {
+            eprintln!("[harness] context at ~{token_estimate} tokens (budget {compact_at}), compacting...");
+            if let Err(e) = compact_messages(&mut messages, &model_spec, compact_keep) {
                 eprintln!("[harness] compaction failed: {e}");
             }
         }
@@ -8159,17 +8334,95 @@ fn run_agent_with_prompt(
                     p.text_preview = Some(content.chars().take(100).collect());
                 }
             }
+            // Track turns for observational memory extraction
+            turns_since_fact_extract += 1;
+
             if should_log {
                 let entry = AgentLogEntry {
                     session: session.clone(),
                     role: "assistant".to_string(),
-                    text: content,
+                    text: content.clone(),
                     meta: None,
                     ts_utc: Some(Utc::now().timestamp()),
                 };
                 log_buffer.push(entry);
                 if log_buffer.len() >= effective_log_commit_interval {
                     flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
+                }
+            }
+
+            // Observational memory: extract durable facts every N turns
+            if turns_since_fact_extract >= fact_extract_interval && !no_memory {
+                turns_since_fact_extract = 0;
+                let snapshot: String = messages.iter()
+                    .filter(|m| m.role == "user" || m.role == "assistant")
+                    .rev()
+                    .take(8)
+                    .filter_map(|m| m.content.as_ref().map(|c| {
+                        let preview: String = c.chars().take(300).collect();
+                        format!("[{}] {}", m.role, preview)
+                    }))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !snapshot.trim().is_empty() {
+                    let mv2_clone = mv2.clone();
+                    let session_clone = session.clone();
+                    thread::spawn(move || {
+                        let extract_request = AgentHookRequest {
+                            messages: vec![
+                                AgentMessage {
+                                    role: "system".to_string(),
+                                    content: Some("You are a fact extractor. Return 3-8 durable, stable facts from the conversation. One fact per line. Only output facts, nothing else.".to_string()),
+                                    tool_calls: Vec::new(),
+                                    name: None,
+                                    tool_call_id: None,
+                                    is_error: None,
+                                },
+                                AgentMessage {
+                                    role: "user".to_string(),
+                                    content: Some(format!("Extract stable facts from:\n{snapshot}")),
+                                    tool_calls: Vec::new(),
+                                    name: None,
+                                    tool_call_id: None,
+                                    is_error: None,
+                                },
+                            ],
+                            tools: Vec::new(),
+                            session: session_clone,
+                        };
+                        if let Ok(response) = call_claude(&extract_request) {
+                            if let Some(facts) = response.message.content {
+                                if !facts.trim().is_empty() {
+                                    let uri = format!(
+                                        "aethervault://memory/observation/{}",
+                                        Utc::now().timestamp()
+                                    );
+                                    let mut mem_w: Option<Vault> = None;
+                                    let mut mem_r: Option<Vault> = None;
+                                    let _ = with_write_mem(
+                                        &mut mem_r,
+                                        &mut mem_w,
+                                        &mv2_clone,
+                                        true,
+                                        |mem| {
+                                            let mut opts = PutOptions::default();
+                                            opts.uri = Some(uri.clone());
+                                            opts.kind = Some("text/markdown".to_string());
+                                            opts.track =
+                                                Some("aethervault.observation".to_string());
+                                            opts.search_text = Some(facts.clone());
+                                            mem.put_bytes_with_options(facts.as_bytes(), opts)
+                                                .map(|_| ())
+                                                .map_err(|e| e.to_string())
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    });
                 }
             }
         }
@@ -8282,6 +8535,26 @@ fn run_agent_with_prompt(
                 }
             }
 
+            // Update reminder state from tool result
+            if result.is_error {
+                reminder_state.last_tool_failed = true;
+                reminder_state.same_tool_fail_streak += 1;
+                reminder_state.no_progress_streak += 1;
+            } else {
+                reminder_state.last_tool_failed = false;
+                reminder_state.same_tool_fail_streak = 0;
+                reminder_state.no_progress_streak = 0;
+            }
+            if requires_approval(&call.name, &call.args) {
+                reminder_state.approval_required_count += 1;
+            }
+            let read_only_tools = ["search", "query", "get", "list", "tool_search", "skill_search", "reflect"];
+            if read_only_tools.iter().any(|t| call.name.contains(t)) {
+                reminder_state.sequential_read_ops += 1;
+            } else {
+                reminder_state.sequential_read_ops = 0;
+            }
+
             if matches!(call.name.as_str(), "put" | "log" | "feedback") && !result.is_error {
                 flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
             }
@@ -8382,32 +8655,53 @@ fn run_agent_with_prompt(
                     }
                 }
 
+                // Update reminder state from parallel tool result
+                if result.is_error {
+                    reminder_state.last_tool_failed = true;
+                    reminder_state.same_tool_fail_streak += 1;
+                    reminder_state.no_progress_streak += 1;
+                } else {
+                    reminder_state.no_progress_streak = 0;
+                }
+
                 if matches!(call.name.as_str(), "put" | "log" | "feedback") && !result.is_error {
                     flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
                 }
             }
         }
 
-        // Mid-loop system reminders
-        let step_num = messages.iter().filter(|m| m.role == "assistant").count();
+        // Mid-loop system reminders (10 rules) + drift detection
         let token_est = estimate_tokens(&messages);
-        let mut reminders = Vec::new();
+        let reminders = collect_mid_loop_reminders(&reminder_state, step, effective_max_steps, token_est);
 
-        if token_est > 80_000 {
-            reminders.push("Context is large. Be concise in your responses and tool calls.");
-        }
-        if step_num > effective_max_steps * 3 / 4 {
-            reminders.push("You are approaching the step limit. Focus on completing the current task.");
-        }
-        // Check if the last tool result was an error
-        if messages.last().map(|m| m.is_error == Some(true)).unwrap_or(false) {
-            reminders.push("The previous tool call failed. Use reflect to analyze what went wrong, then try a different approach. Do not retry the same call.");
+        // Drift detection scoring
+        drift_state.turns += 1;
+        let drift_score = compute_drift_score(&drift_state, &reminder_state, &tool_calls);
+        drift_state.last_score = drift_score;
+        // EMA smoothing: weight recent score 30%
+        if drift_state.ema == 0.0 {
+            drift_state.ema = drift_score;
+        } else {
+            drift_state.ema = drift_state.ema * 0.7 + drift_score * 0.3;
         }
 
-        if !reminders.is_empty() {
+        let mut all_reminders = reminders;
+
+        // Drift-based escalation
+        if drift_score < 70.0 && drift_score >= 55.0 {
+            all_reminders.push("Adherence is degrading. Be more careful and concise with your next action.".to_string());
+        } else if drift_score < 55.0 {
+            all_reminders.push("Adherence is low. Stop and reflect: re-state the user's goal, then take one careful step.".to_string());
+        }
+        if drift_state.ema < 40.0 && drift_state.turns >= 3 {
+            all_reminders.push("Sustained low adherence. Complete current action and provide a status summary.".to_string());
+        }
+
+        if !all_reminders.is_empty() {
+            drift_state.reminder_violations = 0;
             messages.push(AgentMessage {
                 role: "user".to_string(),
-                content: Some(format!("[System Reminder] {}", reminders.join(" "))),
+                content: Some(format!("[System Reminder] {}", all_reminders.join(" "))),
                 tool_calls: Vec::new(),
                 name: None,
                 tool_call_id: None,
