@@ -9131,10 +9131,9 @@ fn spawn_agent_run(
                 Some(worker_progress.clone()),
             )
         }));
-        // Mark done
-        if let Ok(mut p) = worker_progress.lock() {
-            p.phase = "done".to_string();
-        }
+        // Mark done — recover from poison so progress thread always sees completion
+        let mut p = worker_progress.lock().unwrap_or_else(|e| e.into_inner());
+        p.phase = "done".to_string();
         let event = match result {
             Ok(agent_result) => CompletionEvent {
                 chat_id,
@@ -9167,20 +9166,18 @@ fn spawn_agent_run(
         let mut progress_msg_id: Option<i64> = None;
         loop {
             thread::sleep(Duration::from_secs(30));
+            // Recover from poisoned mutex — read whatever state is there
             let (phase, step, max_steps, elapsed, done) = {
-                match prog_ref.lock() {
-                    Ok(p) => (
-                        p.phase.clone(),
-                        p.step,
-                        p.max_steps,
-                        p.started_at.elapsed().as_secs(),
-                        p.phase == "done",
-                    ),
-                    Err(_) => break,
-                }
+                let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    guard.phase.clone(),
+                    guard.step,
+                    guard.max_steps,
+                    guard.started_at.elapsed().as_secs(),
+                    guard.phase == "done",
+                )
             };
             if done {
-                // Clean up progress message
                 if let Some(mid) = progress_msg_id {
                     telegram_delete_message(&prog_agent, &prog_url, chat_id, mid);
                 }
@@ -9200,7 +9197,6 @@ fn spawn_agent_run(
                 None => {
                     progress_msg_id =
                         telegram_send_message_returning_id(&prog_agent, &prog_url, chat_id, &status);
-                    // Fall back to typing indicator if send fails
                     if progress_msg_id.is_none() {
                         telegram_send_typing(&prog_agent, &prog_url, chat_id);
                     }
@@ -9312,12 +9308,6 @@ fn run_telegram_bridge(
         Ok(base) => format!("{base}/bot{token}"),
         Err(_) => format!("https://api.telegram.org/bot{token}"),
     };
-    let (_config, _subagent_specs) = {
-        let mut mem = Vault::open_read_only(&agent_config.mv2)?;
-        let config = load_capsule_config(&mut mem).unwrap_or_default();
-        let subagent_specs = load_subagents_from_config(&config);
-        (config, subagent_specs)
-    };
     let http_agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_write(Duration::from_secs(10))
@@ -9341,10 +9331,11 @@ fn run_telegram_bridge(
             );
         }
 
-        // 2. Long-poll getUpdates
+        // 2. Long-poll getUpdates (short-poll when runs are active to drain completions faster)
+        let effective_timeout = if active_runs.is_empty() { poll_timeout } else { 2 };
         let mut request = http_agent
             .get(&format!("{base_url}/getUpdates"))
-            .query("timeout", &poll_timeout.to_string())
+            .query("timeout", &effective_timeout.to_string())
             .query("limit", &poll_limit.to_string());
         if let Some(last) = offset {
             request = request.query("offset", &(last + 1).to_string());
@@ -9394,17 +9385,25 @@ fn run_telegram_bridge(
             }
 
             // Check if there's already an active run for this chat
+            const MAX_QUEUED_PER_CHAT: usize = 5;
             if let Some(run) = active_runs.get_mut(&chat_id) {
-                // Queue the message and acknowledge
-                run.queued_messages.push((user_text, reply_to_id));
-                let ack = format!(
-                    "Still working on your previous request. Queued \u{2014} I'll handle it next. \
-                    ({} message{} waiting)",
-                    run.queued_messages.len(),
-                    if run.queued_messages.len() == 1 { "" } else { "s" }
-                );
-                if let Err(err) = telegram_send_message(&http_agent, &base_url, chat_id, &ack) {
-                    eprintln!("Telegram ack send failed: {err}");
+                if run.queued_messages.len() >= MAX_QUEUED_PER_CHAT {
+                    let ack = format!(
+                        "Queue full ({MAX_QUEUED_PER_CHAT} messages waiting). \
+                        Please wait for the current task to finish."
+                    );
+                    let _ = telegram_send_message(&http_agent, &base_url, chat_id, &ack);
+                } else {
+                    run.queued_messages.push((user_text, reply_to_id));
+                    let ack = format!(
+                        "Still working on your previous request. Queued \u{2014} I'll handle it next. \
+                        ({} message{} waiting)",
+                        run.queued_messages.len(),
+                        if run.queued_messages.len() == 1 { "" } else { "s" }
+                    );
+                    if let Err(err) = telegram_send_message(&http_agent, &base_url, chat_id, &ack) {
+                        eprintln!("Telegram ack send failed: {err}");
+                    }
                 }
                 continue;
             }
