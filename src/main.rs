@@ -1477,6 +1477,23 @@ fn with_write_mem<F, R>(
 where
     F: FnOnce(&mut Vault) -> Result<R, String>,
 {
+    // Hard cap: refuse ALL writes if vault exceeds size limit (default 500MB).
+    // This is the single chokepoint for every vault write — agent logs, tool puts,
+    // observational memory, feedback, everything. Prevents runaway index bloat.
+    let vault_hard_cap: u64 = std::env::var("VAULT_HARD_CAP_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500_000_000);
+    if let Ok(meta) = std::fs::metadata(mv2) {
+        if meta.len() > vault_hard_cap {
+            return Err(format!(
+                "vault write blocked: size {}MB exceeds {}MB hard cap (set VAULT_HARD_CAP_BYTES to adjust)",
+                meta.len() / 1_000_000,
+                vault_hard_cap / 1_000_000
+            ));
+        }
+    }
+
     // Always open fresh — don't reuse a stale handle that holds a lock.
     *mem_read = None;
     *mem_write = None;
@@ -9664,7 +9681,36 @@ fn run_telegram_bridge(
     let (completion_tx, completion_rx) = mpsc::channel::<CompletionEvent>();
 
     let mut offset: Option<i64> = None;
+    let mut last_vault_check = std::time::Instant::now();
+    let vault_check_interval = Duration::from_secs(300); // every 5 min
     loop {
+        // 0. Periodic vault health check
+        if last_vault_check.elapsed() >= vault_check_interval {
+            last_vault_check = std::time::Instant::now();
+            if let Ok(meta) = std::fs::metadata(&agent_config.mv2) {
+                let size_mb = meta.len() / 1_000_000;
+                if size_mb > 200 {
+                    eprintln!("[bridge] WARNING: vault size {size_mb}MB — approaching hard cap");
+                }
+            }
+            // Also clean temp files that may have accumulated during runtime
+            if let Some(parent) = agent_config.mv2.parent() {
+                if let Some(stem) = agent_config.mv2.file_name().and_then(|f| f.to_str()) {
+                    let prefix = format!(".{stem}.");
+                    if let Ok(entries) = std::fs::read_dir(parent) {
+                        for entry in entries.flatten() {
+                            if let Some(name) = entry.file_name().to_str() {
+                                if name.starts_with(&prefix) {
+                                    let _ = std::fs::remove_file(entry.path());
+                                    eprintln!("[bridge] cleaned runtime temp file: {name}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 1. Drain completions (non-blocking)
         while let Ok(event) = completion_rx.try_recv() {
             handle_telegram_completion(
