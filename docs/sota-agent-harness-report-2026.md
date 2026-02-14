@@ -507,7 +507,7 @@ AetherVault has a rich tool surface:
 ```
 Core: put, search, query, context, log, feedback
 Filesystem: fs_list, fs_read, fs_write
-External: gmail_*, gcal_*, ms_*, http_request, browser_request
+External: gmail_*, gcal_*, ms_*, http_request, browser, excalidraw
 Agent: tool_search, session_context, reflect, skill_store, skill_search
 Orchestration: subagent_list, subagent_invoke, compact, doctor
 ```

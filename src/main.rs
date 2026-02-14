@@ -1772,16 +1772,19 @@ struct ToolHttpRequestArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct ToolBrowserRequestArgs {
+struct ToolBrowserArgs {
+    command: String,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolExcalidrawArgs {
     action: String,
     #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    selector: Option<String>,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    data: Option<serde_json::Value>,
+    elements: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2350,6 +2353,7 @@ fn run_hook_command(
             Ok(None) => {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
+                    let _ = child.wait();
                     return Err(format!("hook timed out after {timeout_ms}ms"));
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -3656,16 +3660,26 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "browser_request",
-            "description": "Send a browser automation request to the configured browser broker.",
+            "name": "browser",
+            "description": "Browser automation via agent-browser CLI. Uses ref-based element selection from accessibility snapshots. Workflow: 1) 'open <url>' to navigate, 2) 'snapshot' to get element refs (@e1, @e2...), 3) interact using refs ('click @e1', 'fill @e2 text'). Sessions persist across calls. Commands: open, snapshot, click, fill, type, press, select, scroll, screenshot, pdf, get text/html/value, wait, eval, cookies, tab, back, forward, reload, close. Use 'find role/text/label' for semantic element finding.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string" },
-                    "url": { "type": "string" },
-                    "selector": { "type": "string" },
-                    "text": { "type": "string" },
-                    "data": { "type": "object" }
+                    "command": { "type": "string", "description": "The agent-browser command (e.g., 'open https://example.com', 'snapshot', 'click @e2', 'fill @e3 hello')" },
+                    "session": { "type": "string", "description": "Session name for browser isolation. Defaults to 'default'." },
+                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds. Default 30000." }
+                },
+                "required": ["command"]
+            }
+        }),
+        serde_json::json!({
+            "name": "excalidraw",
+            "description": "Create hand-drawn diagrams via Excalidraw MCP server. Actions: 'read_me' returns the element format reference (call before first create_view), 'create_view' renders a diagram from Excalidraw JSON elements. Requires excalidraw-mcp server (set EXCALIDRAW_MCP_CMD to override startup command, default: 'npx excalidraw-mcp --stdio').",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "description": "Action: 'read_me' (get element format reference) or 'create_view' (render diagram)" },
+                    "elements": { "type": "string", "description": "JSON array of Excalidraw elements (required for create_view)" }
                 },
                 "required": ["action"]
             }
@@ -4618,6 +4632,7 @@ fn execute_tool_with_handles(
                     Ok(None) => {
                         if start.elapsed() > timeout {
                             let _ = child.kill();
+                            let _ = child.wait();
                             return Err(format!("exec timed out after {timeout_ms}ms"));
                         }
                         thread::sleep(Duration::from_millis(10));
@@ -4630,20 +4645,18 @@ fn execute_tool_with_handles(
                 .map_err(|e| format!("exec output: {e}"))?;
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let is_error = !output.status.success();
+            let exit_code = subprocess_exit_info(&output.status);
             let details = serde_json::json!({
-                "status": output.status.code(),
+                "exit_code": exit_code,
                 "stdout": stdout,
                 "stderr": stderr
             });
-            let output_text = if output.status.success() {
-                "Command executed.".to_string()
-            } else {
-                "Command failed.".to_string()
-            };
+            let output_text = subprocess_output_text(&stdout, &stderr, is_error);
             Ok(ToolExecution {
                 output: output_text,
                 details,
-                is_error: !output.status.success(),
+                is_error,
             })
         }
         "notify" => {
@@ -4796,41 +4809,198 @@ fn execute_tool_with_handles(
                 is_error: status >= 400,
             })
         }
-        "browser_request" => {
-            let parsed: ToolBrowserRequestArgs =
+        "browser" => {
+            let parsed: ToolBrowserArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let endpoint = env_optional("AETHERVAULT_BROWSER_ENDPOINT")
-                .unwrap_or_else(|| "http://127.0.0.1:4040".to_string());
-            let payload = serde_json::json!({
-                "action": parsed.action,
-                "url": parsed.url,
-                "selector": parsed.selector,
-                "text": parsed.text,
-                "data": parsed.data,
-            });
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(10))
-                .timeout_write(Duration::from_secs(20))
-                .timeout_read(Duration::from_secs(30))
-                .build();
-            let resp = agent
-                .post(&endpoint)
-                .set("content-type", "application/json")
-                .send_json(payload);
-            match resp {
-                Ok(resp) => Ok(ToolExecution {
-                    output: "browser_request completed.".to_string(),
-                    details: resp
-                        .into_json::<serde_json::Value>()
-                        .map_err(|e| e.to_string())?,
-                    is_error: false,
-                }),
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    Err(format!("browser_request error {code}: {text}"))
+            let timeout_ms = parsed.timeout_ms.unwrap_or(30_000).max(1);
+            let session = parsed.session.unwrap_or_else(|| "default".to_string());
+
+            let mut cmd_args: Vec<String> = vec!["--session".to_string(), session, "--".to_string()];
+            let parts = shlex::split(&parsed.command)
+                .ok_or_else(|| "browser: malformed command (unmatched quotes)".to_string())?;
+            cmd_args.extend(parts);
+
+            let mut cmd = build_external_command("agent-browser", &cmd_args);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            let mut child = cmd.spawn().map_err(|e| format!("browser spawn: {e}"))?;
+            let timeout = Duration::from_millis(timeout_ms);
+            let start = Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if start.elapsed() > timeout {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(format!("browser timed out after {timeout_ms}ms"));
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => return Err(format!("browser wait: {e}")),
                 }
-                Err(err) => Err(format!("browser_request failed: {err}")),
             }
+            let output = child
+                .wait_with_output()
+                .map_err(|e| format!("browser output: {e}"))?;
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let is_error = !output.status.success();
+            let exit_code = subprocess_exit_info(&output.status);
+            let details = serde_json::json!({
+                "stdout": stdout,
+                "stderr": stderr,
+                "exit_code": exit_code
+            });
+            let output_text = subprocess_output_text(&stdout, &stderr, is_error);
+
+            Ok(ToolExecution {
+                output: output_text,
+                details,
+                is_error,
+            })
+        }
+        "excalidraw" => {
+            let parsed: ToolExcalidrawArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+
+            let tool_name = match parsed.action.as_str() {
+                "read_me" => "read_me",
+                "create_view" => "create_view",
+                _ => return Err(format!("excalidraw: unknown action '{}', use 'read_me' or 'create_view'", parsed.action)),
+            };
+            let tool_args = if tool_name == "create_view" {
+                let elements = parsed.elements
+                    .ok_or("excalidraw: 'elements' required for create_view")?;
+                serde_json::json!({ "elements": elements })
+            } else {
+                serde_json::json!({})
+            };
+
+            // Spawn excalidraw-mcp server via stdio
+            let mcp_cmd = env_optional("EXCALIDRAW_MCP_CMD")
+                .unwrap_or_else(|| "npx excalidraw-mcp --stdio".to_string());
+            let cmd_parts = shlex::split(&mcp_cmd)
+                .ok_or("excalidraw: malformed EXCALIDRAW_MCP_CMD")?;
+            if cmd_parts.is_empty() {
+                return Err("excalidraw: empty EXCALIDRAW_MCP_CMD".into());
+            }
+            let mut cmd = build_external_command(&cmd_parts[0], &cmd_parts[1..]);
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            let mut child = cmd.spawn().map_err(|e| format!("excalidraw spawn: {e}"))?;
+            let mut stdin = child.stdin.take().ok_or("excalidraw: no stdin")?;
+            let stdout = child.stdout.take().ok_or("excalidraw: no stdout")?;
+
+            // Run MCP interaction in a thread with a hard timeout so blocking
+            // read_line can't hang the caller forever.  The closure also
+            // guarantees cleanup (kill + wait) on both success and error paths.
+            let tool_name = tool_name.to_string();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
+
+                // Helper: send JSON-RPC message with Content-Length framing
+                let send_msg = |writer: &mut dyn Write, msg: &serde_json::Value| -> Result<(), String> {
+                    let body = serde_json::to_string(msg).map_err(|e| e.to_string())?;
+                    write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body)
+                        .map_err(|e| format!("excalidraw write: {e}"))?;
+                    writer.flush().map_err(|e| format!("excalidraw flush: {e}"))?;
+                    Ok(())
+                };
+
+                // Helper: read JSON-RPC response with Content-Length framing.
+                // Reads headers until blank line, extracts Content-Length, then reads body.
+                let read_msg = |reader: &mut BufReader<std::process::ChildStdout>| -> Result<serde_json::Value, String> {
+                    let mut content_length: Option<usize> = None;
+                    // Read headers until blank separator line
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).map_err(|e| format!("excalidraw read: {e}"))?;
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            if content_length.is_some() { break; }
+                            continue; // skip leading blank lines before headers
+                        }
+                        if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
+                            content_length = Some(len_str.trim().parse()
+                                .map_err(|e| format!("excalidraw bad content-length: {e}"))?);
+                        }
+                        // ignore other headers (Content-Type, etc.)
+                    }
+                    let len = content_length.ok_or("excalidraw: missing Content-Length header")?;
+                    let mut body = vec![0u8; len];
+                    io::Read::read_exact(reader, &mut body)
+                        .map_err(|e| format!("excalidraw read body: {e}"))?;
+                    serde_json::from_slice(&body).map_err(|e| format!("excalidraw parse: {e}"))
+                };
+
+                let result = (|| -> Result<serde_json::Value, String> {
+                    // 1. Send initialize
+                    send_msg(&mut stdin, &serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "clientInfo": { "name": "aethervault", "version": "0.1" }
+                        }
+                    }))?;
+                    let _init_resp = read_msg(&mut reader)?;
+
+                    // 2. Send initialized notification
+                    send_msg(&mut stdin, &serde_json::json!({
+                        "jsonrpc": "2.0", "method": "notifications/initialized"
+                    }))?;
+
+                    // 3. Call the tool
+                    send_msg(&mut stdin, &serde_json::json!({
+                        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                        "params": { "name": tool_name, "arguments": tool_args }
+                    }))?;
+                    read_msg(&mut reader)
+                })();
+
+                // Cleanup always runs regardless of success/failure
+                drop(stdin);
+                let _ = tx.send(result);
+            });
+
+            // Hard 30s timeout for the entire MCP interaction
+            let tool_resp = match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(result) => {
+                    // Thread completed; child will exit after stdin is dropped
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    result?
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("excalidraw: timed out after 30s".into());
+                }
+            };
+
+            // Extract result
+            let result = tool_resp.get("result")
+                .cloned()
+                .unwrap_or_else(|| tool_resp.clone());
+            let content_text = result.get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|item| item.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+
+            let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+            Ok(ToolExecution {
+                output: content_text.to_string(),
+                details: result,
+                is_error,
+            })
         }
         "fs_list" => {
             let parsed: ToolFsListArgs =
@@ -6128,6 +6298,55 @@ fn build_external_command(program: &str, args: &[String]) -> ProcessCommand {
     cmd
 }
 
+/// Build a descriptive exit code value for subprocess results.
+/// On Unix, reports the signal name when a process is killed by a signal.
+fn subprocess_exit_info(status: &std::process::ExitStatus) -> serde_json::Value {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(code) = status.code() {
+            serde_json::json!(code)
+        } else if let Some(sig) = status.signal() {
+            serde_json::json!(format!("signal {sig}"))
+        } else {
+            serde_json::json!("unknown")
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        serde_json::json!(status.code())
+    }
+}
+
+/// Build primary output text for subprocess results, surfacing stderr when relevant.
+fn subprocess_output_text(stdout: &str, stderr: &str, is_error: bool) -> String {
+    if is_error {
+        // On failure, combine stdout and stderr so the LLM sees the full picture
+        let mut out = String::new();
+        if !stdout.is_empty() {
+            out.push_str(stdout);
+        }
+        if !stderr.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n--- stderr ---\n");
+            }
+            out.push_str(stderr);
+        }
+        if out.is_empty() {
+            "Command failed with no output.".to_string()
+        } else {
+            out
+        }
+    } else if stdout.is_empty() && !stderr.is_empty() {
+        // Some tools write informational output to stderr even on success
+        stderr.to_string()
+    } else if stdout.is_empty() {
+        "Command executed.".to_string()
+    } else {
+        stdout.to_string()
+    }
+}
+
 fn resolve_workspace(cli: Option<PathBuf>, agent_cfg: &AgentConfig) -> Option<PathBuf> {
     if let Some(path) = cli {
         return Some(path);
@@ -6572,7 +6791,7 @@ fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
     match name {
         "exec" | "email_send" | "email_archive" | "config_set" | "gmail_send" | "gcal_create"
         | "ms_calendar_create" | "trigger_add" | "trigger_remove" | "notify" | "signal_send"
-        | "imessage_send" | "memory_export" | "fs_write" | "browser_request" => true,
+        | "imessage_send" | "memory_export" | "fs_write" | "browser" | "excalidraw" => true,
         "http_request" => {
             let method = args
                 .get("method")
@@ -6799,6 +7018,8 @@ fn base_tool_names() -> HashSet<String> {
         "subagent_batch",
         "approval_list",
         "scale",
+        "browser",
+        "excalidraw",
     ]
     .into_iter()
     .map(|s| s.to_string())

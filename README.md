@@ -83,7 +83,7 @@ cargo build --locked
 - `connect` runs a built-in OAuth broker for Google/Microsoft tokens.
 - Gmail/Calendar and Microsoft mail/calendar tools are available after OAuth (`gmail_*`, `gcal_*`, `ms_*`).
 - `http_request` provides a generic API surface (non-GET requires approval).
-- `browser_request` proxies automation to a local browser broker (Stagehand/CUA/etc).
+- `browser` provides CLI-based browser automation via agent-browser (ref-based element selection, named sessions).
 - `fs_list`, `fs_read`, `fs_write` give controlled filesystem access within allowed roots.
 - Sensitive tools require approval; reply `approve <id>` or `reject <id>` when prompted.
 - `tool_search` enables dynamic tool lookup (no bloated prompt).
@@ -103,7 +103,7 @@ cargo build --locked
 - `notify`, `signal_send`, `imessage_send` provide outbound messaging helpers.
 - Approval gates are always enforced for sensitive tools.
 - Set `AETHERVAULT_FS_ROOTS` to restrict filesystem tools.
-- Set `AETHERVAULT_BROWSER_ENDPOINT` to a local browser broker.
+- Browser automation requires `agent-browser` CLI installed (`npm install -g agent-browser`).
 
 ## Maintenance (SOTA compaction)
 

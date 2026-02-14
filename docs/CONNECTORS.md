@@ -79,15 +79,15 @@ After authorization, the following tools are available:
 - `ms_mail_list`, `ms_mail_read`
 - `ms_calendar_list`, `ms_calendar_create`
 
-## Browser automation (brokered)
+## Browser automation (agent-browser CLI)
 
-For SOTA browser control, run a local browser broker (Stagehand / CUA / Anthropic computer-use) and point the agent at it:
+Browser automation uses `agent-browser` with ref-based element selection from accessibility snapshots.
 
 ```bash
-export AETHERVAULT_BROWSER_ENDPOINT=http://127.0.0.1:4040
+npm install -g agent-browser && agent-browser install
 ```
 
-Then use the `browser_request` tool to drive actions (`open`, `click`, `type`, `extract`, etc).
+Use the `browser` tool: `open <url>` → `snapshot` to get element refs (`@e1`, `@e2`…) → interact (`click @e1`, `fill @e2 text`). Named sessions provide per-chat isolation.
 
 ## Generic HTTP tool
 
