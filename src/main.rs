@@ -9485,50 +9485,22 @@ fn spawn_agent_run(
         let _ = worker_tx.send(event);
     });
 
-    // Progress reporter thread
+    // Progress reporter thread — typing indicators only, no robotic status messages
     let prog_ref = progress.clone();
     let prog_agent = http_agent.clone();
     let prog_url = base_url.to_string();
     thread::spawn(move || {
-        let mut progress_msg_id: Option<i64> = None;
         loop {
-            thread::sleep(Duration::from_secs(30));
-            // Recover from poisoned mutex — read whatever state is there
-            let (phase, step, max_steps, elapsed, done) = {
+            thread::sleep(Duration::from_secs(8));
+            let done = {
                 let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
-                (
-                    guard.phase.clone(),
-                    guard.step,
-                    guard.max_steps,
-                    guard.started_at.elapsed().as_secs(),
-                    guard.phase == "done",
-                )
+                guard.phase == "done"
             };
             if done {
-                if let Some(mid) = progress_msg_id {
-                    telegram_delete_message(&prog_agent, &prog_url, chat_id, mid);
-                }
                 break;
             }
-            let status = format!(
-                "Working... step {}/{}, {} ({}s elapsed)",
-                step + 1,
-                max_steps,
-                phase,
-                elapsed
-            );
-            match progress_msg_id {
-                Some(mid) => {
-                    telegram_edit_message(&prog_agent, &prog_url, chat_id, mid, &status);
-                }
-                None => {
-                    progress_msg_id =
-                        telegram_send_message_returning_id(&prog_agent, &prog_url, chat_id, &status);
-                    if progress_msg_id.is_none() {
-                        telegram_send_typing(&prog_agent, &prog_url, chat_id);
-                    }
-                }
-            }
+            // Just send typing indicator — no robotic progress messages
+            telegram_send_typing(&prog_agent, &prog_url, chat_id);
         }
     });
 
@@ -9550,18 +9522,12 @@ fn handle_telegram_completion(
         Ok(result) => {
             let mut text = result.final_text.unwrap_or_default();
             if text.trim().is_empty() {
-                text = "Done.".to_string();
+                text = "\u{2705}".to_string();
             }
             text
         }
         Err(err) => {
-            let detail = err.chars().take(500).collect::<String>();
-            format!(
-                "Something went wrong while processing your request.\n\n\
-                Error: {detail}\n\n\
-                This wasn't your fault. I can retry if you send the message again, \
-                or you can rephrase if you'd like to try a different approach."
-            )
+            err.chars().take(500).collect::<String>()
         }
     };
 
@@ -9587,13 +9553,27 @@ fn handle_telegram_completion(
         eprintln!("Telegram send failed: {err}");
     }
 
-    // Check for queued messages
+    // Check for queued messages — merge all into one prompt
     if let Some(run) = active_runs.get_mut(&chat_id) {
-        if let Some((queued_text, queued_reply_id)) = run.queued_messages.first().cloned() {
-            run.queued_messages.remove(0);
+        if run.queued_messages.is_empty() {
+            active_runs.remove(&chat_id);
+        } else {
+            // Merge all queued messages into a single prompt
+            let merged_text = if run.queued_messages.len() == 1 {
+                run.queued_messages[0].0.clone()
+            } else {
+                // Multiple messages — combine them so the agent sees the full context
+                run.queued_messages.iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            };
+            let last_reply_id = run.queued_messages.last().map(|(_, rid)| *rid).flatten();
+            run.queued_messages.clear();
+
             let session = format!("{}telegram:{chat_id}", agent_config.session_prefix);
 
-            // Save the queued user message to session turns
+            // Save merged user message to session turns
             {
                 let mut turns = load_session_turns(&session, 8);
                 let now = SystemTime::now()
@@ -9602,7 +9582,7 @@ fn handle_telegram_completion(
                     .unwrap_or(0);
                 turns.push(SessionTurn {
                     role: "user".to_string(),
-                    content: queued_text.clone(),
+                    content: merged_text.clone(),
                     timestamp: now,
                 });
                 save_session_turns(&session, &turns, 8);
@@ -9611,16 +9591,14 @@ fn handle_telegram_completion(
             let progress = spawn_agent_run(
                 agent_config,
                 chat_id,
-                queued_reply_id,
-                &queued_text,
+                last_reply_id,
+                &merged_text,
                 session,
                 completion_tx,
                 http_agent,
                 base_url,
             );
             run.progress = progress;
-        } else {
-            active_runs.remove(&chat_id);
         }
     }
 }
@@ -9698,7 +9676,7 @@ fn run_telegram_bridge(
 
             // Handle callback queries (inline keyboard presses)
             if let Some(cb) = &entry.callback_query {
-                telegram_answer_callback(&http_agent, &base_url, &cb.id, Some("Processing..."));
+                telegram_answer_callback(&http_agent, &base_url, &cb.id, None);
             }
 
             let Some((chat_id, reply_to_id, user_text)) = extract_telegram_content(&entry, &http_agent, &base_url) else {
@@ -9714,24 +9692,12 @@ fn run_telegram_bridge(
             // Check if there's already an active run for this chat
             const MAX_QUEUED_PER_CHAT: usize = 5;
             if let Some(run) = active_runs.get_mut(&chat_id) {
-                if run.queued_messages.len() >= MAX_QUEUED_PER_CHAT {
-                    let ack = format!(
-                        "Queue full ({MAX_QUEUED_PER_CHAT} messages waiting). \
-                        Please wait for the current task to finish."
-                    );
-                    let _ = telegram_send_message(&http_agent, &base_url, chat_id, &ack);
-                } else {
+                // Silently queue — no robotic ack messages.
+                // All queued messages are merged into one prompt on completion.
+                if run.queued_messages.len() < MAX_QUEUED_PER_CHAT {
                     run.queued_messages.push((user_text, reply_to_id));
-                    let ack = format!(
-                        "Still working on your previous request. Queued \u{2014} I'll handle it next. \
-                        ({} message{} waiting)",
-                        run.queued_messages.len(),
-                        if run.queued_messages.len() == 1 { "" } else { "s" }
-                    );
-                    if let Err(err) = telegram_send_message(&http_agent, &base_url, chat_id, &ack) {
-                        eprintln!("Telegram ack send failed: {err}");
-                    }
                 }
+                // No response sent — the agent will address everything when it finishes.
                 continue;
             }
 
@@ -9846,7 +9812,7 @@ fn run_whatsapp_bridge(
             Err(err) => format!("Agent error: {err}"),
         };
         if output.trim().is_empty() {
-            output = "Done.".to_string();
+            output = "\u{2705}".to_string();
         }
 
         let twiml = format!(
@@ -9917,7 +9883,7 @@ fn run_webhook_bridge(
         let session = format!("{}{}", agent_config.session_prefix, session_key);
         let result = run_agent_for_bridge(&agent_config, &text, session, None, None, None);
         let output = match result {
-            Ok(output) => output.final_text.unwrap_or_else(|| "Done.".to_string()),
+            Ok(output) => output.final_text.unwrap_or_else(|| "\u{2705}".to_string()),
             Err(err) => format!("Agent error: {err}"),
         };
         if let Some(response_text) = reply(&agent_config, &output) {
