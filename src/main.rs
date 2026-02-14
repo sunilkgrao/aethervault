@@ -8254,6 +8254,26 @@ fn run_agent_with_prompt(
     let mut tools = tools_from_active(&tool_map, &active_tools);
     let mut tool_results: Vec<AgentToolResult> = Vec::new();
     let should_log = log || agent_cfg.log.unwrap_or(false);
+    // Guard: auto-disable logging if vault exceeds size threshold (default 500MB)
+    let vault_max_bytes: u64 = std::env::var("VAULT_MAX_LOG_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500_000_000);
+    let should_log = if should_log {
+        match std::fs::metadata(&mv2) {
+            Ok(meta) if meta.len() > vault_max_bytes => {
+                eprintln!(
+                    "[harness] vault size {}MB exceeds {}MB limit, disabling agent logging",
+                    meta.len() / 1_000_000,
+                    vault_max_bytes / 1_000_000
+                );
+                false
+            }
+            _ => true,
+        }
+    } else {
+        false
+    };
     let mut final_text = None;
 
     // Buffer log entries in memory and batch-flush them. This avoids holding an exclusive
@@ -9618,6 +9638,27 @@ fn run_telegram_bridge(
         .timeout_write(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(poll_timeout.saturating_add(10)))
         .build();
+
+    // Clean up orphaned vault temp files from previous crashes.
+    // These are created during atomic writes and left behind if the process is killed.
+    {
+        let vault_path = &agent_config.mv2;
+        if let Some(parent) = vault_path.parent() {
+            if let Some(stem) = vault_path.file_name().and_then(|f| f.to_str()) {
+                let prefix = format!(".{}.", stem);
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if name.starts_with(&prefix) {
+                                let _ = std::fs::remove_file(entry.path());
+                                eprintln!("[bridge] cleaned up orphaned temp file: {}", name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let mut active_runs: HashMap<i64, ActiveRun> = HashMap::new();
     let (completion_tx, completion_rx) = mpsc::channel::<CompletionEvent>();
