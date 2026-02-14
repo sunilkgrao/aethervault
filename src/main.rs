@@ -995,6 +995,46 @@ struct AgentLogEntry {
     ts_utc: Option<i64>,
 }
 
+/// Derive the JSONL agent log path from the vault path.
+/// e.g. /root/.aethervault/memory.mv2 → /root/.aethervault/logs/agent-turns.jsonl
+fn agent_log_path(mv2: &Path) -> PathBuf {
+    let log_dir = mv2.parent().unwrap_or(Path::new(".")).join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    log_dir.join("agent-turns.jsonl")
+}
+
+/// Append log entries to a JSONL file. Microsecond-fast, no index overhead.
+fn flush_log_to_jsonl(path: &Path, buffer: &mut Vec<AgentLogEntry>) -> Result<(), Box<dyn std::error::Error>> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    for entry in buffer.drain(..) {
+        let line = serde_json::to_string(&entry)?;
+        writeln!(file, "{}", line)?;
+    }
+    Ok(())
+}
+
+/// Rotate the log file when it exceeds max_bytes. Keeps one backup.
+fn rotate_log_if_needed(path: &Path, max_bytes: u64) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > max_bytes {
+            let backup = path.with_extension("jsonl.1");
+            let _ = std::fs::remove_file(&backup);
+            let _ = std::fs::rename(path, &backup);
+            eprintln!(
+                "[harness] rotated agent log (was {}MB)",
+                meta.len() / 1_000_000
+            );
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ContextCitation {
     rank: usize,
@@ -8271,48 +8311,24 @@ fn run_agent_with_prompt(
     let mut tools = tools_from_active(&tool_map, &active_tools);
     let mut tool_results: Vec<AgentToolResult> = Vec::new();
     let should_log = log || agent_cfg.log.unwrap_or(false);
-    // Guard: auto-disable logging if vault exceeds size threshold (default 500MB)
-    let vault_max_bytes: u64 = std::env::var("VAULT_MAX_LOG_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(500_000_000);
-    let should_log = if should_log {
-        match std::fs::metadata(&mv2) {
-            Ok(meta) if meta.len() > vault_max_bytes => {
-                eprintln!(
-                    "[harness] vault size {}MB exceeds {}MB limit, disabling agent logging",
-                    meta.len() / 1_000_000,
-                    vault_max_bytes / 1_000_000
-                );
-                false
-            }
-            _ => true,
-        }
-    } else {
-        false
-    };
     let mut final_text = None;
 
-    // Buffer log entries in memory and batch-flush them. This avoids holding an exclusive
-    // lock on the capsule for the entire agent session, which would block all concurrent
-    // subagents. The Vault is opened exclusively only during flush (milliseconds), then
-    // immediately dropped to release the lock.
+    // Agent logs go to a JSONL file — not the vault. This avoids Tantivy index bloat
+    // that caused the vault to grow from 616KB to 7.5GB. JSONL appends are microsecond-fast,
+    // require no index updates, and support trivial rotation.
+    let log_path = agent_log_path(&mv2);
+    let log_max_bytes: u64 = std::env::var("AGENT_LOG_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000_000); // 50MB default
     let mut log_buffer: Vec<AgentLogEntry> = Vec::new();
     let mut mem_write: Option<Vault> = None;
 
-    let flush_log_buffer = |mv2: &Path, buffer: &mut Vec<AgentLogEntry>, mem_read: &mut Option<Vault>| {
-        if buffer.is_empty() {
-            return Ok(()) as Result<(), Box<dyn std::error::Error>>;
+    let flush_log = |path: &Path, buffer: &mut Vec<AgentLogEntry>, max_bytes: u64| {
+        rotate_log_if_needed(path, max_bytes);
+        if let Err(e) = flush_log_to_jsonl(path, buffer) {
+            eprintln!("[harness] failed to write agent log: {e}");
         }
-        // Drop any read handle so we can acquire exclusive.
-        *mem_read = None;
-        let mut mem = Vault::open(mv2)?;
-        for entry in buffer.drain(..) {
-            let _ = append_agent_log_uncommitted(&mut mem, &entry);
-        }
-        mem.commit()?;
-        // `mem` is dropped here, releasing the exclusive lock immediately.
-        Ok(())
     };
 
     if should_log {
@@ -8325,7 +8341,7 @@ fn run_agent_with_prompt(
         };
         log_buffer.push(entry);
         if log_buffer.len() >= effective_log_commit_interval {
-            flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
+            flush_log(&log_path, &mut log_buffer, log_max_bytes);
         }
     }
 
@@ -8384,7 +8400,7 @@ fn run_agent_with_prompt(
                 };
                 log_buffer.push(entry);
                 if log_buffer.len() >= effective_log_commit_interval {
-                    flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
+                    flush_log(&log_path, &mut log_buffer, log_max_bytes);
                 }
             }
 
@@ -8568,7 +8584,7 @@ fn run_agent_with_prompt(
                     ts_utc: Some(Utc::now().timestamp()),
                 });
                 if log_buffer.len() >= effective_log_commit_interval {
-                    flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
+                    flush_log(&log_path, &mut log_buffer, log_max_bytes);
                 }
             }
 
@@ -8597,7 +8613,7 @@ fn run_agent_with_prompt(
             }
 
             if matches!(call.name.as_str(), "put" | "log" | "feedback") && !result.is_error {
-                flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
+                flush_log(&log_path, &mut log_buffer, log_max_bytes);
             }
         } else {
             // Multiple tool calls — execute in parallel
@@ -8692,7 +8708,7 @@ fn run_agent_with_prompt(
                         ts_utc: Some(Utc::now().timestamp()),
                     });
                     if log_buffer.len() >= effective_log_commit_interval {
-                        flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
+                        flush_log(&log_path, &mut log_buffer, log_max_bytes);
                     }
                 }
 
@@ -8709,7 +8725,7 @@ fn run_agent_with_prompt(
                 }
 
                 if matches!(call.name.as_str(), "put" | "log" | "feedback") && !result.is_error {
-                    flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
+                    flush_log(&log_path, &mut log_buffer, log_max_bytes);
                 }
             }
         }
@@ -8755,7 +8771,7 @@ fn run_agent_with_prompt(
     }
 
     if should_log {
-        flush_log_buffer(&mv2, &mut log_buffer, &mut mem_read)?;
+        flush_log(&log_path, &mut log_buffer, log_max_bytes);
     }
 
     if !completed {
