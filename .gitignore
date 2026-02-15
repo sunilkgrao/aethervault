@@ -61,3 +61,5 @@ memory.mv2.lock
 *.pid
 *.lock
 workspace/sessions/
+memory.mv2.bak-pre-dedup
+*.bak-pre-dedup
