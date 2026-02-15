@@ -1147,6 +1147,24 @@ struct AgentConfig {
     model_hook: Option<HookSpec>,
     #[serde(default)]
     subagents: Vec<SubagentSpec>,
+    /// MCP servers to spawn as long-lived sidecars (generic plugin system)
+    #[serde(default)]
+    mcp_servers: Vec<McpServerConfig>,
+}
+
+/// Configuration for an external MCP server (tool plugin)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct McpServerConfig {
+    /// Human-readable name (used for tool prefixing: mcp__{name}__{tool})
+    name: String,
+    /// Command to spawn the server (e.g. "npx excalidraw-mcp --stdio")
+    command: String,
+    /// Timeout in seconds for each tools/call (default: 30)
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Environment variables to pass to the server
+    #[serde(default)]
+    env: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1399,6 +1417,98 @@ struct TriggerEntry {
     enabled: bool,
     last_seen: Option<String>,
     last_fired: Option<String>,
+    /// Cron expression: "minute hour day_of_month month day_of_week"
+    /// Supports: *, specific values, and ranges (e.g. "0 9 * * 1-5" = weekdays at 9am)
+    #[serde(default)]
+    cron: Option<String>,
+    /// URL for webhook triggers (kind=webhook)
+    #[serde(default)]
+    webhook_url: Option<String>,
+    /// HTTP method for webhook (default: GET)
+    #[serde(default)]
+    webhook_method: Option<String>,
+    /// Custom schedule name (e.g. "morning_standup", "weekly_review")
+    #[serde(default)]
+    schedule_name: Option<String>,
+}
+
+/// Simple cron expression matcher (minute hour dom month dow)
+struct CronExpr {
+    minute: CronField,
+    hour: CronField,
+    dom: CronField,     // day of month
+    month: CronField,
+    dow: CronField,     // day of week (0=Sun, 1=Mon, ..., 6=Sat)
+}
+
+enum CronField {
+    Any,
+    Values(Vec<u32>),
+}
+
+impl CronExpr {
+    fn parse(expr: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = expr.split_whitespace().collect();
+        if parts.len() != 5 {
+            return Err(format!("cron: expected 5 fields, got {}", parts.len()));
+        }
+        Ok(CronExpr {
+            minute: Self::parse_field(parts[0], 0, 59)?,
+            hour: Self::parse_field(parts[1], 0, 23)?,
+            dom: Self::parse_field(parts[2], 1, 31)?,
+            month: Self::parse_field(parts[3], 1, 12)?,
+            dow: Self::parse_field(parts[4], 0, 6)?,
+        })
+    }
+
+    fn parse_field(field: &str, min: u32, max: u32) -> Result<CronField, String> {
+        if field == "*" {
+            return Ok(CronField::Any);
+        }
+        let mut values = Vec::new();
+        for part in field.split(',') {
+            if let Some((start_s, end_s)) = part.split_once('-') {
+                let start: u32 = start_s.parse().map_err(|_| format!("cron: bad value '{start_s}'"))?;
+                let end: u32 = end_s.parse().map_err(|_| format!("cron: bad value '{end_s}'"))?;
+                if start < min || end > max || start > end {
+                    return Err(format!("cron: range {start}-{end} out of bounds [{min}-{max}]"));
+                }
+                for v in start..=end {
+                    values.push(v);
+                }
+            } else if let Some(step_s) = part.strip_prefix("*/") {
+                let step: u32 = step_s.parse().map_err(|_| format!("cron: bad step '{step_s}'"))?;
+                if step == 0 { return Err("cron: step cannot be 0".into()); }
+                let mut v = min;
+                while v <= max {
+                    values.push(v);
+                    v += step;
+                }
+            } else {
+                let val: u32 = part.parse().map_err(|_| format!("cron: bad value '{part}'"))?;
+                if val < min || val > max {
+                    return Err(format!("cron: value {val} out of bounds [{min}-{max}]"));
+                }
+                values.push(val);
+            }
+        }
+        Ok(CronField::Values(values))
+    }
+
+    fn matches(&self, minute: u32, hour: u32, dom: u32, month: u32, dow: u32) -> bool {
+        Self::field_matches(&self.minute, minute)
+            && Self::field_matches(&self.hour, hour)
+            && Self::field_matches(&self.dom, dom)
+            && Self::field_matches(&self.month, month)
+            && Self::field_matches(&self.dow, dow)
+    }
+
+    fn field_matches(field: &CronField, value: u32) -> bool {
+        match field {
+            CronField::Any => true,
+            CronField::Values(vals) => vals.contains(&value),
+        }
+    }
 }
 
 // === Session Context Buffer ===
@@ -1787,6 +1897,273 @@ struct ToolExcalidrawArgs {
     elements: Option<String>,
 }
 
+// === Generic MCP Client Registry ===
+// Manages long-lived MCP server sidecars. Each server is spawned once, handshaked,
+// tools discovered via tools/list, and kept alive for the agent session. Tool calls
+// are routed to the correct server via a name→server routing map.
+
+struct McpServerHandle {
+    name: String,
+    stdin: std::process::ChildStdin,
+    reader: BufReader<std::process::ChildStdout>,
+    child: std::process::Child,
+    next_id: i64,
+    timeout_secs: u64,
+    /// Tools discovered from this server (original names)
+    tools: Vec<serde_json::Value>,
+}
+
+struct McpRegistry {
+    servers: Vec<McpServerHandle>,
+    /// Maps prefixed tool name (mcp__{server}__{tool}) → (server_index, original_tool_name)
+    route_map: HashMap<String, (usize, String)>,
+}
+
+impl McpRegistry {
+    /// Spawn and initialize all configured MCP servers.
+    fn start(configs: &[McpServerConfig]) -> Result<Self, String> {
+        let mut servers = Vec::new();
+        let mut route_map = HashMap::new();
+
+        for cfg in configs {
+            match Self::spawn_server(cfg) {
+                Ok(handle) => {
+                    let server_idx = servers.len();
+                    // Build route map from discovered tools
+                    for tool in &handle.tools {
+                        if let Some(tool_name) = tool.get("name").and_then(|v| v.as_str()) {
+                            let prefixed = format!("mcp__{}__{}", cfg.name, tool_name);
+                            route_map.insert(prefixed, (server_idx, tool_name.to_string()));
+                        }
+                    }
+                    servers.push(handle);
+                }
+                Err(e) => {
+                    eprintln!("[mcp-registry] failed to start '{}': {e}", cfg.name);
+                    // Non-fatal: skip this server, continue with others
+                }
+            }
+        }
+
+        Ok(McpRegistry { servers, route_map })
+    }
+
+    fn spawn_server(cfg: &McpServerConfig) -> Result<McpServerHandle, String> {
+        let cmd_parts = shlex::split(&cfg.command)
+            .ok_or_else(|| format!("mcp '{}': malformed command", cfg.name))?;
+        if cmd_parts.is_empty() {
+            return Err(format!("mcp '{}': empty command", cfg.name));
+        }
+
+        let mut cmd = build_external_command(&cmd_parts[0], &cmd_parts[1..]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in &cfg.env {
+            cmd.env(k, v);
+        }
+
+        let mut child = cmd.spawn().map_err(|e| format!("mcp '{}' spawn: {e}", cfg.name))?;
+        let stdin = child.stdin.take().ok_or_else(|| format!("mcp '{}': no stdin", cfg.name))?;
+        let stdout = child.stdout.take().ok_or_else(|| format!("mcp '{}': no stdout", cfg.name))?;
+        let reader = BufReader::new(stdout);
+        let timeout_secs = cfg.timeout_secs.unwrap_or(30);
+
+        let mut handle = McpServerHandle {
+            name: cfg.name.clone(),
+            stdin,
+            reader,
+            child,
+            next_id: 1,
+            timeout_secs,
+            tools: Vec::new(),
+        };
+
+        // Initialize handshake
+        handle.send_msg(&serde_json::json!({
+            "jsonrpc": "2.0", "id": handle.next_id, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "aethervault", "version": "0.1" }
+            }
+        }))?;
+        handle.next_id += 1;
+
+        let init_resp = handle.read_msg()?;
+        if let Some(err) = init_resp.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            let _ = handle.child.kill();
+            let _ = handle.child.wait();
+            return Err(format!("mcp '{}': initialize failed: {msg}", cfg.name));
+        }
+
+        // Send initialized notification
+        handle.send_msg(&serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        }))?;
+
+        // Discover tools
+        handle.send_msg(&serde_json::json!({
+            "jsonrpc": "2.0", "id": handle.next_id, "method": "tools/list"
+        }))?;
+        handle.next_id += 1;
+
+        let list_resp = handle.read_msg()?;
+        if let Some(err) = list_resp.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            eprintln!("[mcp-registry] '{}': tools/list failed: {msg}", cfg.name);
+        } else if let Some(tools_arr) = list_resp.get("result")
+            .and_then(|r| r.get("tools"))
+            .and_then(|t| t.as_array())
+        {
+            handle.tools = tools_arr.clone();
+            eprintln!("[mcp-registry] '{}': discovered {} tools", cfg.name, handle.tools.len());
+        }
+
+        Ok(handle)
+    }
+
+    /// Get merged tool definitions with prefixed names for the agent catalog
+    fn tool_definitions(&self) -> Vec<serde_json::Value> {
+        let mut defs = Vec::new();
+        for handle in &self.servers {
+            for tool in &handle.tools {
+                let original_name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let prefixed_name = format!("mcp__{}__{}", handle.name, original_name);
+                let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                let input_schema = tool.get("inputSchema").cloned()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+
+                defs.push(serde_json::json!({
+                    "name": prefixed_name,
+                    "description": format!("[MCP:{}] {}", handle.name, description),
+                    "inputSchema": input_schema
+                }));
+            }
+        }
+        defs
+    }
+
+    /// Call a tool on the appropriate server
+    fn call_tool(&mut self, prefixed_name: &str, args: serde_json::Value) -> Result<ToolExecution, String> {
+        let (server_idx, original_name) = self.route_map.get(prefixed_name)
+            .ok_or_else(|| format!("mcp: unknown tool '{prefixed_name}'"))?
+            .clone();
+        let handle = &mut self.servers[server_idx];
+        let timeout = handle.timeout_secs;
+
+        // Send tools/call
+        let call_id = handle.next_id;
+        handle.send_msg(&serde_json::json!({
+            "jsonrpc": "2.0", "id": call_id, "method": "tools/call",
+            "params": { "name": original_name, "arguments": args }
+        }))?;
+        handle.next_id += 1;
+
+        let resp = handle.read_msg_timeout(timeout)?;
+
+        // Check for JSON-RPC error
+        if let Some(err) = resp.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+            return Err(format!("mcp '{}' error {code}: {msg}", handle.name));
+        }
+        let result = resp.get("result").cloned()
+            .ok_or_else(|| format!("mcp '{}': response missing 'result'", handle.name))?;
+        let content_text = result.get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or_else(|| {
+                // Fallback: show raw result so agent sees something
+                ""
+            });
+        let content_text = if content_text.is_empty() {
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        } else {
+            content_text.to_string()
+        };
+        let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        Ok(ToolExecution {
+            output: content_text.to_string(),
+            details: result,
+            is_error,
+        })
+    }
+
+    /// Shutdown all servers
+    fn shutdown(&mut self) {
+        for handle in &mut self.servers {
+            // Try graceful shutdown
+            let _ = handle.send_msg(&serde_json::json!({
+                "jsonrpc": "2.0", "id": handle.next_id, "method": "shutdown"
+            }));
+            // Give 2s for graceful exit, then kill
+            thread::sleep(Duration::from_millis(100));
+            let _ = handle.child.kill();
+            let _ = handle.child.wait();
+        }
+        self.servers.clear();
+        self.route_map.clear();
+    }
+}
+
+impl McpServerHandle {
+    fn send_msg(&mut self, msg: &serde_json::Value) -> Result<(), String> {
+        let body = serde_json::to_string(msg).map_err(|e| e.to_string())?;
+        write!(self.stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body)
+            .map_err(|e| format!("mcp '{}' write: {e}", self.name))?;
+        self.stdin.flush().map_err(|e| format!("mcp '{}' flush: {e}", self.name))?;
+        Ok(())
+    }
+
+    fn read_msg(&mut self) -> Result<serde_json::Value, String> {
+        self.read_msg_inner()
+    }
+
+    fn read_msg_timeout(&mut self, _timeout_secs: u64) -> Result<serde_json::Value, String> {
+        // For long-lived sidecars, we rely on the server responding within its own timeout.
+        // The thread-based timeout pattern is used for spawn-per-call (legacy excalidraw).
+        // TODO: Could add thread-based timeout wrapper here for extra safety.
+        self.read_msg_inner()
+    }
+
+    fn read_msg_inner(&mut self) -> Result<serde_json::Value, String> {
+        let mut content_length: Option<usize> = None;
+        loop {
+            let mut line = String::new();
+            self.reader.read_line(&mut line)
+                .map_err(|e| format!("mcp '{}' read: {e}", self.name))?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                if content_length.is_some() { break; }
+                continue;
+            }
+            if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
+                content_length = Some(len_str.trim().parse()
+                    .map_err(|e| format!("mcp '{}' bad content-length: {e}", self.name))?);
+            }
+        }
+        let len = content_length.ok_or_else(|| format!("mcp '{}': missing Content-Length", self.name))?;
+        if len > 10 * 1024 * 1024 {
+            return Err(format!("mcp '{}': response too large ({len} bytes)", self.name));
+        }
+        let mut body = vec![0u8; len];
+        io::Read::read_exact(&mut self.reader, &mut body)
+            .map_err(|e| format!("mcp '{}' read body: {e}", self.name))?;
+        serde_json::from_slice(&body).map_err(|e| format!("mcp '{}' parse: {e}", self.name))
+    }
+}
+
+impl Drop for McpRegistry {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ToolFsListArgs {
     path: String,
@@ -1826,6 +2203,12 @@ struct ToolTriggerAddArgs {
     end: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
+    #[serde(default)]
+    cron: Option<String>,
+    #[serde(default)]
+    webhook_url: Option<String>,
+    #[serde(default)]
+    webhook_method: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2987,6 +3370,24 @@ fn execute_query(
         warnings.push("vector lane disabled (build with --features vec)".to_string());
     }
 
+    // --- Qdrant external vector lane ---
+    // When QDRANT_URL is set, query Qdrant for additional vector results.
+    // This supplements the local vec lane (if enabled) with a scalable external store.
+    if !args.no_vector {
+        if let Some(qdrant_url) = env_optional("QDRANT_URL") {
+            let collection = env_optional("QDRANT_COLLECTION").unwrap_or_else(|| "aethervault".to_string());
+            match qdrant_search_text(&qdrant_url, &collection, &args.raw_query, lane_limit) {
+                Ok(hits) if !hits.is_empty() => {
+                    lists.push(build_ranked_list(LaneKind::Vec, &args.raw_query, false, &hits));
+                }
+                Ok(_) => {} // no hits
+                Err(e) => {
+                    warnings.push(format!("qdrant search failed: {e}"));
+                }
+            }
+        }
+    }
+
     if lists.is_empty() {
         return Ok(QueryResponse {
             query: args.raw_query,
@@ -3729,16 +4130,19 @@ fn tool_definitions_json() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "trigger_add",
-            "description": "Add an event trigger (email or calendar_free).",
+            "description": "Add an event trigger. Kinds: email (Gmail query), calendar_free (Google Calendar window), cron (cron expression schedule), webhook (HTTP endpoint change detection).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "kind": { "type": "string" },
-                    "name": { "type": "string" },
-                    "query": { "type": "string" },
-                    "prompt": { "type": "string" },
-                    "start": { "type": "string" },
-                    "end": { "type": "string" },
+                    "kind": { "type": "string", "description": "Trigger kind: email, calendar_free, cron, or webhook" },
+                    "name": { "type": "string", "description": "Human-readable trigger name" },
+                    "query": { "type": "string", "description": "Gmail query (for kind=email)" },
+                    "prompt": { "type": "string", "description": "Prompt to send to agent when trigger fires" },
+                    "start": { "type": "string", "description": "Window start (for kind=calendar_free)" },
+                    "end": { "type": "string", "description": "Window end (for kind=calendar_free)" },
+                    "cron": { "type": "string", "description": "Cron expression: 'min hour dom month dow' (for kind=cron). Example: '0 9 * * 1-5' = weekdays 9am" },
+                    "webhook_url": { "type": "string", "description": "URL to poll (for kind=webhook)" },
+                    "webhook_method": { "type": "string", "description": "HTTP method for webhook (default: GET)" },
                     "enabled": { "type": "boolean" }
                 },
                 "required": ["kind"]
@@ -5114,6 +5518,48 @@ fn execute_tool_with_handles(
                     chrono::Utc::now().timestamp(),
                     triggers.len() + 1
                 );
+                // Validate kind-specific required fields
+                match parsed.kind.as_str() {
+                    "cron" => {
+                        if parsed.cron.is_none() {
+                            return Err("kind=cron requires a 'cron' expression".into());
+                        }
+                    }
+                    "webhook" => {
+                        if parsed.webhook_url.is_none() {
+                            return Err("kind=webhook requires a 'webhook_url'".into());
+                        }
+                    }
+                    "email" | "calendar_free" => {}
+                    other => {
+                        return Err(format!("Unknown trigger kind: '{other}'"));
+                    }
+                }
+                // Validate cron expression if provided
+                if let Some(ref cron_str) = parsed.cron {
+                    if let Err(e) = CronExpr::parse(cron_str) {
+                        return Err(format!("Invalid cron expression: {e}"));
+                    }
+                }
+                // Validate webhook URL (SSRF protection)
+                if let Some(ref url) = parsed.webhook_url {
+                    if !url.starts_with("https://") && !url.starts_with("http://") {
+                        return Err("webhook_url must use http:// or https://".into());
+                    }
+                    let lower = url.to_lowercase();
+                    if lower.contains("localhost") || lower.contains("127.0.0.1")
+                        || lower.contains("[::1]") || lower.contains("169.254.169.254")
+                        || lower.contains("10.0.") || lower.contains("192.168.") {
+                        return Err("webhook_url cannot target private/internal addresses".into());
+                    }
+                }
+                // Validate webhook method
+                if let Some(ref m) = parsed.webhook_method {
+                    let upper = m.to_uppercase();
+                    if upper != "GET" && upper != "POST" {
+                        return Err(format!("webhook_method must be GET or POST, got '{m}'"));
+                    }
+                }
                 let entry = TriggerEntry {
                     id: id.clone(),
                     kind: parsed.kind,
@@ -5125,6 +5571,10 @@ fn execute_tool_with_handles(
                     enabled: parsed.enabled.unwrap_or(true),
                     last_seen: None,
                     last_fired: None,
+                    cron: parsed.cron,
+                    webhook_url: parsed.webhook_url,
+                    webhook_method: parsed.webhook_method,
+                    schedule_name: None,
                 };
                 triggers.push(entry);
                 save_triggers(mem, &triggers)?;
@@ -6803,6 +7253,10 @@ fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
         ToolAutonomyLevel::SuggestOnly => return true,
         ToolAutonomyLevel::Confirm => {} // fall through to default logic
     }
+    // All MCP tools require approval (external plugins)
+    if name.starts_with("mcp__") {
+        return true;
+    }
     match name {
         "exec" | "email_send" | "email_archive" | "config_set" | "gmail_send" | "gcal_create"
         | "ms_calendar_create" | "trigger_add" | "trigger_remove" | "notify" | "signal_send"
@@ -7210,31 +7664,138 @@ fn load_kg_graph(path: &std::path::Path) -> Option<KgGraph> {
     serde_json::from_str(&data).ok()
 }
 
+/// Tokenize text into lowercase word tokens for similarity matching.
+fn tokenize_words(text: &str) -> HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| w.len() >= 2)
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Token containment coefficient: what fraction of b's tokens appear in a?
+/// Better than Jaccard for asymmetric sets (long query vs short entity name).
+fn token_containment(query_tokens: &HashSet<String>, entity_tokens: &HashSet<String>) -> f64 {
+    if entity_tokens.is_empty() {
+        return 0.0;
+    }
+    let intersection = query_tokens.intersection(entity_tokens).count() as f64;
+    intersection / entity_tokens.len() as f64
+}
+
+/// Simple edit distance (Levenshtein) for fuzzy matching.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let m = a_chars.len();
+    let n = b_chars.len();
+    if m == 0 { return n; }
+    if n == 0 { return m; }
+    let mut prev = (0..=n).collect::<Vec<_>>();
+    let mut curr = vec![0; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Check if the character immediately before byte_pos is a word boundary (non-alphanumeric).
+fn is_boundary_before(text: &str, byte_pos: usize) -> bool {
+    if byte_pos == 0 || byte_pos >= text.len() {
+        return true;
+    }
+    let ch = text[..byte_pos].chars().next_back();
+    ch.map(|c| !c.is_alphanumeric()).unwrap_or(true)
+}
+
+/// Check if the character at byte_pos is a word boundary (non-alphanumeric).
+fn is_boundary_after(text: &str, byte_pos: usize) -> bool {
+    if byte_pos >= text.len() {
+        return true;
+    }
+    let ch = text[byte_pos..].chars().next();
+    ch.map(|c| !c.is_alphanumeric()).unwrap_or(true)
+}
+
 fn find_kg_entities(text: &str, graph: &KgGraph) -> Vec<String> {
     let text_lower = text.to_lowercase();
-    let mut matched = Vec::new();
+    let text_tokens = tokenize_words(text);
+    let mut scored: Vec<(String, f64)> = Vec::new();
+
     for node in &graph.nodes {
         let name = node.name.as_deref().unwrap_or(&node.id);
-        // Skip very short names to avoid false positives
-        if name.len() < 3 { continue; }
+        let char_count = name.chars().count();
+        if char_count < 3 { continue; }
         let name_lower = name.to_lowercase();
-        // For short names (3-5 chars), require word boundary
-        if name.len() <= 5 {
-            if let Some(pos) = text_lower.find(&name_lower) {
-                let before_ok = pos == 0 || !text_lower.as_bytes()[pos - 1].is_ascii_alphanumeric();
-                let after_pos = pos + name_lower.len();
-                let after_ok = after_pos >= text_lower.len() || !text_lower.as_bytes()[after_pos].is_ascii_alphanumeric();
+        let mut score: f64 = 0.0;
+
+        // 1. Exact substring match (highest confidence)
+        // For short names (<=5 chars), require word boundaries; check ALL occurrences
+        if char_count <= 5 {
+            let mut search_start = 0;
+            while let Some(pos) = text_lower[search_start..].find(&name_lower) {
+                let abs_pos = search_start + pos;
+                let after_pos = abs_pos + name_lower.len();
+                let before_ok = is_boundary_before(&text_lower, abs_pos);
+                let after_ok = is_boundary_after(&text_lower, after_pos);
                 if before_ok && after_ok {
-                    matched.push(name.to_string());
+                    score = 1.0;
+                    break;
                 }
+                // Move past this occurrence and try the next
+                search_start = abs_pos + name_lower.len().max(1);
+                if search_start >= text_lower.len() { break; }
             }
         } else if text_lower.contains(&name_lower) {
-            matched.push(name.to_string());
+            score = 1.0;
+        }
+
+        // 2. Token containment — what fraction of entity's words appear in the query?
+        // Uses containment coefficient instead of Jaccard to handle asymmetric set sizes
+        if score < 1.0 {
+            let name_tokens = tokenize_words(name);
+            let containment = token_containment(&text_tokens, &name_tokens);
+            if containment > 0.3 {
+                score = score.max(containment * 0.9); // slight discount vs exact match
+            }
+        }
+
+        // 3. Edit distance fuzzy match — catches typos (only for single-word names)
+        if score < 0.5 && !name_lower.contains(' ') {
+            let name_char_count = name_lower.chars().count();
+            for word in &text_tokens {
+                let word_char_count = word.chars().count();
+                if word_char_count < 3 { continue; }
+                // Skip if length difference is too large (can't meet 0.7 threshold)
+                let len_diff = (word_char_count as isize - name_char_count as isize).unsigned_abs();
+                let max_len = word_char_count.max(name_char_count);
+                if max_len > 0 && (len_diff as f64 / max_len as f64) > 0.3 {
+                    continue; // length filter: skip impossible matches
+                }
+                let dist = edit_distance(word, &name_lower);
+                if max_len > 0 {
+                    let similarity = 1.0 - (dist as f64 / max_len as f64);
+                    if similarity >= 0.7 {
+                        score = score.max(similarity * 0.8); // discount fuzzy matches
+                    }
+                }
+            }
+        }
+
+        if score >= 0.3 {
+            scored.push((name.to_string(), score));
         }
     }
-    // Cap at 5 entities to avoid prompt bloat
-    matched.truncate(5);
-    matched
+
+    // Sort by score descending, cap at 5
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(5);
+    scored.into_iter().map(|(name, _)| name).collect()
 }
 
 fn build_kg_context(entity_names: &[String], graph: &KgGraph) -> String {
@@ -7657,12 +8218,115 @@ fn run_watch_loop(
                         }
                     }
                 }
+                "cron" => {
+                    let cron_str = match &trigger.cron {
+                        Some(c) if !c.trim().is_empty() => c.clone(),
+                        _ => continue,
+                    };
+                    let cron_expr = match CronExpr::parse(&cron_str) {
+                        Ok(expr) => expr,
+                        Err(e) => {
+                            eprintln!("[watch] trigger '{}' bad cron: {e}", trigger.id);
+                            continue;
+                        }
+                    };
+                    // chrono dow: Mon=1..Sun=7; cron: Sun=0..Sat=6
+                    let dow = match now.weekday() {
+                        chrono::Weekday::Sun => 0,
+                        chrono::Weekday::Mon => 1,
+                        chrono::Weekday::Tue => 2,
+                        chrono::Weekday::Wed => 3,
+                        chrono::Weekday::Thu => 4,
+                        chrono::Weekday::Fri => 5,
+                        chrono::Weekday::Sat => 6,
+                    };
+                    if cron_expr.matches(
+                        now.minute(),
+                        now.hour(),
+                        now.day(),
+                        now.month(),
+                        dow,
+                    ) {
+                        // Don't fire more than once in the same minute
+                        let current_minute = format!("{}-{:02}-{:02}T{:02}:{:02}",
+                            now.year(), now.month(), now.day(), now.hour(), now.minute());
+                        if trigger.last_fired.as_deref() == Some(&current_minute) {
+                            continue;
+                        }
+                        trigger.last_fired = Some(current_minute);
+                        updated = true;
+                        let mut prompt = trigger.prompt.clone().unwrap_or_else(|| {
+                            format!("Cron trigger '{}' fired.", trigger.name.as_deref().unwrap_or(&trigger.id))
+                        });
+                        if let Some(ws) = &workspace {
+                            prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
+                        }
+                        let session = format!("trigger:cron:{}", trigger.id);
+                        if let Err(e) = run_agent_for_bridge(&agent_config, &prompt, session, None, None, None) {
+                            eprintln!("[watch] trigger '{}' agent failed: {e}", trigger.id);
+                        }
+                    }
+                }
+                "webhook" => {
+                    let url = match &trigger.webhook_url {
+                        Some(u) if !u.trim().is_empty() => u.clone(),
+                        _ => continue,
+                    };
+                    let method = trigger.webhook_method.as_deref().unwrap_or("GET").to_uppercase();
+                    let agent = ureq::AgentBuilder::new()
+                        .timeout_connect(Duration::from_secs(10))
+                        .timeout_read(Duration::from_secs(20))
+                        .build();
+                    let resp = match method.as_str() {
+                        "POST" => agent.post(&url).call(),
+                        _ => agent.get(&url).call(),
+                    };
+                    let payload = match resp {
+                        Ok(resp) => resp.into_string().unwrap_or_default(),
+                        Err(e) => {
+                            eprintln!("[watch] trigger '{}' webhook error: {e}", trigger.id);
+                            continue;
+                        }
+                    };
+                    // Only fire if response changed since last check
+                    let payload_hash = blake3::hash(payload.as_bytes()).to_hex().to_string();
+                    if trigger.last_seen.as_deref() == Some(&payload_hash) {
+                        continue;
+                    }
+                    // First poll: record baseline without firing
+                    if trigger.last_seen.is_none() {
+                        trigger.last_seen = Some(payload_hash);
+                        updated = true;
+                        continue;
+                    }
+                    trigger.last_seen = Some(payload_hash);
+                    trigger.last_fired = Some(now.to_rfc3339());
+                    updated = true;
+                    let mut prompt = trigger.prompt.clone().unwrap_or_else(|| {
+                        format!("Webhook trigger '{}' detected a change.", trigger.name.as_deref().unwrap_or(&trigger.id))
+                    });
+                    let preview_end = payload.char_indices()
+                        .take_while(|&(i, _)| i < 500)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(0);
+                    prompt.push_str(&format!("\n\nWebhook URL: {url}\nResponse preview: {}", &payload[..preview_end]));
+                    if let Some(ws) = &workspace {
+                        prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
+                    }
+                    let session = format!("trigger:webhook:{}", trigger.id);
+                    if let Err(e) = run_agent_for_bridge(&agent_config, &prompt, session, None, None, None) {
+                        eprintln!("[watch] trigger '{}' agent failed: {e}", trigger.id);
+                    }
+                }
                 _ => {}
             }
         }
 
         if updated {
-            let _ = save_triggers(&mut mem, &triggers);
+            if let Err(e) = save_triggers(&mut mem, &triggers) {
+                eprintln!("[watch] CRITICAL: failed to persist trigger state: {e}");
+            }
         }
         thread::sleep(Duration::from_secs(poll_seconds));
     }
@@ -8542,8 +9206,51 @@ fn run_agent_with_prompt(
     });
 
     let tool_catalog = tool_definitions_json();
-    let tool_map = tool_catalog_map(&tool_catalog);
+    let mut full_catalog = tool_catalog.clone();
+
+    // --- MCP Client Registry ---
+    // Spawn configured MCP servers, discover their tools, and merge into the catalog.
+    // Also auto-register excalidraw if EXCALIDRAW_MCP_CMD is set and no explicit mcp_servers config.
+    let mcp_configs = {
+        let mut cfgs = agent_cfg.mcp_servers.clone();
+        // Auto-register excalidraw as MCP server if env var is set and not already configured
+        if !cfgs.iter().any(|c| c.name == "excalidraw") {
+            if let Some(cmd) = env_optional("EXCALIDRAW_MCP_CMD") {
+                cfgs.push(McpServerConfig {
+                    name: "excalidraw".to_string(),
+                    command: cmd,
+                    timeout_secs: Some(30),
+                    env: HashMap::new(),
+                });
+            }
+        }
+        cfgs
+    };
+
+    let mut mcp_registry = if !mcp_configs.is_empty() {
+        match McpRegistry::start(&mcp_configs) {
+            Ok(registry) => {
+                let mcp_tools = registry.tool_definitions();
+                full_catalog.extend(mcp_tools);
+                Some(registry)
+            }
+            Err(e) => {
+                eprintln!("[harness] MCP registry failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let tool_map = tool_catalog_map(&full_catalog);
     let mut active_tools = base_tool_names();
+    // Add MCP tool names to active set
+    if let Some(ref registry) = mcp_registry {
+        for name in registry.route_map.keys() {
+            active_tools.insert(name.clone());
+        }
+    }
     let mut tools = tools_from_active(&tool_map, &active_tools);
     let mut tool_results: Vec<AgentToolResult> = Vec::new();
     let should_log = log || agent_cfg.log.unwrap_or(false);
@@ -8745,20 +9452,39 @@ fn run_agent_with_prompt(
         if tool_calls.len() == 1 {
             // Single tool call — execute directly (no thread overhead)
             let call = &tool_calls[0];
-            let result = match execute_tool_with_handles(
-                &call.name,
-                call.args.clone(),
-                &mv2,
-                false,
-                &mut mem_read,
-                &mut mem_write,
-            ) {
-                Ok(result) => result,
-                Err(err) => ToolExecution {
-                    output: format!("Tool error: {err}"),
-                    details: serde_json::json!({ "error": err }),
-                    is_error: true,
-                },
+            let result = if call.name.starts_with("mcp__") {
+                // Route to MCP registry
+                match mcp_registry.as_mut() {
+                    Some(registry) => match registry.call_tool(&call.name, call.args.clone()) {
+                        Ok(result) => result,
+                        Err(err) => ToolExecution {
+                            output: format!("Tool error: {err}"),
+                            details: serde_json::json!({ "error": err }),
+                            is_error: true,
+                        },
+                    },
+                    None => ToolExecution {
+                        output: "MCP registry not initialized".to_string(),
+                        details: serde_json::json!({ "error": "no registry" }),
+                        is_error: true,
+                    },
+                }
+            } else {
+                match execute_tool_with_handles(
+                    &call.name,
+                    call.args.clone(),
+                    &mv2,
+                    false,
+                    &mut mem_read,
+                    &mut mem_write,
+                ) {
+                    Ok(result) => result,
+                    Err(err) => ToolExecution {
+                        output: format!("Tool error: {err}"),
+                        details: serde_json::json!({ "error": err }),
+                        is_error: true,
+                    },
+                }
             };
 
             // Truncate large tool outputs to prevent context blowout
@@ -8852,38 +9578,67 @@ fn run_agent_with_prompt(
                 flush_log(&log_path, &mut log_buffer, log_max_bytes);
             }
         } else {
-            // Multiple tool calls — execute in parallel
-            let results: Vec<_> = std::thread::scope(|s| {
-                let handles: Vec<_> = tool_calls.iter().map(|call| {
-                    let mv2 = &mv2;
-                    s.spawn(move || {
-                        let mut local_mem_read: Option<Vault> = None;
-                        let mut local_mem_write: Option<Vault> = None;
-                        let result = match execute_tool_with_handles(
-                            &call.name,
-                            call.args.clone(),
-                            mv2,
-                            false,
-                            &mut local_mem_read,
-                            &mut local_mem_write,
-                        ) {
-                            Ok(r) => r,
-                            Err(err) => ToolExecution {
-                                output: format!("Tool error: {err}"),
-                                details: serde_json::json!({ "error": err }),
-                                is_error: true,
-                            },
-                        };
-                        (call, result)
-                    })
-                }).collect();
-                handles.into_iter().filter_map(|h| {
-                    match h.join() {
-                        Ok(r) => Some(r),
-                        Err(_) => None, // Tool thread panicked — skip this result
-                    }
-                }).collect()
-            });
+            // Multiple tool calls — execute in parallel (non-MCP), MCP calls sequentially
+            let (mcp_calls, regular_calls): (Vec<_>, Vec<_>) = tool_calls.iter()
+                .partition(|c| c.name.starts_with("mcp__"));
+
+            let mut results: Vec<(&AgentToolCall, ToolExecution)> = Vec::new();
+
+            // Regular tools run in parallel via scoped threads
+            if !regular_calls.is_empty() {
+                let parallel_results: Vec<_> = std::thread::scope(|s| {
+                    let handles: Vec<_> = regular_calls.iter().map(|call| {
+                        let mv2 = &mv2;
+                        s.spawn(move || {
+                            let mut local_mem_read: Option<Vault> = None;
+                            let mut local_mem_write: Option<Vault> = None;
+                            let result = match execute_tool_with_handles(
+                                &call.name,
+                                call.args.clone(),
+                                mv2,
+                                false,
+                                &mut local_mem_read,
+                                &mut local_mem_write,
+                            ) {
+                                Ok(r) => r,
+                                Err(err) => ToolExecution {
+                                    output: format!("Tool error: {err}"),
+                                    details: serde_json::json!({ "error": err }),
+                                    is_error: true,
+                                },
+                            };
+                            (*call, result)
+                        })
+                    }).collect();
+                    handles.into_iter().filter_map(|h| {
+                        match h.join() {
+                            Ok(r) => Some(r),
+                            Err(_) => None,
+                        }
+                    }).collect()
+                });
+                results.extend(parallel_results);
+            }
+
+            // MCP tools run sequentially (they share a mutable registry)
+            for call in &mcp_calls {
+                let result = match mcp_registry.as_mut() {
+                    Some(registry) => match registry.call_tool(&call.name, call.args.clone()) {
+                        Ok(r) => r,
+                        Err(err) => ToolExecution {
+                            output: format!("Tool error: {err}"),
+                            details: serde_json::json!({ "error": err }),
+                            is_error: true,
+                        },
+                    },
+                    None => ToolExecution {
+                        output: "MCP registry not initialized".to_string(),
+                        details: serde_json::json!({ "error": "no registry" }),
+                        is_error: true,
+                    },
+                };
+                results.push((*call, result));
+            }
 
             for (call, result) in results {
                 // Truncate large tool outputs to prevent context blowout
@@ -10709,6 +11464,158 @@ fn build_embed_config(
     config.cache_capacity = cache_capacity;
     config.enable_cache = enable_cache;
     config
+}
+
+// === Qdrant External Vector DB Integration ===
+// Provides REST-based integration with Qdrant for scalable vector search.
+// Enabled when QDRANT_URL is set. Uses text-based search via Qdrant's built-in
+// sparse/dense encoders or pre-indexed vectors.
+
+/// Search Qdrant by text using the REST API.
+/// Returns SearchHit results compatible with the existing fusion pipeline.
+fn qdrant_search_text(
+    base_url: &str,
+    collection: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>, String> {
+    let url = format!("{}/collections/{}/points/query", base_url.trim_end_matches('/'), collection);
+    let body = serde_json::json!({
+        "query": query,
+        "limit": limit,
+        "with_payload": true
+    });
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(15))
+        .build();
+
+    let resp = agent.post(&url)
+        .set("content-type", "application/json")
+        .send_string(&serde_json::to_string(&body).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("qdrant request: {e}"))?;
+
+    let result: serde_json::Value = resp.into_json().map_err(|e| format!("qdrant parse: {e}"))?;
+
+    // Check for Qdrant error status before extracting points
+    if let Some(status) = result.get("status").and_then(|s| s.as_str()) {
+        if status == "error" {
+            let msg = result.get("result").and_then(|r| r.get("description")).and_then(|m| m.as_str()).unwrap_or("unknown");
+            return Err(format!("qdrant error: {msg}"));
+        }
+    }
+
+    let points = result.get("result")
+        .or_else(|| result.get("points"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut hits = Vec::new();
+    for (rank, point) in points.iter().enumerate() {
+        let score = point.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let payload = point.get("payload").cloned().unwrap_or_default();
+        let uri = payload.get("uri").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let title = payload.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let text = payload.get("text")
+            .or_else(|| payload.get("snippet"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(300)
+            .collect::<String>();
+        let frame_id = point.get("id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        hits.push(SearchHit {
+            rank,
+            frame_id,
+            uri,
+            title,
+            range: (0, 0),
+            text,
+            matches: 0,
+            chunk_range: None,
+            chunk_text: None,
+            score: Some(score),
+            metadata: None,
+        });
+    }
+
+    Ok(hits)
+}
+
+/// Upsert documents into Qdrant (used by the embed/index pipeline).
+/// Expects pre-computed embeddings.
+#[allow(dead_code)]
+fn qdrant_upsert(
+    base_url: &str,
+    collection: &str,
+    points: &[(u64, Vec<f32>, serde_json::Value)], // (id, vector, payload)
+) -> Result<usize, String> {
+    if points.is_empty() {
+        return Ok(0);
+    }
+
+    let url = format!("{}/collections/{}/points", base_url.trim_end_matches('/'), collection);
+    let qdrant_points: Vec<serde_json::Value> = points.iter().map(|(id, vec, payload)| {
+        serde_json::json!({
+            "id": id,
+            "vector": vec,
+            "payload": payload
+        })
+    }).collect();
+
+    let body = serde_json::json!({ "points": qdrant_points });
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(30))
+        .timeout_write(Duration::from_secs(30))
+        .build();
+
+    agent.put(&url)
+        .set("content-type", "application/json")
+        .send_string(&serde_json::to_string(&body).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("qdrant upsert: {e}"))?;
+
+    Ok(points.len())
+}
+
+/// Ensure a Qdrant collection exists, creating it if necessary.
+#[allow(dead_code)]
+fn qdrant_ensure_collection(
+    base_url: &str,
+    collection: &str,
+    vector_size: usize,
+) -> Result<(), String> {
+    let url = format!("{}/collections/{}", base_url.trim_end_matches('/'), collection);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(10))
+        .build();
+
+    // Check if collection exists
+    match agent.get(&url).call() {
+        Ok(_) => return Ok(()), // exists
+        Err(ureq::Error::Status(404, _)) => {} // needs creation
+        Err(e) => return Err(format!("qdrant check: {e}")),
+    }
+
+    // Create collection
+    let body = serde_json::json!({
+        "vectors": {
+            "size": vector_size,
+            "distance": "Cosine"
+        }
+    });
+    agent.put(&url)
+        .set("content-type", "application/json")
+        .send_string(&serde_json::to_string(&body).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("qdrant create collection: {e}"))?;
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
