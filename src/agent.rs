@@ -15,10 +15,10 @@ use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde_json;
 
-use crate::claude::{call_agent_hook, call_claude};
+use crate::claude::{call_agent_hook, call_claude, call_critic};
 use crate::{
     agent_log_path, base_tool_names, build_context_pack, build_kg_context,
-    collect_mid_loop_reminders, compute_drift_score, env_optional,
+    collect_mid_loop_reminders, compute_drift_score, critic_should_fire, env_optional,
     execute_tool_with_handles, find_kg_entities, flush_log_to_jsonl,
     format_tool_message_content, load_capsule_config, load_kg_graph, load_session_turns,
     load_workspace_context, requires_approval, resolve_hook_spec, resolve_workspace,
@@ -581,6 +581,11 @@ pub(crate) fn run_agent_with_prompt(
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
 
+    let critic_interval: usize = env_optional("CRITIC_INTERVAL")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let mut last_critic_step: usize = 0;
+
     let mut completed = false;
     let mut current_max_steps = effective_max_steps;
     let mut step = 0;
@@ -1099,6 +1104,20 @@ pub(crate) fn run_agent_with_prompt(
         }
         if drift_state.ema < 40.0 && drift_state.turns >= 3 {
             all_reminders.push("Sustained low adherence. Complete current action and provide a status summary.".to_string());
+        }
+
+        // Covert critic: periodic reality grounding via Opus evaluation
+        if critic_should_fire(step, critic_interval, &mut last_critic_step, &reminder_state, &tool_calls, &messages) {
+            if let Some(correction) = call_critic(
+                &prompt_text,
+                &messages,
+                step,
+                current_max_steps,
+            ) {
+                all_reminders.push(correction);
+                drift_state.violations.entry("critic_correction".to_string())
+                    .and_modify(|c| *c += 1).or_insert(1);
+            }
         }
 
         if !all_reminders.is_empty() {

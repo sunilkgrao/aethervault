@@ -1007,6 +1007,93 @@ pub(crate) fn compute_drift_score(
     score.max(0.0)
 }
 
+/// Heuristic scan for high-confidence markers in assistant text.
+/// Returns true if the text contains phrases suggesting unverified claims.
+pub(crate) fn scan_confidence_markers(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "fully deployed",
+        "fully optimized",
+        "fully complete",
+        "fully implemented",
+        "perfectly",
+        "no issues",
+        "completely done",
+        "all tests pass",
+        "everything works",
+        "no problems",
+        "100% complete",
+        "flawlessly",
+        "works perfectly",
+        "successfully deployed",
+        "production ready",
+        "no errors",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Determine whether the covert critic should fire this step.
+/// Updates `last_critic_step` when it decides to fire.
+pub(crate) fn critic_should_fire(
+    step: usize,
+    interval: usize,
+    last_critic_step: &mut usize,
+    reminder_state: &ReminderState,
+    tool_calls: &[AgentToolCall],
+    messages: &[AgentMessage],
+) -> bool {
+    if !env_bool("CRITIC_ENABLED", true) {
+        return false;
+    }
+
+    let within_interval = step > 0 && step.saturating_sub(*last_critic_step) < interval;
+
+    if within_interval {
+        // Check for high-priority triggers that override the interval
+        let last_assistant = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .and_then(|m| m.content.as_deref())
+            .unwrap_or("");
+
+        // Confidence signal: override interval
+        if scan_confidence_markers(last_assistant) {
+            eprintln!("[critic] triggered: confidence markers detected");
+            *last_critic_step = step;
+            return true;
+        }
+
+        // Tool failure without acknowledgment: override interval
+        if reminder_state.last_tool_failed {
+            let lower = last_assistant.to_ascii_lowercase();
+            let acknowledges = lower.contains("error")
+                || lower.contains("fail")
+                || lower.contains("issue")
+                || lower.contains("problem")
+                || lower.contains("sorry");
+            if !acknowledges {
+                eprintln!("[critic] triggered: unacknowledged tool failure");
+                *last_critic_step = step;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Periodic trigger
+    *last_critic_step = step;
+
+    if tool_calls.len() >= 3 {
+        eprintln!("[critic] triggered: periodic + large tool batch ({})", tool_calls.len());
+    } else {
+        eprintln!("[critic] triggered: periodic (step {})", step);
+    }
+
+    true
+}
+
 pub(crate) fn tool_autonomy_for(tool_name: &str) -> ToolAutonomyLevel {
     if let Ok(level_str) = std::env::var(format!("TOOL_AUTONOMY_{}", tool_name.to_ascii_uppercase())) {
         match level_str.as_str() {

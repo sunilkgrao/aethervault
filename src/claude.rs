@@ -10,6 +10,23 @@ use crate::{
     AgentMessage, AgentToolCall, CommandSpec, HookSpec,
 };
 
+const CRITIC_SYSTEM_PROMPT: &str = "\
+You are a silent quality auditor for an AI agent. Your job is to evaluate whether \
+the agent's recent reasoning is grounded in evidence or drifting into overconfidence.\n\n\
+Evaluate the conversation and return JSON:\n\
+{\"grounded\": true/false, \"issues\": [...], \"correction\": \"...\"}\n\n\
+Flag as NOT grounded if the agent:\n\
+- Claims something is \"done\" or \"working\" without running a verification step\n\
+- Makes optimistic assumptions without checking (e.g., \"this should work\" without testing)\n\
+- Ignores or minimizes errors/failures in tool output\n\
+- Over-engineers or adds scope beyond what was asked\n\
+- Reports success on aspirational claims (deployed, optimized, complete) without evidence\n\
+- Takes destructive or irreversible actions without confirming with the user\n\
+- Spins on the same approach after repeated failures instead of changing strategy\n\n\
+If grounded, return {\"grounded\": true}. If not, write a terse correction (1-2 sentences) \
+that steers back to reality. Do NOT reveal you are a separate critic — write as a \
+system reminder.";
+
 pub(crate) fn collect_system_blocks(messages: &[AgentMessage]) -> Vec<String> {
     let mut blocks = Vec::new();
     for msg in messages {
@@ -442,6 +459,173 @@ pub(crate) fn run_claude_hook() -> Result<(), Box<dyn std::error::Error>> {
     let response = call_claude(&req)?;
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
+}
+
+/// Silent critic: evaluates agent reasoning via a separate Opus API call.
+/// Returns a correction string if the agent is not grounded, or None if grounded/error.
+/// Never blocks or crashes the agent — all errors are silently swallowed.
+pub(crate) fn call_critic(
+    original_prompt: &str,
+    messages: &[AgentMessage],
+    step: usize,
+    max_steps: usize,
+) -> Option<String> {
+    if !env_bool("CRITIC_ENABLED", true) {
+        return None;
+    }
+
+    let api_key = env_optional("CRITIC_API_KEY")
+        .or_else(|| env_optional("ANTHROPIC_API_KEY"))?;
+    let model = env_optional("CRITIC_MODEL")
+        .unwrap_or_else(|| "claude-opus-4-6".to_string());
+    let base_url = env_optional("ANTHROPIC_BASE_URL")
+        .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".to_string());
+    let timeout_ms: u64 = env_optional("CRITIC_TIMEOUT")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15_000);
+    let max_tokens: u64 = env_optional("CRITIC_MAX_TOKENS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    let context_turns: usize = env_optional("CRITIC_CONTEXT_TURNS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
+    let version = env_optional("ANTHROPIC_VERSION")
+        .unwrap_or_else(|| "2023-06-01".to_string());
+
+    // Collect recent non-system messages
+    let recent: Vec<&AgentMessage> = messages
+        .iter()
+        .filter(|m| m.role != "system")
+        .collect();
+    let recent_slice = if recent.len() > context_turns {
+        &recent[recent.len() - context_turns..]
+    } else {
+        &recent[..]
+    };
+
+    // Count tool successes and failures
+    let tool_ok = messages
+        .iter()
+        .filter(|m| m.role == "tool" && !m.is_error.unwrap_or(false))
+        .count();
+    let tool_fail = messages
+        .iter()
+        .filter(|m| m.role == "tool" && m.is_error.unwrap_or(false))
+        .count();
+
+    // Build user prompt for the critic
+    let mut context_text = format!(
+        "## Original User Request\n{}\n\n## Agent Progress\nStep {}/{}\nTool calls: {} succeeded, {} failed\n\n## Recent Conversation\n",
+        original_prompt,
+        step + 1,
+        max_steps,
+        tool_ok,
+        tool_fail,
+    );
+    for msg in recent_slice {
+        let role = &msg.role;
+        let content = msg.content.as_deref().unwrap_or("");
+        let preview: String = content.chars().take(500).collect();
+        context_text.push_str(&format!("[{role}] {preview}\n\n"));
+    }
+
+    let payload = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "system": CRITIC_SYSTEM_PROMPT,
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": context_text}]
+        }]
+    });
+
+    let timeout_secs = (timeout_ms as f64 / 1000.0).max(1.0);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs_f64(timeout_secs))
+        .timeout_read(Duration::from_secs_f64(timeout_secs))
+        .timeout_write(Duration::from_secs_f64(timeout_secs))
+        .build();
+
+    let response = agent
+        .post(&base_url)
+        .set("content-type", "application/json")
+        .set("x-api-key", &api_key)
+        .set("anthropic-version", &version)
+        .send_json(payload);
+
+    let body = match response {
+        Ok(resp) => match resp.into_string() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[critic] response read error: {e}");
+                return None;
+            }
+        },
+        Err(e) => {
+            eprintln!("[critic] API error: {e}");
+            return None;
+        }
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[critic] JSON parse error: {e}");
+            return None;
+        }
+    };
+
+    // Extract text from the Anthropic response
+    let content = parsed.get("content")?.as_array()?;
+    let text = content
+        .iter()
+        .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .and_then(|b| b.get("text").and_then(|t| t.as_str()))?;
+
+    // Parse the critic's JSON verdict (strip markdown fences if present)
+    let clean_text = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    let verdict: serde_json::Value = match serde_json::from_str(clean_text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[critic] verdict parse error: {e}");
+            return None;
+        }
+    };
+
+    let grounded = verdict
+        .get("grounded")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    if grounded {
+        eprintln!("[critic] grounded=true");
+        return None;
+    }
+
+    let issues = verdict
+        .get("issues")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
+    eprintln!("[critic] grounded=false issues=[{issues}]");
+
+    verdict
+        .get("correction")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
 }
 
 pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Result<AgentMessage, String> {
