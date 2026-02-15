@@ -64,8 +64,9 @@ use aether_core::types::EmbeddingProvider;
 #[derive(Debug, Serialize)]
 struct ArchiveSummary {
     source: String,
-    out: String,
-    days: u64,
+    target: String,
+    before: String,
+    collection: String,
     scanned: usize,
     eligible: usize,
     archived: usize,
@@ -79,7 +80,103 @@ struct DedupSummary {
     scanned: usize,
     unique_uris: usize,
     duplicates_removed: usize,
+    keep_versions: usize,
     dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsSummary {
+    source: String,
+    total_frames: u64,
+    active_frames: u64,
+    by_collection: Vec<(String, usize)>,
+    by_age_days: Vec<(String, usize)>,
+    by_size: Vec<(String, usize)>,
+    duplicate_uris: usize,
+    duplicate_frames: usize,
+    total_breakdown: Vec<(String, u64)>,
+}
+
+fn frame_collection_name(frame: &Frame) -> String {
+    if let Some(track) = frame.track.as_deref() {
+        let normalized = normalize_collection(track);
+        if !normalized.is_empty() {
+            return normalized;
+        }
+    }
+
+    let Some(uri) = frame.uri.as_deref() else {
+        return "<no-uri>".to_string();
+    };
+
+    let Some(rest) = uri.strip_prefix("aethervault://") else {
+        return "<non-aethervault-uri>".to_string();
+    };
+    rest
+        .split('/')
+        .next()
+        .filter(|collection| !collection.is_empty())
+        .map(normalize_collection)
+        .unwrap_or_else(|| "<invalid-uri>".to_string())
+}
+
+fn frame_matches_collection(frame: &Frame, collection: &str) -> bool {
+    let expected = normalize_collection(collection);
+    if frame.track.as_deref() == Some(expected.as_str()) {
+        return true;
+    }
+
+    frame
+        .uri
+        .as_deref()
+        .is_some_and(|uri| uri.starts_with(&scope_prefix(&expected)))
+}
+
+fn frame_age_bucket(age_days: i64) -> String {
+    if age_days < 0 {
+        return "future".to_string();
+    }
+    if age_days <= 1 {
+        return "0-1 day".to_string();
+    }
+    if age_days <= 7 {
+        return "2-7 days".to_string();
+    }
+    if age_days <= 30 {
+        return "8-30 days".to_string();
+    }
+    if age_days <= 90 {
+        return "31-90 days".to_string();
+    }
+    if age_days <= 365 {
+        return "91-365 days".to_string();
+    }
+    "> 365 days".to_string()
+}
+
+fn frame_size_bucket(size_bytes: u64) -> String {
+    if size_bytes < 1_024 {
+        return "<1 KB".to_string();
+    }
+    if size_bytes < 10 * 1_024 {
+        return "1-10 KB".to_string();
+    }
+    if size_bytes < 100 * 1_024 {
+        return "10-100 KB".to_string();
+    }
+    if size_bytes < 1_024 * 1_024 {
+        return "100 KB-1 MB".to_string();
+    }
+    if size_bytes < 10 * 1_024 * 1_024 {
+        return "1-10 MB".to_string();
+    }
+    "10 MB+".to_string()
+}
+
+fn to_sorted_stats(map: HashMap<String, usize>) -> Vec<(String, usize)> {
+    let mut entries: Vec<(String, usize)> = map.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
 }
 
 fn copy_frame_to_archive(
@@ -1153,32 +1250,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Archive {
             mv2,
-            days,
-            out,
+            before,
+            collection,
+            target,
             dry_run,
-            json,
         } => {
             let source_path = mv2.display().to_string();
-            let out = out.unwrap_or_else(|| {
+            let target = target.unwrap_or_else(|| {
                 mv2.parent()
                     .unwrap_or(Path::new("."))
                     .join("archive.mv2")
             });
+            let cutoff = parse_date_to_ts(&before)
+                .ok_or_else(|| format!("invalid before date: {before}"))?;
 
-            let out_display = out.display().to_string();
-            if out == mv2 {
+            let target_display = target.display().to_string();
+            if target == mv2 {
                 return Err("archive destination must differ from source".into());
             }
 
             let mut source = Vault::open(&mv2)?;
-            let mut out_mem = if out.exists() {
-                Vault::open(&out)?
+            let mut target_mem = if dry_run {
+                None
+            } else if target.exists() {
+                Some(Vault::open(&target)?)
             } else {
-                Vault::create(&out)?
+                Some(Vault::create(&target)?)
             };
 
-            let age_seconds = i64::try_from(days).unwrap_or(i64::MAX).saturating_mul(86_400);
-            let cutoff = Utc::now().timestamp().saturating_sub(age_seconds);
             let mut scanned = 0usize;
             let mut eligible = 0usize;
             let mut archived = 0usize;
@@ -1195,7 +1294,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 scanned += 1;
-                if frame.timestamp < cutoff {
+                if frame.timestamp < cutoff && frame_matches_collection(&frame, &collection) {
                     candidates.push(frame.id);
                     eligible += 1;
                 }
@@ -1203,23 +1302,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if !dry_run {
                 for frame_id in candidates {
-                    let frame = source.frame_by_id(frame_id)?;
-                    if frame.status != FrameStatus::Active || frame.timestamp >= cutoff {
-                        continue;
-                    }
-                    copy_frame_to_archive(&mut source, &mut out_mem, &frame)?;
-                    source.delete_frame(frame_id)?;
-                    archived += 1;
-                    deleted += 1;
+                let frame = source.frame_by_id(frame_id)?;
+                if frame.status != FrameStatus::Active
+                    || frame.timestamp >= cutoff
+                    || !frame_matches_collection(&frame, &collection)
+                {
+                    continue;
                 }
-                out_mem.commit()?;
+                let target_mem = target_mem
+                    .as_mut()
+                    .expect("archive vault initialized");
+                copy_frame_to_archive(&mut source, target_mem, &frame)?;
+                source.delete_frame(frame_id)?;
+                archived += 1;
+                deleted += 1;
+            }
+                target_mem
+                    .as_mut()
+                    .expect("archive vault initialized")
+                    .commit()?;
                 source.vacuum()?;
             }
 
             let report = ArchiveSummary {
                 source: source_path.clone(),
-                out: out_display.clone(),
-                days,
+                target: target_display.clone(),
+                before: before.clone(),
+                collection: collection.clone(),
                 scanned,
                 eligible,
                 archived,
@@ -1227,17 +1336,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dry_run,
             };
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else if dry_run {
+            let _ = report;
+            if dry_run {
                 println!(
-                    "Dry run: archive {} frames older than {days} days from {} to {} (scanned active={scanned}, eligible={eligible})",
-                    eligible, source_path, out_display
+                    "Dry run: archive {} frames before {} in collection '{}' from {} to {} (scanned active={scanned}, eligible={eligible})",
+                    eligible, before, collection, source_path, target_display
                 );
             } else {
                 println!(
-                    "Archived {} frames from {} to {} (scanned active={}, deleted={})",
-                    archived, source_path, out_display, scanned, deleted
+                    "Archived {} frames before {} in collection '{}' from {} to {} (scanned active={}, deleted={})",
+                    archived, before, collection, source_path, target_display, scanned, deleted
                 );
             }
             Ok(())
@@ -1245,14 +1353,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Dedup {
             mv2,
+            keep_versions,
             dry_run,
-            json,
         } => {
             let source_path = mv2.display().to_string();
             let mut source = Vault::open(&mv2)?;
 
-            let mut by_uri_latest: HashMap<String, (i64, u64)> = HashMap::new();
-            let mut active_frames: Vec<(u64, String, i64)> = Vec::new();
+            let mut by_uri_versions: HashMap<String, Vec<(i64, u64)>> = HashMap::new();
+            let mut scanned = 0usize;
 
             for frame_id in 0..source.frame_count() {
                 let frame_id = frame_id as u64;
@@ -1266,38 +1374,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Some(uri) = frame.uri.clone() else {
                     continue;
                 };
-                active_frames.push((frame.id, uri.clone(), frame.timestamp));
+                by_uri_versions
+                    .entry(uri)
+                    .or_default()
+                    .push((frame.timestamp, frame.id));
+                scanned += 1;
             }
 
-            let scanned = active_frames.len();
-            for (frame_id, uri, timestamp) in &active_frames {
-                by_uri_latest
-                    .entry(uri.clone())
-                    .and_modify(|(latest_timestamp, latest_id)| {
-                        if *timestamp > *latest_timestamp
-                            || (*timestamp == *latest_timestamp && *frame_id > *latest_id)
-                        {
-                            *latest_timestamp = *timestamp;
-                            *latest_id = *frame_id;
-                        }
-                    })
-                    .or_insert((*timestamp, *frame_id));
+            let mut duplicate_ids = Vec::new();
+            for versions in by_uri_versions.values_mut() {
+                versions.sort_by(|left, right| {
+                    right
+                        .0
+                        .cmp(&left.0)
+                        .then_with(|| right.1.cmp(&left.1))
+                });
+                if versions.len() > keep_versions {
+                    duplicate_ids.extend(versions.iter().skip(keep_versions).map(|(_, frame_id)| *frame_id));
+                }
             }
 
-            let duplicate_ids: Vec<u64> = active_frames
-                .iter()
-                .filter_map(|(frame_id, uri, _timestamp)| {
-                    by_uri_latest.get(uri).and_then(|(_ts, keep_id)| {
-                        if frame_id != keep_id {
-                            Some(*frame_id)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect();
-
-            let mut deleted = duplicate_ids.len();
+            let deleted = duplicate_ids.len();
             if !dry_run {
                 for frame_id in &duplicate_ids {
                     source.delete_frame(*frame_id)?;
@@ -1308,23 +1405,115 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let report = DedupSummary {
                 source: source_path.clone(),
                 scanned,
-                unique_uris: by_uri_latest.len(),
+                unique_uris: by_uri_versions.len(),
                 duplicates_removed: deleted,
+                keep_versions,
                 dry_run,
             };
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else if dry_run {
+            let _ = report;
+            if dry_run {
                 println!(
-                    "Dry run: dedup would remove {} duplicate frames from {} ({} unique URIs)",
-                    deleted, source_path, by_uri_latest.len()
+                    "Dry run: dedup would remove {} duplicate frames from {} while keeping {} newest versions per URI",
+                    deleted, source_path, keep_versions
                 );
             } else {
                 println!(
-                    "Dedup removed {} duplicate frames from {} ({} unique URIs)",
-                    deleted, source_path, by_uri_latest.len()
+                    "Dedup removed {} duplicate frames from {} while keeping {} newest versions per URI",
+                    deleted, source_path, keep_versions
                 );
+            }
+
+            Ok(())
+        }
+
+        Command::Stats { mv2 } => {
+            let source_path = mv2.display().to_string();
+            let source = Vault::open_read_only(&mv2)?;
+            let stats = source.stats()?;
+            let now = Utc::now().timestamp();
+
+            let mut by_collection: HashMap<String, usize> = HashMap::new();
+            let mut by_age_days: HashMap<String, usize> = HashMap::new();
+            let mut by_size: HashMap<String, usize> = HashMap::new();
+            let mut uri_counts: HashMap<String, usize> = HashMap::new();
+
+            for frame_id in 0..source.frame_count() {
+                let frame_id = frame_id as u64;
+                let frame = match source.frame_by_id(frame_id) {
+                    Ok(frame) => frame,
+                    Err(_) => continue,
+                };
+                if frame.status != FrameStatus::Active {
+                    continue;
+                }
+                *by_collection
+                    .entry(frame_collection_name(&frame))
+                    .or_insert(0) += 1;
+
+                let age_days = now.saturating_sub(frame.timestamp).div_euclid(86_400);
+                *by_age_days
+                    .entry(frame_age_bucket(age_days))
+                    .or_insert(0) += 1;
+                *by_size
+                    .entry(frame_size_bucket(frame.payload_length))
+                    .or_insert(0) += 1;
+                let uri_key = frame.uri.unwrap_or_else(|| "<no-uri>".to_string());
+                *uri_counts.entry(uri_key).or_insert(0) += 1;
+            }
+
+            let duplicate_uris = uri_counts.values().filter(|count| **count > 1).count();
+            let duplicate_frames: usize = uri_counts
+                .values()
+                .map(|count| count.saturating_sub(1))
+                .sum();
+            let total_breakdown = vec![
+                ("total_frames".to_string(), stats.frame_count),
+                ("active_frames".to_string(), stats.active_frame_count),
+                (
+                    "deleted_frames".to_string(),
+                    stats.frame_count.saturating_sub(stats.active_frame_count),
+                ),
+                ("payload_bytes".to_string(), stats.payload_bytes),
+                ("logical_bytes".to_string(), stats.logical_bytes),
+                ("size_bytes".to_string(), stats.size_bytes),
+                ("wal_bytes".to_string(), stats.wal_bytes),
+                ("lex_index_bytes".to_string(), stats.lex_index_bytes),
+                ("vec_index_bytes".to_string(), stats.vec_index_bytes),
+                ("time_index_bytes".to_string(), stats.time_index_bytes),
+            ];
+
+            let report = StatsSummary {
+                source: source_path.clone(),
+                total_frames: stats.frame_count,
+                active_frames: stats.active_frame_count,
+                by_collection: to_sorted_stats(by_collection),
+                by_age_days: to_sorted_stats(by_age_days),
+                by_size: to_sorted_stats(by_size),
+                duplicate_uris,
+                duplicate_frames,
+                total_breakdown,
+            };
+
+            println!("Stats for {}", report.source);
+            println!("Active frames: {}", report.active_frames);
+            println!("Total frames: {}", report.total_frames);
+            println!("Duplicate URIs: {} ({} duplicate frames)", report.duplicate_uris, report.duplicate_frames);
+            println!("By collection:");
+            for (collection, count) in &report.by_collection {
+                println!("  {collection}: {count}");
+            }
+            println!("By age:");
+            for (bucket, count) in &report.by_age_days {
+                println!("  {bucket}: {count}");
+            }
+            println!("By size:");
+            for (bucket, count) in &report.by_size {
+                println!("  {bucket}: {count}");
+            }
+            println!("Total breakdown:");
+            for (name, value) in &report.total_breakdown {
+                println!("  {name}: {value}");
             }
 
             Ok(())

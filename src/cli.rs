@@ -569,29 +569,34 @@ pub(crate) enum Command {
     /// Move old frames into an archive capsule.
     Archive {
         mv2: PathBuf,
-        /// Archive frames older than N days (default: 30)
-        #[arg(long, default_value_t = 30)]
-        days: u64,
-        /// Target archive capsule path (created if missing)
+        /// Archive frames older than this timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM)
         #[arg(long)]
-        out: Option<PathBuf>,
+        before: String,
+        /// Only archive this collection
+        #[arg(long)]
+        collection: String,
+        /// Target archive capsule path (default: archive.mv2)
+        #[arg(long)]
+        target: Option<PathBuf>,
         /// Do not write anything; only report what would change.
         #[arg(long)]
         dry_run: bool,
-        /// Output JSON summary
-        #[arg(long)]
-        json: bool,
     },
 
     /// Remove duplicate URI versions, keeping newest frame per URI.
     Dedup {
         mv2: PathBuf,
+        /// Keep N newest versions for each URI.
+        #[arg(long, default_value_t = 1)]
+        keep_versions: usize,
         /// Do not delete anything; only report what would change.
         #[arg(long)]
         dry_run: bool,
-        /// Output JSON summary
-        #[arg(long)]
-        json: bool,
+    },
+
+    /// Capsule statistics and breakdown by collection, age, size, and duplicates.
+    Stats {
+        mv2: PathBuf,
     },
 }
 
