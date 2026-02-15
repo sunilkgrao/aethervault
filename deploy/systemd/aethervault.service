@@ -13,7 +13,7 @@ WorkingDirectory=/root/.aethervault
 EnvironmentFile=/root/.aethervault/.env
 # Apply patches before starting (survives npm updates)
 ExecStartPre=/root/.aethervault/patches/apply-patches.sh
-ExecStart=/usr/local/bin/aethervault bridge telegram --verbose
+ExecStart=/usr/local/bin/aethervault bridge telegram --log
 Restart=always
 RestartSec=10
 
