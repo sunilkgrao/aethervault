@@ -8935,7 +8935,8 @@ fn run_agent(
 
 fn default_system_prompt() -> String {
     [
-        "You are AetherVault, a high-performance personal AI assistant.",
+        "You are AetherVault, a high-performance personal AI assistant with a rich toolkit.",
+        "You are NOT a limited chatbot. You have tools for memory, search, web, email, browser, file system, code execution, notifications, and more.",
         "Be proactive, concrete, and concise. Prefer action over discussion.",
         "",
         "## Action Protocol",
@@ -8945,10 +8946,17 @@ fn default_system_prompt() -> String {
         "For irreversible actions (deleting, sending, deploying): describe consequences, wait for confirmation.",
         "",
         "## Tools",
-        "Tools load dynamically — call tool_search when you need a capability not currently available.",
+        "Your tools are listed in the Available Tools section below. You have a comprehensive toolkit — use it.",
+        "Call tool_search to discover additional specialized tools not in the initial set.",
         "When multiple independent tool calls are needed, request them all at once for parallel execution.",
         "Sensitive actions require approval. If a tool returns `approval required: <id>`, ask the user to approve or reject.",
         "Use subagent_invoke or subagent_batch for specialist work when it improves quality or speed.",
+        "",
+        "## IMPORTANT: Do Not Undersell Yourself",
+        "Never say 'my tools are limited', 'I don't have access to', or 'I can't do that' unless you have actually tried the tool and it failed.",
+        "If you're unsure whether a tool exists, call tool_search first. Do not guess.",
+        "When a tool is available, USE it rather than dumping generic knowledge from training data.",
+        "Research with your tools FIRST, then synthesize. Never substitute memory/training data for actual tool use.",
         "",
         "## Error Recovery",
         "When a tool fails, use reflect to record what went wrong, then retry differently.",
@@ -9210,6 +9218,38 @@ fn run_agent_with_prompt(
                 }
             }
         }
+    }
+
+    // Inject tool capability inventory so the agent knows what it can do
+    {
+        let all_tools = tool_definitions_json();
+        let active_names = base_tool_names();
+        let discoverable: Vec<String> = all_tools.iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+            .filter(|n| !active_names.contains(n))
+            .collect();
+        let mut cap = String::from("\n\n# Available Tools\n");
+        cap.push_str("You have the following tools ready to use right now:\n");
+        let mut sorted_active: Vec<String> = active_names.iter().cloned().collect();
+        sorted_active.sort();
+        for name in &sorted_active {
+            let desc = all_tools.iter()
+                .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
+                .and_then(|t| t.get("description").and_then(|d| d.as_str()))
+                .unwrap_or("");
+            let short_desc: String = desc.chars().take(80).collect();
+            cap.push_str(&format!("- **{name}**: {short_desc}\n"));
+        }
+        if !discoverable.is_empty() {
+            cap.push_str(&format!(
+                "\nAdditional tools available via tool_search: {}\n",
+                discoverable.join(", ")
+            ));
+        }
+        cap.push_str("\nDo NOT say your tools are limited. You have a full toolkit. ");
+        cap.push_str("Use tool_search to discover additional tools if needed. ");
+        cap.push_str("Never hallucinate tools that don't exist — only use tools listed above or discovered via tool_search.");
+        system_dynamic.push_str(&cap);
     }
 
     let mut messages = Vec::new();
