@@ -8708,7 +8708,8 @@ fn call_claude(
                     thread::sleep(Duration::from_secs_f64(delay));
                     continue;
                 }
-                return Err(format!("Anthropic API error: {code} {text}").into());
+                eprintln!("[call_claude] primary API failed after {} retries: {code} {text}", max_retries);
+                break; // fall through to fallback/Vertex
             }
             Err(ureq::Error::Transport(err)) => {
                 if attempt < max_retries {
@@ -8718,7 +8719,8 @@ fn call_claude(
                     thread::sleep(Duration::from_secs_f64(delay));
                     continue;
                 }
-                return Err(format!("Anthropic API request failed: {err}").into());
+                eprintln!("[call_claude] primary API transport error after {} retries: {err}", max_retries);
+                break; // fall through to fallback/Vertex
             }
         }
     }
@@ -8833,9 +8835,25 @@ fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Result<AgentM
             .unwrap_or(false),
     };
     if is_builtin {
-        return call_claude(request)
-            .map(|resp| resp.message)
-            .map_err(|e| format!("claude hook: {e}"));
+        // Retry once at this level for transient failures (covers the case where
+        // all fallback endpoints failed due to a temporary network blip)
+        let result = call_claude(request);
+        match result {
+            Ok(resp) => return Ok(resp.message),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("transport") || err_str.contains("timed out") || err_str.contains("Network") {
+                    eprintln!("[call_agent_hook] first attempt failed ({err_str}), retrying in 3s...");
+                    thread::sleep(Duration::from_secs(3));
+                    return call_claude(request)
+                        .map(|resp| resp.message)
+                        .map_err(|e| {
+                            format!("I hit an API error and couldn't recover after retrying. The error was: {e}")
+                        });
+                }
+                return Err(format!("API error: {e}"));
+            }
+        }
     }
 
     let cmd = command_spec_to_vec(&hook.command);
