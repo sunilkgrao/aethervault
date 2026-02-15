@@ -1,0 +1,20 @@
+[Unit]
+Description=Codex Agent %i
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/aethervault
+EnvironmentFile=/root/.aethervault/.env
+ExecStart=/usr/bin/codex --yolo "You are agent %i in a swarm. Work on tasks from /root/aethervault. Focus on code quality, testing, and improvements."
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=3
+MemoryMax=4G
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

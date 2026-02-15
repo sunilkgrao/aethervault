@@ -469,7 +469,8 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
     match name {
         "exec" | "email_send" | "email_archive" | "config_set" | "gmail_send" | "gcal_create"
         | "ms_calendar_create" | "trigger_add" | "trigger_remove" | "notify" | "signal_send"
-        | "imessage_send" | "memory_export" | "fs_write" | "browser" | "excalidraw" => true,
+        | "imessage_send" | "memory_export" | "fs_write" | "browser" | "excalidraw"
+        | "self_upgrade" => true,
         "http_request" => {
             let method = args
                 .get("method")

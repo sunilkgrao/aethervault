@@ -443,6 +443,14 @@ pub(crate) struct ToolScaleArgs {
     pub(crate) size: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolSelfUpgradeArgs {
+    #[serde(default)]
+    pub(crate) branch: Option<String>,
+    #[serde(default)]
+    pub(crate) skip_tests: Option<bool>,
+}
+
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub(crate) enum LaneKind {

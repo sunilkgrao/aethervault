@@ -1,0 +1,30 @@
+[Unit]
+Description=AetherVault Automatic Rollback (triggered on crash)
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '\
+    DEPLOY_DIR=/opt/aethervault; \
+    ACTIVE_FILE="${DEPLOY_DIR}/active"; \
+    SYMLINK=/usr/local/bin/aethervault; \
+    LOG="${DEPLOY_DIR}/upgrade.log"; \
+    echo "[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] ROLLBACK triggered by OnFailure" >> "$LOG"; \
+    if [ ! -f "$ACTIVE_FILE" ]; then \
+        echo "[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] No active file found, cannot rollback" >> "$LOG"; \
+        exit 1; \
+    fi; \
+    CURRENT=$(cat "$ACTIVE_FILE"); \
+    if [ "$CURRENT" = "blue" ]; then OTHER="green"; else OTHER="blue"; fi; \
+    if [ ! -f "${DEPLOY_DIR}/${OTHER}/aethervault" ]; then \
+        echo "[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] No binary in ${OTHER} slot, cannot rollback" >> "$LOG"; \
+        exit 1; \
+    fi; \
+    ln -sfn "${DEPLOY_DIR}/${OTHER}/aethervault" "${SYMLINK}.tmp"; \
+    mv -f "${SYMLINK}.tmp" "$SYMLINK"; \
+    echo "$OTHER" > "$ACTIVE_FILE"; \
+    echo "[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] Rolled back: ${CURRENT} -> ${OTHER}" >> "$LOG"; \
+    systemctl restart aethervault; \
+'
+StandardOutput=journal
+StandardError=journal

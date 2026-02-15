@@ -139,6 +139,7 @@ use crate::{
     ToolMsCalendarListArgs,
     ToolMsCalendarCreateArgs,
     ToolScaleArgs,
+    ToolSelfUpgradeArgs,
 };
 
 const EXEC_BACKGROUND_THRESHOLD_MS: u64 = 300_000;
@@ -2322,6 +2323,46 @@ pub(crate) fn execute_tool_with_handles(
                     })
                 }
                 other => Err(format!("unknown scale action: {other} (use status, sizes, or resize)")),
+            }
+        }
+        "self_upgrade" => {
+            let parsed: ToolSelfUpgradeArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let branch = parsed.branch.as_deref().unwrap_or("main");
+            let skip_tests = parsed.skip_tests.unwrap_or(false);
+            let upgrade_script = "/opt/aethervault/upgrade.sh";
+            if !std::path::Path::new(upgrade_script).exists() {
+                return Err("upgrade.sh not found at /opt/aethervault/upgrade.sh — deploy it first".into());
+            }
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg(upgrade_script)
+                .arg("--branch").arg(branch);
+            if skip_tests {
+                cmd.arg("--skip-tests");
+            }
+            cmd.stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let output = cmd.output().map_err(|e| format!("failed to run upgrade.sh: {e}"))?;
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let combined = if stderr.is_empty() {
+                stdout.clone()
+            } else {
+                format!("{stdout}\n--- stderr ---\n{stderr}")
+            };
+            if output.status.success() {
+                Ok(ToolExecution {
+                    output: format!("Upgrade succeeded (branch: {branch}). Binary hot-swapped. Service will restart momentarily.\n\n{combined}"),
+                    details: serde_json::json!({
+                        "branch": branch,
+                        "skip_tests": skip_tests,
+                        "exit_code": 0,
+                    }),
+                    is_error: false,
+                })
+            } else {
+                let code = output.status.code().unwrap_or(-1);
+                Err(format!("upgrade.sh failed (exit {code}):\n{combined}"))
             }
         }
         _ => Err("unknown tool".into()),

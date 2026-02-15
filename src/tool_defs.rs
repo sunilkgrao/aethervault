@@ -637,6 +637,17 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
                 "required": ["action"]
             }
         }),
+        serde_json::json!({
+            "name": "self_upgrade",
+            "description": "Trigger a self-upgrade: pull latest code, compile, validate, and hot-swap the binary. Uses blue-green deployment with automatic rollback. Requires approval.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "branch": { "type": "string", "description": "Git branch to pull from (default: main)" },
+                    "skip_tests": { "type": "boolean", "description": "Skip smoke test (not recommended)" }
+                }
+            }
+        }),
     ]
 }
 
@@ -713,6 +724,7 @@ pub(crate) fn base_tool_names() -> HashSet<String> {
         "subagent_batch",
         "approval_list",
         "scale",
+        "self_upgrade",
         "browser",
         "excalidraw",
     ]
