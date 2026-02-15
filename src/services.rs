@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use aether_core::types::SearchHit;
+use aether_core::types::{FrameStatus, SearchHit};
 use aether_core::{PutOptions, Vault};
 use chrono::{Datelike, Timelike, Utc};
 use serde::Deserialize;
