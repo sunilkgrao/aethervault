@@ -1313,6 +1313,10 @@ struct AgentProgress {
     checkpoint_response: Option<bool>,
     /// Extended step budget (set when user says "continue")
     extended_max_steps: Option<usize>,
+    /// Interim messages to send to the user (drained by progress reporter)
+    interim_messages: Vec<String>,
+    /// Whether the first interim/acknowledgment has been sent
+    first_ack_sent: bool,
 }
 
 struct CompletionEvent {
@@ -8976,6 +8980,12 @@ fn default_system_prompt() -> String {
         "When a tool is available, USE it rather than dumping generic knowledge from training data.",
         "Research with your tools FIRST, then synthesize. Never substitute memory/training data for actual tool use.",
         "",
+        "## Communication Style",
+        "Before calling tools, briefly say what you're about to do in a natural way (e.g., 'Let me check your calendar' or 'Searching for that...').",
+        "These interim messages are sent to the user immediately, so they know you're working on it.",
+        "Keep interim messages short and natural — one sentence, no bullet points.",
+        "Do NOT narrate every single tool call. Only narrate when starting a new logical step.",
+        "",
         "## Error Recovery",
         "When a tool fails, use reflect to record what went wrong, then retry differently.",
         "Never retry the same failing call. If stuck after 2 attempts, ask the user for guidance.",
@@ -9564,10 +9574,24 @@ fn run_agent_with_prompt(
             }
         }
         let tool_calls = message.tool_calls.clone();
+        let has_interim_text = !tool_calls.is_empty() && final_text.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false);
         messages.push(message);
         if tool_calls.is_empty() {
             completed = true;
             break;
+        }
+
+        // Send interim text to user when agent narrates before tool calls
+        if has_interim_text {
+            if let Some(ref prog) = progress {
+                if let Ok(mut p) = prog.lock() {
+                    let text = final_text.as_ref().unwrap().clone();
+                    // Only send if substantive (not just "OK" or single words)
+                    if text.len() > 15 {
+                        p.interim_messages.push(text);
+                    }
+                }
+            }
         }
 
         // Validate all tool calls before execution
@@ -10646,6 +10670,8 @@ fn spawn_agent_run(
         checkpoint_sent: false,
         checkpoint_response: None,
         extended_max_steps: None,
+        interim_messages: Vec::new(),
+        first_ack_sent: false,
     }));
 
     // Worker thread — calls run_agent_with_prompt directly (no middle thread)
@@ -10710,24 +10736,62 @@ fn spawn_agent_run(
         let _ = worker_tx.send(event);
     });
 
-    // Progress reporter thread — typing indicators + checkpoint at 75% steps
+    // Progress reporter thread — interim messages + typing indicators + checkpoint
     let prog_ref = progress.clone();
     let prog_agent = http_agent.clone();
     let prog_url = base_url.to_string();
     thread::spawn(move || {
+        let mut tick_count: usize = 0;
         loop {
-            thread::sleep(Duration::from_secs(8));
-            let (done, should_checkpoint) = {
+            thread::sleep(Duration::from_secs(4));
+            tick_count += 1;
+
+            // Drain and send any interim messages from the agent
+            let pending: Vec<String> = {
+                let mut guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
+                guard.interim_messages.drain(..).collect()
+            };
+            for msg in &pending {
+                let _ = telegram_send_message(&prog_agent, &prog_url, chat_id, msg);
+                // Mark that we've sent something
+                if let Ok(mut guard) = prog_ref.lock() {
+                    guard.first_ack_sent = true;
+                }
+            }
+
+            let (done, should_checkpoint, first_ack_needed) = {
                 let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
                 let done = guard.phase == "done";
                 let effective_max = guard.extended_max_steps.unwrap_or(guard.max_steps);
                 let at_checkpoint = guard.step >= effective_max * 3 / 4
                     && !guard.checkpoint_sent
-                    && effective_max > 4; // don't checkpoint tiny runs
-                (done, at_checkpoint)
+                    && effective_max > 4;
+                // Send a first ack after ~12s if nothing has been sent yet and agent is working
+                let needs_first_ack = !guard.first_ack_sent
+                    && tick_count >= 3  // ~12 seconds
+                    && guard.step > 0   // agent has started processing
+                    && !done;
+                (done, at_checkpoint, needs_first_ack)
             };
             if done {
                 break;
+            }
+
+            // First-response acknowledgment after ~12s of silence
+            if first_ack_needed {
+                let ack_msg = {
+                    let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
+                    let tools: Vec<String> = guard.tools_used.keys().take(3).cloned().collect();
+                    if tools.is_empty() {
+                        "Working on it...".to_string()
+                    } else {
+                        format!("On it — using {}...", tools.join(", "))
+                    }
+                };
+                let _ = telegram_send_message(&prog_agent, &prog_url, chat_id, &ack_msg);
+                if let Ok(mut guard) = prog_ref.lock() {
+                    guard.first_ack_sent = true;
+                }
             }
             if should_checkpoint {
                 // Build checkpoint message from progress state
