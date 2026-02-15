@@ -1,8 +1,10 @@
 [Unit]
-Description=AetherVault Gateway Service (AetherVault runtime)
+Description=AetherVault Telegram Bridge (AetherVault runtime)
 After=network.target ollama.service
 Wants=ollama.service
 OnFailure=aethervault-rollback.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -11,11 +13,9 @@ WorkingDirectory=/root/.aethervault
 EnvironmentFile=/root/.aethervault/.env
 # Apply patches before starting (survives npm updates)
 ExecStartPre=/root/.aethervault/patches/apply-patches.sh
-ExecStart=/usr/local/bin/aethervault gateway --verbose
+ExecStart=/usr/local/bin/aethervault bridge telegram --verbose
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=120
-StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target
