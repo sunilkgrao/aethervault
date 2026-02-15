@@ -1957,6 +1957,17 @@ impl McpRegistry {
     }
 
     fn spawn_server(cfg: &McpServerConfig) -> Result<McpServerHandle, String> {
+        // Validate server name for safe use in tool prefixes
+        if cfg.name.is_empty() {
+            return Err("mcp server name cannot be empty".to_string());
+        }
+        if !cfg.name.chars().all(|c| c.is_alphanumeric() || c == '-') {
+            return Err(format!(
+                "mcp server name '{}' must be alphanumeric or hyphenated (no underscores)",
+                cfg.name
+            ));
+        }
+
         let cmd_parts = shlex::split(&cfg.command)
             .ok_or_else(|| format!("mcp '{}': malformed command", cfg.name))?;
         if cmd_parts.is_empty() {
@@ -1976,6 +1987,17 @@ impl McpRegistry {
         let stdout = child.stdout.take().ok_or_else(|| format!("mcp '{}': no stdout", cfg.name))?;
         let reader = BufReader::new(stdout);
         let timeout_secs = cfg.timeout_secs.unwrap_or(30);
+
+        // Drain stderr in background to prevent pipe buffer deadlock and capture diagnostics
+        if let Some(stderr) = child.stderr.take() {
+            let name = cfg.name.clone();
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    eprintln!("[mcp:{name}:stderr] {line}");
+                }
+            });
+        }
 
         let mut handle = McpServerHandle {
             name: cfg.name.clone(),
@@ -2069,7 +2091,26 @@ impl McpRegistry {
         }))?;
         handle.next_id += 1;
 
-        let resp = handle.read_msg_timeout(timeout)?;
+        // Read response, skipping any asynchronous notifications (messages without id)
+        let resp = loop {
+            let msg = handle.read_msg_timeout(timeout)?;
+            if msg.get("id").is_none() {
+                // This is a notification (no id field) — skip it
+                let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("unknown");
+                eprintln!("[mcp:{}] skipping notification: {method}", handle.name);
+                continue;
+            }
+            // Validate response ID matches our request
+            if let Some(resp_id) = msg.get("id").and_then(|v| v.as_i64()) {
+                if resp_id != call_id {
+                    return Err(format!(
+                        "mcp '{}': response id mismatch (expected {call_id}, got {resp_id})",
+                        handle.name
+                    ));
+                }
+            }
+            break msg;
+        };
 
         // Check for JSON-RPC error
         if let Some(err) = resp.get("error") {
@@ -2079,19 +2120,20 @@ impl McpRegistry {
         }
         let result = resp.get("result").cloned()
             .ok_or_else(|| format!("mcp '{}': response missing 'result'", handle.name))?;
-        let content_text = result.get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|item| item.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or_else(|| {
-                // Fallback: show raw result so agent sees something
-                ""
-            });
-        let content_text = if content_text.is_empty() {
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        } else {
-            content_text.to_string()
+        // Extract all text parts from content array (MCP responses can have multiple items)
+        let content_text = match result.get("content").and_then(|c| c.as_array()) {
+            Some(arr) => {
+                let text_parts: Vec<&str> = arr.iter()
+                    .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                    .collect();
+                if text_parts.is_empty() {
+                    // Content exists but no text parts — show raw JSON so agent sees something
+                    serde_json::to_string_pretty(&result).unwrap_or_default()
+                } else {
+                    text_parts.join("\n")
+                }
+            }
+            None => serde_json::to_string_pretty(&result).unwrap_or_default(),
         };
         let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -2109,8 +2151,8 @@ impl McpRegistry {
             let _ = handle.send_msg(&serde_json::json!({
                 "jsonrpc": "2.0", "id": handle.next_id, "method": "shutdown"
             }));
-            // Give 2s for graceful exit, then kill
-            thread::sleep(Duration::from_millis(100));
+            // Brief pause for graceful exit, then kill
+            thread::sleep(Duration::from_millis(500));
             let _ = handle.child.kill();
             let _ = handle.child.wait();
         }
@@ -2143,8 +2185,14 @@ impl McpServerHandle {
         let mut content_length: Option<usize> = None;
         loop {
             let mut line = String::new();
-            self.reader.read_line(&mut line)
+            let bytes_read = self.reader.read_line(&mut line)
                 .map_err(|e| format!("mcp '{}' read: {e}", self.name))?;
+            if bytes_read == 0 {
+                return Err(format!(
+                    "mcp '{}': server closed connection (process likely crashed)",
+                    self.name
+                ));
+            }
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 if content_length.is_some() { break; }
@@ -7676,7 +7724,7 @@ fn load_kg_graph(path: &std::path::Path) -> Option<KgGraph> {
 fn tokenize_words(text: &str) -> HashSet<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric() && c != '\'')
-        .filter(|w| w.len() >= 2)
+        .filter(|w| w.chars().count() >= 2)
         .map(|w| w.to_string())
         .collect()
 }
@@ -9627,7 +9675,7 @@ fn run_agent_with_prompt(
                 let parallel_results: Vec<_> = std::thread::scope(|s| {
                     let handles: Vec<_> = regular_calls.iter().map(|call| {
                         let mv2 = &mv2;
-                        s.spawn(move || {
+                        let handle = s.spawn(move || {
                             let mut local_mem_read: Option<Vault> = None;
                             let mut local_mem_write: Option<Vault> = None;
                             let result = match execute_tool_with_handles(
@@ -9646,12 +9694,27 @@ fn run_agent_with_prompt(
                                 },
                             };
                             (*call, result)
-                        })
+                        });
+                        (*call, handle)
                     }).collect();
-                    handles.into_iter().filter_map(|h| {
+                    handles.into_iter().map(|(call, h)| {
                         match h.join() {
-                            Ok(r) => Some(r),
-                            Err(_) => None,
+                            Ok(r) => r,
+                            Err(panic_info) => {
+                                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                eprintln!("[harness] tool thread panicked on '{}': {msg}", call.name);
+                                (call, ToolExecution {
+                                    output: format!("Internal error: tool execution panicked: {msg}"),
+                                    details: serde_json::json!({ "error": "panic", "message": msg }),
+                                    is_error: true,
+                                })
+                            }
                         }
                     }).collect()
                 });
