@@ -1,6 +1,7 @@
 #[allow(unused_imports)]
 use std::collections::{HashMap, HashSet};
 use std::fs;
+#[allow(unused_imports)]
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -8,7 +9,10 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_core::{PutOptions, Vault};
+#[allow(unused_imports)]
 use chrono::{TimeZone, Utc};
+use rayon::ThreadPoolBuilder;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde_json;
 
 use crate::claude::{call_agent_hook, call_claude};
@@ -342,7 +346,7 @@ pub(crate) fn run_agent_with_prompt(
         let query = context_query
             .or(agent_cfg.context_query)
             .unwrap_or_else(|| prompt_text.clone());
-        let qargs = QueryArgs {
+            let qargs = QueryArgs {
             raw_query: query,
             collection: session.as_ref().map(|s| format!("agent-log/{s}")),
             limit: agent_cfg.max_context_results.unwrap_or(context_results),
@@ -350,11 +354,11 @@ pub(crate) fn run_agent_with_prompt(
             no_expand: false,
             max_expansions: 2,
             expand_hook: None,
-            expand_hook_timeout_ms: 2000,
+            expand_hook_timeout_ms: u64::MAX,
             no_vector: false,
             rerank: "local".to_string(),
             rerank_hook: None,
-            rerank_hook_timeout_ms: 6000,
+            rerank_hook_timeout_ms: u64::MAX,
             rerank_hook_full_text: false,
             embed_model: None,
             embed_cache: 4096,
@@ -367,6 +371,8 @@ pub(crate) fn run_agent_with_prompt(
             before: None,
             after: None,
             feedback_weight: 0.15,
+            vault_path: Some(mv2.clone()),
+            parallel_lanes: true,
         };
         if let Ok(pack) = build_context_pack(
             mem_read.as_mut().unwrap(),
@@ -499,7 +505,7 @@ pub(crate) fn run_agent_with_prompt(
                 cfgs.push(McpServerConfig {
                     name: "excalidraw".to_string(),
                     command: cmd,
-                    timeout_secs: Some(30),
+                    timeout_secs: Some(u64::MAX),
                     env: HashMap::new(),
                 });
             }
@@ -906,56 +912,64 @@ pub(crate) fn run_agent_with_prompt(
             let (mcp_calls, regular_calls): (Vec<_>, Vec<_>) = tool_calls.iter()
                 .partition(|c| c.name.starts_with("mcp__"));
 
-            let mut results: Vec<(&AgentToolCall, ToolExecution)> = Vec::new();
+            let mut results: Vec<(AgentToolCall, ToolExecution)> = Vec::new();
 
-            // Regular tools run in parallel via scoped threads
+            // Regular tools run in a bounded worker pool.
             if !regular_calls.is_empty() {
-                let parallel_results: Vec<_> = std::thread::scope(|s| {
-                    let handles: Vec<_> = regular_calls.iter().map(|call| {
-                        let mv2 = &mv2;
-                        let handle = s.spawn(move || {
-                            let mut local_mem_read: Option<Vault> = None;
-                            let mut local_mem_write: Option<Vault> = None;
-                            let result = match execute_tool_with_handles(
-                                &call.name,
-                                call.args.clone(),
-                                mv2,
-                                false,
-                                &mut local_mem_read,
-                                &mut local_mem_write,
-                            ) {
-                                Ok(r) => r,
-                                Err(err) => ToolExecution {
-                                    output: format!("Tool error: {err}"),
-                                    details: serde_json::json!({ "error": err }),
-                                    is_error: true,
-                                },
+                let execute_regular_call = |call: &&AgentToolCall| -> (AgentToolCall, ToolExecution) {
+                    let call = *call;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut local_mem_read: Option<Vault> = None;
+                        let mut local_mem_write: Option<Vault> = None;
+                        execute_tool_with_handles(
+                            &call.name,
+                            call.args.clone(),
+                            &mv2,
+                            false,
+                            &mut local_mem_read,
+                            &mut local_mem_write,
+                        )
+                    }));
+
+                    let execution = match result {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(err)) => ToolExecution {
+                            output: format!("Tool error: {err}"),
+                            details: serde_json::json!({ "error": err }),
+                            is_error: true,
+                        },
+                        Err(panic_info) => {
+                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
                             };
-                            (*call, result)
-                        });
-                        (*call, handle)
-                    }).collect();
-                    handles.into_iter().map(|(call, h)| {
-                        match h.join() {
-                            Ok(r) => r,
-                            Err(panic_info) => {
-                                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                                    s.to_string()
-                                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                                    s.clone()
-                                } else {
-                                    "unknown panic".to_string()
-                                };
-                                eprintln!("[harness] tool thread panicked on '{}': {msg}", call.name);
-                                (call, ToolExecution {
-                                    output: format!("Internal error: tool execution panicked: {msg}"),
-                                    details: serde_json::json!({ "error": "panic", "message": msg }),
-                                    is_error: true,
-                                })
+                            eprintln!("[harness] tool thread panicked on '{}': {msg}", call.name);
+                            ToolExecution {
+                                output: format!(
+                                    "Internal error: tool execution panicked: {msg}"
+                                ),
+                                details: serde_json::json!({ "error": "panic", "message": msg }),
+                                is_error: true,
                             }
                         }
-                    }).collect()
-                });
+                    };
+
+                    (call.clone(), execution)
+                };
+
+                let parallel_results: Vec<(AgentToolCall, ToolExecution)> = ThreadPoolBuilder::new()
+                    .num_threads(
+                        std::thread::available_parallelism()
+                            .map(|v| v.get())
+                            .unwrap_or(4)
+                            .min(regular_calls.len())
+                    )
+                    .build()
+                    .map(|pool| pool.install(|| regular_calls.par_iter().map(execute_regular_call).collect()))
+                    .unwrap_or_else(|_| regular_calls.iter().map(execute_regular_call).collect());
                 results.extend(parallel_results);
             }
 
@@ -976,7 +990,7 @@ pub(crate) fn run_agent_with_prompt(
                         is_error: true,
                     },
                 };
-                results.push((*call, result));
+                results.push(((*call).clone(), result));
             }
 
             for (call, result) in results {

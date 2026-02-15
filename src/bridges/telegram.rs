@@ -1,5 +1,6 @@
 #[allow(unused_imports)]
 use std::collections::HashMap;
+#[allow(unused_imports)]
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,6 +18,8 @@ use crate::{
     SessionTurn, load_session_turns, save_session_turns,
     run_agent_with_prompt, try_handle_approval_chat,
 };
+
+const NO_TIMEOUT_MS: u64 = u64::MAX;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TelegramUpdateResponse {
@@ -39,6 +42,7 @@ pub(crate) struct TelegramUpdate {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct TelegramUser {
     pub(crate) id: i64,
     #[serde(default)]
@@ -86,6 +90,7 @@ pub(crate) struct TelegramCallbackQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct TelegramPhotoSize {
     pub(crate) file_id: String,
     #[serde(default)]
@@ -97,6 +102,7 @@ pub(crate) struct TelegramPhotoSize {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct TelegramVoice {
     pub(crate) file_id: String,
     #[serde(default)]
@@ -106,6 +112,7 @@ pub(crate) struct TelegramVoice {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct TelegramAudio {
     pub(crate) file_id: String,
     #[serde(default)]
@@ -190,8 +197,8 @@ pub(crate) fn transcribe_audio_deepgram(audio_bytes: &[u8], mime_type: &str) -> 
     let api_key = std::env::var("DEEPGRAM_API_KEY").ok()?;
     if api_key.trim().is_empty() { return None; }
     let agent = ureq::AgentBuilder::new()
-        .timeout_read(Duration::from_secs(60))
-        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
         .build();
     let resp = agent.post("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true")
         .set("Authorization", &format!("Token {api_key}"))
@@ -410,6 +417,7 @@ pub(crate) fn split_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+#[allow(dead_code)]
 pub(crate) fn telegram_send_message_returning_id(
     agent: &ureq::Agent,
     base_url: &str,
@@ -435,6 +443,7 @@ pub(crate) fn telegram_send_message_returning_id(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn telegram_edit_message(
     agent: &ureq::Agent,
     base_url: &str,
@@ -451,6 +460,7 @@ pub(crate) fn telegram_edit_message(
     let _ = agent.post(&url).set("content-type", "application/json").send_json(payload);
 }
 
+#[allow(dead_code)]
 pub(crate) fn telegram_delete_message(agent: &ureq::Agent, base_url: &str, chat_id: i64, message_id: i64) {
     let url = format!("{base_url}/deleteMessage");
     let payload = serde_json::json!({
@@ -482,6 +492,7 @@ pub(crate) fn telegram_answer_callback(agent: &ureq::Agent, base_url: &str, call
         .send_json(payload);
 }
 
+#[allow(dead_code)]
 pub(crate) fn escape_markdown_v2(text: &str) -> String {
     let special = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
     let mut out = String::with_capacity(text.len() * 2);
@@ -589,6 +600,8 @@ pub(crate) fn spawn_agent_run(
         checkpoint_response: None,
         extended_max_steps: None,
         interim_messages: Vec::new(),
+        milestone: String::new(),
+        percent: 0,
         first_ack_sent: false,
     }));
 
@@ -862,9 +875,9 @@ pub(crate) fn run_telegram_bridge(
         Err(_) => format!("https://api.telegram.org/bot{token}"),
     };
     let http_agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_write(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(poll_timeout.saturating_add(10)))
+        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
         .build();
 
     // Clean up orphaned vault temp files from previous crashes.
@@ -935,11 +948,20 @@ pub(crate) fn run_telegram_bridge(
         }
 
         // 2. Long-poll getUpdates (short-poll when runs are active to drain completions faster)
-        let effective_timeout = if active_runs.is_empty() { poll_timeout } else { 2 };
         let mut request = http_agent
             .get(&format!("{base_url}/getUpdates"))
-            .query("timeout", &effective_timeout.to_string())
             .query("limit", &poll_limit.to_string());
+        if let Some(effective_timeout) = if active_runs.is_empty() {
+            if poll_timeout == u64::MAX {
+                None
+            } else {
+                Some(poll_timeout.min(100))
+            }
+        } else {
+            Some(2)
+        } {
+            request = request.query("timeout", &effective_timeout.to_string());
+        }
         if let Some(last) = offset {
             request = request.query("offset", &(last + 1).to_string());
         }

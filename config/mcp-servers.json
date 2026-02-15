@@ -1,0 +1,23 @@
+{
+  "servers": {
+    "filesystem": {
+      "enabled": true,
+      "command": "python3",
+      "args": ["/root/.aethervault/mcp/filesystem-server.py"],
+      "description": "Read/write files in workspace"
+    },
+    "system": {
+      "enabled": true,
+      "command": "python3",
+      "args": ["/root/.aethervault/mcp/system-server.py"],
+      "description": "System commands and monitoring"
+    },
+    "github": {
+      "enabled": false,
+      "note": "Requires GITHUB_TOKEN in env. Set enabled=true when ready.",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "description": "GitHub repo management"
+    }
+  }
+}

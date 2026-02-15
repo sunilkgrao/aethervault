@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""
+Codex CLI model hook for AetherVault subagent system.
+Reads AgentHookRequest JSON from stdin, extracts the user prompt,
+runs Codex CLI, and returns an AgentHookResponse on stdout.
+
+Sends periodic Telegram progress updates during long-running Codex sessions
+with real-time status: what's happening now, output progress, full prompt.
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+import urllib.error
+
+CODEX_TIMEOUT = 900  # 15 minutes max per Codex run
+PROGRESS_INTERVAL = 60  # Check every 60 seconds
+TEXT_UPDATE_INTERVAL = 120  # Send text update every 2 minutes
+AETHERVAULT_HOME = os.environ.get("AETHERVAULT_HOME", os.path.expanduser("~/.aethervault"))
+ENV_FILE = AETHERVAULT_HOME + "/.env"
+
+
+def load_env_var(key):
+    """Load a var from environment or .env file."""
+    val = os.environ.get(key, "")
+    if val:
+        return val
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, _, v = line.partition('=')
+                    if k.strip() == key:
+                        return v.strip()
+    return ""
+
+
+def send_telegram(text):
+    """Send a Telegram message (best-effort, never blocks the hook)."""
+    token = load_env_var("TELEGRAM_BOT_TOKEN")
+    chat_id = load_env_var("TELEGRAM_CHAT_ID")
+    if not chat_id:
+        try:
+            cfg_path = os.path.join(AETHERVAULT_HOME, "config", "briefing.json")
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+                chat_id = str(cfg.get("chat_id", ""))
+        except Exception:
+            pass
+    if not token or not chat_id:
+        return
+    try:
+        data = json.dumps({"chat_id": chat_id, "text": text}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass  # Progress updates are best-effort
+
+
+def send_typing(chat_id, token):
+    """Send typing indicator to Telegram."""
+    if not token or not chat_id:
+        return
+    try:
+        data = json.dumps({"chat_id": chat_id, "action": "typing"}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendChatAction",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+
+def extract_last_user_message(messages):
+    """Extract the last user message text from the messages array."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user" and msg.get("content"):
+            return msg["content"]
+    return ""
+
+
+def tail_file(filepath, n_lines=5, max_chars=400):
+    """Read the last N lines of a file, capped at max_chars total."""
+    try:
+        with open(filepath, "r", errors="replace") as f:
+            lines = f.readlines()
+        if not lines:
+            return "(no output yet)"
+        # Take last N non-empty lines
+        tail = [l.rstrip() for l in lines[-n_lines:] if l.strip()]
+        if not tail:
+            return "(no output yet)"
+        result = "\n".join(tail)
+        if len(result) > max_chars:
+            result = "..." + result[-(max_chars - 3):]
+        return result
+    except (OSError, IOError):
+        return "(output not available)"
+
+
+def count_output_stats(filepath):
+    """Get output file stats: line count, byte size."""
+    try:
+        size = os.path.getsize(filepath)
+        with open(filepath, "r", errors="replace") as f:
+            lines = sum(1 for _ in f)
+        return lines, size
+    except (OSError, IOError):
+        return 0, 0
+
+
+def format_elapsed(seconds):
+    """Format seconds as Xm Ys."""
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s}s"
+
+
+def progress_reporter(full_prompt, output_path, start_time, stop_event):
+    """Background thread: sends real-time Telegram updates with actual progress."""
+    token = load_env_var("TELEGRAM_BOT_TOKEN")
+    chat_id = load_env_var("TELEGRAM_CHAT_ID")
+    if not chat_id:
+        try:
+            cfg_path = os.path.join(AETHERVAULT_HOME, "config", "briefing.json")
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+                chat_id = str(cfg.get("chat_id", ""))
+        except Exception:
+            pass
+
+    update_num = 0
+    last_line_count = 0
+
+    while not stop_event.is_set():
+        stop_event.wait(PROGRESS_INTERVAL)
+        if stop_event.is_set():
+            break
+        update_num += 1
+        elapsed = time.time() - start_time
+
+        # Send typing indicator every interval
+        send_typing(chat_id, token)
+
+        # Send text update every TEXT_UPDATE_INTERVAL
+        if elapsed >= TEXT_UPDATE_INTERVAL * (update_num // (TEXT_UPDATE_INTERVAL // PROGRESS_INTERVAL)):
+            if update_num % (TEXT_UPDATE_INTERVAL // PROGRESS_INTERVAL) != 0:
+                continue
+
+        # But always send on the TEXT_UPDATE_INTERVAL boundary
+        if (update_num * PROGRESS_INTERVAL) % TEXT_UPDATE_INTERVAL != 0:
+            continue
+
+        # Get current output status
+        line_count, byte_size = count_output_stats(output_path)
+        current_activity = tail_file(output_path, n_lines=3, max_chars=300)
+        new_lines = line_count - last_line_count
+        last_line_count = line_count
+
+        # Build progress message
+        size_str = f"{byte_size / 1024:.1f}KB" if byte_size < 1024 * 1024 else f"{byte_size / (1024*1024):.1f}MB"
+        msg_parts = [
+            f"[Codex] {format_elapsed(elapsed)} elapsed",
+            f"Output: {line_count} lines ({size_str}), +{new_lines} since last update",
+            "",
+            f"Prompt:\n{full_prompt[:500]}",
+        ]
+        if len(full_prompt) > 500:
+            msg_parts.append(f"... ({len(full_prompt)} chars total)")
+        msg_parts.extend([
+            "",
+            f"Current activity:\n{current_activity}",
+        ])
+
+        send_telegram("\n".join(msg_parts))
+
+
+def run_codex(prompt):
+    """Run Codex CLI with streaming output and real-time progress reporting."""
+    # Create temp file for streaming output
+    fd, output_path = tempfile.mkstemp(prefix="codex-output-", suffix=".log",
+                                        dir=os.path.join(AETHERVAULT_HOME, "logs"))
+    os.close(fd)
+
+    # Start progress reporter thread
+    stop_event = threading.Event()
+    start_time = time.time()
+    reporter = threading.Thread(
+        target=progress_reporter,
+        args=(prompt, output_path, start_time, stop_event),
+        daemon=True,
+    )
+    reporter.start()
+
+    try:
+        # Stream output to file so progress reporter can read it
+        with open(output_path, "w") as out_f:
+            proc = subprocess.Popen(
+                ["codex", "exec",
+                 "-m", "gpt-5.3-codex-spark",
+                 "--dangerously-bypass-approvals-and-sandbox",
+                 "--skip-git-repo-check",
+                 "-c", 'model_reasoning_effort="xhigh"',
+                 prompt],
+                stdout=out_f,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd="/root/quake",
+            )
+
+            try:
+                proc.wait(timeout=CODEX_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+                elapsed = time.time() - start_time
+                line_count, _ = count_output_stats(output_path)
+                send_telegram(
+                    f"[Codex] Timed out after {format_elapsed(elapsed)}\n"
+                    f"Output: {line_count} lines before timeout\n\n"
+                    f"Prompt:\n{prompt[:500]}\n\n"
+                    f"Last activity:\n{tail_file(output_path, n_lines=5, max_chars=400)}"
+                )
+                # Still return partial output
+                try:
+                    with open(output_path, "r") as f:
+                        return f.read() or f"(Codex timed out after {CODEX_TIMEOUT // 60} minutes)"
+                except OSError:
+                    return f"(Codex timed out after {CODEX_TIMEOUT // 60} minutes)"
+
+        # Read final output
+        with open(output_path, "r") as f:
+            output = f.read().strip()
+
+        elapsed = time.time() - start_time
+        line_count, byte_size = count_output_stats(output_path)
+
+        # Send completion notification for long tasks
+        if elapsed > TEXT_UPDATE_INTERVAL:
+            size_str = f"{byte_size / 1024:.1f}KB" if byte_size < 1024 * 1024 else f"{byte_size / (1024*1024):.1f}MB"
+            status = "completed" if proc.returncode == 0 else f"exited with code {proc.returncode}"
+            send_telegram(
+                f"[Codex] {status} in {format_elapsed(elapsed)}\n"
+                f"Output: {line_count} lines ({size_str})\n\n"
+                f"Prompt:\n{prompt[:500]}\n\n"
+                f"Final output:\n{tail_file(output_path, n_lines=5, max_chars=400)}"
+            )
+
+        return output if output else "(Codex returned no output)"
+
+    except Exception as e:
+        send_telegram(f"[Codex] Error: {e}\nPrompt:\n{prompt[:300]}")
+        return f"(Codex error: {e})"
+
+    finally:
+        stop_event.set()
+        reporter.join(timeout=2)
+        # Clean up temp file
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+
+
+def main():
+    try:
+        request = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        print(json.dumps({
+            "message": {
+                "role": "assistant",
+                "content": "(Error: Invalid JSON input to Codex hook)",
+                "tool_calls": []
+            }
+        }))
+        return
+
+    messages = request.get("messages", [])
+    prompt = extract_last_user_message(messages)
+
+    if not prompt:
+        response_text = "(No user prompt found in messages)"
+    else:
+        response_text = run_codex(prompt)
+
+    response = {
+        "message": {
+            "role": "assistant",
+            "content": response_text,
+            "tool_calls": []
+        }
+    }
+    print(json.dumps(response))
+
+
+if __name__ == "__main__":
+    main()

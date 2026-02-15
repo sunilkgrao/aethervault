@@ -1,6 +1,6 @@
 #[allow(unused_imports)]
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -9,11 +9,15 @@ use aether_core::{PutOptions, Vault};
 use std::collections::HashSet;
 use std::thread;
 use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
     build_external_command, dedup_keep_order, CapsuleConfig, CommandSpec, ConfigEntry,
     ExpansionHookInput, ExpansionHookOutput, HookSpec, RerankHookInput, RerankHookOutput,
 };
+
+const NO_DEADLINE_TIMEOUT_MS: u64 = u64::MAX;
 
 pub(crate) fn config_key_to_uri(key: &str) -> String {
     let mut key = key.trim().to_string();
@@ -136,15 +140,24 @@ pub(crate) fn run_hook_command(
     }
 
     let timeout = Duration::from_millis(timeout_ms.max(1));
-    let start = Instant::now();
+    let timeout_ms = timeout.as_millis() as u64;
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    let pid = child.id().to_string();
+    let mut last_update = Instant::now();
     loop {
+        if cancel_token.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("hook '{kind}' canceled after {timeout_ms}ms"));
+        }
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("hook timed out after {timeout_ms}ms"));
+                if last_update.elapsed() >= Duration::from_secs(5) {
+                    eprintln!(
+                        "[hook:{kind}] pid={pid} still running (no deadline, configured timeout {timeout_ms}ms)"
+                    );
+                    last_update = Instant::now();
                 }
                 thread::sleep(Duration::from_millis(10));
             }
@@ -198,7 +211,7 @@ pub(crate) fn run_expansion_hook(
     input: &ExpansionHookInput,
 ) -> Result<ExpansionHookOutput, String> {
     let cmd = command_spec_to_vec(&hook.command);
-    let timeout = hook.timeout_ms.unwrap_or(2000);
+    let timeout = hook.timeout_ms.unwrap_or(NO_DEADLINE_TIMEOUT_MS);
     let value = serde_json::to_value(input).map_err(|e| format!("hook input: {e}"))?;
     let raw = run_hook_command(&cmd, &value, timeout, "expansion")?;
     let mut output: ExpansionHookOutput =
@@ -210,7 +223,7 @@ pub(crate) fn run_expansion_hook(
 
 pub(crate) fn run_rerank_hook(hook: &HookSpec, input: &RerankHookInput) -> Result<RerankHookOutput, String> {
     let cmd = command_spec_to_vec(&hook.command);
-    let timeout = hook.timeout_ms.unwrap_or(6000);
+    let timeout = hook.timeout_ms.unwrap_or(NO_DEADLINE_TIMEOUT_MS);
     let value = serde_json::to_value(input).map_err(|e| format!("hook input: {e}"))?;
     let raw = run_hook_command(&cmd, &value, timeout, "rerank")?;
     let mut output: RerankHookOutput =

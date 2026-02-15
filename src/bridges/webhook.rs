@@ -1,5 +1,6 @@
 #[allow(unused_imports)]
 use std::collections::HashMap;
+#[allow(unused_imports)]
 use std::io::Read;
 
 use serde_json;

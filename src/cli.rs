@@ -104,7 +104,7 @@ pub(crate) enum Command {
         #[arg(long)]
         expand_hook: Option<String>,
         /// Expansion hook timeout (ms)
-        #[arg(long, default_value_t = 2000)]
+        #[arg(long, default_value_t = u64::MAX)]
         expand_hook_timeout_ms: u64,
         /// Disable vector lane (if enabled at build time)
         #[arg(long)]
@@ -116,7 +116,7 @@ pub(crate) enum Command {
         #[arg(long)]
         rerank_hook: Option<String>,
         /// Rerank hook timeout (ms)
-        #[arg(long, default_value_t = 6000)]
+        #[arg(long, default_value_t = u64::MAX)]
         rerank_hook_timeout_ms: u64,
         /// Provide full text to rerank hook
         #[arg(long)]
@@ -194,7 +194,7 @@ pub(crate) enum Command {
         #[arg(long)]
         expand_hook: Option<String>,
         /// Expansion hook timeout (ms)
-        #[arg(long, default_value_t = 2000)]
+        #[arg(long, default_value_t = u64::MAX)]
         expand_hook_timeout_ms: u64,
         /// Disable vector lane (if enabled at build time)
         #[arg(long)]
@@ -206,7 +206,7 @@ pub(crate) enum Command {
         #[arg(long)]
         rerank_hook: Option<String>,
         /// Rerank hook timeout (ms)
-        #[arg(long, default_value_t = 6000)]
+        #[arg(long, default_value_t = u64::MAX)]
         rerank_hook_timeout_ms: u64,
         /// Provide full text to rerank hook
         #[arg(long)]
@@ -412,6 +412,9 @@ pub(crate) enum Command {
         /// Commit agent logs every N entries (1 = fsync each log)
         #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
+        /// Emit incremental progress lines in JSON for long-running sessions
+        #[arg(long)]
+        progress: bool,
     },
 
     /// Built-in model hooks (stdio JSON).
@@ -562,6 +565,34 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Move old frames into an archive capsule.
+    Archive {
+        mv2: PathBuf,
+        /// Archive frames older than N days (default: 30)
+        #[arg(long, default_value_t = 30)]
+        days: u64,
+        /// Target archive capsule path (created if missing)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Do not write anything; only report what would change.
+        #[arg(long)]
+        dry_run: bool,
+        /// Output JSON summary
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove duplicate URI versions, keeping newest frame per URI.
+    Dedup {
+        mv2: PathBuf,
+        /// Do not delete anything; only report what would change.
+        #[arg(long)]
+        dry_run: bool,
+        /// Output JSON summary
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -581,7 +612,7 @@ pub(crate) enum BridgeCommand {
         #[arg(long)]
         token: Option<String>,
         /// Long-poll timeout in seconds
-        #[arg(long, default_value_t = 25)]
+        #[arg(long, default_value_t = u64::MAX)]
         poll_timeout: u64,
         /// Max updates per poll
         #[arg(long, default_value_t = 50)]

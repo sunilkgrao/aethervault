@@ -49,7 +49,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use aether_core::types::SearchRequest;
+use aether_core::types::{Frame, FrameStatus, SearchRequest};
 use aether_core::{DoctorOptions, PutOptions, Vault, VaultError};
 use chrono::Utc;
 use clap::Parser;
@@ -60,6 +60,53 @@ use walkdir::WalkDir;
 use aether_core::text_embed::{LocalTextEmbedder, TextEmbedConfig};
 #[cfg(feature = "vec")]
 use aether_core::types::EmbeddingProvider;
+
+#[derive(Debug, Serialize)]
+struct ArchiveSummary {
+    source: String,
+    out: String,
+    days: u64,
+    scanned: usize,
+    eligible: usize,
+    archived: usize,
+    deleted: usize,
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DedupSummary {
+    source: String,
+    scanned: usize,
+    unique_uris: usize,
+    duplicates_removed: usize,
+    dry_run: bool,
+}
+
+fn copy_frame_to_archive(
+    source: &mut Vault,
+    archive: &mut Vault,
+    frame: &Frame,
+) -> aether_core::Result<u64> {
+    let payload = source.frame_canonical_payload(frame.id)?;
+    let mut options = PutOptions::default();
+    options.timestamp = Some(frame.timestamp);
+    options.track = frame.track.clone();
+    options.kind = frame.kind.clone();
+    options.uri = frame.uri.clone();
+    options.title = frame.title.clone();
+    options.metadata = frame.metadata.clone();
+    options.search_text = frame.search_text.clone();
+    options.tags = frame.tags.clone();
+    options.labels = frame.labels.clone();
+    options.extra_metadata = frame.extra_metadata.clone();
+    options.role = frame.role;
+    options.parent_id = frame.parent_id;
+    options.source_path = frame.source_path.clone();
+    options.auto_tag = false;
+    options.extract_dates = false;
+    options.extract_triplets = false;
+    archive.put_bytes_with_options(&payload, options)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -357,6 +404,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 before,
                 after,
                 feedback_weight,
+                vault_path: Some(mv2.clone()),
+                parallel_lanes: !log,
             };
 
             let response = execute_query(&mut mem, args)?;
@@ -480,6 +529,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 before,
                 after,
                 feedback_weight,
+                vault_path: Some(mv2.clone()),
+                parallel_lanes: true,
             };
 
             let pack = build_context_pack(&mut mem, args, max_bytes, full)?;
@@ -943,7 +994,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_steps,
             log_commit_interval,
             json,
-            log,
+            log, ..
         } => run_agent(
             mv2,
             prompt,
@@ -1097,6 +1148,185 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 print_doctor_report(&report);
             }
+            Ok(())
+        }
+
+        Command::Archive {
+            mv2,
+            days,
+            out,
+            dry_run,
+            json,
+        } => {
+            let source_path = mv2.display().to_string();
+            let out = out.unwrap_or_else(|| {
+                mv2.parent()
+                    .unwrap_or(Path::new("."))
+                    .join("archive.mv2")
+            });
+
+            let out_display = out.display().to_string();
+            if out == mv2 {
+                return Err("archive destination must differ from source".into());
+            }
+
+            let mut source = Vault::open(&mv2)?;
+            let mut out_mem = if out.exists() {
+                Vault::open(&out)?
+            } else {
+                Vault::create(&out)?
+            };
+
+            let age_seconds = i64::try_from(days).unwrap_or(i64::MAX).saturating_mul(86_400);
+            let cutoff = Utc::now().timestamp().saturating_sub(age_seconds);
+            let mut scanned = 0usize;
+            let mut eligible = 0usize;
+            let mut archived = 0usize;
+            let mut deleted = 0usize;
+            let mut candidates = Vec::new();
+
+            for frame_id in 0..source.frame_count() {
+                let frame_id = frame_id as u64;
+                let frame = match source.frame_by_id(frame_id) {
+                    Ok(frame) => frame,
+                    Err(_) => continue,
+                };
+                if frame.status != FrameStatus::Active {
+                    continue;
+                }
+                scanned += 1;
+                if frame.timestamp < cutoff {
+                    candidates.push(frame.id);
+                    eligible += 1;
+                }
+            }
+
+            if !dry_run {
+                for frame_id in candidates {
+                    let frame = source.frame_by_id(frame_id)?;
+                    if frame.status != FrameStatus::Active || frame.timestamp >= cutoff {
+                        continue;
+                    }
+                    copy_frame_to_archive(&mut source, &mut out_mem, &frame)?;
+                    source.delete_frame(frame_id)?;
+                    archived += 1;
+                    deleted += 1;
+                }
+                out_mem.commit()?;
+                source.vacuum()?;
+            }
+
+            let report = ArchiveSummary {
+                source: source_path.clone(),
+                out: out_display.clone(),
+                days,
+                scanned,
+                eligible,
+                archived,
+                deleted,
+                dry_run,
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if dry_run {
+                println!(
+                    "Dry run: archive {} frames older than {days} days from {} to {} (scanned active={scanned}, eligible={eligible})",
+                    eligible, source_path, out_display
+                );
+            } else {
+                println!(
+                    "Archived {} frames from {} to {} (scanned active={}, deleted={})",
+                    archived, source_path, out_display, scanned, deleted
+                );
+            }
+            Ok(())
+        }
+
+        Command::Dedup {
+            mv2,
+            dry_run,
+            json,
+        } => {
+            let source_path = mv2.display().to_string();
+            let mut source = Vault::open(&mv2)?;
+
+            let mut by_uri_latest: HashMap<String, (i64, u64)> = HashMap::new();
+            let mut active_frames: Vec<(u64, String, i64)> = Vec::new();
+
+            for frame_id in 0..source.frame_count() {
+                let frame_id = frame_id as u64;
+                let frame = match source.frame_by_id(frame_id) {
+                    Ok(frame) => frame,
+                    Err(_) => continue,
+                };
+                if frame.status != FrameStatus::Active {
+                    continue;
+                }
+                let Some(uri) = frame.uri.clone() else {
+                    continue;
+                };
+                active_frames.push((frame.id, uri.clone(), frame.timestamp));
+            }
+
+            let scanned = active_frames.len();
+            for (frame_id, uri, timestamp) in &active_frames {
+                by_uri_latest
+                    .entry(uri.clone())
+                    .and_modify(|(latest_timestamp, latest_id)| {
+                        if *timestamp > *latest_timestamp
+                            || (*timestamp == *latest_timestamp && *frame_id > *latest_id)
+                        {
+                            *latest_timestamp = *timestamp;
+                            *latest_id = *frame_id;
+                        }
+                    })
+                    .or_insert((*timestamp, *frame_id));
+            }
+
+            let duplicate_ids: Vec<u64> = active_frames
+                .iter()
+                .filter_map(|(frame_id, uri, _timestamp)| {
+                    by_uri_latest.get(uri).and_then(|(_ts, keep_id)| {
+                        if frame_id != keep_id {
+                            Some(*frame_id)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+
+            let mut deleted = duplicate_ids.len();
+            if !dry_run {
+                for frame_id in &duplicate_ids {
+                    source.delete_frame(*frame_id)?;
+                }
+                source.vacuum()?;
+            }
+
+            let report = DedupSummary {
+                source: source_path.clone(),
+                scanned,
+                unique_uris: by_uri_latest.len(),
+                duplicates_removed: deleted,
+                dry_run,
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if dry_run {
+                println!(
+                    "Dry run: dedup would remove {} duplicate frames from {} ({} unique URIs)",
+                    deleted, source_path, by_uri_latest.len()
+                );
+            } else {
+                println!(
+                    "Dedup removed {} duplicate frames from {} ({} unique URIs)",
+                    deleted, source_path, by_uri_latest.len()
+                );
+            }
+
             Ok(())
         }
     }

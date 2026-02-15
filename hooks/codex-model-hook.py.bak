@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""
+Codex CLI model hook for AetherVault subagent system.
+Reads AgentHookRequest JSON from stdin, extracts the user prompt,
+runs Codex CLI, and returns an AgentHookResponse on stdout.
+"""
+import json
+import sys
+import subprocess
+
+def extract_last_user_message(messages):
+    """Extract the last user message text from the messages array."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user" and msg.get("content"):
+            return msg["content"]
+    return ""
+
+def run_codex(prompt, timeout=900):
+    """Run Codex CLI and return the output."""
+    try:
+        result = subprocess.run(
+            ["codex", "exec",
+             "-m", "gpt-5.3-codex-spark",
+             "--dangerously-bypass-approvals-and-sandbox",
+             "--skip-git-repo-check",
+             "-c", "model_reasoning_effort=\"high\"",
+             prompt],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd="/root/quake"
+        )
+        output = result.stdout.strip()
+        if result.returncode != 0 and result.stderr.strip():
+            output += "\n\nStderr: " + result.stderr.strip()
+        return output if output else "(Codex returned no output)"
+    except subprocess.TimeoutExpired:
+        return "(Codex timed out after 5 minutes)"
+    except Exception as e:
+        return f"(Codex error: {e})"
+
+def main():
+    try:
+        request = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        print(json.dumps({
+            "message": {
+                "role": "assistant",
+                "content": "(Error: Invalid JSON input to Codex hook)",
+                "tool_calls": []
+            }
+        }))
+        return
+
+    messages = request.get("messages", [])
+    prompt = extract_last_user_message(messages)
+
+    if not prompt:
+        response_text = "(No user prompt found in messages)"
+    else:
+        response_text = run_codex(prompt)
+
+    response = {
+        "message": {
+            "role": "assistant",
+            "content": response_text,
+            "tool_calls": []
+        }
+    }
+    print(json.dumps(response))
+
+if __name__ == "__main__":
+    main()

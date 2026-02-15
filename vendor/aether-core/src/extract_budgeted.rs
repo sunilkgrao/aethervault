@@ -205,6 +205,7 @@ pub fn extract_pdf_budgeted(
 }
 
 /// Truncate text at a word/sentence boundary
+#[allow(dead_code)]
 fn truncate_at_boundary(text: &str, max_chars: usize) -> String {
     if text.len() <= max_chars {
         return text.to_string();

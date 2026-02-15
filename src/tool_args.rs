@@ -123,6 +123,10 @@ pub(crate) struct ToolExecArgs {
     pub(crate) cwd: Option<String>,
     #[serde(default)]
     pub(crate) timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) estimated_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) background: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

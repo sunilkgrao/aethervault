@@ -48,3 +48,16 @@ build/
 
 # Editor/temp
 /.tmp
+.vault-cache/
+models/
+target/
+rust-src/
+old-backups/
+archive/
+logs/
+data/
+memory.mv2
+memory.mv2.lock
+*.pid
+*.lock
+workspace/sessions/

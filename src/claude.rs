@@ -1,6 +1,4 @@
-#[allow(unused_imports)]
-use std::collections::HashMap;
-use std::io::{self, BufRead, Read};
+use std::io::{self, Read};
 use std::thread;
 use std::time::Duration;
 
@@ -229,7 +227,7 @@ pub(crate) fn call_claude(
         .map(|v| v.parse::<f64>())
         .transpose()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid ANTHROPIC_TOP_P"))?;
-    let timeout = env_f64("ANTHROPIC_TIMEOUT", 60.0)?;
+    let timeout = env_u64("ANTHROPIC_TIMEOUT", u64::MAX)?;
     let max_retries = env_usize("ANTHROPIC_MAX_RETRIES", 2)?;
     let retry_base = env_f64("ANTHROPIC_RETRY_BASE", 0.5)?;
     let retry_max = env_f64("ANTHROPIC_RETRY_MAX", 4.0)?;
@@ -295,9 +293,9 @@ pub(crate) fn call_claude(
     }
 
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs_f64(timeout))
-        .timeout_read(Duration::from_secs_f64(timeout))
-        .timeout_write(Duration::from_secs_f64(timeout))
+        .timeout_connect(Duration::from_secs(timeout))
+        .timeout_read(Duration::from_secs(timeout))
+        .timeout_write(Duration::from_secs(timeout))
         .build();
 
     let retryable = |status: u16| matches!(status, 429 | 500 | 502 | 503 | 504 | 529);
@@ -481,7 +479,7 @@ pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Re
     }
 
     let cmd = command_spec_to_vec(&hook.command);
-    let timeout = hook.timeout_ms.unwrap_or(300000);
+    let timeout = hook.timeout_ms.unwrap_or(u64::MAX);
     let value = serde_json::to_value(request).map_err(|e| format!("hook input: {e}"))?;
     let raw = run_hook_command(&cmd, &value, timeout, "agent")?;
     let response: AgentHookResponse =

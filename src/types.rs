@@ -1,12 +1,10 @@
 #[allow(unused_imports)]
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use aether_core::types::TemporalFilter;
 use aether_core::Vault;
-use chrono::{Datelike, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 
 use super::open_or_create;
@@ -212,6 +210,8 @@ pub(crate) struct QueryArgs {
     pub(crate) before: Option<String>,
     pub(crate) after: Option<String>,
     pub(crate) feedback_weight: f32,
+    pub(crate) vault_path: Option<std::path::PathBuf>,
+    pub(crate) parallel_lanes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -407,6 +407,10 @@ pub(crate) struct AgentHookResponse {
     pub(crate) message: AgentMessage,
 }
 
+pub(crate) trait ProgressStream: Send + Sync {
+    fn emit(&self, milestone: &str, percent: u8, message: &str);
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct AgentToolResult {
     pub(crate) id: String,
@@ -436,6 +440,8 @@ pub(crate) struct AgentProgress {
     pub(crate) step: usize,
     pub(crate) max_steps: usize,
     pub(crate) phase: String,
+    pub(crate) milestone: String,
+    pub(crate) percent: u8,
     pub(crate) text_preview: Option<String>,
     pub(crate) started_at: std::time::Instant,
     /// Tools invoked so far (name -> count)
@@ -452,6 +458,17 @@ pub(crate) struct AgentProgress {
     pub(crate) first_ack_sent: bool,
 }
 
+impl ProgressStream for Arc<Mutex<AgentProgress>> {
+    fn emit(&self, milestone: &str, percent: u8, message: &str) {
+        if let Ok(mut progress) = self.lock() {
+            progress.milestone = milestone.to_string();
+            progress.percent = percent.min(100);
+            progress.text_preview = Some(message.to_string());
+            progress.started_at = progress.started_at; // keep last started_at stable
+        }
+    }
+}
+
 pub(crate) struct CompletionEvent {
     pub(crate) chat_id: i64,
     pub(crate) reply_to_id: Option<i64>,
@@ -463,7 +480,19 @@ pub(crate) struct ActiveRun {
     pub(crate) queued_messages: Vec<(String, Option<i64>)>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ProgressEvent {
+    #[serde(default)]
+    pub(crate) session: Option<String>,
+    pub(crate) milestone: String,
+    pub(crate) percent: u8,
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) ts_utc: i64,
+}
+
 #[derive(Default)]
+#[allow(dead_code)]
 pub(crate) struct ReminderState {
     pub(crate) last_tool_failed: bool,
     pub(crate) same_tool_fail_streak: usize,
@@ -476,6 +505,7 @@ pub(crate) struct ReminderState {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 pub(crate) struct DriftState {
     pub(crate) ema: f32,
     pub(crate) turns: usize,
@@ -500,6 +530,7 @@ impl Default for ToolAutonomyLevel {
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct ToolAutonomyConfig {
     #[serde(default)]
     pub(crate) default_level: ToolAutonomyLevel,

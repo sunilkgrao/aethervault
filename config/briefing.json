@@ -1,0 +1,20 @@
+{
+  "schedule_utc": "13:00",
+  "timezone_offset": "-05:00",
+  "topics": [
+    "AI agents",
+    "Anthropic Claude",
+    "OpenAI",
+    "tech industry"
+  ],
+  "handles": [
+    "AnthropicAI",
+    "OpenAI",
+    "elikiiga",
+    "kaboratory"
+  ],
+  "include_system_health": true,
+  "include_web_news": true,
+  "include_twitter": false,
+  "chat_id": 8280335652
+}

@@ -1,0 +1,6 @@
+{
+  "entity_types": ["person", "project", "technology", "organization", "preference", "topic", "location"],
+  "relation_types": ["owns", "works-on", "uses", "runs-on", "part-of", "knows", "prefers", "located-at"],
+  "auto_ingest": false,
+  "graph_file": "/root/.aethervault/data/knowledge-graph.json"
+}

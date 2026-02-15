@@ -6,14 +6,51 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aether_core::types::SearchRequest;
 use aether_core::{PutOptions, Vault};
 use base64::Engine;
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use walkdir::WalkDir;
 
 use std::sync::mpsc;
+
+const NO_TIMEOUT_MS: u64 = u64::MAX;
+const PROCESS_POLL_MS: u64 = 250;
+const STATUS_REPORT_MS: u64 = 3_000;
+
+fn wait_for_child(
+    child: &mut std::process::Child,
+    label: &str,
+    timeout_ms: u64,
+    cancel_token: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let pid = child.id().to_string();
+    let mut last_report = Instant::now();
+    loop {
+        if cancel_token.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{label} (pid={pid}) canceled after {timeout_ms}ms"));
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {
+                if last_report.elapsed() >= Duration::from_millis(STATUS_REPORT_MS) {
+                    eprintln!("[tool:{label}] pid={pid} still running (no deadline, configured timeout {timeout_ms}ms)");
+                    last_report = Instant::now();
+                }
+                thread::sleep(Duration::from_millis(PROCESS_POLL_MS));
+            }
+            Err(err) => {
+                return Err(format!("{label} wait failed: {err}"));
+            }
+        }
+    }
+}
 
 use crate::{
     env_optional,
@@ -103,6 +140,62 @@ use crate::{
     ToolMsCalendarCreateArgs,
     ToolScaleArgs,
 };
+
+const EXEC_BACKGROUND_THRESHOLD_MS: u64 = 300_000;
+const DEFAULT_EXEC_BG_URL: &str = "http://127.0.0.1:8082";
+
+fn background_exec_job_name(command: &str) -> String {
+    let short: String = command.chars().take(80).collect();
+    if short.len() < command.len() {
+        format!("{short}...")
+    } else {
+        short
+    }
+}
+
+fn submit_exec_background_job(
+    command: &str,
+    cwd: Option<&String>,
+    timeout_ms: u64,
+    estimated_ms: u64,
+) -> Result<serde_json::Value, String> {
+    let base_url = env_optional("AETHERVAULT_BACKGROUND_URL")
+        .unwrap_or_else(|| DEFAULT_EXEC_BG_URL.to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let endpoint = format!("{base_url}/jobs");
+    let payload = serde_json::json!({
+        "command": command,
+        "cwd": cwd,
+        "priority": 75,
+        "timeout_ms": timeout_ms,
+        "estimated_ms": estimated_ms,
+        "name": background_exec_job_name(command),
+    });
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
+        .build();
+    let response = agent
+        .post(&endpoint)
+        .set("content-type", "application/json")
+        .send_json(payload)
+        .map_err(|err| format!("background queue request failed: {err}"))?;
+    let response_status = response.status();
+    if response_status >= 300 {
+        let body = response.into_string().unwrap_or_default();
+        return Err(format!(
+            "background queue rejected with HTTP {}: {}",
+            response_status,
+            body
+        ));
+    }
+    response
+        .into_json::<serde_json::Value>()
+        .map_err(|err| format!("invalid background queue response: {err}"))
+}
 
 #[allow(dead_code)]
 pub(crate) fn execute_tool(
@@ -208,11 +301,11 @@ pub(crate) fn execute_tool_with_handles(
                     no_expand: parsed.no_expand.unwrap_or(false),
                     max_expansions: parsed.max_expansions.unwrap_or(2),
                     expand_hook: None,
-                    expand_hook_timeout_ms: 2000,
+                    expand_hook_timeout_ms: NO_TIMEOUT_MS,
                     no_vector: parsed.no_vector.unwrap_or(false),
                     rerank: parsed.rerank.unwrap_or_else(|| "local".to_string()),
                     rerank_hook: None,
-                    rerank_hook_timeout_ms: 6000,
+                    rerank_hook_timeout_ms: NO_TIMEOUT_MS,
                     rerank_hook_full_text: false,
                     embed_model: None,
                     embed_cache: 4096,
@@ -225,6 +318,8 @@ pub(crate) fn execute_tool_with_handles(
                     before: parsed.before,
                     after: parsed.after,
                     feedback_weight: parsed.feedback_weight.unwrap_or(0.15),
+                    vault_path: Some(mv2.to_path_buf()),
+                    parallel_lanes: true,
                 };
                 let response = execute_query(mem, qargs).map_err(|e| e.to_string())?;
                 let mut lines = Vec::new();
@@ -256,11 +351,11 @@ pub(crate) fn execute_tool_with_handles(
                     no_expand: parsed.no_expand.unwrap_or(false),
                     max_expansions: parsed.max_expansions.unwrap_or(2),
                     expand_hook: None,
-                    expand_hook_timeout_ms: 2000,
+                    expand_hook_timeout_ms: NO_TIMEOUT_MS,
                     no_vector: parsed.no_vector.unwrap_or(false),
                     rerank: parsed.rerank.unwrap_or_else(|| "local".to_string()),
                     rerank_hook: None,
-                    rerank_hook_timeout_ms: 6000,
+                    rerank_hook_timeout_ms: NO_TIMEOUT_MS,
                     rerank_hook_full_text: false,
                     embed_model: None,
                     embed_cache: 4096,
@@ -273,6 +368,8 @@ pub(crate) fn execute_tool_with_handles(
                     before: parsed.before,
                     after: parsed.after,
                     feedback_weight: parsed.feedback_weight.unwrap_or(0.15),
+                    vault_path: Some(mv2.to_path_buf()),
+                    parallel_lanes: true,
                 };
                 let pack = build_context_pack(
                     mem,
@@ -733,7 +830,42 @@ pub(crate) fn execute_tool_with_handles(
         "exec" => {
             let parsed: ToolExecArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let timeout_ms = parsed.timeout_ms.unwrap_or(60_000).max(1);
+            let timeout_ms = parsed.timeout_ms.unwrap_or(NO_TIMEOUT_MS).max(1);
+            let estimated_ms = parsed.estimated_ms.unwrap_or(timeout_ms);
+            let is_codex_session = parsed.command.to_ascii_lowercase().contains("codex");
+            let should_background = parsed.background.unwrap_or(false)
+                || (is_codex_session && estimated_ms >= EXEC_BACKGROUND_THRESHOLD_MS);
+
+            if should_background {
+                let response = submit_exec_background_job(
+                    &parsed.command,
+                    parsed.cwd.as_ref(),
+                    timeout_ms,
+                    estimated_ms,
+                )?;
+                let job_id = response
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let status_url = response
+                    .get("status_url")
+                    .and_then(|value| value.as_str())
+                    .map(std::borrow::ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("/jobs/{job_id}/status"));
+                let details = serde_json::json!({
+                    "background": true,
+                    "job_id": job_id,
+                    "status_url": status_url,
+                    "estimated_ms": estimated_ms,
+                    "timeout_ms": timeout_ms
+                });
+                return Ok(ToolExecution {
+                    output: format!("background job started: {job_id}"),
+                    details,
+                    is_error: false,
+                });
+            }
+
             let command = if cfg!(windows) {
                 vec!["cmd".to_string(), "/C".to_string(), parsed.command]
             } else {
@@ -747,22 +879,8 @@ pub(crate) fn execute_tool_with_handles(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             let mut child = cmd.spawn().map_err(|e| format!("exec spawn: {e}"))?;
-            let timeout = Duration::from_millis(timeout_ms);
-            let start = Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if start.elapsed() > timeout {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err(format!("exec timed out after {timeout_ms}ms"));
-                        }
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(err) => return Err(format!("exec wait failed: {err}")),
-                }
-            }
+            let cancel_token = Arc::new(AtomicBool::new(false));
+            wait_for_child(&mut child, "exec", timeout_ms, &cancel_token)?;
             let output = child
                 .wait_with_output()
                 .map_err(|e| format!("exec output: {e}"))?;
@@ -803,9 +921,9 @@ pub(crate) fn execute_tool_with_handles(
                 _ => serde_json::json!({ "text": parsed.text }),
             };
             let agent = ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(10))
-                .timeout_read(Duration::from_secs(20))
-                .timeout_write(Duration::from_secs(10))
+                .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
                 .build();
             let response = agent
                 .post(&webhook)
@@ -876,7 +994,7 @@ pub(crate) fn execute_tool_with_handles(
                 .method
                 .unwrap_or_else(|| "GET".to_string())
                 .to_ascii_uppercase();
-            let timeout = parsed.timeout_ms.unwrap_or(20_000);
+            let timeout = parsed.timeout_ms.unwrap_or(NO_TIMEOUT_MS);
             let agent = ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_millis(timeout))
                 .timeout_write(Duration::from_millis(timeout))
@@ -935,7 +1053,7 @@ pub(crate) fn execute_tool_with_handles(
         "browser" => {
             let parsed: ToolBrowserArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let timeout_ms = parsed.timeout_ms.unwrap_or(30_000).max(1);
+            let timeout_ms = parsed.timeout_ms.unwrap_or(NO_TIMEOUT_MS);
             let session = parsed.session.unwrap_or_else(|| "default".to_string());
 
             let mut cmd_args: Vec<String> = vec!["--session".to_string(), session, "--".to_string()];
@@ -952,22 +1070,8 @@ pub(crate) fn execute_tool_with_handles(
                 .stderr(Stdio::piped());
 
             let mut child = cmd.spawn().map_err(|e| format!("browser spawn: {e}"))?;
-            let timeout = Duration::from_millis(timeout_ms);
-            let start = Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if start.elapsed() > timeout {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err(format!("browser timed out after {timeout_ms}ms"));
-                        }
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(e) => return Err(format!("browser wait: {e}")),
-                }
-            }
+            let cancel_token = Arc::new(AtomicBool::new(false));
+            wait_for_child(&mut child, "browser", timeout_ms, &cancel_token)?;
             let output = child
                 .wait_with_output()
                 .map_err(|e| format!("browser output: {e}"))?;
@@ -1022,7 +1126,7 @@ pub(crate) fn execute_tool_with_handles(
             let mut stdin = child.stdin.take().ok_or("excalidraw: no stdin")?;
             let stdout = child.stdout.take().ok_or("excalidraw: no stdout")?;
 
-            // Run MCP interaction in a thread with a hard timeout so blocking
+            // Run MCP interaction in a thread with cancellation-aware polling.
             // read_line can't hang the caller forever.  The closure also
             // guarantees cleanup (kill + wait) on both success and error paths.
             let tool_name = tool_name.to_string();
@@ -1102,18 +1206,33 @@ pub(crate) fn execute_tool_with_handles(
                 let _ = tx.send(result);
             });
 
-            // Hard 30s timeout for the entire MCP interaction
-            let tool_resp = match rx.recv_timeout(Duration::from_secs(30)) {
-                Ok(result) => {
-                    // Thread completed; child will exit after stdin is dropped
+            let cancel_token = Arc::new(AtomicBool::new(false));
+            let mut last_update = Instant::now();
+            let tool_resp: serde_json::Value = loop {
+                if cancel_token.load(Ordering::Acquire) {
                     let _ = child.kill();
                     let _ = child.wait();
-                    result?
+                    return Err("excalidraw: canceled while waiting for MCP response".into());
                 }
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("excalidraw: timed out after 30s".into());
+                match rx.recv_timeout(Duration::from_millis(PROCESS_POLL_MS)) {
+                    Ok(result) => {
+                        // Thread completed; child will exit after stdin is dropped
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break result?;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if last_update.elapsed() >= Duration::from_millis(STATUS_REPORT_MS) {
+                            eprintln!("[tool:excalidraw] waiting for MCP response (no deadline)");
+                            last_update = Instant::now();
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err("excalidraw: MCP worker channel disconnected".into());
+                    }
                 }
             };
 
@@ -1695,7 +1814,7 @@ pub(crate) fn execute_tool_with_handles(
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_secs(20))
+                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                 .build();
             let mut url = format!(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={}",
@@ -1730,7 +1849,7 @@ pub(crate) fn execute_tool_with_handles(
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_secs(20))
+                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                 .build();
             let url = format!(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=full",
@@ -1772,7 +1891,7 @@ pub(crate) fn execute_tool_with_handles(
                 .to_string();
             let payload = serde_json::json!({ "raw": encoded });
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_secs(20))
+                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
@@ -1799,7 +1918,7 @@ pub(crate) fn execute_tool_with_handles(
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_secs(20))
+                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                 .build();
             let url = format!(
                 "https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults={}",
@@ -1836,7 +1955,7 @@ pub(crate) fn execute_tool_with_handles(
                 "end": { "dateTime": parsed.end }
             });
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_secs(20))
+                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .post("https://www.googleapis.com/calendar/v3/calendars/primary/events")
@@ -1867,7 +1986,7 @@ pub(crate) fn execute_tool_with_handles(
                 parsed.top.unwrap_or(10)
             );
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_secs(20))
+                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .get(&url)
@@ -1895,7 +2014,7 @@ pub(crate) fn execute_tool_with_handles(
             let token = get_oauth_token(mv2, "microsoft").map_err(|e| e.to_string())?;
             let url = format!("https://graph.microsoft.com/v1.0/me/messages/{}", parsed.id);
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_secs(20))
+                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .get(&url)
@@ -1926,7 +2045,7 @@ pub(crate) fn execute_tool_with_handles(
                 parsed.top.unwrap_or(10)
             );
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_secs(20))
+                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .get(&url)
@@ -1962,7 +2081,7 @@ pub(crate) fn execute_tool_with_handles(
                 "end": { "dateTime": parsed.end, "timeZone": "UTC" }
             });
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_secs(20))
+                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .post("https://graph.microsoft.com/v1.0/me/events")

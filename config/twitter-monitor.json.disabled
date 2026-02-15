@@ -1,0 +1,24 @@
+{
+  "enabled": true,
+  "poll_interval_minutes": 15,
+  "topics": [
+    {
+      "query": "AI agents breaking news",
+      "priority": "high"
+    },
+    {
+      "query": "Claude Anthropic announcements",
+      "priority": "medium"
+    },
+    {
+      "query": "AetherVault OR OpenClaw",
+      "priority": "high"
+    }
+  ],
+  "handles": [
+    "AnthropicAI",
+    "OpenAI",
+    "xaboratory"
+  ],
+  "chat_id": 8280335652
+}

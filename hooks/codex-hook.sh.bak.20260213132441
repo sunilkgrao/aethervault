@@ -1,0 +1,4 @@
+#!/bin/bash
+# AetherVault model_hook wrapper for Codex CLI
+# Reads AgentHookRequest JSON from stdin, passes to Python hook
+exec python3 /root/.aethervault/hooks/codex-model-hook.py

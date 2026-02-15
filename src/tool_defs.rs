@@ -254,7 +254,9 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
                 "properties": {
                     "command": { "type": "string" },
                     "cwd": { "type": "string" },
-                    "timeout_ms": { "type": "integer" }
+                    "timeout_ms": { "type": "integer" },
+                    "estimated_ms": { "type": "integer", "description": "Optional runtime estimate used by background scheduling (milliseconds)." },
+                    "background": { "type": "boolean", "description": "Force background execution even below five-minute threshold." }
                 },
                 "required": ["command"]
             }
@@ -321,7 +323,7 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
                 "properties": {
                     "command": { "type": "string", "description": "The agent-browser command (e.g., 'open https://example.com', 'snapshot', 'click @e2', 'fill @e3 hello')" },
                     "session": { "type": "string", "description": "Session name for browser isolation. Defaults to 'default'." },
-                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds. Default 30000." }
+                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds. Default u64::MAX (no deadline)." }
                 },
                 "required": ["command"]
             }

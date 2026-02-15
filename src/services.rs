@@ -2,11 +2,12 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+#[allow(unused_imports)]
 use aether_core::types::{FrameStatus, SearchHit};
 use aether_core::{PutOptions, Vault};
 use chrono::{Datelike, Timelike, Utc};
@@ -28,6 +29,8 @@ use crate::{
 };
 use tiny_http::{Response, Server};
 use walkdir::WalkDir;
+
+const NO_TIMEOUT_MS: u64 = u64::MAX;
 
 // ── Memory helpers ──────────────────────────────────────────────────────
 
@@ -233,9 +236,9 @@ pub(crate) fn exchange_oauth_code(
     code: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(20))
-        .timeout_write(Duration::from_secs(10))
+        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
         .build();
     let payload = form_urlencoded::Serializer::new(String::new())
         .append_pair("client_id", client_id)
@@ -561,9 +564,9 @@ pub(crate) fn refresh_google_token(
         .append_pair("refresh_token", refresh_token)
         .finish();
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(20))
-        .timeout_write(Duration::from_secs(10))
+        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
         .build();
     let resp = agent
         .post("https://oauth2.googleapis.com/token")
@@ -607,9 +610,9 @@ pub(crate) fn refresh_microsoft_token(
         .append_pair("scope", "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Calendars.ReadWrite")
         .finish();
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(20))
-        .timeout_write(Duration::from_secs(10))
+        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
         .build();
     let resp = agent
         .post("https://login.microsoftonline.com/common/oauth2/v2.0/token")
@@ -1080,9 +1083,9 @@ pub(crate) fn run_schedule_loop(
                         (telegram_token.as_ref(), telegram_chat_id.as_ref())
                     {
                         let agent = ureq::AgentBuilder::new()
-                            .timeout_connect(Duration::from_secs(10))
-                            .timeout_write(Duration::from_secs(10))
-                            .timeout_read(Duration::from_secs(20))
+                            .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+                            .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
+                            .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                             .build();
                         let base_url = match std::env::var("TELEGRAM_API_BASE") {
     Ok(base) => format!("{base}/bot{token}"),
@@ -1149,8 +1152,8 @@ pub(crate) fn run_watch_loop(
                         Err(_) => continue,
                     };
                     let agent = ureq::AgentBuilder::new()
-                        .timeout_connect(Duration::from_secs(10))
-                        .timeout_read(Duration::from_secs(20))
+                        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+                        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                         .build();
                     let mut url =
                         "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=1"
@@ -1206,8 +1209,8 @@ pub(crate) fn run_watch_loop(
                         Err(_) => continue,
                     };
                     let agent = ureq::AgentBuilder::new()
-                        .timeout_connect(Duration::from_secs(10))
-                        .timeout_read(Duration::from_secs(20))
+                        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+                        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                         .build();
                     let url = format!(
                         "https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin={}&timeMax={}&maxResults=1&singleEvents=true",
@@ -1309,8 +1312,8 @@ pub(crate) fn run_watch_loop(
                     };
                     let method = trigger.webhook_method.as_deref().unwrap_or("GET").to_uppercase();
                     let agent = ureq::AgentBuilder::new()
-                        .timeout_connect(Duration::from_secs(10))
-                        .timeout_read(Duration::from_secs(20))
+                        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+                        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
                         .build();
                     let resp = match method.as_str() {
                         "POST" => agent.post(&url).call(),
@@ -1447,8 +1450,8 @@ pub(crate) fn qdrant_search_text(
     });
 
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(15))
+        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
         .build();
 
     let resp = agent.post(&url)
@@ -1530,9 +1533,9 @@ pub(crate) fn qdrant_upsert(
 
     let body = serde_json::json!({ "points": qdrant_points });
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(30))
-        .timeout_write(Duration::from_secs(30))
+        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
         .build();
 
     agent.put(&url)
@@ -1552,8 +1555,8 @@ pub(crate) fn qdrant_ensure_collection(
 ) -> Result<(), String> {
     let url = format!("{}/collections/{}", base_url.trim_end_matches('/'), collection);
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(10))
+        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
         .build();
 
     // Check if collection exists
