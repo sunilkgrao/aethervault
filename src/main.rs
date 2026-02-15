@@ -1305,6 +1305,14 @@ struct AgentProgress {
     phase: String,
     text_preview: Option<String>,
     started_at: std::time::Instant,
+    /// Tools invoked so far (name -> count)
+    tools_used: HashMap<String, usize>,
+    /// Whether the checkpoint message has been sent
+    checkpoint_sent: bool,
+    /// User responded to checkpoint: Some(true) = continue, Some(false) = wrap up
+    checkpoint_response: Option<bool>,
+    /// Extended step budget (set when user says "continue")
+    extended_max_steps: Option<usize>,
 }
 
 struct CompletionEvent {
@@ -9296,7 +9304,34 @@ fn run_agent_with_prompt(
         .unwrap_or(4);
 
     let mut completed = false;
-    for step in 0..effective_max_steps {
+    let mut current_max_steps = effective_max_steps;
+    let mut step = 0;
+    let mut wrap_up_injected = false;
+    while step < current_max_steps {
+        // Check if user extended step budget via checkpoint response
+        if let Some(ref prog) = progress {
+            if let Ok(p) = prog.lock() {
+                if let Some(ext) = p.extended_max_steps {
+                    if ext > current_max_steps {
+                        current_max_steps = ext;
+                    }
+                }
+                if p.checkpoint_response == Some(false) && !wrap_up_injected {
+                    // User said "wrap up" — inject once then let agent finish naturally
+                    wrap_up_injected = true;
+                    drop(p);
+                    messages.push(AgentMessage {
+                        role: "user".to_string(),
+                        content: Some("[System] The user has asked you to wrap up. Provide a concise summary of what you've accomplished so far and any remaining work. Do NOT start new tool calls.".to_string()),
+                        tool_calls: Vec::new(),
+                        name: None,
+                        tool_call_id: None,
+                        is_error: None,
+                    });
+                }
+            }
+        }
+
         // Update progress: thinking phase
         if let Some(ref prog) = progress {
             if let Ok(mut p) = prog.lock() {
@@ -9441,11 +9476,14 @@ fn run_agent_with_prompt(
 
         let max_tool_output = 8000; // chars (~2000 tokens)
 
-        // Update progress: tool execution phase
+        // Update progress: tool execution phase + track tools used
         if let Some(ref prog) = progress {
             if let Ok(mut p) = prog.lock() {
                 let names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
                 p.phase = format!("tool:{}", names.join(","));
+                for call in &tool_calls {
+                    *p.tools_used.entry(call.name.clone()).or_insert(0) += 1;
+                }
             }
         }
 
@@ -9723,7 +9761,7 @@ fn run_agent_with_prompt(
 
         // Mid-loop system reminders (10 rules) + drift detection
         let token_est = estimate_tokens(&messages);
-        let reminders = collect_mid_loop_reminders(&reminder_state, step, effective_max_steps, token_est);
+        let reminders = collect_mid_loop_reminders(&reminder_state, step, current_max_steps, token_est);
 
         // Drift detection scoring
         drift_state.turns += 1;
@@ -9759,6 +9797,7 @@ fn run_agent_with_prompt(
                 is_error: None,
             });
         }
+        step += 1;
     }
 
     if should_log {
@@ -9772,9 +9811,26 @@ fn run_agent_with_prompt(
             .and_then(|m| m.content.as_ref())
             .map(|c| c.chars().take(200).collect::<String>())
             .unwrap_or_else(|| "(no context available)".to_string());
+        // Build a richer exhaustion summary with tool stats
+        let tool_summary = if let Some(ref prog) = progress {
+            if let Ok(p) = prog.lock() {
+                let mut sorted: Vec<_> = p.tools_used.iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                let top: Vec<String> = sorted.into_iter().take(5)
+                    .map(|(k, v)| format!("{k}({v}x)"))
+                    .collect();
+                if top.is_empty() { String::new() } else { format!(" Tools: {}", top.join(", ")) }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "Agent used all {effective_max_steps} steps without finishing. \
-            Last action: {last_action}"
+            "Reached {current_max_steps} steps without finishing. \
+            Last action: {last_action}.{tool_summary}"
         )
         .into());
     }
@@ -10465,6 +10521,10 @@ fn spawn_agent_run(
         phase: "starting".to_string(),
         text_preview: None,
         started_at: std::time::Instant::now(),
+        tools_used: HashMap::new(),
+        checkpoint_sent: false,
+        checkpoint_response: None,
+        extended_max_steps: None,
     }));
 
     // Worker thread — calls run_agent_with_prompt directly (no middle thread)
@@ -10529,22 +10589,63 @@ fn spawn_agent_run(
         let _ = worker_tx.send(event);
     });
 
-    // Progress reporter thread — typing indicators only, no robotic status messages
+    // Progress reporter thread — typing indicators + checkpoint at 75% steps
     let prog_ref = progress.clone();
     let prog_agent = http_agent.clone();
     let prog_url = base_url.to_string();
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(8));
-            let done = {
+            let (done, should_checkpoint) = {
                 let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
-                guard.phase == "done"
+                let done = guard.phase == "done";
+                let effective_max = guard.extended_max_steps.unwrap_or(guard.max_steps);
+                let at_checkpoint = guard.step >= effective_max * 3 / 4
+                    && !guard.checkpoint_sent
+                    && effective_max > 4; // don't checkpoint tiny runs
+                (done, at_checkpoint)
             };
             if done {
                 break;
             }
-            // Just send typing indicator — no robotic progress messages
-            telegram_send_typing(&prog_agent, &prog_url, chat_id);
+            if should_checkpoint {
+                // Build checkpoint message from progress state
+                let (step, max, tools, preview, elapsed) = {
+                    let mut guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.checkpoint_sent = true;
+                    let elapsed = guard.started_at.elapsed().as_secs();
+                    let tools: Vec<String> = {
+                        let mut sorted: Vec<_> = guard.tools_used.iter()
+                            .map(|(k, v)| (k.clone(), *v))
+                            .collect();
+                        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                        sorted.into_iter().take(5)
+                            .map(|(k, v)| format!("{k} ({v}x)"))
+                            .collect()
+                    };
+                    (guard.step, guard.extended_max_steps.unwrap_or(guard.max_steps),
+                     tools, guard.text_preview.clone(), elapsed)
+                };
+                let tools_str = if tools.is_empty() {
+                    "none yet".to_string()
+                } else {
+                    tools.join(", ")
+                };
+                let preview_str = preview
+                    .map(|p| format!("\nLast update: {p}"))
+                    .unwrap_or_default();
+                let mins = elapsed / 60;
+                let secs = elapsed % 60;
+                let msg = format!(
+                    "I'm at step {step}/{max} ({mins}m{secs}s elapsed).{preview_str}\n\
+                     Tools used: {tools_str}\n\n\
+                     Reply \"continue\" to extend by {max} more steps, \
+                     or \"wrap up\" to finish with what I have."
+                );
+                let _ = telegram_send_message(&prog_agent, &prog_url, chat_id, &msg);
+            } else {
+                telegram_send_typing(&prog_agent, &prog_url, chat_id);
+            }
         }
     });
 
@@ -10786,6 +10887,33 @@ fn run_telegram_bridge(
             // Check if there's already an active run for this chat
             const MAX_QUEUED_PER_CHAT: usize = 5;
             if let Some(run) = active_runs.get_mut(&chat_id) {
+                // Check if user is responding to a checkpoint
+                let lower = user_text.trim().to_lowercase();
+                let is_checkpoint_response = {
+                    let guard = run.progress.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.checkpoint_sent && guard.checkpoint_response.is_none()
+                };
+                if is_checkpoint_response {
+                    if lower.contains("continue") || lower.contains("keep going") || lower.contains("yes") || lower.contains("extend") {
+                        let mut guard = run.progress.lock().unwrap_or_else(|e| e.into_inner());
+                        let current_max = guard.extended_max_steps.unwrap_or(guard.max_steps);
+                        guard.extended_max_steps = Some(current_max + guard.max_steps);
+                        guard.checkpoint_response = Some(true);
+                        guard.checkpoint_sent = false; // allow another checkpoint at new 75%
+                        drop(guard);
+                        let _ = telegram_send_message(&http_agent, &base_url, chat_id,
+                            &format!("Got it, extending by {} more steps.", run.progress.lock().unwrap_or_else(|e| e.into_inner()).max_steps));
+                        continue;
+                    } else if lower.contains("wrap") || lower.contains("stop") || lower.contains("finish") || lower.contains("no") {
+                        let mut guard = run.progress.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.checkpoint_response = Some(false);
+                        drop(guard);
+                        let _ = telegram_send_message(&http_agent, &base_url, chat_id,
+                            "Wrapping up with what I have so far.");
+                        continue;
+                    }
+                    // Not a clear checkpoint response — treat as queued message
+                }
                 // Silently queue — no robotic ack messages.
                 // All queued messages are merged into one prompt on completion.
                 if run.queued_messages.len() < MAX_QUEUED_PER_CHAT {
