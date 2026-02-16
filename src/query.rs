@@ -809,6 +809,15 @@ pub(crate) fn append_agent_log_with_commit(
     entry: &AgentLogEntry,
     commit: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // Dual-write: JSONL file (primary) + MV2 capsule (legacy)
+    let workspace = std::env::var("AETHERVAULT_WORKSPACE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_WORKSPACE_DIR));
+    let log_dir = log_dir_path(&workspace);
+    if let Err(e) = append_log_jsonl(&log_dir, entry) {
+        eprintln!("[agent-log] JSONL write failed: {e}");
+    }
+
     let bytes = serde_json::to_vec(entry)?;
     let ts = Utc::now().timestamp();
     let hash = blake3_hash(&bytes);

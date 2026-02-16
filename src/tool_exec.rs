@@ -140,6 +140,12 @@ use crate::{
     ToolMsCalendarCreateArgs,
     ToolScaleArgs,
     ToolSelfUpgradeArgs,
+    open_skill_db,
+    upsert_skill,
+    search_skills,
+    SkillRecord,
+    log_dir_path,
+    load_session_logs,
 };
 
 const EXEC_BACKGROUND_THRESHOLD_MS: u64 = 300_000;
@@ -1500,50 +1506,77 @@ pub(crate) fn execute_tool_with_handles(
         "session_context" => {
             let parsed: ToolSessionContextArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let scope = format!("aethervault://agent-log/{}/", parsed.session);
             let limit = parsed.limit.unwrap_or(20);
-            with_read_mem(mem_read, mem_write, mv2, |mem| {
-                let request = SearchRequest {
-                    query: parsed.session.clone(),
-                    top_k: 200,
-                    snippet_chars: 200,
-                    uri: None,
-                    scope: Some(scope),
-                    cursor: None,
-                    temporal: None,
-                    as_of_frame: None,
-                    as_of_ts: None,
-                    no_sketch: true,
-                };
-                let response = mem.search(request).map_err(|e| e.to_string())?;
-                let mut entries = Vec::new();
-                for hit in response.hits {
-                    let uri = hit.uri.clone();
-                    let ts = parse_log_ts_from_uri(&uri).unwrap_or_default();
-                    if let Ok(text) = mem.frame_text_by_id(hit.frame_id) {
-                        if let Ok(entry) = serde_json::from_str::<AgentLogEntry>(&text) {
-                            entries.push(serde_json::json!({
-                                "ts": entry.ts_utc.unwrap_or(ts),
-                                "role": entry.role,
-                                "text": entry.text,
-                                "meta": entry.meta,
-                                "uri": uri
-                            }));
-                        }
-                    }
-                }
-                entries.sort_by(|a, b| {
-                    b.get("ts")
-                        .and_then(|v| v.as_i64())
-                        .cmp(&a.get("ts").and_then(|v| v.as_i64()))
-                });
-                let results: Vec<serde_json::Value> = entries.into_iter().take(limit).collect();
+            // Try JSONL logs first, fall back to MV2 capsule
+            let workspace = workspace_override
+                .clone()
+                .unwrap_or_else(|| mv2.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR)));
+            let log_dir = log_dir_path(&workspace);
+            let jsonl_entries = load_session_logs(&log_dir, &parsed.session, limit);
+            if !jsonl_entries.is_empty() {
+                let results: Vec<serde_json::Value> = jsonl_entries
+                    .into_iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "ts": e.ts_utc,
+                            "role": e.role,
+                            "text": e.text,
+                            "meta": e.meta,
+                            "source": "jsonl"
+                        })
+                    })
+                    .collect();
                 Ok(ToolExecution {
-                    output: format!("Loaded {} entries.", results.len()),
+                    output: format!("Loaded {} entries from logs.", results.len()),
                     details: serde_json::json!({ "entries": results }),
                     is_error: false,
                 })
-            })
+            } else {
+                // Fallback: search MV2 capsule for legacy data
+                let scope = format!("aethervault://agent-log/{}/", parsed.session);
+                with_read_mem(mem_read, mem_write, mv2, |mem| {
+                    let request = SearchRequest {
+                        query: parsed.session.clone(),
+                        top_k: 200,
+                        snippet_chars: 200,
+                        uri: None,
+                        scope: Some(scope),
+                        cursor: None,
+                        temporal: None,
+                        as_of_frame: None,
+                        as_of_ts: None,
+                        no_sketch: true,
+                    };
+                    let response = mem.search(request).map_err(|e| e.to_string())?;
+                    let mut entries = Vec::new();
+                    for hit in response.hits {
+                        let uri = hit.uri.clone();
+                        let ts = parse_log_ts_from_uri(&uri).unwrap_or_default();
+                        if let Ok(text) = mem.frame_text_by_id(hit.frame_id) {
+                            if let Ok(entry) = serde_json::from_str::<AgentLogEntry>(&text) {
+                                entries.push(serde_json::json!({
+                                    "ts": entry.ts_utc.unwrap_or(ts),
+                                    "role": entry.role,
+                                    "text": entry.text,
+                                    "meta": entry.meta,
+                                    "source": "capsule"
+                                }));
+                            }
+                        }
+                    }
+                    entries.sort_by(|a, b| {
+                        b.get("ts")
+                            .and_then(|v| v.as_i64())
+                            .cmp(&a.get("ts").and_then(|v| v.as_i64()))
+                    });
+                    let results: Vec<serde_json::Value> = entries.into_iter().take(limit).collect();
+                    Ok(ToolExecution {
+                        output: format!("Loaded {} entries from capsule.", results.len()),
+                        details: serde_json::json!({ "entries": results }),
+                        is_error: false,
+                    })
+                })
+            }
         }
         "reflect" => {
             let parsed: ToolReflectArgs =
@@ -1587,72 +1620,61 @@ pub(crate) fn execute_tool_with_handles(
         "skill_store" => {
             let parsed: ToolSkillStoreArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let ts = Utc::now().timestamp();
-            let payload = serde_json::json!({
-                "name": parsed.name,
-                "trigger": parsed.trigger,
-                "steps": parsed.steps,
-                "tools": parsed.tools,
-                "notes": parsed.notes,
-                "ts_utc": ts
-            });
-            let bytes = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
-            let hash = blake3_hash(&bytes);
-            let slug = payload
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("skill")
-                .to_ascii_lowercase()
-                .replace(' ', "-");
-            let uri = format!("aethervault://skills/{}/{}-{}", slug, ts, hash.to_hex());
-            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
-                let mut options = PutOptions::default();
-                options.uri = Some(uri.clone());
-                options.title = Some("skill".to_string());
-                options.kind = Some("application/json".to_string());
-                options.track = Some("aethervault.skill".to_string());
-                options.search_text = Some(payload.to_string());
-                mem.put_bytes_with_options(&bytes, options)
-                    .map_err(|e| e.to_string())?;
-                mem.commit().map_err(|e| e.to_string())?;
-                Ok(ToolExecution {
-                    output: "Skill stored.".to_string(),
-                    details: serde_json::json!({ "uri": uri }),
-                    is_error: false,
-                })
+            let workspace = workspace_override
+                .clone()
+                .unwrap_or_else(|| mv2.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR)));
+            let db_path = workspace.join("skills.sqlite");
+            let conn = open_skill_db(&db_path).map_err(|e| format!("skill db: {e}"))?;
+            let now = Utc::now().to_rfc3339();
+            let skill = SkillRecord {
+                name: parsed.name.clone(),
+                trigger: parsed.trigger,
+                steps: parsed.steps.unwrap_or_default(),
+                tools: parsed.tools.unwrap_or_default(),
+                notes: parsed.notes,
+                success_rate: 0.0,
+                times_used: 0,
+                times_succeeded: 0,
+                last_used: None,
+                created_at: now,
+                contexts: Vec::new(),
+            };
+            upsert_skill(&conn, &skill).map_err(|e| format!("upsert: {e}"))?;
+            Ok(ToolExecution {
+                output: format!("Skill '{}' stored in SQLite.", parsed.name),
+                details: serde_json::json!({ "name": parsed.name, "db": db_path.display().to_string() }),
+                is_error: false,
             })
         }
         "skill_search" => {
             let parsed: ToolSkillSearchArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            with_read_mem(mem_read, mem_write, mv2, |mem| {
-                let request = SearchRequest {
-                    query: parsed.query.clone(),
-                    top_k: parsed.limit.unwrap_or(10),
-                    snippet_chars: 200,
-                    uri: None,
-                    scope: Some("aethervault://skills/".to_string()),
-                    cursor: None,
-                    temporal: None,
-                    as_of_frame: None,
-                    as_of_ts: None,
-                    no_sketch: true,
-                };
-                let response = mem.search(request).map_err(|e| e.to_string())?;
-                let mut out = Vec::new();
-                for hit in response.hits {
-                    out.push(serde_json::json!({
-                        "uri": hit.uri,
-                        "title": hit.title,
-                        "text": hit.text,
-                        "score": hit.score
-                    }));
-                }
-                Ok(ToolExecution {
-                    output: format!("Found {} skills.", out.len()),
-                    details: serde_json::json!({ "results": out }),
-                    is_error: false,
+            let workspace = workspace_override
+                .clone()
+                .unwrap_or_else(|| mv2.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR)));
+            let db_path = workspace.join("skills.sqlite");
+            let limit = parsed.limit.unwrap_or(10);
+            let conn = open_skill_db(&db_path).map_err(|e| format!("skill db: {e}"))?;
+            let results = search_skills(&conn, &parsed.query, limit);
+            let out: Vec<serde_json::Value> = results
+                .into_iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "name": s.name,
+                        "trigger": s.trigger,
+                        "steps": s.steps,
+                        "tools": s.tools,
+                        "notes": s.notes,
+                        "success_rate": s.success_rate,
+                        "times_used": s.times_used,
+                        "last_used": s.last_used,
+                    })
                 })
+                .collect();
+            Ok(ToolExecution {
+                output: format!("Found {} skills.", out.len()),
+                details: serde_json::json!({ "results": out }),
+                is_error: false,
             })
         }
         "subagent_list" => with_read_mem(mem_read, mem_write, mv2, |mem| {

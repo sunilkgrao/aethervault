@@ -12,6 +12,11 @@ mod claude;
 mod agent;
 mod bridges;
 mod services;
+mod agent_log;
+#[allow(dead_code)]
+mod config_file;
+#[allow(dead_code)]
+mod skill_registry;
 
 // Re-export all module items at crate root so cross-module references work.
 // Before this split, everything lived in main.rs and shared a single namespace.
@@ -42,6 +47,12 @@ pub(crate) use agent::*;
 pub(crate) use bridges::*;
 #[allow(unused_imports)]
 pub(crate) use services::*;
+#[allow(unused_imports)]
+pub(crate) use agent_log::*;
+#[allow(unused_imports)]
+pub(crate) use config_file::*;
+#[allow(unused_imports)]
+pub(crate) use skill_registry::*;
 
 // External crate imports used directly in main()
 use std::collections::HashMap;

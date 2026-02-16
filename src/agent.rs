@@ -29,6 +29,46 @@ use crate::{
     ToolExecution,
 };
 
+/// Returns true if an observation is worth persisting to long-term memory.
+fn observation_is_useful(text: &str) -> bool {
+    let trimmed = text.trim();
+    // Too short to be useful
+    if trimmed.len() < 30 {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    // Meta-observations about the agent itself
+    if lower.starts_with("the assistant") || lower.starts_with("the agent") {
+        return false;
+    }
+    // Generic status checks
+    let status_noise = [
+        "all services are", "everything is running", "everything is working",
+        "currently up", "currently running", "currently active",
+        "all systems", "is currently ok", "are currently ok",
+        "no issues found", "nothing to report",
+    ];
+    for pattern in &status_noise {
+        if lower.contains(pattern) {
+            return false;
+        }
+    }
+    // Must contain something specific: a number, a proper noun, a technology name,
+    // a concrete preference, or a lesson learned
+    let has_number = trimmed.chars().any(|c| c.is_ascii_digit());
+    let has_proper_noun = trimmed.split_whitespace().skip(1).any(|w| {
+        w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+            && w.len() > 1
+            && !["I", "A", "The", "An", "In", "On", "At", "To", "For", "And", "But", "Or", "Is", "It", "My"].contains(&w)
+    });
+    let specificity_markers = ["because", "prefers", "always", "never", "important",
+        "learned", "rule", "policy", "deadline", "budget", "password", "key",
+        "api", "token", "endpoint", "port", "version", "config"];
+    let has_specificity = specificity_markers.iter().any(|m| lower.contains(m));
+
+    has_number || has_proper_noun || has_specificity
+}
+
 pub(crate) fn run_agent(
     mv2: PathBuf,
     prompt: Option<String>,
@@ -709,7 +749,7 @@ pub(crate) fn run_agent_with_prompt(
                         };
                         if let Ok(response) = call_claude(&extract_request) {
                             if let Some(facts) = response.message.content {
-                                if !facts.trim().is_empty() {
+                                if !facts.trim().is_empty() && observation_is_useful(&facts) {
                                     let uri = format!(
                                         "aethervault://memory/observation/{}",
                                         Utc::now().timestamp()
@@ -733,6 +773,8 @@ pub(crate) fn run_agent_with_prompt(
                                                 .map_err(|e| e.to_string())
                                         },
                                     );
+                                } else if !facts.trim().is_empty() {
+                                    eprintln!("[observation-gate] skipped: {}...", &facts.chars().take(60).collect::<String>());
                                 }
                             }
                         }
