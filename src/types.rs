@@ -422,6 +422,9 @@ pub(crate) struct AgentProgress {
     pub(crate) opus_steps: usize,
     /// Steps delegated to Codex CLI or Ollama via exec
     pub(crate) delegated_steps: usize,
+    /// Messages from the user injected mid-run (steering).
+    /// The Telegram bridge pushes here; the agent loop drains and injects.
+    pub(crate) steering_messages: Vec<String>,
 }
 
 pub(crate) struct CompletionEvent {

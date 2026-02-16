@@ -209,6 +209,22 @@ pub(crate) fn default_system_prompt() -> String {
         "Sensitive actions require approval. If a tool returns `approval required: <id>`, ask the user to approve or reject.",
         "Use subagent_invoke or subagent_batch for specialist work when it improves quality or speed.",
         "",
+        "## Implementation Strategy: Prefer Parallel Subagent Swarms",
+        "For ANY technical implementation work (code changes, debugging, research, infrastructure):",
+        "- Do NOT do the implementation yourself step-by-step. Instead, spin up multiple Codex subagents in parallel via subagent_batch.",
+        "- Each subagent should handle one independent piece of work. This achieves massive parallelism.",
+        "- Use exec to invoke Codex CLI sessions (e.g., `codex --approval-mode full-auto -q 'task description'`).",
+        "- For large tasks, decompose into 3-8 parallel subagents, each with a clear scope.",
+        "- Only do simple, single-step operations yourself (quick lookups, sending messages, file reads).",
+        "- Think of yourself as an orchestrator dispatching work, not a solo implementer.",
+        "",
+        "## Mid-Run User Messages",
+        "The user can send messages at any time, even while you are working on a task.",
+        "These messages are injected directly into your conversation as they arrive.",
+        "Treat every mid-run user message as a potential course correction — read it immediately and adjust your approach.",
+        "If the user's message changes what you should be doing, acknowledge it and pivot.",
+        "Never ignore a user message or defer it until later.",
+        "",
         "## IMPORTANT: Do Not Undersell Yourself",
         "Never say 'my tools are limited', 'I don't have access to', or 'I can't do that' unless you have actually tried the tool and it failed.",
         "If you're unsure whether a tool exists, call tool_search first. Do not guess.",
@@ -726,6 +742,28 @@ pub(crate) fn run_agent_with_prompt(
                     messages.push(AgentMessage {
                         role: "user".to_string(),
                         content: Some("[System] The user has asked you to wrap up. Provide a concise summary of what you've accomplished so far and any remaining work. Do NOT start new tool calls.".to_string()),
+                        tool_calls: Vec::new(),
+                        name: None,
+                        tool_call_id: None,
+                        is_error: None,
+                    });
+                }
+            }
+        }
+
+        // Drain steering messages: user sent messages mid-run that should
+        // alter the agent's course. Inject them as user messages so the LLM
+        // sees them immediately at the next step.
+        if let Some(ref prog) = progress {
+            if let Ok(mut p) = prog.lock() {
+                let steering: Vec<String> = p.steering_messages.drain(..).collect();
+                if !steering.is_empty() {
+                    let combined = steering.join("\n\n");
+                    drop(p);
+                    eprintln!("[harness] injecting {} steering message(s) from user", steering.len());
+                    messages.push(AgentMessage {
+                        role: "user".to_string(),
+                        content: Some(combined),
                         tool_calls: Vec::new(),
                         name: None,
                         tool_call_id: None,

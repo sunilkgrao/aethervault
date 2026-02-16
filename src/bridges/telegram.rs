@@ -525,6 +525,7 @@ pub(crate) fn spawn_agent_run(
         first_ack_sent: false,
         opus_steps: 0,
         delegated_steps: 0,
+        steering_messages: Vec::new(),
     }));
 
     // Worker thread -- calls run_agent_with_prompt directly (no middle thread)
@@ -1015,7 +1016,6 @@ pub(crate) fn run_telegram_bridge(
             }
 
             // Check if there's already an active run for this chat
-            const MAX_QUEUED_PER_CHAT: usize = 5;
             if let Some(run) = active_runs.get_mut(&chat_id) {
                 // Check if user is responding to a checkpoint
                 let lower = user_text.trim().to_lowercase();
@@ -1044,12 +1044,15 @@ pub(crate) fn run_telegram_bridge(
                     }
                     // Not a clear checkpoint response -- treat as queued message
                 }
-                // Silently queue -- no robotic ack messages.
-                // All queued messages are merged into one prompt on completion.
-                if run.queued_messages.len() < MAX_QUEUED_PER_CHAT {
-                    run.queued_messages.push((user_text, reply_to_id));
+                // Inject into the running agent as a steering message.
+                // The agent loop drains these at each step and injects them
+                // as user messages so the LLM can adjust course immediately.
+                // We do NOT also queue them — that would cause double-handling
+                // (once mid-run, once as a new prompt after completion).
+                {
+                    let mut guard = run.progress.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.steering_messages.push(user_text);
                 }
-                // No response sent -- the agent will address everything when it finishes.
                 continue;
             }
 
