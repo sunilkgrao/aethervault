@@ -246,6 +246,21 @@ pub(crate) fn default_system_prompt() -> String {
         "Investigate before answering — search memory before making claims.",
         "Match the user's energy. Be concise when they're concise, detailed when they need detail.",
         "For irreversible actions, always confirm first.",
+        "",
+        "## Tool Output Grounding Rule",
+        "When reporting what a tool returned, ONLY state information literally present in the output.",
+        "NEVER infer details not shown (config values from key names, success from partial output).",
+        "NEVER claim error messages, file paths, or identifiers not in the tool output.",
+        "NEVER report success when the tool output shows errors or empty results.",
+        "If output is ambiguous or incomplete, say so. Quote the relevant output to support claims.",
+        "",
+        "## Request Triage",
+        "Before using tools, classify the request:",
+        "- Conversational (greeting, thanks, status check): Respond directly. No tools needed.",
+        "- Clear bounded task (specific file, command, question): Execute directly, report results.",
+        "- Ambiguous/vague request (unclear scope, vague pronouns like 'this'/'everything'): Ask 1-2 clarifying questions BEFORE acting.",
+        "- Complex multi-step task: Create a 3-5 step plan, share it, get confirmation, then execute incrementally.",
+        "Do NOT launch extensive tool use for greetings or vague requests.",
     ]
     .join("\n")
 }
@@ -457,16 +472,15 @@ pub(crate) fn run_agent_with_prompt(
         || is_continuation;
     if long_run_mode {
         system_prompt.push_str(concat!(
-            "\n\n# Resource Guide — Long-Running Tasks\n",
-            "For tasks requiring heavy computation, research, code analysis, or batch processing:\n",
-            "- Use `exec` to run `codex exec -m gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox \"detailed prompt\"` for substantial work\n",
-            "- Codex sessions have no timeout — let them run for hours if needed\n",
-            "- For parallelism: launch multiple `exec` calls with different Codex prompts simultaneously\n",
-            "- Each Codex session can itself spawn internal swarms via its --yolo mode\n",
-            "- For summarization/classification: use `exec` to call Ollama via `ssh -p 2222 sunil@localhost ",
-            "'curl -s localhost:11434/api/generate -d \"{\\\"model\\\":\\\"qwen3:14b\\\",\\\"prompt\\\":\\\"...\\\",\\\"stream\\\":false}\"'`\n",
-            "- Reserve your own reasoning for: orchestration decisions, user-facing responses, complex planning, and quality review of delegated results\n",
-            "- Prefer fire-and-forget background patterns: `nohup codex exec ... > /tmp/result.txt 2>&1 &` then check results later\n",
+            "\n\n## Resource Guide — Long-Running Tasks\n",
+            "For delegation, ALWAYS use the subagent system (not raw exec for LLM work):\n",
+            "- subagent_invoke(name=\"researcher\", prompt=\"...\") for research and analysis\n",
+            "- subagent_invoke(name=\"coder\", prompt=\"...\") for coding tasks (uses Codex internally)\n",
+            "- subagent_invoke(name=\"critic\", prompt=\"...\") for review and quality checking\n",
+            "- subagent_batch(invocations=[...]) for parallel fan-out of independent tasks\n",
+            "- The coder subagent handles Codex CLI integration internally via model_hook\n",
+            "Reserve exec for: shell commands, file operations, service management — NOT for LLM delegation.\n",
+            "If you need to run multiple research or coding tasks in parallel, use subagent_batch, not multiple exec calls.\n",
         ));
     }
 
@@ -1292,17 +1306,24 @@ pub(crate) fn run_agent_with_prompt(
 
         let mut all_reminders = reminders;
 
+        // Budget tracking: inject step budget awareness
+        let budget_msg = format!(
+            "Steps used: {}/{} | Remaining: {}",
+            step + 1, current_max_steps, current_max_steps.saturating_sub(step + 1)
+        );
+        all_reminders.push(budget_msg);
+
         // Resource-awareness: nudge delegation to free compute when in long-run mode
         if long_run_mode {
             if let Some(ref prog) = progress {
                 if let Ok(p) = prog.lock() {
                     if step > 10 && p.delegated_steps == 0 {
-                        all_reminders.push("Consider delegating research, code analysis, or batch work to Codex CLI via `exec` to save tokens.".to_string());
+                        all_reminders.push("Consider delegating research, code analysis, or batch work to subagents via subagent_invoke/subagent_batch to save tokens.".to_string());
                     } else if step > 20 && p.opus_steps > 0 {
                         let total = p.opus_steps + p.delegated_steps;
                         let opus_ratio = p.opus_steps as f64 / total.max(1) as f64;
                         if opus_ratio > 0.8 {
-                            all_reminders.push("Token efficiency is low. Delegate more work to free compute (Codex CLI, Ollama) via exec tool.".to_string());
+                            all_reminders.push("Token efficiency is low. Delegate more work to subagents via subagent_invoke/subagent_batch.".to_string());
                         }
                     }
                 }
@@ -1339,20 +1360,7 @@ pub(crate) fn run_agent_with_prompt(
             all_reminders.push("Sustained low adherence. Complete current action and provide a status summary.".to_string());
         }
 
-        // Covert critic: periodic reality grounding via Opus evaluation
-        if critic_should_fire(step, critic_interval, &mut last_critic_step, &reminder_state, &tool_calls, &messages) {
-            if let Some(correction) = call_critic(
-                &prompt_text,
-                &messages,
-                step,
-                current_max_steps,
-            ) {
-                all_reminders.push(correction);
-                drift_state.violations.entry("critic_correction".to_string())
-                    .and_modify(|c| *c += 1).or_insert(1);
-            }
-        }
-
+        // Inject routine reminders (budget, drift, cycle, etc.) — excludes critic corrections
         if !all_reminders.is_empty() {
             drift_state.reminder_violations = 0;
             messages.push(AgentMessage {
@@ -1364,6 +1372,90 @@ pub(crate) fn run_agent_with_prompt(
                 is_error: None,
             });
         }
+
+        // Covert critic: periodic reality grounding via Opus evaluation
+        // Critic corrections are injected as a SEPARATE message from routine reminders
+        let current_violation_count = drift_state.violations.get("critic_correction").copied().unwrap_or(0);
+        if critic_should_fire(step, critic_interval, &mut last_critic_step, &reminder_state, &tool_calls, &messages, current_violation_count) {
+            if let Some(correction) = call_critic(
+                &prompt_text,
+                &messages,
+                step,
+                current_max_steps,
+            ) {
+                // Don't add to all_reminders. Inject as separate message.
+                let critic_msg = format!(
+                    "[CRITICAL CORRECTION — Grounding Violation]\n{}\nYou MUST acknowledge this correction before continuing.",
+                    correction
+                );
+                messages.push(AgentMessage {
+                    role: "user".to_string(),
+                    content: Some(critic_msg),
+                    tool_calls: Vec::new(),
+                    name: None,
+                    tool_call_id: None,
+                    is_error: None,
+                });
+                // Track in drift state
+                drift_state.violations.entry("critic_correction".to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+
+                // Progressive escalation based on violation count
+                let violation_count = drift_state.violations.get("critic_correction").copied().unwrap_or(0);
+                match violation_count {
+                    0..=2 => { /* Standard correction — already injected above */ }
+                    3..=4 => {
+                        // Level 2: Stronger language
+                        messages.push(AgentMessage {
+                            role: "user".to_string(),
+                            content: Some(format!("[ESCALATION WARNING] This is correction #{violation_count}. Repeated grounding violations detected. You MUST quote specific tool output for every factual claim. Failure to comply will result in reduced capabilities.")),
+                            tool_calls: Vec::new(),
+                            name: None,
+                            tool_call_id: None,
+                            is_error: None,
+                        });
+                    }
+                    5..=6 => {
+                        // Level 3: Log severe warning
+                        eprintln!("[critic] LEVEL 3 escalation: {violation_count} violations — consider tool restriction");
+                        messages.push(AgentMessage {
+                            role: "user".to_string(),
+                            content: Some(format!("[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says.")),
+                            tool_calls: Vec::new(),
+                            name: None,
+                            tool_call_id: None,
+                            is_error: None,
+                        });
+                    }
+                    _ => {
+                        // Level 4: Log for potential session termination
+                        eprintln!("[critic] LEVEL 4 escalation: {violation_count} violations — session should be terminated");
+                        messages.push(AgentMessage {
+                            role: "user".to_string(),
+                            content: Some(format!("[CRITICAL] {violation_count} grounding violations. Your outputs are unreliable. Simplify your approach: one tool call at a time, quote the output, then respond. No multi-step plans until grounding improves.")),
+                            tool_calls: Vec::new(),
+                            name: None,
+                            tool_call_id: None,
+                            is_error: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Checkpoint-and-report every 10 steps
+        if step > 0 && step % 10 == 0 {
+            messages.push(AgentMessage {
+                role: "user".to_string(),
+                content: Some(format!("[Checkpoint — Step {}] Summarize what you have accomplished so far and what you plan to do next. If the user's request was vague, confirm you are on the right track.", step)),
+                tool_calls: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                is_error: None,
+            });
+        }
+
         step += 1;
     }
 

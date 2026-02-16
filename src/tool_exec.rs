@@ -17,12 +17,42 @@ use walkdir::WalkDir;
 use std::sync::mpsc;
 
 const NO_TIMEOUT_MS: u64 = u64::MAX;
+const DEFAULT_EXEC_TIMEOUT_MS: u64 = 120_000;  // 2 minutes default
+const MAX_EXEC_TIMEOUT_MS: u64 = 600_000;       // 10 minutes ceiling
 const PROCESS_POLL_MS: u64 = 250;
 const STATUS_REPORT_MS: u64 = 3_000;
 /// Kill a process after this long with zero stdout/stderr output.
 /// This catches hung SSH, stuck network calls, etc. while allowing
 /// legitimately long processes (Codex, cargo build) that produce output.
-const STALE_OUTPUT_THRESHOLD_MS: u64 = 600_000; // 10 minutes
+/// Reduced from 10 minutes now that we have proper per-command timeouts.
+const STALE_OUTPUT_THRESHOLD_MS: u64 = 180_000; // 3 minutes
+
+/// Classify a command and return an appropriate default timeout in milliseconds.
+/// Build tools and Codex get longer; network commands get shorter.
+fn classify_exec_timeout(command: &str) -> u64 {
+    let cmd = command.to_ascii_lowercase();
+    if cmd.starts_with("ssh ") || cmd.contains("| ssh ") { return 60_000; }
+    if cmd.starts_with("curl ") || cmd.starts_with("wget ") { return 30_000; }
+    if cmd.starts_with("cargo build") || cmd.starts_with("cargo test") || cmd.starts_with("cargo check")
+        || cmd.starts_with("npm install") || cmd.starts_with("npm run build") || cmd.starts_with("make") {
+        return 300_000;
+    }
+    if cmd.contains("codex") { return 600_000; }
+    DEFAULT_EXEC_TIMEOUT_MS
+}
+
+/// Inject SSH safety flags (ConnectTimeout, ServerAliveInterval, BatchMode)
+/// into commands that invoke `ssh` without already specifying ConnectTimeout.
+/// Only applies when `ssh` appears as a standalone command (at start or after a pipe).
+fn harden_ssh_in_command(command: &str) -> String {
+    let needs_hardening = (command.starts_with("ssh ") || command.contains(" ssh ") || command.contains("| ssh "))
+        && !command.contains("ConnectTimeout");
+    if needs_hardening {
+        command.replace("ssh ", "ssh -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o BatchMode=yes ")
+    } else {
+        command.to_string()
+    }
+}
 
 /// Result from wait_for_child_monitored — owns the captured output.
 struct ChildResult {
@@ -35,10 +65,14 @@ struct ChildResult {
 /// If the process produces no output for STALE_OUTPUT_THRESHOLD_MS, it is
 /// killed and a descriptive error is returned so the agent can inform the user.
 /// Long-running processes that actively produce output are never interrupted.
+///
+/// `timeout_ms` enforces a hard wall-clock deadline. Pass `NO_TIMEOUT_MS` to
+/// disable the hard timeout (stale-output detection still applies).
 fn wait_for_child_monitored(
     child: &mut std::process::Child,
     label: &str,
     cancel_token: &Arc<AtomicBool>,
+    timeout_ms: u64,
 ) -> Result<ChildResult, String> {
     let pid = child.id();
     let start = Instant::now();
@@ -104,8 +138,7 @@ fn wait_for_child_monitored(
     loop {
         // External cancellation
         if cancel_token.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::kill_process_tree(child);
             return Err(format!("{label} (pid={pid}) canceled"));
         }
 
@@ -128,6 +161,42 @@ fn wait_for_child_monitored(
                 let last_ms = last_activity.load(Ordering::Acquire);
                 let idle_ms = now_ms - last_ms;
 
+                // Hard timeout enforcement: wall-clock deadline exceeded → kill
+                if timeout_ms != NO_TIMEOUT_MS && now_ms >= timeout_ms {
+                    let total_s = now_ms / 1000;
+                    eprintln!(
+                        "[tool:{label}] pid={pid} timeout-killed: \
+                         exceeded {timeout_ms}ms deadline (ran {total_s}s)"
+                    );
+                    crate::kill_process_tree(child);
+                    thread::sleep(Duration::from_millis(100));
+                    let stdout = String::from_utf8_lossy(
+                        &stdout_buf.lock().unwrap_or_else(|e| e.into_inner()),
+                    )
+                    .to_string();
+                    let stderr = String::from_utf8_lossy(
+                        &stderr_buf.lock().unwrap_or_else(|e| e.into_inner()),
+                    )
+                    .to_string();
+                    let stdout_tail = if stdout.len() > 500 {
+                        &stdout[stdout.len() - 500..]
+                    } else {
+                        &stdout
+                    };
+                    let stderr_tail = if stderr.len() > 500 {
+                        &stderr[stderr.len() - 500..]
+                    } else {
+                        &stderr
+                    };
+                    return Err(format!(
+                        "Process timed out (pid {pid}): exceeded {timeout_ms}ms deadline \
+                         (ran {total_s}s). Consider increasing timeout_ms or using \
+                         background execution.\n\
+                         --- last stdout ---\n{stdout_tail}\n\
+                         --- last stderr ---\n{stderr_tail}"
+                    ));
+                }
+
                 // Stale-process detection: no output for threshold → kill
                 if idle_ms >= STALE_OUTPUT_THRESHOLD_MS {
                     let idle_min = idle_ms / 60_000;
@@ -136,8 +205,7 @@ fn wait_for_child_monitored(
                         "[tool:{label}] pid={pid} stale-killed: \
                          no output for {idle_min}m (total runtime {total_min}m)"
                     );
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::kill_process_tree(child);
                     thread::sleep(Duration::from_millis(100));
                     let stdout = String::from_utf8_lossy(
                         &stdout_buf.lock().unwrap_or_else(|e| e.into_inner()),
@@ -196,6 +264,7 @@ fn wait_for_child_monitored(
 
 use crate::{
     env_optional,
+    kill_process_tree,
     with_read_mem,
     with_write_mem,
     load_approvals,
@@ -974,11 +1043,21 @@ pub(crate) fn execute_tool_with_handles(
         "exec" => {
             let parsed: ToolExecArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let timeout_ms = parsed.timeout_ms.unwrap_or(NO_TIMEOUT_MS).max(1);
+            let timeout_ms = parsed.timeout_ms
+                .unwrap_or_else(|| classify_exec_timeout(&parsed.command))
+                .min(MAX_EXEC_TIMEOUT_MS)
+                .max(1);
             let estimated_ms = parsed.estimated_ms.unwrap_or(timeout_ms);
             let is_codex_session = parsed.command.to_ascii_lowercase().contains("codex");
             let should_background = parsed.background.unwrap_or(false)
                 || (is_codex_session && estimated_ms >= EXEC_BACKGROUND_THRESHOLD_MS);
+
+            // Codex-in-exec detection guardrail
+            let codex_warning = if parsed.command.contains("codex exec") || parsed.command.contains("codex --full-auto") {
+                Some("[ROUTING HINT: This command delegates to an LLM. Consider using subagent_invoke(name=\"coder\", prompt=\"...\") instead, which provides better timeout handling and memory access. Continuing with exec as requested.]\n\n")
+            } else {
+                None
+            };
 
             if should_background {
                 let response = submit_exec_background_job(
@@ -1003,17 +1082,24 @@ pub(crate) fn execute_tool_with_handles(
                     "estimated_ms": estimated_ms,
                     "timeout_ms": timeout_ms
                 });
+                let mut output = format!("background job started: {job_id}");
+                if let Some(warning) = codex_warning {
+                    output = format!("{warning}{output}");
+                }
                 return Ok(ToolExecution {
-                    output: format!("background job started: {job_id}"),
+                    output,
                     details,
                     is_error: false,
                 });
             }
 
+            // SSH hardening: inject safety flags before spawning
+            let hardened_command = harden_ssh_in_command(&parsed.command);
+
             let command = if cfg!(windows) {
-                vec!["cmd".to_string(), "/C".to_string(), parsed.command]
+                vec!["cmd".to_string(), "/C".to_string(), hardened_command]
             } else {
-                vec!["sh".to_string(), "-c".to_string(), parsed.command]
+                vec!["sh".to_string(), "-c".to_string(), hardened_command]
             };
             let mut cmd = build_external_command(&command[0], &command[1..]);
             if let Some(cwd) = parsed.cwd {
@@ -1024,7 +1110,7 @@ pub(crate) fn execute_tool_with_handles(
                 .stderr(Stdio::piped());
             let mut child = cmd.spawn().map_err(|e| format!("exec spawn: {e}"))?;
             let cancel_token = Arc::new(AtomicBool::new(false));
-            let result = wait_for_child_monitored(&mut child, "exec", &cancel_token)?;
+            let result = wait_for_child_monitored(&mut child, "exec", &cancel_token, timeout_ms)?;
             let stdout = result.stdout;
             let stderr = result.stderr;
             let is_error = !result.status.success();
@@ -1034,7 +1120,10 @@ pub(crate) fn execute_tool_with_handles(
                 "stdout": stdout,
                 "stderr": stderr
             });
-            let output_text = subprocess_output_text(&stdout, &stderr, is_error);
+            let mut output_text = subprocess_output_text(&stdout, &stderr, is_error);
+            if let Some(warning) = codex_warning {
+                output_text = format!("{warning}{output_text}");
+            }
             Ok(ToolExecution {
                 output: output_text,
                 details,
@@ -1194,7 +1283,7 @@ pub(crate) fn execute_tool_with_handles(
         "browser" => {
             let parsed: ToolBrowserArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let _timeout_ms = parsed.timeout_ms.unwrap_or(NO_TIMEOUT_MS);
+            let browser_timeout_ms = parsed.timeout_ms.unwrap_or(NO_TIMEOUT_MS);
             let session = parsed.session.unwrap_or_else(|| "default".to_string());
 
             let mut cmd_args: Vec<String> = vec!["--session".to_string(), session, "--".to_string()];
@@ -1212,7 +1301,7 @@ pub(crate) fn execute_tool_with_handles(
 
             let mut child = cmd.spawn().map_err(|e| format!("browser spawn: {e}"))?;
             let cancel_token = Arc::new(AtomicBool::new(false));
-            let result = wait_for_child_monitored(&mut child, "browser", &cancel_token)?;
+            let result = wait_for_child_monitored(&mut child, "browser", &cancel_token, browser_timeout_ms)?;
             let stdout = result.stdout;
             let stderr = result.stderr;
             let is_error = !result.status.success();
@@ -1348,15 +1437,13 @@ pub(crate) fn execute_tool_with_handles(
             let mut last_update = Instant::now();
             let tool_resp: serde_json::Value = loop {
                 if cancel_token.load(Ordering::Acquire) {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_process_tree(&mut child);
                     return Err("excalidraw: canceled while waiting for MCP response".into());
                 }
                 match rx.recv_timeout(Duration::from_millis(PROCESS_POLL_MS)) {
                     Ok(result) => {
                         // Thread completed; child will exit after stdin is dropped
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_process_tree(&mut child);
                         break result?;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1367,8 +1454,7 @@ pub(crate) fn execute_tool_with_handles(
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_process_tree(&mut child);
                         return Err("excalidraw: MCP worker channel disconnected".into());
                     }
                 }

@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -11,21 +12,144 @@ use crate::{
 };
 
 const CRITIC_SYSTEM_PROMPT: &str = "\
-You are a silent quality auditor for an AI agent. Your job is to evaluate whether \
-the agent's recent reasoning is grounded in evidence or drifting into overconfidence.\n\n\
-Evaluate the conversation and return JSON:\n\
-{\"grounded\": true/false, \"issues\": [...], \"correction\": \"...\"}\n\n\
-Flag as NOT grounded if the agent:\n\
-- Claims something is \"done\" or \"working\" without running a verification step\n\
-- Makes optimistic assumptions without checking (e.g., \"this should work\" without testing)\n\
-- Ignores or minimizes errors/failures in tool output\n\
-- Over-engineers or adds scope beyond what was asked\n\
-- Reports success on aspirational claims (deployed, optimized, complete) without evidence\n\
-- Takes destructive or irreversible actions without confirming with the user\n\
-- Spins on the same approach after repeated failures instead of changing strategy\n\n\
-If grounded, return {\"grounded\": true}. If not, write a terse correction (1-2 sentences) \
-that steers back to reality. Do NOT reveal you are a separate critic — write as a \
-system reminder.";
+You are a silent quality monitor embedded in an AI agent's runtime. Your job is to verify \
+the agent's claims against actual evidence in the conversation.\n\n\
+EVALUATION CRITERIA (check ALL):\n\
+1. FABRICATION: Does the agent claim specific details (file paths, config values, error messages, \
+identifiers, version numbers, boot sequences) that do NOT appear in any tool output?\n\
+2. OVERCLAIMING: Does the agent say tools succeeded when they actually failed or returned errors?\n\
+3. UNACKNOWLEDGED FAILURES: Did a tool call fail (non-zero exit, error text) and the agent \
+did not address it?\n\
+4. SCOPE CREEP: Is the agent doing work far beyond what the user requested?\n\
+5. PHANTOM CAPABILITIES: Does the agent claim to be doing something (\"launching a swarm\", \
+\"deploying agents\") when the tool outputs show no evidence of it?\n\n\
+RESPONSE FORMAT — return ONLY this JSON:\n\
+{\"grounded\": true/false, \"issues\": [\"specific issue with evidence quote\"], \
+\"agent_claim\": \"what the agent claimed (quote)\", \
+\"evidence_shows\": \"what the tool output actually says (quote)\", \
+\"correction\": \"specific behavioral instruction\"}\n\n\
+If grounded=true, issues/agent_claim/evidence_shows/correction can be empty arrays/strings.\n\
+If grounded=false, you MUST include at least one issue with specific quotes from the conversation.\n\
+Do NOT return anything outside this JSON structure.";
+
+// Critic circuit breaker: after N consecutive failures, skip critic for rest of session
+static CRITIC_CONSECUTIVE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+const CRITIC_MAX_CONSECUTIVE_FAILURES: usize = 3;
+
+// ---------------------------------------------------------------------------
+// Image validation
+// ---------------------------------------------------------------------------
+
+fn validate_image_base64(media_type: &str, b64_data: &str) -> Result<(), String> {
+    // 1. Check media type is supported
+    let valid_types = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+    if !valid_types.contains(&media_type) {
+        return Err(format!("unsupported media type: {media_type}"));
+    }
+
+    // 2. Check base64 is not empty and has reasonable length
+    if b64_data.len() < 20 {
+        return Err("base64 data too short".into());
+    }
+
+    // 3. Check decoded size (base64 is ~4/3 of raw, so 5MB raw = ~6.7MB base64)
+    if b64_data.len() > 7_000_000 {
+        return Err("image exceeds 5MB limit".into());
+    }
+
+    // 4. Try to decode first 16 bytes and check magic bytes
+    use base64::Engine;
+    let prefix = &b64_data[..b64_data.len().min(24)]; // 24 b64 chars = 18 raw bytes
+    match base64::engine::general_purpose::STANDARD.decode(prefix) {
+        Ok(bytes) if bytes.len() >= 4 => {
+            let valid_magic = match media_type {
+                "image/png" => bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
+                "image/jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+                "image/gif" => bytes.starts_with(b"GIF8"),
+                "image/webp" => {
+                    bytes.len() >= 12
+                        && &bytes[0..4] == b"RIFF"
+                        && &bytes[8..12] == b"WEBP"
+                }
+                _ => false,
+            };
+            if !valid_magic {
+                return Err(format!("magic bytes don't match {media_type}"));
+            }
+            Ok(())
+        }
+        Ok(_) => Err("decoded image too small".into()),
+        Err(e) => Err(format!("invalid base64: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request repair for 400 errors (strips problematic image blocks)
+// ---------------------------------------------------------------------------
+
+fn repair_request_for_400(messages: &mut Vec<serde_json::Value>, error_body: &str) -> bool {
+    let lower = error_body.to_lowercase();
+    if lower.contains("base64")
+        || lower.contains("could not process image")
+        || lower.contains("image")
+    {
+        // Strip all image content blocks from messages
+        let mut stripped = false;
+        for msg in messages.iter_mut() {
+            if let Some(content) = msg.get_mut("content") {
+                if let Some(arr) = content.as_array_mut() {
+                    let before = arr.len();
+                    arr.retain(|block| {
+                        block.get("type").and_then(|t| t.as_str()) != Some("image")
+                    });
+                    if arr.len() < before {
+                        stripped = true;
+                        // Add a text block noting images were removed
+                        arr.push(serde_json::json!({"type": "text", "text": "[Images removed due to processing error]"}));
+                    }
+                    // If all content was images and was stripped, ensure at least one text block
+                    if arr.is_empty() {
+                        arr.push(serde_json::json!({"type": "text", "text": "[Images removed due to processing error]"}));
+                        stripped = true;
+                    }
+                }
+            }
+        }
+        return stripped;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Lenient JSON extraction for critic verdicts
+// ---------------------------------------------------------------------------
+
+fn extract_critic_json(text: &str) -> Option<serde_json::Value> {
+    let clean = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(clean) {
+        return Some(v);
+    }
+    // Try to find JSON object within text
+    if let Some(start) = clean.find('{') {
+        if let Some(end) = clean.rfind('}') {
+            if start < end {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&clean[start..=end]) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Message conversion helpers
+// ---------------------------------------------------------------------------
 
 pub(crate) fn collect_system_blocks(messages: &[AgentMessage]) -> Vec<String> {
     let mut blocks = Vec::new();
@@ -65,14 +189,26 @@ pub(crate) fn to_anthropic_messages(messages: &[AgentMessage]) -> Vec<serde_json
                             if let Some(colon) = marker_content.find(':') {
                                 let media_type = &marker_content[..colon];
                                 let b64_data = &marker_content[colon + 1..];
-                                blocks.push(serde_json::json!({
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": media_type,
-                                        "data": b64_data
+                                // Validate image before creating block
+                                match validate_image_base64(media_type, b64_data) {
+                                    Ok(()) => {
+                                        blocks.push(serde_json::json!({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": media_type,
+                                                "data": b64_data
+                                            }
+                                        }));
                                     }
-                                }));
+                                    Err(reason) => {
+                                        eprintln!("[to_anthropic_messages] image validation failed: {reason}");
+                                        blocks.push(serde_json::json!({
+                                            "type": "text",
+                                            "text": format!("[Image could not be included: {reason}]")
+                                        }));
+                                    }
+                                }
                             }
                             remaining = &after_prefix[end + 1..];
                         } else {
@@ -317,6 +453,8 @@ pub(crate) fn call_claude(
 
     let retryable = |status: u16| matches!(status, 429 | 500 | 502 | 503 | 504 | 529);
     let mut body = None;
+    // Track 400 error body for potential repair
+    let mut last_400_body: Option<String> = None;
 
     for attempt in 0..=max_retries {
         let mut request = agent
@@ -337,6 +475,11 @@ pub(crate) fn call_claude(
             Err(ureq::Error::Status(code, resp)) => {
                 let retry_after = parse_retry_after(&resp);
                 let text = resp.into_string().unwrap_or_default();
+                if code == 400 {
+                    eprintln!("[call_claude] got 400 from primary: {text}");
+                    last_400_body = Some(text);
+                    break; // don't retry 400s in the normal loop — handled below via repair
+                }
                 if attempt < max_retries && retryable(code) {
                     let mut delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
                     if let Some(retry_after) = retry_after {
@@ -364,10 +507,99 @@ pub(crate) fn call_claude(
         }
     }
 
-    // If primary model failed, try fallback model
+    // REPAIR on 400: try to fix the request and retry primary once
+    if body.is_none() {
+        if let Some(ref error_text) = last_400_body {
+            // Clone the messages array from the payload for repair
+            let mut repaired_messages: Vec<serde_json::Value> = payload
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            if repair_request_for_400(&mut repaired_messages, error_text) {
+                eprintln!("[call_claude] repaired request (stripped images), retrying primary once");
+                let mut repaired_payload = payload.clone();
+                repaired_payload["messages"] = serde_json::json!(repaired_messages);
+
+                let mut req = agent
+                    .post(&base_url)
+                    .set("content-type", "application/json")
+                    .set("x-api-key", &api_key)
+                    .set("anthropic-version", &version);
+                if !beta_values.is_empty() {
+                    req = req.set("anthropic-beta", &beta_values.join(","));
+                }
+                match req.send_json(repaired_payload.clone()) {
+                    Ok(resp) => {
+                        body = Some(resp.into_string()?);
+                        // Update payload for downstream fallbacks if needed
+                        payload = repaired_payload;
+                    }
+                    Err(ureq::Error::Status(code, resp)) => {
+                        let text = resp.into_string().unwrap_or_default();
+                        eprintln!("[call_claude] repaired request also failed: {code} {text}");
+                        // Update payload so Vertex/Sonnet use the repaired version
+                        payload = repaired_payload;
+                    }
+                    Err(ureq::Error::Transport(err)) => {
+                        eprintln!("[call_claude] repaired request transport error: {err}");
+                        payload = repaired_payload;
+                    }
+                }
+            }
+        }
+    }
+
+    // Vertex proxy — same model, different endpoint (tried BEFORE Sonnet fallback)
+    if body.is_none() {
+        let vertex_url = env_optional("VERTEX_FALLBACK_URL")
+            .unwrap_or_else(|| "http://localhost:11436/v1/messages".to_string());
+        let vertex_enabled = env_optional("VERTEX_FALLBACK").unwrap_or_else(|| "1".to_string()) == "1";
+        if vertex_enabled {
+            eprintln!("Anthropic direct failed, falling back to Vertex proxy at {vertex_url}");
+            payload["model"] = serde_json::json!(model);
+            let vertex_key = env_optional("VERTEX_API_KEY").unwrap_or_else(|| api_key.clone());
+            for attempt in 0..=max_retries {
+                let mut request = agent
+                    .post(&vertex_url)
+                    .set("content-type", "application/json")
+                    .set("x-api-key", &vertex_key)
+                    .set("anthropic-version", &version);
+                if !beta_values.is_empty() {
+                    request = request.set("anthropic-beta", &beta_values.join(","));
+                }
+                match request.send_json(payload.clone()) {
+                    Ok(resp) => {
+                        body = Some(resp.into_string()?);
+                        break;
+                    }
+                    Err(ureq::Error::Status(code, resp)) => {
+                        let text = resp.into_string().unwrap_or_default();
+                        if attempt == max_retries {
+                            eprintln!("[call_claude] Vertex fallback failed: {code} {text}");
+                        } else {
+                            let delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
+                            thread::sleep(Duration::from_secs_f64(delay));
+                        }
+                    }
+                    Err(ureq::Error::Transport(err)) => {
+                        if attempt == max_retries {
+                            eprintln!("[call_claude] Vertex fallback transport error: {err}");
+                        } else {
+                            let delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
+                            thread::sleep(Duration::from_secs_f64(delay));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sonnet fallback — last resort, different (cheaper/faster) model
     if body.is_none() {
         if let Ok(fallback_model) = std::env::var("ANTHROPIC_FALLBACK_MODEL") {
-            eprintln!("Primary model failed, trying fallback: {fallback_model}");
+            eprintln!("All primary endpoints failed, trying Sonnet fallback: {fallback_model}");
             payload["model"] = serde_json::json!(fallback_model);
             for attempt in 0..=1 {
                 let mut request = agent
@@ -401,50 +633,7 @@ pub(crate) fn call_claude(
         }
     }
 
-    // If both primary and fallback model failed, try Vertex proxy as last resort.
-    if body.is_none() {
-        let vertex_url = env_optional("VERTEX_FALLBACK_URL")
-            .unwrap_or_else(|| "http://localhost:11436/v1/messages".to_string());
-        let vertex_enabled = env_optional("VERTEX_FALLBACK").unwrap_or_else(|| "1".to_string()) == "1";
-        if vertex_enabled {
-            eprintln!("Anthropic direct failed, falling back to Vertex proxy at {vertex_url}");
-            payload["model"] = serde_json::json!(model);
-            let vertex_key = env_optional("VERTEX_API_KEY").unwrap_or_else(|| api_key.clone());
-            for attempt in 0..=max_retries {
-                let mut request = agent
-                    .post(&vertex_url)
-                    .set("content-type", "application/json")
-                    .set("x-api-key", &vertex_key)
-                    .set("anthropic-version", &version);
-                if !beta_values.is_empty() {
-                    request = request.set("anthropic-beta", &beta_values.join(","));
-                }
-                match request.send_json(payload.clone()) {
-                    Ok(resp) => {
-                        body = Some(resp.into_string()?);
-                        break;
-                    }
-                    Err(ureq::Error::Status(code, resp)) => {
-                        let text = resp.into_string().unwrap_or_default();
-                        if attempt == max_retries {
-                            return Err(format!("Vertex fallback also failed: {code} {text}").into());
-                        }
-                        let delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
-                        thread::sleep(Duration::from_secs_f64(delay));
-                    }
-                    Err(ureq::Error::Transport(err)) => {
-                        if attempt == max_retries {
-                            return Err(format!("Vertex fallback transport error: {err}").into());
-                        }
-                        let delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
-                        thread::sleep(Duration::from_secs_f64(delay));
-                    }
-                }
-            }
-        }
-    }
-
-    let body = body.ok_or("All API endpoints failed (Anthropic direct + Vertex fallback)")?;
+    let body = body.ok_or("All API endpoints failed (Anthropic direct + Vertex + Sonnet fallback)")?;
     let payload: serde_json::Value = serde_json::from_str(&body)?;
     parse_claude_response(&payload)
 }
@@ -474,6 +663,12 @@ pub(crate) fn call_critic(
         return None;
     }
 
+    // Circuit breaker: skip critic after too many consecutive failures
+    if CRITIC_CONSECUTIVE_FAILURES.load(Ordering::Relaxed) >= CRITIC_MAX_CONSECUTIVE_FAILURES {
+        eprintln!("[critic] circuit breaker open — skipping for rest of session");
+        return None;
+    }
+
     let api_key = env_optional("CRITIC_API_KEY")
         .or_else(|| env_optional("ANTHROPIC_API_KEY"))?;
     let model = env_optional("CRITIC_MODEL")
@@ -485,7 +680,7 @@ pub(crate) fn call_critic(
         .unwrap_or(15_000);
     let max_tokens: u64 = env_optional("CRITIC_MAX_TOKENS")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(512);
+        .unwrap_or(1024);
     let context_turns: usize = env_optional("CRITIC_CONTEXT_TURNS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(6);
@@ -525,7 +720,7 @@ pub(crate) fn call_critic(
     for msg in recent_slice {
         let role = &msg.role;
         let content = msg.content.as_deref().unwrap_or("");
-        let preview: String = content.chars().take(500).collect();
+        let preview: String = content.chars().take(2000).collect();
         context_text.push_str(&format!("[{role}] {preview}\n\n"));
     }
 
@@ -559,11 +754,13 @@ pub(crate) fn call_critic(
             Ok(b) => b,
             Err(e) => {
                 eprintln!("[critic] response read error: {e}");
+                CRITIC_CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         },
         Err(e) => {
             eprintln!("[critic] API error: {e}");
+            CRITIC_CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             return None;
         }
     };
@@ -572,6 +769,7 @@ pub(crate) fn call_critic(
         Ok(v) => v,
         Err(e) => {
             eprintln!("[critic] JSON parse error: {e}");
+            CRITIC_CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             return None;
         }
     };
@@ -583,21 +781,18 @@ pub(crate) fn call_critic(
         .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
         .and_then(|b| b.get("text").and_then(|t| t.as_str()))?;
 
-    // Parse the critic's JSON verdict (strip markdown fences if present)
-    let clean_text = text
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-
-    let verdict: serde_json::Value = match serde_json::from_str(clean_text) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[critic] verdict parse error: {e}");
+    // Parse the critic's JSON verdict using lenient extractor
+    let verdict = match extract_critic_json(text) {
+        Some(v) => v,
+        None => {
+            eprintln!("[critic] verdict parse error: could not extract JSON from response");
+            CRITIC_CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             return None;
         }
     };
+
+    // Success — reset circuit breaker
+    CRITIC_CONSECUTIVE_FAILURES.store(0, Ordering::Relaxed);
 
     let grounded = verdict
         .get("grounded")
@@ -619,7 +814,19 @@ pub(crate) fn call_critic(
                 .join("; ")
         })
         .unwrap_or_default();
-    eprintln!("[critic] grounded=false issues=[{issues}]");
+
+    let agent_claim = verdict
+        .get("agent_claim")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let evidence_shows = verdict
+        .get("evidence_shows")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    eprintln!(
+        "[critic] grounded=false issues=[{issues}] claim=[{agent_claim}] evidence=[{evidence_shows}]"
+    );
 
     verdict
         .get("correction")

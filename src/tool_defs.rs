@@ -247,15 +247,15 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "exec",
-            "description": "Execute a shell command on the host (use with care).",
+            "description": "Execute a shell command. Default timeout: 2 minutes. SSH commands auto-timeout at 60s. Build commands (cargo, npm, make) get 5 minutes. Set timeout_ms to override. Use background=true for commands expected to run >5 minutes. Do NOT use exec to spawn LLM processes (codex, ollama) — use subagent_invoke or subagent_batch instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string" },
+                    "command": { "type": "string", "description": "Shell command to execute. For LLM delegation, use subagent_invoke instead." },
                     "cwd": { "type": "string" },
-                    "timeout_ms": { "type": "integer" },
-                    "estimated_ms": { "type": "integer", "description": "Optional runtime estimate used by background scheduling (milliseconds)." },
-                    "background": { "type": "boolean", "description": "Force background execution even below five-minute threshold." }
+                    "timeout_ms": { "type": "integer", "description": "Hard timeout in ms. Default: 120000 (2min). Max: 600000 (10min). SSH auto-gets 60s, builds auto-get 300s. Use background=true for longer." },
+                    "estimated_ms": { "type": "integer", "description": "Expected runtime in ms. Helps the system choose appropriate monitoring." },
+                    "background": { "type": "boolean", "description": "Run in background job queue. Required for commands expected to run >10 minutes. Returns a job ID for status checking." }
                 },
                 "required": ["command"]
             }
@@ -484,34 +484,34 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "subagent_list",
-            "description": "List configured subagents with their names, descriptions, and capabilities. Call this first to see what specialists are available before using subagent_invoke or subagent_batch.",
+            "description": "List all configured subagents with their capabilities, tools, and limits. ALWAYS call this before using subagent_invoke or subagent_batch to discover available specialists. Returns name, description, allowed tools, max_steps, and timeout for each subagent.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         serde_json::json!({
             "name": "subagent_invoke",
-            "description": "Invoke a named subagent with a prompt. The subagent runs in its own session with independent memory access. Use subagent_list first to see available subagents and their descriptions.",
+            "description": "Invoke a named subagent to perform a task. PREFERRED method for delegating work — use this instead of exec for any LLM/AI delegation. The subagent runs with its own session, tools, and memory. Example: subagent_invoke(name='coder', prompt='Write a Python script that...') delegates to the Codex-powered coding agent. Call subagent_list first to see available agents.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "Name of a configured subagent (from subagent_list)" },
-                    "prompt": { "type": "string", "description": "The task/prompt to send to the subagent" },
+                    "name": { "type": "string", "description": "Name of the subagent to invoke. Must match a configured subagent from subagent_list." },
+                    "prompt": { "type": "string", "description": "Detailed task description for the subagent. Be specific — the subagent has its own context." },
                     "system": { "type": "string", "description": "Override the subagent's system prompt" },
                     "model_hook": { "type": "string", "description": "Override the subagent's model hook" },
-                    "max_steps": { "type": "integer", "description": "Override max agent loop iterations" },
-                    "timeout_secs": { "type": "integer", "description": "Hard timeout in seconds" }
+                    "max_steps": { "type": "integer", "description": "Override max reasoning steps for this invocation. Default: from subagent config, fallback 64." },
+                    "timeout_secs": { "type": "integer", "description": "Hard timeout in seconds. Default: from subagent config. The invocation is killed if exceeded." }
                 },
                 "required": ["name", "prompt"]
             }
         }),
         serde_json::json!({
             "name": "subagent_batch",
-            "description": "Invoke multiple subagents concurrently. Each runs in its own thread with independent memory access. Returns all results once every subagent completes. Use for parallel fan-out of independent tasks.",
+            "description": "Invoke multiple subagents concurrently for parallel fan-out. PREFERRED over multiple exec calls for parallel LLM work. Each invocation runs independently. Example: fan out research to 'researcher' and coding to 'coder' simultaneously. Use max_concurrent to limit parallelism.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "invocations": {
                         "type": "array",
-                        "description": "Array of subagent invocations to run concurrently",
+                        "description": "Array of subagent invocations to run concurrently. Each has name, prompt, and optional overrides.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -525,7 +525,7 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
                             "required": ["name", "prompt"]
                         }
                     },
-                    "max_concurrent": { "type": "integer", "description": "Max threads to run at once (default: all)" }
+                    "max_concurrent": { "type": "integer", "description": "Maximum concurrent subagents. Default: all at once. Set lower to reduce resource usage." }
                 },
                 "required": ["invocations"]
             }

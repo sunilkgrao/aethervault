@@ -461,6 +461,16 @@ pub(crate) struct ReminderState {
     pub(crate) reminder_ignored_count: usize,
 }
 
+/// Tracks a single critic correction event within an agent session.
+/// Used to build a history of corrections for escalation and audit.
+#[derive(Debug, Clone)]
+pub(crate) struct CriticCorrection {
+    pub(crate) step: usize,
+    pub(crate) issues: Vec<String>,
+    pub(crate) correction_text: String,
+    pub(crate) acknowledged: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct DriftState {
     pub(crate) ema: f32,
@@ -468,6 +478,9 @@ pub(crate) struct DriftState {
     pub(crate) violations: HashMap<String, usize>,
     pub(crate) reminder_violations: usize,
     pub(crate) last_score: f32,
+    /// History of critic corrections issued during this session.
+    /// Used by the agent loop to track escalation and decide critic frequency.
+    pub(crate) critic_history: Vec<CriticCorrection>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

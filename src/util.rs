@@ -277,14 +277,48 @@ pub(crate) fn command_wrapper() -> Option<Vec<String>> {
 }
 
 pub(crate) fn build_external_command(program: &str, args: &[String]) -> ProcessCommand {
-    if let Some(wrapper) = command_wrapper() {
-        let mut cmd = ProcessCommand::new(&wrapper[0]);
-        cmd.args(&wrapper[1..]).arg(program).args(args);
-        return cmd;
+    let mut cmd = if let Some(wrapper) = command_wrapper() {
+        let mut c = ProcessCommand::new(&wrapper[0]);
+        c.args(&wrapper[1..]).arg(program).args(args);
+        c
+    } else {
+        let mut c = ProcessCommand::new(program);
+        c.args(args);
+        c
+    };
+
+    // Process group isolation: the child becomes its own process group leader
+    // so we can kill the entire tree without affecting the parent.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
-    let mut cmd = ProcessCommand::new(program);
-    cmd.args(args);
+
     cmd
+}
+
+/// Kill a child process and its entire process group.
+/// On Unix, sends SIGTERM first for graceful shutdown, then SIGKILL after 2 seconds.
+#[cfg(unix)]
+pub(crate) fn kill_process_tree(child: &mut std::process::Child) {
+    let pid = child.id() as i32;
+    // SIGTERM the group first (graceful)
+    unsafe { libc::kill(-pid, libc::SIGTERM); }
+    // Give 2 seconds for graceful shutdown
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    // SIGKILL if still running
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        _ => { unsafe { libc::killpg(pid, libc::SIGKILL); } }
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+pub(crate) fn kill_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Build a descriptive exit code value for subprocess results.

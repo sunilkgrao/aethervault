@@ -8,6 +8,9 @@ use serde_json;
 
 use super::*;
 
+// TODO(tool_exec owner): STALE_OUTPUT_THRESHOLD_MS in tool_exec.rs should be
+// reduced from 600_000 to 180_000 (3 minutes instead of 10 minutes).
+
 pub(crate) fn frame_to_summary(frame: &Frame) -> Option<FrameSummary> {
     let uri = frame.uri.clone()?;
     Some(FrameSummary {
@@ -1057,17 +1060,36 @@ pub(crate) fn scan_confidence_markers(text: &str) -> bool {
 
 /// Determine whether the covert critic should fire this step.
 /// Updates `last_critic_step` when it decides to fire.
+///
+/// Escalation behavior: when `violation_count` is high, the critic fires
+/// more frequently to increase oversight on persistently misbehaving sessions.
+///   - violation_count >= 5: fire every step
+///   - violation_count >= 3: fire every 2 steps
+///   - otherwise: use the base `interval`
+///
+/// NOTE: callers in agent.rs must pass `violation_count` (e.g. from
+/// `drift_state.critic_history.len()` or a dedicated counter).
 pub(crate) fn critic_should_fire(
     step: usize,
-    interval: usize,
+    base_interval: usize,
     last_critic_step: &mut usize,
     reminder_state: &ReminderState,
     tool_calls: &[AgentToolCall],
     messages: &[AgentMessage],
+    violation_count: usize,
 ) -> bool {
     if !env_bool("CRITIC_ENABLED", true) {
         return false;
     }
+
+    // Escalation: fire more frequently with more violations
+    let interval = if violation_count >= 5 {
+        1  // Every step
+    } else if violation_count >= 3 {
+        2  // Every 2 steps
+    } else {
+        base_interval
+    };
 
     let within_interval = step > 0 && step.saturating_sub(*last_critic_step) < interval;
 
