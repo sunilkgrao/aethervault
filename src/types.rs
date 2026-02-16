@@ -400,6 +400,14 @@ pub(crate) struct ContinuationCheckpoint {
     pub(crate) chain_depth: usize,
 }
 
+/// A skill pattern distilled from an agent trajectory by the SkillRL system.
+#[derive(Debug, Deserialize)]
+pub(crate) struct DistilledSkill {
+    pub(crate) title: String,
+    pub(crate) principle: String,
+    pub(crate) when_to_apply: String,
+}
+
 pub(crate) struct AgentProgress {
     pub(crate) step: usize,
     pub(crate) max_steps: usize,

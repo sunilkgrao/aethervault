@@ -167,25 +167,39 @@ pub(crate) fn export_capsule_memory(
         }
     }
     if include_daily {
+        use aether_core::types::SearchRequest;
+
         let daily_dir = workspace.join("memory");
         fs::create_dir_all(&daily_dir)?;
-        let total = mem.frame_count() as u64;
-        for frame_id in 0..total {
-            let frame = match mem.frame_by_id(frame_id) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let Some(uri) = frame.uri.as_deref() else {
-                continue;
-            };
-            if !uri.starts_with("aethervault://memory/daily/") {
-                continue;
-            }
-            if let Some(name) = uri.rsplit('/').next() {
-                let path = daily_dir.join(name);
-                if let Ok(text) = mem.frame_text_by_id(frame_id) {
-                    fs::write(&path, text)?;
-                    paths.push(path.display().to_string());
+
+        // Use scoped search instead of O(n) linear scan over all frames.
+        let request = SearchRequest {
+            query: "track:aethervault.memory".to_string(),
+            top_k: 500,
+            snippet_chars: 0,
+            uri: None,
+            scope: Some("aethervault://memory/daily/".to_string()),
+            cursor: None,
+            temporal: None,
+            as_of_frame: None,
+            as_of_ts: None,
+            no_sketch: true,
+        };
+
+        if let Ok(response) = mem.search(request) {
+            for hit in &response.hits {
+                let frame = match mem.frame_by_id(hit.frame_id) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                let Some(uri) = frame.uri.as_deref() else { continue };
+                if !uri.starts_with("aethervault://memory/daily/") { continue; }
+                if let Some(name) = uri.rsplit('/').next() {
+                    let path = daily_dir.join(name);
+                    if let Ok(text) = mem.frame_text_by_id(hit.frame_id) {
+                        fs::write(&path, text)?;
+                        paths.push(path.display().to_string());
+                    }
                 }
             }
         }

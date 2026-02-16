@@ -26,6 +26,7 @@ use crate::{
     ContinuationCheckpoint,
     DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
     ToolExecution,
+    open_skill_db, list_skills, search_skills, record_skill_use,
 };
 
 /// Tracks blake3 hashes of observations already written this process lifetime.
@@ -211,11 +212,26 @@ pub(crate) fn default_system_prompt() -> String {
         "Sensitive actions require approval. If a tool returns `approval required: <id>`, this is NOT an error — ask the user to approve or reject via `approve <id>` or `reject <id>`.",
         "For specialist or parallel work: call subagent_list to see configured subagents. If subagents exist, use subagent_batch for parallel fan-out or subagent_invoke for single delegation. Each subagent has a description explaining when to use it.",
         "",
-        "## Implementation Strategy: Maximize Parallelism",
-        "For complex tasks, parallelize aggressively:",
-        "- Check subagent_list. If subagents exist, use subagent_batch to fan out independent work in parallel.",
-        "- If no subagents are configured, use parallel exec calls to run independent tasks concurrently.",
-        "- Decompose large tasks into independent pieces and run them simultaneously.",
+        "## Implementation Strategy: Delegate First, Audit Second",
+        "You are the orchestrator, not the worker. Your primary role is to decompose tasks, delegate to subagents, and audit results.",
+        "",
+        "### Delegation Protocol",
+        "1. For ANY non-trivial task (research, debugging, coding, analysis, troubleshooting), delegate to subagents via subagent_invoke or subagent_batch.",
+        "2. Subagents (especially the coder agent) use Codex internally at ZERO token cost. Your main loop uses Opus — expensive. Delegate aggressively to save cost.",
+        "3. Subagents can themselves spawn further sub-agents and Codex swarms. A single subagent_invoke can trigger a tree of parallel workers.",
+        "4. Use subagent_batch to fan out independent work in parallel. Decompose large tasks into independent pieces and run them simultaneously.",
+        "5. After subagents return, YOUR job is to audit, synthesize, and verify — not to redo their work.",
+        "",
+        "### When to Delegate vs Do Directly",
+        "- DELEGATE: research, code writing, debugging, file exploration, log analysis, troubleshooting, complex reasoning, multi-file changes",
+        "- DO DIRECTLY: simple tool calls (memory, search, single file read), conversational responses, quick config changes, single exec commands",
+        "- RULE OF THUMB: If you're about to reason through more than 3 steps or read more than 3 files, delegate instead.",
+        "",
+        "### Swarm Pattern for Complex Tasks",
+        "For complex tasks, use subagent_batch to spawn multiple specialists in parallel:",
+        "- One agent researches, another codes, a third reviews — all simultaneously.",
+        "- Each subagent can spawn its own Codex sub-workers, creating a tree of parallel execution.",
+        "- You orchestrate and audit the final results.",
         "- NEVER describe a fallback plan. If something isn't available, silently use the next best approach.",
         "",
         "## Mid-Run User Messages",
@@ -257,10 +273,11 @@ pub(crate) fn default_system_prompt() -> String {
         "## Request Triage",
         "Before using tools, classify the request:",
         "- Conversational (greeting, thanks, status check): Respond directly. No tools needed.",
-        "- Clear bounded task (specific file, command, question): Execute directly, report results.",
+        "- Clear bounded task (single file, one command, quick lookup): Execute directly, report results.",
         "- Ambiguous/vague request (unclear scope, vague pronouns like 'this'/'everything'): Ask 1-2 clarifying questions BEFORE acting.",
-        "- Complex multi-step task: Create a 3-5 step plan, share it, get confirmation, then execute incrementally.",
+        "- Complex multi-step task (research, multi-file code, debugging, troubleshooting): Decompose and DELEGATE to subagents. You orchestrate, they execute.",
         "Do NOT launch extensive tool use for greetings or vague requests.",
+        "Do NOT execute complex tasks step-by-step in your main loop when subagents can do it cheaper and faster.",
     ]
     .join("\n")
 }
@@ -418,6 +435,7 @@ pub(crate) fn run_agent_with_prompt(
         load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default()
     };
     let agent_cfg = config.agent.clone().unwrap_or_default();
+    let agent_workspace = resolve_workspace(None, &agent_cfg);
     let hook_cfg = config.hooks.clone().unwrap_or_default();
     let model_spec = resolve_hook_spec(
         model_hook,
@@ -459,6 +477,42 @@ pub(crate) fn run_agent_with_prompt(
         }
     }
 
+    // --- SkillRL R1: Auto-inject top skills into stable prefix ---
+    if let Some(workspace) = resolve_workspace(None, &agent_cfg) {
+        let db_path = workspace.join("skills.sqlite");
+        if db_path.exists() {
+            if let Ok(conn) = open_skill_db(&db_path) {
+                let general = list_skills(&conn, 3);
+                let prompt_words: String = prompt_text
+                    .split_whitespace()
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let task_specific = search_skills(&conn, &prompt_words, 3);
+                let mut skill_block = String::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                for s in general.iter().chain(task_specific.iter()) {
+                    if !seen.insert(s.name.clone()) {
+                        continue;
+                    }
+                    skill_block.push_str(&format!(
+                        "- **{}**: {} (trigger: {}, success: {:.0}%, used {}x)\n",
+                        s.name,
+                        s.notes.as_deref().unwrap_or(""),
+                        s.trigger.as_deref().unwrap_or("any"),
+                        s.success_rate * 100.0,
+                        s.times_used
+                    ));
+                }
+                if !skill_block.is_empty() {
+                    system_prompt.push_str("\n\n# Learned Skills\n");
+                    system_prompt.push_str("These are proven strategies from past experience. Apply them when their trigger conditions match.\n\n");
+                    system_prompt.push_str(&skill_block);
+                }
+            }
+        }
+    }
+
     if let Some(global_context) = config.context {
         if !global_context.trim().is_empty() {
             system_prompt.push_str("\n\n# Global Context\n");
@@ -473,14 +527,26 @@ pub(crate) fn run_agent_with_prompt(
     if long_run_mode {
         system_prompt.push_str(concat!(
             "\n\n## Resource Guide — Long-Running Tasks\n",
-            "For delegation, ALWAYS use the subagent system (not raw exec for LLM work):\n",
-            "- subagent_invoke(name=\"researcher\", prompt=\"...\") for research and analysis\n",
-            "- subagent_invoke(name=\"coder\", prompt=\"...\") for coding tasks (uses Codex internally)\n",
-            "- subagent_invoke(name=\"critic\", prompt=\"...\") for review and quality checking\n",
-            "- subagent_batch(invocations=[...]) for parallel fan-out of independent tasks\n",
-            "- The coder subagent handles Codex CLI integration internally via model_hook\n",
-            "Reserve exec for: shell commands, file operations, service management — NOT for LLM delegation.\n",
-            "If you need to run multiple research or coding tasks in parallel, use subagent_batch, not multiple exec calls.\n",
+            "You are the orchestrator. Subagents are your workforce. Delegate everything non-trivial.\n\n",
+            "### Delegation Hierarchy\n",
+            "- subagent_invoke(name=\"researcher\", prompt=\"...\") — research, analysis, exploration. Zero token cost.\n",
+            "- subagent_invoke(name=\"coder\", prompt=\"...\") — coding, debugging, implementation. Uses Codex internally. Zero token cost.\n",
+            "- subagent_invoke(name=\"critic\", prompt=\"...\") — review, audit, quality checking. Zero token cost.\n",
+            "- subagent_batch(invocations=[...]) — parallel fan-out of independent tasks. Massively parallel.\n\n",
+            "### Cost Model\n",
+            "- YOUR main loop: Opus tokens. Expensive. Use for orchestration, auditing results, user communication.\n",
+            "- Subagents: Codex tokens. FREE. Use for ALL heavy lifting — research, coding, debugging, troubleshooting.\n",
+            "- A coder subagent can itself spawn Codex sub-workers, creating nested parallelism at zero marginal cost.\n\n",
+            "### Anti-Patterns (Do NOT)\n",
+            "- Do NOT troubleshoot complex issues step-by-step in your main loop. Delegate to a subagent.\n",
+            "- Do NOT read 5+ files sequentially to understand a codebase. Spawn a researcher subagent.\n",
+            "- Do NOT write multi-file code changes yourself. Spawn a coder subagent.\n",
+            "- Do NOT use exec to invoke codex/ollama directly. Use subagent_invoke instead.\n\n",
+            "### Correct Pattern\n",
+            "1. Decompose the task into independent subtasks.\n",
+            "2. Use subagent_batch to run them in parallel.\n",
+            "3. Audit the results. Verify quality. Report to user.\n",
+            "Reserve exec for: shell commands, file operations, service management — NOT for LLM work.\n",
         ));
     }
 
@@ -721,6 +787,7 @@ pub(crate) fn run_agent_with_prompt(
     let mut reminder_state = ReminderState::default();
     let mut drift_state = DriftState::default();
     let mut recent_actions: VecDeque<String> = VecDeque::with_capacity(30);
+    let mut retrieved_skills: Vec<String> = Vec::new();
     let mut turns_since_fact_extract: usize = 0;
     let fact_extract_interval: usize = env_optional("AGENT_FACT_TURNS")
         .and_then(|v| v.parse().ok())
@@ -1079,6 +1146,17 @@ pub(crate) fn run_agent_with_prompt(
                 }
             }
 
+            // SkillRL R4: Track skill names retrieved via skill_search
+            if call.name == "skill_search" && !result.is_error {
+                if let Some(results_arr) = result.details.get("results").and_then(|v| v.as_array()) {
+                    for item in results_arr {
+                        if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                            retrieved_skills.push(name.to_string());
+                        }
+                    }
+                }
+            }
+
             if should_log {
                 let entry = AgentLogEntry {
                     session: session.clone(),
@@ -1251,6 +1329,17 @@ pub(crate) fn run_agent_with_prompt(
                     }
                 }
 
+                // SkillRL R4: Track skill names retrieved via skill_search
+                if call.name == "skill_search" && !result.is_error {
+                    if let Some(results_arr) = result.details.get("results").and_then(|v| v.as_array()) {
+                        for item in results_arr {
+                            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                                retrieved_skills.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+
                 if should_log {
                     let entry = AgentLogEntry {
                         session: session.clone(),
@@ -1360,6 +1449,32 @@ pub(crate) fn run_agent_with_prompt(
             all_reminders.push("Sustained low adherence. Complete current action and provide a status summary.".to_string());
         }
 
+        // SkillRL R6: Behavioral anchoring — inject proven skills when drifting
+        if drift_score < 70.0 {
+            if let Some(ref workspace) = agent_workspace {
+                let db_path = workspace.join("skills.sqlite");
+                if db_path.exists() {
+                    if let Ok(conn) = open_skill_db(&db_path) {
+                        let top_skills = list_skills(&conn, 3);
+                        if !top_skills.is_empty() {
+                            let anchor: String = top_skills
+                                .iter()
+                                .filter_map(|s| {
+                                    s.notes.as_ref().map(|n| format!("- {}: {}", s.name, n))
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !anchor.is_empty() {
+                                all_reminders.push(format!(
+                                    "Re-anchor with proven strategies:\n{anchor}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Inject routine reminders (budget, drift, cycle, etc.) — excludes critic corrections
         if !all_reminders.is_empty() {
             drift_state.reminder_violations = 0;
@@ -1457,6 +1572,18 @@ pub(crate) fn run_agent_with_prompt(
         }
 
         step += 1;
+    }
+
+    // SkillRL R4: Record usage of retrieved skills based on session outcome
+    if !retrieved_skills.is_empty() {
+        if let Some(ref workspace) = agent_workspace {
+            let db_path = workspace.join("skills.sqlite");
+            if let Ok(conn) = open_skill_db(&db_path) {
+                for skill_name in &retrieved_skills {
+                    let _ = record_skill_use(&conn, skill_name, completed);
+                }
+            }
+        }
     }
 
     if !completed {

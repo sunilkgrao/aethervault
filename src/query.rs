@@ -239,32 +239,39 @@ pub(crate) fn load_feedback_scores(
         return scores;
     }
 
-    let mut remaining = targets.clone();
-    let total = mem.frame_count() as i64;
-    for idx in (0..total).rev() {
-        if remaining.is_empty() {
-            break;
-        }
-        let frame_id = idx as u64;
-        let frame = match mem.frame_by_id(frame_id) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        if frame.track.as_deref() != Some("aethervault.feedback") {
-            continue;
-        }
+    // Use scoped search instead of O(n) linear scan over all frames.
+    // The Tantivy index supports track: field queries, and all feedback frames
+    // live under the aethervault://feedback/ URI prefix.
+    let request = SearchRequest {
+        query: "track:aethervault.feedback".to_string(),
+        top_k: targets.len().max(50),
+        snippet_chars: 0,
+        uri: None,
+        scope: Some("aethervault://feedback/".to_string()),
+        cursor: None,
+        temporal: None,
+        as_of_frame: None,
+        as_of_ts: None,
+        no_sketch: true,
+    };
 
-        let bytes = match mem.frame_canonical_payload(frame.id) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let event: FeedbackEvent = match serde_json::from_slice(&bytes) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        if remaining.remove(&event.uri) {
-            scores.insert(event.uri, event.score);
+    if let Ok(response) = mem.search(request) {
+        let mut remaining = targets.clone();
+        for hit in &response.hits {
+            if remaining.is_empty() {
+                break;
+            }
+            let bytes = match mem.frame_canonical_payload(hit.frame_id) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let event: FeedbackEvent = match serde_json::from_slice(&bytes) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if remaining.remove(&event.uri) {
+                scores.insert(event.uri, event.score);
+            }
         }
     }
 
@@ -521,25 +528,19 @@ pub(crate) fn execute_query(
                 };
 
                 // Manual as-of / temporal filter for vector lane (best-effort).
+                // Batch-fetch timestamps for all hits in a single pass instead of
+                // calling frame_by_id() per-hit (avoids N+1 lookups).
                 if asof_ts.is_some() || before_ts.is_some() || after_ts.is_some() {
+                    let timestamps: HashMap<u64, i64> = resp.hits.iter()
+                        .filter_map(|hit| {
+                            mem.frame_by_id(hit.frame_id).ok().map(|f| (hit.frame_id, f.timestamp))
+                        })
+                        .collect();
                     resp.hits.retain(|hit| {
-                        let frame = mem.frame_by_id(hit.frame_id).ok();
-                        let Some(frame) = frame else { return false };
-                        if let Some(ts) = asof_ts {
-                            if frame.timestamp > ts {
-                                return false;
-                            }
-                        }
-                        if let Some(after_ts) = after_ts {
-                            if frame.timestamp < after_ts {
-                                return false;
-                            }
-                        }
-                        if let Some(before_ts) = before_ts {
-                            if frame.timestamp > before_ts {
-                                return false;
-                            }
-                        }
+                        let Some(&ts) = timestamps.get(&hit.frame_id) else { return false };
+                        if let Some(asof) = asof_ts { if ts > asof { return false; } }
+                        if let Some(after) = after_ts { if ts < after { return false; } }
+                        if let Some(before) = before_ts { if ts > before { return false; } }
                         true
                     });
                 }

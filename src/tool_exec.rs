@@ -1647,7 +1647,7 @@ pub(crate) fn execute_tool_with_handles(
                 })
             })
         }
-        "trigger_list" => with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+        "trigger_list" => with_read_mem(mem_read, mem_write, mv2, |mem| {
             let triggers = load_triggers(mem);
             Ok(ToolExecution {
                 output: format!("{} triggers.", triggers.len()),
@@ -1858,7 +1858,7 @@ pub(crate) fn execute_tool_with_handles(
             };
             upsert_skill(&conn, &skill).map_err(|e| format!("upsert: {e}"))?;
             Ok(ToolExecution {
-                output: format!("Skill '{}' stored in SQLite.", parsed.name),
+                output: format!("Skill '{}' stored.", parsed.name),
                 details: serde_json::json!({ "name": parsed.name, "db": db_path.display().to_string() }),
                 is_error: false,
             })

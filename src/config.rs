@@ -139,31 +139,43 @@ fn file_config_to_capsule_config(fc: &FileConfig) -> CapsuleConfig {
 }
 
 pub(crate) fn list_config_entries(mem: &mut Vault) -> Vec<ConfigEntry> {
+    use aether_core::types::SearchRequest;
+
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
-    let total = mem.frame_count() as i64;
-    for idx in (0..total).rev() {
-        let frame_id = idx as u64;
-        let frame = match mem.frame_by_id(frame_id) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let uri = match frame.uri.as_deref() {
-            Some(u) => u,
-            None => continue,
-        };
-        let key = match config_uri_to_key(uri) {
-            Some(k) => k,
-            None => continue,
-        };
-        if seen.insert(key.clone()) {
-            entries.push(ConfigEntry {
-                key,
-                frame_id: frame.id,
-                timestamp: frame.timestamp,
-            });
+
+    // Use scoped search instead of O(n) linear scan over all frames.
+    let request = SearchRequest {
+        query: "track:aethervault.config".to_string(),
+        top_k: 200,
+        snippet_chars: 0,
+        uri: None,
+        scope: Some("aethervault://config/".to_string()),
+        cursor: None,
+        temporal: None,
+        as_of_frame: None,
+        as_of_ts: None,
+        no_sketch: true,
+    };
+
+    if let Ok(response) = mem.search(request) {
+        // Hits are scored by relevance; we need latest-first dedup by key.
+        // Collect all hits with their frame metadata, sort by frame_id desc (latest first).
+        let mut hits: Vec<_> = response.hits.iter().filter_map(|hit| {
+            let frame = mem.frame_by_id(hit.frame_id).ok()?;
+            let uri = frame.uri.as_deref()?;
+            let key = config_uri_to_key(uri)?;
+            Some((key, frame.id, frame.timestamp))
+        }).collect();
+        hits.sort_by(|a, b| b.1.cmp(&a.1)); // latest frame_id first
+
+        for (key, frame_id, timestamp) in hits {
+            if seen.insert(key.clone()) {
+                entries.push(ConfigEntry { key, frame_id, timestamp });
+            }
         }
     }
+
     entries
 }
 
