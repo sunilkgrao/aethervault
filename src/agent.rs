@@ -808,6 +808,8 @@ pub(crate) fn run_agent_with_prompt(
     let mut current_max_steps = effective_max_steps;
     let mut step = 0;
     let mut wrap_up_injected = false;
+    let mut consecutive_hook_failures: usize = 0;
+    const MAX_CONSECUTIVE_HOOK_FAILURES: usize = 3;
     while step < current_max_steps {
         // Check if user extended step budget via checkpoint response
         if let Some(ref prog) = progress {
@@ -885,7 +887,40 @@ pub(crate) fn run_agent_with_prompt(
             tools: tools.clone(),
             session: session.clone(),
         };
-        let message = call_agent_hook(&model_spec, &request)?;
+        let message = match call_agent_hook(&model_spec, &request) {
+            Ok(msg) => {
+                consecutive_hook_failures = 0;
+                msg
+            }
+            Err(e) => {
+                consecutive_hook_failures += 1;
+                eprintln!(
+                    "[harness] hook failed ({consecutive_hook_failures}/{MAX_CONSECUTIVE_HOOK_FAILURES}): {e}"
+                );
+                if consecutive_hook_failures >= MAX_CONSECUTIVE_HOOK_FAILURES {
+                    eprintln!(
+                        "[harness] {MAX_CONSECUTIVE_HOOK_FAILURES} consecutive failures, ending run"
+                    );
+                    final_text = Some(format!(
+                        "(Agent terminated: model hook failed {MAX_CONSECUTIVE_HOOK_FAILURES} \
+                         consecutive times. Last error: {e})"
+                    ));
+                    break; // Exits loop -> continuation checkpoint created
+                }
+                // Inject error as assistant message — agent sees it next iteration
+                AgentMessage {
+                    role: "assistant".to_string(),
+                    content: Some(format!(
+                        "(Model hook error on attempt {consecutive_hook_failures}: {e}. \
+                         Will retry on next step.)"
+                    )),
+                    tool_calls: Vec::new(),
+                    name: None,
+                    tool_call_id: None,
+                    is_error: None,
+                }
+            }
+        };
         if let Some(content) = message.content.clone() {
             final_text = Some(content.clone());
             // Update progress: text preview

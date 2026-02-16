@@ -870,10 +870,61 @@ pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Re
     }
 
     let cmd = command_spec_to_vec(&hook.command);
-    let timeout = hook.timeout_ms.unwrap_or(u64::MAX);
+    let timeout = hook.timeout_ms.unwrap_or(300_000); // 5 min default safety net
     let value = serde_json::to_value(request).map_err(|e| format!("hook input: {e}"))?;
-    let raw = run_hook_command(&cmd, &value, timeout, "agent")?;
-    let response: AgentHookResponse =
-        serde_json::from_str(&raw).map_err(|e| format!("hook output: {e}"))?;
-    Ok(response.message)
+
+    let max_retries: usize = std::env::var("HOOK_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+
+    let mut last_err = String::new();
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            let delay = Duration::from_secs(3u64.pow(attempt as u32).min(30));
+            eprintln!(
+                "[call_agent_hook] attempt {}/{} failed ({last_err}), retrying in {delay:?}...",
+                attempt,
+                max_retries + 1
+            );
+            thread::sleep(delay);
+        }
+        match run_hook_command(&cmd, &value, timeout, "agent") {
+            Ok(raw) => {
+                match serde_json::from_str::<AgentHookResponse>(&raw) {
+                    Ok(response) => return Ok(response.message),
+                    Err(e) => {
+                        // JSON parse failure = NOT retryable (hook ran but returned garbage)
+                        return Err(format!(
+                            "hook output parse error: {e}\nraw: {}",
+                            &raw[..raw.len().min(200)]
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                last_err = e.clone();
+                if !is_hook_error_retryable(&e) {
+                    return Err(format!("hook fatal error: {e}"));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "External hook failed after {} attempts. Last error: {last_err}",
+        max_retries + 1
+    ))
+}
+
+fn is_hook_error_retryable(err: &str) -> bool {
+    [
+        "write stdin",
+        "timed out",
+        "hook exited",
+        "spawn failed",
+        "hook wait failed",
+        "hook returned empty",
+    ]
+    .iter()
+    .any(|p| err.contains(p))
 }

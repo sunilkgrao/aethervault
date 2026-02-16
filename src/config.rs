@@ -8,8 +8,6 @@ use aether_core::{PutOptions, Vault};
 use std::collections::HashSet;
 use std::thread;
 use std::time::Instant;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::path::Path;
 
@@ -208,53 +206,99 @@ pub(crate) fn run_hook_command(
         .env("KAIROS_HOOK", kind);
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let payload = serde_json::to_vec(input).map_err(|e| format!("encode input: {e}"))?;
-        stdin
-            .write_all(&payload)
-            .and_then(|_| stdin.flush())
-            .map_err(|e| format!("write stdin: {e}"))?;
-    }
 
-    let timeout = Duration::from_millis(timeout_ms.max(1));
-    let timeout_ms = timeout.as_millis() as u64;
-    let cancel_token = Arc::new(AtomicBool::new(false));
-    let pid = child.id().to_string();
-    let mut last_update = Instant::now();
-    loop {
-        if cancel_token.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("hook '{kind}' canceled after {timeout_ms}ms"));
+    // Write stdin with broken-pipe resilience: if the child dies before reading,
+    // capture the error but still collect stdout/stderr for diagnostics.
+    let stdin_err = if let Some(mut stdin) = child.stdin.take() {
+        let payload = serde_json::to_vec(input).map_err(|e| format!("encode input: {e}"))?;
+        match stdin.write_all(&payload).and_then(|_| stdin.flush()) {
+            Ok(()) => None,
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                eprintln!("[hook:{kind}] broken pipe writing stdin, collecting output...");
+                Some(e)
+            }
+            Err(e) => return Err(format!("write stdin: {e}")),
         }
+    } else {
+        None
+    };
+
+    // Real wall-clock deadline enforcement using Instant.
+    let start = Instant::now();
+    let deadline = if timeout_ms < u64::MAX {
+        Some(Duration::from_millis(timeout_ms))
+    } else {
+        None
+    };
+    let pid = child.id();
+    let mut last_log = Instant::now();
+
+    loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
-                if last_update.elapsed() >= Duration::from_secs(5) {
-                    eprintln!(
-                        "[hook:{kind}] pid={pid} still running (no deadline, configured timeout {timeout_ms}ms)"
-                    );
-                    last_update = Instant::now();
+                if let Some(dl) = deadline {
+                    if start.elapsed() >= dl {
+                        eprintln!("[hook:{kind}] pid={pid} exceeded {timeout_ms}ms deadline, killing");
+                        crate::kill_process_tree(&mut child);
+                        return Err(format!("hook '{kind}' timed out after {timeout_ms}ms"));
+                    }
                 }
-                thread::sleep(Duration::from_millis(10));
+                if last_log.elapsed() >= Duration::from_secs(30) {
+                    eprintln!(
+                        "[hook:{kind}] pid={pid} still running ({:.0}s elapsed)",
+                        start.elapsed().as_secs_f64()
+                    );
+                    last_log = Instant::now();
+                }
+                thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("hook wait failed: {e}")),
+            Err(e) => {
+                crate::kill_process_tree(&mut child);
+                return Err(format!("hook wait failed: {e}"));
+            }
         }
     }
 
+    // Collect output — recover valid JSON from non-zero exit codes.
+    // codex-hook.sh emits valid JSON even when killed by signal (exit > 128).
     let output = child
         .wait_with_output()
         .map_err(|e| format!("hook output failed: {e}"))?;
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            return Err("hook exited with error".into());
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // If stdout has valid JSON, use it despite non-zero exit
+        if !stdout.is_empty() {
+            if serde_json::from_str::<serde_json::Value>(&stdout).is_ok() {
+                eprintln!("[hook:{kind}] non-zero exit but stdout has valid JSON, using it");
+                return Ok(stdout);
+            }
         }
-        return Err(format!("hook error: {stderr}"));
+        let code = output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into());
+        let mut msg = format!("hook exited {code}");
+        if !stderr.is_empty() {
+            msg.push_str(&format!(": {}", &stderr[..stderr.len().min(500)]));
+        }
+        if let Some(ref e) = stdin_err {
+            msg.push_str(&format!(" (broken pipe: {e})"));
+        }
+        return Err(msg);
     }
+
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if stdout.is_empty() {
-        return Err("hook returned empty output".into());
+        return Err(format!(
+            "hook returned empty output{}",
+            stdin_err
+                .map(|e| format!(" (broken pipe: {e})"))
+                .unwrap_or_default()
+        ));
     }
     Ok(stdout)
 }
