@@ -15,8 +15,9 @@ use base64::Engine;
 
 use crate::{
     AgentProgress, BridgeAgentConfig, CompletionEvent, ActiveRun,
+    ContinuationCheckpoint,
     SessionTurn, load_session_turns, save_session_turns,
-    run_agent_with_prompt, try_handle_approval_chat,
+    run_agent_with_prompt, try_handle_approval_chat, env_optional,
 };
 
 const NO_TIMEOUT_MS: u64 = u64::MAX;
@@ -601,6 +602,8 @@ pub(crate) fn spawn_agent_run(
         extended_max_steps: None,
         interim_messages: Vec::new(),
         first_ack_sent: false,
+        opus_steps: 0,
+        delegated_steps: 0,
     }));
 
     // Worker thread -- calls run_agent_with_prompt directly (no middle thread)
@@ -789,6 +792,89 @@ pub(crate) fn handle_telegram_completion(
             err.chars().take(500).collect::<String>()
         }
     };
+
+    // Self-continuation: check for continuation marker and auto-chain
+    let max_chain_depth: usize = env_optional("AGENT_MAX_CHAIN_DEPTH")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+
+    if let Some(checkpoint_path) = output.strip_prefix("[CONTINUATION_NEEDED:")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        // Load the checkpoint and spawn a continuation session
+        if let Ok(checkpoint_json) = std::fs::read_to_string(checkpoint_path) {
+            if let Ok(checkpoint) = serde_json::from_str::<ContinuationCheckpoint>(&checkpoint_json) {
+                if checkpoint.chain_depth <= max_chain_depth {
+                    // Send progress message
+                    let _ = telegram_send_message(
+                        http_agent, base_url, chat_id,
+                        &format!("Continuing task (phase {}/{max_chain_depth})...", checkpoint.chain_depth),
+                    );
+
+                    // Build continuation prompt
+                    let key_decisions_str = if checkpoint.key_decisions.is_empty() {
+                        "None recorded yet.".to_string()
+                    } else {
+                        checkpoint.key_decisions.join("\n- ")
+                    };
+                    let continuation_prompt = format!(
+                        "[Continuation from previous session — chain depth {}]\n\n\
+                         ORIGINAL GOAL: {}\n\n\
+                         WHAT WAS DONE:\n{}\n\n\
+                         KEY DECISIONS SO FAR:\n- {}\n\n\
+                         REMAINING WORK:\n{}\n\n\
+                         Total steps so far: {}. Continue working toward the goal.",
+                        checkpoint.chain_depth,
+                        checkpoint.goal,
+                        checkpoint.summary,
+                        key_decisions_str,
+                        checkpoint.remaining_work,
+                        checkpoint.total_steps,
+                    );
+
+                    let continuation_session = format!(
+                        "{}:chain:{}",
+                        checkpoint.session.split(":chain:").next().unwrap_or(&checkpoint.session),
+                        checkpoint.chain_depth,
+                    );
+
+                    let progress = spawn_agent_run(
+                        agent_config,
+                        chat_id,
+                        reply_to_id,
+                        &continuation_prompt,
+                        continuation_session,
+                        completion_tx,
+                        http_agent,
+                        base_url,
+                    );
+
+                    if let Some(run) = active_runs.get_mut(&chat_id) {
+                        run.progress = progress;
+                    } else {
+                        active_runs.insert(chat_id, ActiveRun {
+                            progress,
+                            queued_messages: Vec::new(),
+                        });
+                    }
+                    return;
+                }
+                // Max chain depth reached — fall through to send final output
+                let _ = telegram_send_message(
+                    http_agent, base_url, chat_id,
+                    &format!("Reached maximum chain depth ({max_chain_depth}). Summary of progress:\n{}", checkpoint.summary),
+                );
+                if let Some(run) = active_runs.get_mut(&chat_id) {
+                    if run.queued_messages.is_empty() {
+                        active_runs.remove(&chat_id);
+                    }
+                }
+                return;
+            }
+        }
+        // Checkpoint load failed — send error and fall through
+        eprintln!("[continuation] failed to load checkpoint: {checkpoint_path}");
+    }
 
     // Save conversation turns for session continuity
     let session_id = format!("{}telegram:{chat_id}", agent_config.session_prefix);

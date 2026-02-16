@@ -966,6 +966,45 @@ pub(crate) fn collect_mid_loop_reminders(
     out
 }
 
+/// Detect cycles in a rolling window of recent actions.
+/// Each action is a string like "tool_name:args_hash".
+/// Returns Some((cycle_length, repeat_count)) if a cycle is found.
+pub(crate) fn detect_cycle(actions: &std::collections::VecDeque<String>) -> Option<(usize, usize)> {
+    let len = actions.len();
+    // Check cycle lengths from 1 (single repeat) to 5 (5-step pattern)
+    for cycle_len in 1..=5 {
+        if len < cycle_len * 2 {
+            continue;
+        }
+        // Minimum repeats to declare a cycle: 3 for single, 2 for multi-step
+        let min_repeats = if cycle_len == 1 { 3 } else { 2 };
+        if len < cycle_len * min_repeats {
+            continue;
+        }
+        // Extract the most recent `cycle_len` items as the candidate pattern
+        let pattern: Vec<&String> = actions.iter().rev().take(cycle_len).collect();
+        // Check how many consecutive times this pattern repeats going backwards
+        let mut repeats = 1usize;
+        'outer: for rep in 1..min_repeats {
+            let start = cycle_len * rep;
+            if start + cycle_len > len {
+                break;
+            }
+            for (i, pat_item) in pattern.iter().enumerate() {
+                let idx = len - 1 - start - i;
+                if actions[idx] != **pat_item {
+                    break 'outer;
+                }
+            }
+            repeats += 1;
+        }
+        if repeats >= min_repeats {
+            return Some((cycle_len, repeats));
+        }
+    }
+    None
+}
+
 pub(crate) fn compute_drift_score(
     drift: &DriftState,
     reminder_state: &ReminderState,

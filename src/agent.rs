@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 #[allow(unused_imports)]
 use std::io::{self, Read};
@@ -18,7 +18,7 @@ use serde_json;
 use crate::claude::{call_agent_hook, call_claude, call_critic};
 use crate::{
     append_log_jsonl, base_tool_names, build_context_pack, build_kg_context,
-    collect_mid_loop_reminders, compute_drift_score, critic_should_fire, env_optional,
+    collect_mid_loop_reminders, compute_drift_score, critic_should_fire, detect_cycle, env_optional,
     execute_tool_with_handles, find_kg_entities, log_dir_path,
     config_file_path, format_tool_message_content, load_capsule_config, load_config_from_file,
     load_kg_graph, load_session_turns, load_workspace_context, requires_approval,
@@ -26,6 +26,7 @@ use crate::{
     save_session_turns, tool_catalog_map, tool_definitions_json,
     tools_from_active, with_write_mem, AgentHookRequest, AgentLogEntry, AgentMessage,
     AgentProgress, AgentRunOutput, AgentSession, AgentToolCall, AgentToolResult,
+    ContinuationCheckpoint,
     DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
     ToolExecution,
 };
@@ -261,13 +262,15 @@ pub(crate) fn keep_recent_turns() -> usize {
 /// Compact messages when context is getting large.
 /// Preserves all leading system blocks and last `keep_recent` messages verbatim.
 /// Summarizes everything in between into a compaction notice.
+/// Compact messages when context is getting large.
+/// Returns the extracted GOAL from the structured summary (if any).
 pub(crate) fn compact_messages(
     messages: &mut Vec<AgentMessage>,
     hook: &HookSpec,
     keep_recent: usize,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     if messages.len() <= keep_recent + 2 {
-        return Ok(()); // Nothing to compact
+        return Ok(None); // Nothing to compact
     }
     // Preserve all leading system blocks (supports cache-split: stable prefix + dynamic suffix)
     let system_end = messages.iter().take_while(|m| m.role == "system").count().max(1);
@@ -285,14 +288,21 @@ pub(crate) fn compact_messages(
     }).collect::<Vec<_>>().join("\n");
 
     let summary_prompt = format!(
-        "Summarize this conversation concisely. Preserve: key decisions, file paths, unresolved issues, user preferences. Discard: verbose tool outputs, redundant context.\n\n{summary_text}"
+        "Summarize this conversation. Output in this format:\n\
+         GOAL: <the user's original goal in one sentence>\n\
+         PROGRESS: <what has been accomplished>\n\
+         PENDING: <what still needs to be done>\n\
+         KEY_FILES: <important file paths mentioned>\n\
+         AVOID: <mistakes made or approaches that failed>\n\
+         CONTEXT: <other important context>\n\n\
+         {summary_text}"
     );
 
     let summary_request = AgentHookRequest {
         messages: vec![
             AgentMessage {
                 role: "system".to_string(),
-                content: Some("You are a conversation summarizer. Output only the summary, nothing else. Be concise — use bullet points.".to_string()),
+                content: Some("You are a conversation summarizer. Output only the structured summary, nothing else. Be concise.".to_string()),
                 tool_calls: Vec::new(),
                 name: None,
                 tool_call_id: None,
@@ -314,6 +324,11 @@ pub(crate) fn compact_messages(
     let summary_response = call_agent_hook(hook, &summary_request)?;
     let summary = summary_response.content.unwrap_or_else(|| "(compaction failed)".to_string());
 
+    // Extract the GOAL field from the structured summary
+    let extracted_goal = summary.lines()
+        .find(|line| line.starts_with("GOAL:"))
+        .map(|line| line.trim_start_matches("GOAL:").trim().to_string());
+
     // Rebuild messages: system blocks + compaction notice + recent
     *messages = system_msgs;
     messages.push(AgentMessage {
@@ -333,7 +348,7 @@ pub(crate) fn compact_messages(
         is_error: None,
     });
     messages.extend(recent);
-    Ok(())
+    Ok(extracted_goal)
 }
 
 pub(crate) fn run_agent_with_prompt(
@@ -420,6 +435,25 @@ pub(crate) fn run_agent_with_prompt(
             system_prompt.push_str("\n\n# Global Context\n");
             system_prompt.push_str(&global_context);
         }
+    }
+
+    // Resource-aware orchestration: inject compute delegation guide for long-running tasks
+    let is_continuation = prompt_text.contains("[Continuation from previous session");
+    let long_run_mode = env_optional("AGENT_LONG_RUN").map(|v| v == "1").unwrap_or(false)
+        || is_continuation;
+    if long_run_mode {
+        system_prompt.push_str(concat!(
+            "\n\n# Resource Guide — Long-Running Tasks\n",
+            "For tasks requiring heavy computation, research, code analysis, or batch processing:\n",
+            "- Use `exec` to run `codex exec -m gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox \"detailed prompt\"` for substantial work\n",
+            "- Codex sessions have no timeout — let them run for hours if needed\n",
+            "- For parallelism: launch multiple `exec` calls with different Codex prompts simultaneously\n",
+            "- Each Codex session can itself spawn internal swarms via its --yolo mode\n",
+            "- For summarization/classification: use `exec` to call Ollama via `ssh -p 2222 sunil@localhost ",
+            "'curl -s localhost:11434/api/generate -d \"{\\\"model\\\":\\\"qwen3:14b\\\",\\\"prompt\\\":\\\"...\\\",\\\"stream\\\":false}\"'`\n",
+            "- Reserve your own reasoning for: orchestration decisions, user-facing responses, complex planning, and quality review of delegated results\n",
+            "- Prefer fire-and-forget background patterns: `nohup codex exec ... > /tmp/result.txt 2>&1 &` then check results later\n",
+        ));
     }
 
     // --- KV-Cache Breakpoint ---
@@ -658,6 +692,7 @@ pub(crate) fn run_agent_with_prompt(
 
     let mut reminder_state = ReminderState::default();
     let mut drift_state = DriftState::default();
+    let mut recent_actions: VecDeque<String> = VecDeque::with_capacity(30);
     let mut turns_since_fact_extract: usize = 0;
     let fact_extract_interval: usize = env_optional("AGENT_FACT_TURNS")
         .and_then(|v| v.parse().ok())
@@ -667,6 +702,12 @@ pub(crate) fn run_agent_with_prompt(
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
     let mut last_critic_step: usize = 0;
+
+    // Goal recitation: extract and periodically re-inject the user's goal
+    let mut current_plan: Option<String> = Some(prompt_text.chars().take(500).collect());
+    let plan_recite_interval: usize = env_optional("PLAN_RECITE_INTERVAL")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
 
     let mut completed = false;
     let mut current_max_steps = effective_max_steps;
@@ -711,8 +752,14 @@ pub(crate) fn run_agent_with_prompt(
         let compact_keep = keep_recent_turns().max(2);
         if token_estimate > compact_at {
             eprintln!("[harness] context at ~{token_estimate} tokens (budget {compact_at}), compacting...");
-            if let Err(e) = compact_messages(&mut messages, &model_spec, compact_keep) {
-                eprintln!("[harness] compaction failed: {e}");
+            match compact_messages(&mut messages, &model_spec, compact_keep) {
+                Ok(Some(goal)) => {
+                    current_plan = Some(goal);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("[harness] compaction failed: {e}");
+                }
             }
         }
 
@@ -872,13 +919,24 @@ pub(crate) fn run_agent_with_prompt(
 
         let max_tool_output = 8000; // chars (~2000 tokens)
 
-        // Update progress: tool execution phase + track tools used
+        // Update progress: tool execution phase + track tools used + delegation tracking
         if let Some(ref prog) = progress {
             if let Ok(mut p) = prog.lock() {
                 let names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
                 p.phase = format!("tool:{}", names.join(","));
                 for call in &tool_calls {
                     *p.tools_used.entry(call.name.clone()).or_insert(0) += 1;
+                    // Track delegation: exec calls containing codex/ollama are delegated
+                    if call.name == "exec" {
+                        let args_str = call.args.to_string().to_lowercase();
+                        if args_str.contains("codex") || args_str.contains("ollama") {
+                            p.delegated_steps += 1;
+                        } else {
+                            p.opus_steps += 1;
+                        }
+                    } else {
+                        p.opus_steps += 1;
+                    }
                 }
             }
         }
@@ -1170,6 +1228,17 @@ pub(crate) fn run_agent_with_prompt(
             }
         }
 
+        // Track recent actions for cycle detection
+        for call in &tool_calls {
+            let args_preview: String = call.args.to_string().chars().take(200).collect();
+            let hash = blake3::hash(args_preview.as_bytes()).to_hex()[..16].to_string();
+            let action_key = format!("{}:{}", call.name, hash);
+            if recent_actions.len() >= 30 {
+                recent_actions.pop_front();
+            }
+            recent_actions.push_back(action_key);
+        }
+
         // Mid-loop system reminders (10 rules) + drift detection
         let token_est = estimate_tokens(&messages);
         let reminders = collect_mid_loop_reminders(&reminder_state, step, current_max_steps, token_est);
@@ -1186,6 +1255,43 @@ pub(crate) fn run_agent_with_prompt(
         }
 
         let mut all_reminders = reminders;
+
+        // Resource-awareness: nudge delegation to free compute when in long-run mode
+        if long_run_mode {
+            if let Some(ref prog) = progress {
+                if let Ok(p) = prog.lock() {
+                    if step > 10 && p.delegated_steps == 0 {
+                        all_reminders.push("Consider delegating research, code analysis, or batch work to Codex CLI via `exec` to save tokens.".to_string());
+                    } else if step > 20 && p.opus_steps > 0 {
+                        let total = p.opus_steps + p.delegated_steps;
+                        let opus_ratio = p.opus_steps as f64 / total.max(1) as f64;
+                        if opus_ratio > 0.8 {
+                            all_reminders.push("Token efficiency is low. Delegate more work to free compute (Codex CLI, Ollama) via exec tool.".to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cycle detection: catch repeated action patterns
+        if let Some((cycle_len, _repeats)) = detect_cycle(&recent_actions) {
+            if cycle_len == 1 {
+                all_reminders.push("You are repeating the same action 3 times. Try a completely different approach.".to_string());
+            } else {
+                all_reminders.push(format!("You are in a {cycle_len}-step loop. Break out by trying a fundamentally different strategy."));
+            }
+            reminder_state.no_progress_streak += 3;
+        }
+
+        // Goal recitation: periodically re-inject the user's goal
+        if plan_recite_interval > 0 && step > 0 && step % plan_recite_interval == 0 {
+            if let Some(ref plan) = current_plan {
+                all_reminders.push(format!(
+                    "[Plan Check] Your current goal: {}. Progress: step {}/{current_max_steps}. Remain focused on the objective.",
+                    plan, step
+                ));
+            }
+        }
 
         // Drift-based escalation
         if drift_score < 70.0 && drift_score >= 55.0 {
@@ -1226,34 +1332,72 @@ pub(crate) fn run_agent_with_prompt(
     }
 
     if !completed {
-        // Extract the last assistant message for context on what was in progress
-        let last_action = messages.iter().rev()
+        // Self-continuation: instead of erroring, create a checkpoint for session chaining
+        // Compact to get a tight summary for the checkpoint
+        let compact_keep = keep_recent_turns().max(2);
+        let compacted_goal = compact_messages(&mut messages, &model_spec, compact_keep)
+            .ok()
+            .flatten();
+        let goal = compacted_goal
+            .or_else(|| current_plan.clone())
+            .unwrap_or_else(|| prompt_text.chars().take(500).collect());
+
+        // Build the summary from the compacted context
+        let summary = messages.iter()
+            .find(|m| m.role == "user" && m.content.as_ref().map(|c| c.contains("[Context compacted")).unwrap_or(false))
+            .and_then(|m| m.content.clone())
+            .unwrap_or_else(|| {
+                messages.iter().rev()
+                    .find(|m| m.role == "assistant")
+                    .and_then(|m| m.content.as_ref())
+                    .map(|c| c.chars().take(500).collect::<String>())
+                    .unwrap_or_default()
+            });
+
+        let remaining_work = messages.iter().rev()
             .find(|m| m.role == "assistant")
             .and_then(|m| m.content.as_ref())
-            .map(|c| c.chars().take(200).collect::<String>())
-            .unwrap_or_else(|| "(no context available)".to_string());
-        // Build a richer exhaustion summary with tool stats
-        let tool_summary = if let Some(ref prog) = progress {
-            if let Ok(p) = prog.lock() {
-                let mut sorted: Vec<_> = p.tools_used.iter()
-                    .map(|(k, v)| (k.clone(), *v))
-                    .collect();
-                sorted.sort_by(|a, b| b.1.cmp(&a.1));
-                let top: Vec<String> = sorted.into_iter().take(5)
-                    .map(|(k, v)| format!("{k}({v}x)"))
-                    .collect();
-                if top.is_empty() { String::new() } else { format!(" Tools: {}", top.join(", ")) }
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
+            .map(|c| c.chars().take(300).collect::<String>())
+            .unwrap_or_else(|| "Continue working toward the goal.".to_string());
+
+        let chain_depth = session.as_ref()
+            .and_then(|s| s.rsplit(":chain:").next())
+            .and_then(|d| d.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let checkpoint = ContinuationCheckpoint {
+            session: session.clone().unwrap_or_else(|| "default".to_string()),
+            summary,
+            goal: goal.clone(),
+            remaining_work,
+            key_decisions: Vec::new(),
+            total_steps: step,
+            chain_depth: chain_depth + 1,
         };
-        return Err(format!(
-            "Reached {current_max_steps} steps without finishing. \
-            Last action: {last_action}.{tool_summary}"
-        )
-        .into());
+
+        // Save checkpoint to file
+        let checkpoint_dir = PathBuf::from("/root/.aethervault/workspace/checkpoints");
+        let _ = fs::create_dir_all(&checkpoint_dir);
+        let checkpoint_path = checkpoint_dir.join(format!(
+            "{}.json",
+            checkpoint.session.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+        ));
+        if let Ok(json) = serde_json::to_string_pretty(&checkpoint) {
+            let _ = fs::write(&checkpoint_path, &json);
+        }
+
+        let continuation_marker = format!(
+            "[CONTINUATION_NEEDED:{}]",
+            checkpoint_path.display()
+        );
+
+        return Ok(AgentRunOutput {
+            session,
+            context: context_pack,
+            messages,
+            tool_results,
+            final_text: Some(continuation_marker),
+        });
     }
 
     Ok(AgentRunOutput {

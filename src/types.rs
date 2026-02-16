@@ -435,6 +435,17 @@ pub(crate) struct AgentRunOutput {
     pub(crate) final_text: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ContinuationCheckpoint {
+    pub(crate) session: String,
+    pub(crate) summary: String,
+    pub(crate) goal: String,
+    pub(crate) remaining_work: String,
+    pub(crate) key_decisions: Vec<String>,
+    pub(crate) total_steps: usize,
+    pub(crate) chain_depth: usize,
+}
+
 pub(crate) struct AgentProgress {
     pub(crate) step: usize,
     pub(crate) max_steps: usize,
@@ -453,6 +464,10 @@ pub(crate) struct AgentProgress {
     pub(crate) interim_messages: Vec<String>,
     /// Whether the first interim/acknowledgment has been sent
     pub(crate) first_ack_sent: bool,
+    /// Steps using Opus reasoning directly
+    pub(crate) opus_steps: usize,
+    /// Steps delegated to Codex CLI or Ollama via exec
+    pub(crate) delegated_steps: usize,
 }
 
 pub(crate) struct CompletionEvent {
