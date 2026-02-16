@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # Blue-Green Binary Upgrade for AetherVault
 # Compiles to the inactive slot, smoke tests, swaps symlink, restarts.
+# The restart + health check run in a detached background process so they
+# survive the service restart (which kills the calling agent process).
 # Usage: upgrade.sh [--branch BRANCH] [--skip-tests]
 set -euo pipefail
+
+# Source Rust toolchain (cargo may not be in PATH for systemd services)
+# shellcheck disable=SC1091
+[[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
 
 DEPLOY_DIR="/opt/aethervault"
 ACTIVE_FILE="${DEPLOY_DIR}/active"
@@ -43,7 +49,6 @@ else
     # First run: initialize from current binary
     ACTIVE="blue"
     if [[ -f "$SYMLINK" ]] && [[ ! -L "$SYMLINK" ]]; then
-        # Current binary is a regular file, copy to blue slot
         cp "$SYMLINK" "${DEPLOY_DIR}/blue/aethervault"
     elif [[ -L "$SYMLINK" ]]; then
         ACTIVE=$(basename "$(dirname "$(readlink -f "$SYMLINK")")")
@@ -60,7 +65,7 @@ fi
 
 log "=== Upgrade started: branch=$BRANCH, active=$ACTIVE, target=$INACTIVE ==="
 
-# Step 1: Pull latest code
+# Step 1: Pull latest code from git (the source of truth)
 log "Pulling branch $BRANCH..."
 cd "$REPO_DIR"
 git fetch origin "$BRANCH" || die "git fetch failed"
@@ -80,6 +85,10 @@ if [[ ! -f "$BUILT_BINARY" ]]; then
     die "Binary not found at $BUILT_BINARY"
 fi
 
+# Remove old binary first — if the service is still running from this slot
+# (e.g. after a prior swap without restart), Linux returns ETXTBSY on cp.
+# Unlinking is safe: the running process keeps its file handle.
+rm -f "${DEPLOY_DIR}/${INACTIVE}/aethervault"
 cp "$BUILT_BINARY" "${DEPLOY_DIR}/${INACTIVE}/aethervault"
 chmod +x "${DEPLOY_DIR}/${INACTIVE}/aethervault"
 log "Binary copied to ${INACTIVE} slot"
@@ -96,33 +105,58 @@ else
     log "Smoke test skipped (--skip-tests)"
 fi
 
-# Step 4: Backup and swap symlink atomically
+# Step 4: Swap symlink atomically
 log "Swapping symlink: $SYMLINK -> ${DEPLOY_DIR}/${INACTIVE}/aethervault"
 ln -sfn "${DEPLOY_DIR}/${INACTIVE}/aethervault" "${SYMLINK}.tmp"
 mv -f "${SYMLINK}.tmp" "$SYMLINK"
 echo "$INACTIVE" > "$ACTIVE_FILE"
 log "Symlink swapped. Active slot is now: $INACTIVE"
 
-# Step 5: Restart the service
-log "Restarting aethervault service..."
-systemctl restart aethervault || die "systemctl restart failed"
+# Step 5: Detach restart + health check into a background process.
+# systemctl restart kills the aethervault service (which is our parent),
+# so the health check must survive independently via setsid/nohup.
+log "Spawning detached restart + health check..."
+setsid bash -c "
+    LOG_FILE='${LOG_FILE}'
+    DEPLOY_DIR='${DEPLOY_DIR}'
+    SYMLINK='${SYMLINK}'
+    ACTIVE='${ACTIVE}'
+    INACTIVE='${INACTIVE}'
+    HEALTH_CHECK_SECONDS=${HEALTH_CHECK_SECONDS}
+    HEALTH_CHECK_INTERVAL=${HEALTH_CHECK_INTERVAL}
 
-# Step 6: Health check (30 seconds)
-log "Monitoring for ${HEALTH_CHECK_SECONDS}s..."
-ELAPSED=0
-while [[ $ELAPSED -lt $HEALTH_CHECK_SECONDS ]]; do
-    sleep "$HEALTH_CHECK_INTERVAL"
-    ELAPSED=$((ELAPSED + HEALTH_CHECK_INTERVAL))
-    if ! systemctl is-active --quiet aethervault; then
-        log "Service crashed after ${ELAPSED}s! Rolling back..."
-        # Rollback: swap back to previous slot
-        ln -sfn "${DEPLOY_DIR}/${ACTIVE}/aethervault" "${SYMLINK}.tmp"
-        mv -f "${SYMLINK}.tmp" "$SYMLINK"
-        echo "$ACTIVE" > "$ACTIVE_FILE"
-        systemctl restart aethervault
-        die "Rolled back to $ACTIVE slot after crash"
-    fi
-    log "Health check ${ELAPSED}/${HEALTH_CHECK_SECONDS}s: OK"
-done
+    log() {
+        local msg=\"[\$(date -u '+%Y-%m-%dT%H:%M:%SZ')] \$*\"
+        echo \"\$msg\" >> \"\$LOG_FILE\"
+    }
 
-log "=== Upgrade complete: $(${SYMLINK} --version 2>/dev/null || echo 'version unknown') ==="
+    # Wait 5s so the agent can send its response before we kill the service
+    log 'Waiting 5s for agent to finish responding...'
+    sleep 5
+    log 'Restarting aethervault service...'
+    systemctl restart aethervault
+
+    log \"Monitoring for \${HEALTH_CHECK_SECONDS}s...\"
+    ELAPSED=0
+    while [[ \$ELAPSED -lt \$HEALTH_CHECK_SECONDS ]]; do
+        sleep \$HEALTH_CHECK_INTERVAL
+        ELAPSED=\$((ELAPSED + HEALTH_CHECK_INTERVAL))
+        if ! systemctl is-active --quiet aethervault; then
+            log \"Service crashed after \${ELAPSED}s! Rolling back to \${ACTIVE}...\"
+            ln -sfn \"\${DEPLOY_DIR}/\${ACTIVE}/aethervault\" \"\${SYMLINK}.tmp\"
+            mv -f \"\${SYMLINK}.tmp\" \"\$SYMLINK\"
+            echo \"\$ACTIVE\" > \"\${DEPLOY_DIR}/active\"
+            systemctl restart aethervault
+            log \"FATAL: Rolled back to \$ACTIVE slot after crash\"
+            exit 1
+        fi
+        log \"Health check \${ELAPSED}/\${HEALTH_CHECK_SECONDS}s: OK\"
+    done
+
+    log \"=== Upgrade complete: \$(\$SYMLINK --version 2>/dev/null || echo 'version unknown') ===\"
+" >> "$LOG_FILE" 2>&1 &
+
+# Give the background process a moment to start
+sleep 1
+log "Detached health check PID: $!"
+echo "Upgrade binary swapped successfully. Service restart + health check running in background (PID $!)."

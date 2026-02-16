@@ -5,7 +5,8 @@ use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use aether_core::types::SearchRequest;
 use aether_core::{PutOptions, Vault};
@@ -18,29 +19,172 @@ use std::sync::mpsc;
 const NO_TIMEOUT_MS: u64 = u64::MAX;
 const PROCESS_POLL_MS: u64 = 250;
 const STATUS_REPORT_MS: u64 = 3_000;
+/// Kill a process after this long with zero stdout/stderr output.
+/// This catches hung SSH, stuck network calls, etc. while allowing
+/// legitimately long processes (Codex, cargo build) that produce output.
+const STALE_OUTPUT_THRESHOLD_MS: u64 = 600_000; // 10 minutes
 
-fn wait_for_child(
+/// Result from wait_for_child_monitored — owns the captured output.
+struct ChildResult {
+    stdout: String,
+    stderr: String,
+    status: std::process::ExitStatus,
+}
+
+/// Waits for a child process while monitoring stdout/stderr activity.
+/// If the process produces no output for STALE_OUTPUT_THRESHOLD_MS, it is
+/// killed and a descriptive error is returned so the agent can inform the user.
+/// Long-running processes that actively produce output are never interrupted.
+fn wait_for_child_monitored(
     child: &mut std::process::Child,
     label: &str,
-    timeout_ms: u64,
     cancel_token: &Arc<AtomicBool>,
-) -> Result<(), String> {
-    let pid = child.id().to_string();
+) -> Result<ChildResult, String> {
+    let pid = child.id();
+    let start = Instant::now();
+
+    // Take stdout/stderr pipes for incremental reading
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    // Shared: milliseconds-since-start of last output activity
+    let last_activity = Arc::new(AtomicU64::new(0));
+    // Shared output buffers
+    let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Spawn reader thread for stdout
+    if let Some(pipe) = stdout_pipe {
+        let buf = stdout_buf.clone();
+        let activity = last_activity.clone();
+        let t0 = start;
+        thread::spawn(move || {
+            let mut reader = BufReader::new(pipe);
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        activity.store(t0.elapsed().as_millis() as u64, Ordering::Release);
+                        if let Ok(mut guard) = buf.lock() {
+                            guard.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Spawn reader thread for stderr
+    if let Some(pipe) = stderr_pipe {
+        let buf = stderr_buf.clone();
+        let activity = last_activity.clone();
+        let t0 = start;
+        thread::spawn(move || {
+            let mut reader = BufReader::new(pipe);
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        activity.store(t0.elapsed().as_millis() as u64, Ordering::Release);
+                        if let Ok(mut guard) = buf.lock() {
+                            guard.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
     let mut last_report = Instant::now();
+
     loop {
+        // External cancellation
         if cancel_token.load(Ordering::Acquire) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("{label} (pid={pid}) canceled after {timeout_ms}ms"));
+            return Err(format!("{label} (pid={pid}) canceled"));
         }
 
         match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
+            Ok(Some(status)) => {
+                // Give reader threads a moment to drain remaining pipe data
+                thread::sleep(Duration::from_millis(100));
+                let stdout = String::from_utf8_lossy(
+                    &stdout_buf.lock().unwrap_or_else(|e| e.into_inner()),
+                )
+                .to_string();
+                let stderr = String::from_utf8_lossy(
+                    &stderr_buf.lock().unwrap_or_else(|e| e.into_inner()),
+                )
+                .to_string();
+                return Ok(ChildResult { stdout, stderr, status });
+            }
             Ok(None) => {
+                let now_ms = start.elapsed().as_millis() as u64;
+                let last_ms = last_activity.load(Ordering::Acquire);
+                let idle_ms = now_ms - last_ms;
+
+                // Stale-process detection: no output for threshold → kill
+                if idle_ms >= STALE_OUTPUT_THRESHOLD_MS {
+                    let idle_min = idle_ms / 60_000;
+                    let total_min = now_ms / 60_000;
+                    eprintln!(
+                        "[tool:{label}] pid={pid} stale-killed: \
+                         no output for {idle_min}m (total runtime {total_min}m)"
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    thread::sleep(Duration::from_millis(100));
+                    let stdout = String::from_utf8_lossy(
+                        &stdout_buf.lock().unwrap_or_else(|e| e.into_inner()),
+                    )
+                    .to_string();
+                    let stderr = String::from_utf8_lossy(
+                        &stderr_buf.lock().unwrap_or_else(|e| e.into_inner()),
+                    )
+                    .to_string();
+                    let stdout_tail = if stdout.len() > 500 {
+                        &stdout[stdout.len() - 500..]
+                    } else {
+                        &stdout
+                    };
+                    let stderr_tail = if stderr.len() > 500 {
+                        &stderr[stderr.len() - 500..]
+                    } else {
+                        &stderr
+                    };
+                    return Err(format!(
+                        "Process stale-killed (pid {pid}): no stdout/stderr output for \
+                         {idle_min} minutes (ran {total_min} minutes total). \
+                         The command appears stuck — consider retrying with a different approach.\n\
+                         --- last stdout ---\n{stdout_tail}\n\
+                         --- last stderr ---\n{stderr_tail}"
+                    ));
+                }
+
+                // Periodic status report
                 if last_report.elapsed() >= Duration::from_millis(STATUS_REPORT_MS) {
-                    eprintln!("[tool:{label}] pid={pid} still running (no deadline, configured timeout {timeout_ms}ms)");
+                    let elapsed_s = now_ms / 1000;
+                    let idle_s = idle_ms / 1000;
+                    let stdout_len = stdout_buf
+                        .lock()
+                        .map(|g| g.len())
+                        .unwrap_or(0);
+                    let stderr_len = stderr_buf
+                        .lock()
+                        .map(|g| g.len())
+                        .unwrap_or(0);
+                    eprintln!(
+                        "[tool:{label}] pid={pid} running {elapsed_s}s \
+                         (idle {idle_s}s, stdout={stdout_len}B stderr={stderr_len}B)"
+                    );
                     last_report = Instant::now();
                 }
+
                 thread::sleep(Duration::from_millis(PROCESS_POLL_MS));
             }
             Err(err) => {
@@ -880,14 +1024,11 @@ pub(crate) fn execute_tool_with_handles(
                 .stderr(Stdio::piped());
             let mut child = cmd.spawn().map_err(|e| format!("exec spawn: {e}"))?;
             let cancel_token = Arc::new(AtomicBool::new(false));
-            wait_for_child(&mut child, "exec", timeout_ms, &cancel_token)?;
-            let output = child
-                .wait_with_output()
-                .map_err(|e| format!("exec output: {e}"))?;
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let is_error = !output.status.success();
-            let exit_code = subprocess_exit_info(&output.status);
+            let result = wait_for_child_monitored(&mut child, "exec", &cancel_token)?;
+            let stdout = result.stdout;
+            let stderr = result.stderr;
+            let is_error = !result.status.success();
+            let exit_code = subprocess_exit_info(&result.status);
             let details = serde_json::json!({
                 "exit_code": exit_code,
                 "stdout": stdout,
@@ -1053,7 +1194,7 @@ pub(crate) fn execute_tool_with_handles(
         "browser" => {
             let parsed: ToolBrowserArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let timeout_ms = parsed.timeout_ms.unwrap_or(NO_TIMEOUT_MS);
+            let _timeout_ms = parsed.timeout_ms.unwrap_or(NO_TIMEOUT_MS);
             let session = parsed.session.unwrap_or_else(|| "default".to_string());
 
             let mut cmd_args: Vec<String> = vec!["--session".to_string(), session, "--".to_string()];
@@ -1071,14 +1212,11 @@ pub(crate) fn execute_tool_with_handles(
 
             let mut child = cmd.spawn().map_err(|e| format!("browser spawn: {e}"))?;
             let cancel_token = Arc::new(AtomicBool::new(false));
-            wait_for_child(&mut child, "browser", timeout_ms, &cancel_token)?;
-            let output = child
-                .wait_with_output()
-                .map_err(|e| format!("browser output: {e}"))?;
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let is_error = !output.status.success();
-            let exit_code = subprocess_exit_info(&output.status);
+            let result = wait_for_child_monitored(&mut child, "browser", &cancel_token)?;
+            let stdout = result.stdout;
+            let stderr = result.stderr;
+            let is_error = !result.status.success();
+            let exit_code = subprocess_exit_info(&result.status);
             let details = serde_json::json!({
                 "stdout": stdout,
                 "stderr": stderr,

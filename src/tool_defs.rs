@@ -638,7 +638,7 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "self_upgrade",
-            "description": "Trigger a self-upgrade: pull latest code, compile, validate, and hot-swap the binary. Uses blue-green deployment with automatic rollback. Requires approval.",
+            "description": "Trigger a self-upgrade: pull latest code from git, compile, validate, and hot-swap the binary. Uses blue-green deployment with automatic rollback. Requires approval. IMPORTANT: If you edited source files, you MUST git add, commit, and push your changes BEFORE calling this tool — it does `git reset --hard origin/<branch>` which wipes uncommitted changes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
