@@ -287,6 +287,30 @@ def progress_reporter(full_prompt, output_path, start_time, stop_event):
         send_telegram("\n".join(msg_parts))
 
 
+def parse_codex_jsonl(filepath):
+    """Parse Codex --json JSONL output file, extracting message text from item.completed events."""
+    text_parts = []
+    with open(filepath, "r", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type", "")
+                # Extract text from completed agent messages
+                if event_type == "item.completed":
+                    item = event.get("item", {})
+                    if isinstance(item, dict) and item.get("text"):
+                        text_parts.append(item["text"])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                # Non-JSON line — might be raw text output, include it
+                text_parts.append(line)
+    return "\n".join(text_parts).strip()
+
+
 def run_codex(prompt):
     """Run Codex CLI with streaming output and real-time progress reporting."""
     logs_dir = os.path.join(AETHERVAULT_HOME, "logs")
@@ -310,13 +334,12 @@ def run_codex(prompt):
                 ["codex", "exec",
                  "-m", "gpt-5.3-codex-spark",
                  "--dangerously-bypass-approvals-and-sandbox",
-                 "--progress",
                  "--json",
                  "--skip-git-repo-check",
                  "-c", "model_reasoning_effort=\"xhigh\"",
                  prompt],
                 stdout=out_f,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.DEVNULL,
                 text=True,
                 cwd="/root/quake",
             )
@@ -336,22 +359,12 @@ def run_codex(prompt):
                 f"Last activity:\n{tail_file(output_path, n_lines=5, max_chars=400)}"
             )
             try:
-                partial_lines = []
-                with open(output_path, "r", errors="replace") as f:
-                    for line in f:
-                        if parse_progress_line(line.strip()) is None:
-                            partial_lines.append(line)
-                partial = "".join(partial_lines).strip()
+                partial = parse_codex_jsonl(output_path)
                 return partial or f"(Codex timed out after {CODEX_TIMEOUT // 60} minutes)"
             except OSError:
                 return f"(Codex timed out after {CODEX_TIMEOUT // 60} minutes)"
 
-        output_lines = []
-        with open(output_path, "r", errors="replace") as f:
-            for line in f:
-                if parse_progress_line(line.strip()) is None:
-                    output_lines.append(line)
-        output = "".join(output_lines).strip()
+        output = parse_codex_jsonl(output_path)
 
         elapsed = time.time() - start_time
         line_count, byte_size = count_output_stats(output_path)
