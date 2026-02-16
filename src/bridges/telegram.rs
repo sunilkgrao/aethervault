@@ -1,6 +1,4 @@
-#[allow(unused_imports)]
 use std::collections::HashMap;
-#[allow(unused_imports)]
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -418,59 +416,6 @@ pub(crate) fn split_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
-#[allow(dead_code)]
-pub(crate) fn telegram_send_message_returning_id(
-    agent: &ureq::Agent,
-    base_url: &str,
-    chat_id: i64,
-    text: &str,
-) -> Option<i64> {
-    let url = format!("{base_url}/sendMessage");
-    let payload = serde_json::json!({
-        "chat_id": chat_id,
-        "text": text,
-    });
-    match agent.post(&url).set("content-type", "application/json").send_json(payload) {
-        Ok(resp) => {
-            if let Ok(body) = resp.into_json::<serde_json::Value>() {
-                body.get("result")
-                    .and_then(|r| r.get("message_id"))
-                    .and_then(|v| v.as_i64())
-            } else {
-                None
-            }
-        }
-        Err(_) => None,
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn telegram_edit_message(
-    agent: &ureq::Agent,
-    base_url: &str,
-    chat_id: i64,
-    message_id: i64,
-    text: &str,
-) {
-    let url = format!("{base_url}/editMessageText");
-    let payload = serde_json::json!({
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-    });
-    let _ = agent.post(&url).set("content-type", "application/json").send_json(payload);
-}
-
-#[allow(dead_code)]
-pub(crate) fn telegram_delete_message(agent: &ureq::Agent, base_url: &str, chat_id: i64, message_id: i64) {
-    let url = format!("{base_url}/deleteMessage");
-    let payload = serde_json::json!({
-        "chat_id": chat_id,
-        "message_id": message_id,
-    });
-    let _ = agent.post(&url).set("content-type", "application/json").send_json(payload);
-}
-
 pub(crate) fn telegram_send_typing(agent: &ureq::Agent, base_url: &str, chat_id: i64) {
     let url = format!("{base_url}/sendChatAction");
     let payload = serde_json::json!({
@@ -491,30 +436,6 @@ pub(crate) fn telegram_answer_callback(agent: &ureq::Agent, base_url: &str, call
     let _ = agent.post(&url)
         .set("content-type", "application/json")
         .send_json(payload);
-}
-
-#[allow(dead_code)]
-pub(crate) fn escape_markdown_v2(text: &str) -> String {
-    let special = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
-    let mut out = String::with_capacity(text.len() * 2);
-    let in_code_block = false;
-    let mut in_inline_code = false;
-    for ch in text.chars() {
-        if ch == '`' {
-            in_inline_code = !in_inline_code;
-            out.push(ch);
-            continue;
-        }
-        if in_inline_code || in_code_block {
-            out.push(ch);
-            continue;
-        }
-        if special.contains(&ch) {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 pub(crate) fn telegram_send_message(

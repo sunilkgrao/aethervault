@@ -1,8 +1,5 @@
-#[allow(unused_imports)]
-use std::io::Write;
 use std::collections::HashMap;
-#[allow(unused_imports)]
-use std::io::{self, Read};
+use std::io;
 
 use tiny_http::{Header, Method, Response, Server};
 use url::form_urlencoded;
@@ -112,4 +109,47 @@ pub(crate) fn run_whatsapp_bridge(
         let _ = request.respond(response);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_xml_no_special_chars() {
+        assert_eq!(escape_xml("hello world"), "hello world");
+    }
+
+    #[test]
+    fn escape_xml_ampersand() {
+        assert_eq!(escape_xml("a & b"), "a &amp; b");
+    }
+
+    #[test]
+    fn escape_xml_angle_brackets() {
+        assert_eq!(escape_xml("<tag>"), "&lt;tag&gt;");
+    }
+
+    #[test]
+    fn escape_xml_quotes() {
+        assert_eq!(escape_xml(r#"say "hello""#), "say &quot;hello&quot;");
+    }
+
+    #[test]
+    fn escape_xml_apostrophe() {
+        assert_eq!(escape_xml("it's"), "it&apos;s");
+    }
+
+    #[test]
+    fn escape_xml_all_special() {
+        assert_eq!(
+            escape_xml(r#"<a href="x">&'test'</a>"#),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&apos;test&apos;&lt;/a&gt;"
+        );
+    }
+
+    #[test]
+    fn escape_xml_empty() {
+        assert_eq!(escape_xml(""), "");
+    }
 }

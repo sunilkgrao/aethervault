@@ -1,5 +1,4 @@
-#[allow(unused_imports)]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -124,51 +123,6 @@ pub(crate) struct AgentLogEntry {
     pub(crate) meta: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) ts_utc: Option<i64>,
-}
-
-/// Legacy: derive the JSONL agent log path from the vault path.
-/// Superseded by date-based logs in agent_log.rs (workspace/logs/agent-YYYY-MM-DD.jsonl).
-#[allow(dead_code)]
-pub(crate) fn agent_log_path(mv2: &Path) -> PathBuf {
-    let log_dir = mv2.parent().unwrap_or(Path::new(".")).join("logs");
-    let _ = std::fs::create_dir_all(&log_dir);
-    log_dir.join("agent-turns.jsonl")
-}
-
-/// Legacy: append log entries to a single JSONL file.
-/// Superseded by append_log_jsonl in agent_log.rs.
-#[allow(dead_code)]
-pub(crate) fn flush_log_to_jsonl(path: &Path, buffer: &mut Vec<AgentLogEntry>) -> Result<(), Box<dyn std::error::Error>> {
-    if buffer.is_empty() {
-        return Ok(());
-    }
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    for entry in buffer.drain(..) {
-        let line = serde_json::to_string(&entry)?;
-        writeln!(file, "{}", line)?;
-    }
-    Ok(())
-}
-
-/// Legacy: rotate the log file when it exceeds max_bytes.
-/// Superseded by date-based log partitioning in agent_log.rs.
-#[allow(dead_code)]
-pub(crate) fn rotate_log_if_needed(path: &Path, max_bytes: u64) {
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > max_bytes {
-            let backup = path.with_extension("jsonl.1");
-            let _ = std::fs::remove_file(&backup);
-            let _ = std::fs::rename(path, &backup);
-            eprintln!(
-                "[harness] rotated agent log (was {}MB)",
-                meta.len() / 1_000_000
-            );
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -493,7 +447,6 @@ pub(crate) struct ProgressEvent {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 pub(crate) struct ReminderState {
     pub(crate) last_tool_failed: bool,
     pub(crate) same_tool_fail_streak: usize,
@@ -506,7 +459,6 @@ pub(crate) struct ReminderState {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 pub(crate) struct DriftState {
     pub(crate) ema: f32,
     pub(crate) turns: usize,
@@ -528,17 +480,6 @@ impl Default for ToolAutonomyLevel {
     fn default() -> Self {
         ToolAutonomyLevel::Confirm
     }
-}
-
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub(crate) struct ToolAutonomyConfig {
-    #[serde(default)]
-    pub(crate) default_level: ToolAutonomyLevel,
-    #[serde(default)]
-    pub(crate) by_tool: HashMap<String, ToolAutonomyLevel>,
-    #[serde(default)]
-    pub(crate) by_prefix: Option<HashMap<String, ToolAutonomyLevel>>,
 }
 
 #[derive(Clone)]

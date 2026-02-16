@@ -1,4 +1,3 @@
-#[allow(unused_imports)]
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::Stdio;
@@ -309,4 +308,89 @@ pub(crate) fn checksum_hex(checksum: &[u8; 32]) -> String {
         out.push_str(&format!("{:02x}", byte));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_key_to_uri_basic() {
+        assert_eq!(config_key_to_uri("index"), "aethervault://config/index.json");
+    }
+
+    #[test]
+    fn config_key_to_uri_already_has_extension() {
+        assert_eq!(
+            config_key_to_uri("my_config.json"),
+            "aethervault://config/my_config.json"
+        );
+    }
+
+    #[test]
+    fn config_key_to_uri_empty_defaults_to_index() {
+        assert_eq!(config_key_to_uri(""), "aethervault://config/index.json");
+    }
+
+    #[test]
+    fn config_key_to_uri_with_dots() {
+        assert_eq!(
+            config_key_to_uri("oauth.google"),
+            "aethervault://config/oauth.google.json"
+        );
+    }
+
+    #[test]
+    fn config_uri_to_key_basic() {
+        assert_eq!(
+            config_uri_to_key("aethervault://config/index.json"),
+            Some("index".to_string())
+        );
+    }
+
+    #[test]
+    fn config_uri_to_key_no_extension() {
+        assert_eq!(
+            config_uri_to_key("aethervault://config/mykey"),
+            Some("mykey".to_string())
+        );
+    }
+
+    #[test]
+    fn config_uri_to_key_wrong_prefix() {
+        assert_eq!(config_uri_to_key("other://config/index.json"), None);
+    }
+
+    #[test]
+    fn config_uri_to_key_empty_key() {
+        // "aethervault://config/.json" -> key after stripping is empty
+        assert_eq!(config_uri_to_key("aethervault://config/.json"), None);
+    }
+
+    #[test]
+    fn config_key_roundtrip() {
+        let key = "oauth.google";
+        let uri = config_key_to_uri(key);
+        let recovered = config_uri_to_key(&uri);
+        assert_eq!(recovered, Some(key.to_string()));
+    }
+
+    #[test]
+    fn checksum_hex_all_zeros() {
+        let checksum = [0u8; 32];
+        let hex = checksum_hex(&checksum);
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|c| c == '0'));
+    }
+
+    #[test]
+    fn checksum_hex_known_value() {
+        let mut checksum = [0u8; 32];
+        checksum[0] = 0xff;
+        checksum[31] = 0xab;
+        let hex = checksum_hex(&checksum);
+        assert!(hex.starts_with("ff"));
+        assert!(hex.ends_with("ab"));
+        assert_eq!(hex.len(), 64);
+    }
 }

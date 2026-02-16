@@ -1,5 +1,3 @@
-#[allow(unused_imports)]
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -206,7 +204,6 @@ fn submit_exec_background_job(
         .map_err(|err| format!("invalid background queue response: {err}"))
 }
 
-#[allow(dead_code)]
 pub(crate) fn execute_tool(
     name: &str,
     args: serde_json::Value,

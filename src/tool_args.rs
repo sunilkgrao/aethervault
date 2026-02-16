@@ -1,4 +1,3 @@
-#[allow(unused_imports)]
 use serde::Deserialize;
 
 use std::collections::HashMap;
@@ -452,7 +451,6 @@ pub(crate) struct ToolSelfUpgradeArgs {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) enum LaneKind {
     Lex,
     Vec,
@@ -468,7 +466,6 @@ impl LaneKind {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct Candidate {
     pub(crate) key: String,
     pub(crate) frame_id: u64,

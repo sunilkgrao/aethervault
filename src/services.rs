@@ -1,4 +1,3 @@
-#[allow(unused_imports)]
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -7,8 +6,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-#[allow(unused_imports)]
-use aether_core::types::{FrameStatus, SearchHit};
+use aether_core::types::SearchHit;
 use aether_core::{PutOptions, Vault};
 use chrono::{Datelike, Timelike, Utc};
 use serde::Deserialize;
@@ -1616,73 +1614,3 @@ pub(crate) fn qdrant_search_text(
     Ok(hits)
 }
 
-/// Upsert documents into Qdrant (used by the embed/index pipeline).
-/// Expects pre-computed embeddings.
-#[allow(dead_code)]
-pub(crate) fn qdrant_upsert(
-    base_url: &str,
-    collection: &str,
-    points: &[(u64, Vec<f32>, serde_json::Value)], // (id, vector, payload)
-) -> Result<usize, String> {
-    if points.is_empty() {
-        return Ok(0);
-    }
-
-    let url = format!("{}/collections/{}/points", base_url.trim_end_matches('/'), collection);
-    let qdrant_points: Vec<serde_json::Value> = points.iter().map(|(id, vec, payload)| {
-        serde_json::json!({
-            "id": id,
-            "vector": vec,
-            "payload": payload
-        })
-    }).collect();
-
-    let body = serde_json::json!({ "points": qdrant_points });
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
-        .build();
-
-    agent.put(&url)
-        .set("content-type", "application/json")
-        .send_string(&serde_json::to_string(&body).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("qdrant upsert: {e}"))?;
-
-    Ok(points.len())
-}
-
-/// Ensure a Qdrant collection exists, creating it if necessary.
-#[allow(dead_code)]
-pub(crate) fn qdrant_ensure_collection(
-    base_url: &str,
-    collection: &str,
-    vector_size: usize,
-) -> Result<(), String> {
-    let url = format!("{}/collections/{}", base_url.trim_end_matches('/'), collection);
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
-        .build();
-
-    // Check if collection exists
-    match agent.get(&url).call() {
-        Ok(_) => return Ok(()), // exists
-        Err(ureq::Error::Status(404, _)) => {} // needs creation
-        Err(e) => return Err(format!("qdrant check: {e}")),
-    }
-
-    // Create collection
-    let body = serde_json::json!({
-        "vectors": {
-            "size": vector_size,
-            "distance": "Cosine"
-        }
-    });
-    agent.put(&url)
-        .set("content-type", "application/json")
-        .send_string(&serde_json::to_string(&body).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("qdrant create collection: {e}"))?;
-
-    Ok(())
-}

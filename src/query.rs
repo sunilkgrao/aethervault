@@ -1,5 +1,4 @@
-#[allow(unused_imports)]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use aether_core::types::{Frame, FrameStatus, SearchHit, SearchRequest, TemporalFilter};
@@ -7,7 +6,6 @@ use aether_core::{PutOptions, Vault};
 use chrono::Utc;
 use serde_json;
 
-#[allow(unused_imports)]
 use super::*;
 
 pub(crate) fn frame_to_summary(frame: &Frame) -> Option<FrameSummary> {
@@ -1129,4 +1127,152 @@ pub(crate) fn tool_autonomy_for(tool_name: &str) -> ToolAutonomyLevel {
         }
     }
     ToolAutonomyLevel::Confirm
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    // ── detect_cycle tests ──────────────────────────────────────────────
+
+    #[test]
+    fn detect_cycle_single_repeat() {
+        // 3 identical actions = cycle(1, 3)
+        let mut actions = VecDeque::new();
+        actions.push_back("read:abc".to_string());
+        actions.push_back("read:abc".to_string());
+        actions.push_back("read:abc".to_string());
+        let result = detect_cycle(&actions);
+        assert!(result.is_some());
+        let (cycle_len, repeats) = result.unwrap();
+        assert_eq!(cycle_len, 1);
+        assert_eq!(repeats, 3);
+    }
+
+    #[test]
+    fn detect_cycle_no_cycle() {
+        let mut actions = VecDeque::new();
+        actions.push_back("read:abc".to_string());
+        actions.push_back("write:def".to_string());
+        actions.push_back("query:ghi".to_string());
+        assert!(detect_cycle(&actions).is_none());
+    }
+
+    #[test]
+    fn detect_cycle_two_step_pattern() {
+        // A-B-A-B = cycle(2, 2)
+        let mut actions = VecDeque::new();
+        actions.push_back("read:abc".to_string());
+        actions.push_back("write:def".to_string());
+        actions.push_back("read:abc".to_string());
+        actions.push_back("write:def".to_string());
+        let result = detect_cycle(&actions);
+        assert!(result.is_some());
+        let (cycle_len, _) = result.unwrap();
+        assert_eq!(cycle_len, 2);
+    }
+
+    #[test]
+    fn detect_cycle_empty() {
+        let actions = VecDeque::new();
+        assert!(detect_cycle(&actions).is_none());
+    }
+
+    #[test]
+    fn detect_cycle_too_few() {
+        // Only 2 identical — not enough (need 3 for cycle_len=1)
+        let mut actions = VecDeque::new();
+        actions.push_back("read:abc".to_string());
+        actions.push_back("read:abc".to_string());
+        assert!(detect_cycle(&actions).is_none());
+    }
+
+    // ── rrf_fuse tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn rrf_fuse_single_list() {
+        let lists = vec![RankedList {
+            lane: LaneKind::Lex,
+            query: "test".to_string(),
+            is_base: true,
+            items: vec![
+                Candidate {
+                    key: "a".to_string(),
+                    frame_id: 1,
+                    uri: "uri:a".to_string(),
+                    title: Some("A".to_string()),
+                    snippet: "snippet a".to_string(),
+                    score: Some(1.0),
+                    lane: LaneKind::Lex,
+                    query: "test".to_string(),
+                    rank: 0,
+                },
+                Candidate {
+                    key: "b".to_string(),
+                    frame_id: 2,
+                    uri: "uri:b".to_string(),
+                    title: Some("B".to_string()),
+                    snippet: "snippet b".to_string(),
+                    score: Some(0.5),
+                    lane: LaneKind::Lex,
+                    query: "test".to_string(),
+                    rank: 1,
+                },
+            ],
+        }];
+        let fused = rrf_fuse(&lists, 60.0);
+        assert_eq!(fused.len(), 2);
+        // First should be "a" (rank 1, base weight 2.0)
+        assert_eq!(fused[0].key, "a");
+        assert!(fused[0].rrf_score > fused[1].rrf_score);
+    }
+
+    #[test]
+    fn rrf_fuse_merge_across_lists() {
+        let lists = vec![
+            RankedList {
+                lane: LaneKind::Lex,
+                query: "q1".to_string(),
+                is_base: true,
+                items: vec![Candidate {
+                    key: "shared".to_string(),
+                    frame_id: 1,
+                    uri: "uri:shared".to_string(),
+                    title: Some("Shared".to_string()),
+                    snippet: "s1".to_string(),
+                    score: Some(1.0),
+                    lane: LaneKind::Lex,
+                    query: "q1".to_string(),
+                    rank: 0,
+                }],
+            },
+            RankedList {
+                lane: LaneKind::Vec,
+                query: "q2".to_string(),
+                is_base: false,
+                items: vec![Candidate {
+                    key: "shared".to_string(),
+                    frame_id: 1,
+                    uri: "uri:shared".to_string(),
+                    title: Some("Shared".to_string()),
+                    snippet: "s2".to_string(),
+                    score: Some(0.8),
+                    lane: LaneKind::Vec,
+                    query: "q2".to_string(),
+                    rank: 0,
+                }],
+            },
+        ];
+        let fused = rrf_fuse(&lists, 60.0);
+        // Same key appears in both lists — should be fused into one entry
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].sources.len(), 2);
+    }
+
+    #[test]
+    fn rrf_fuse_empty() {
+        let fused = rrf_fuse(&[], 60.0);
+        assert!(fused.is_empty());
+    }
 }

@@ -1,7 +1,5 @@
-#[allow(unused_imports)]
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-#[allow(unused_imports)]
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -9,8 +7,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_core::{PutOptions, Vault};
-#[allow(unused_imports)]
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde_json;

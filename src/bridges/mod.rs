@@ -4,8 +4,6 @@ pub(crate) mod webhook;
 
 pub(crate) use telegram::*;
 
-#[allow(unused_imports)]
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;

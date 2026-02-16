@@ -1,4 +1,3 @@
-#[allow(unused_imports)]
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;

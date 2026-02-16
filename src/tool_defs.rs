@@ -1,4 +1,3 @@
-#[allow(unused_imports)]
 use std::collections::{HashMap, HashSet};
 
 use serde_json;

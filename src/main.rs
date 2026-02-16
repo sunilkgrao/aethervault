@@ -19,37 +19,21 @@ mod skill_registry;
 // Re-export all module items at crate root so cross-module references work.
 // Before this split, everything lived in main.rs and shared a single namespace.
 // These wildcard re-exports preserve that behavior.
-#[allow(unused_imports)]
 pub(crate) use cli::*;
-#[allow(unused_imports)]
 pub(crate) use types::*;
-#[allow(unused_imports)]
 pub(crate) use tool_args::*;
-#[allow(unused_imports)]
 pub(crate) use util::*;
-#[allow(unused_imports)]
 pub(crate) use config::*;
-#[allow(unused_imports)]
 pub(crate) use query::*;
-#[allow(unused_imports)]
 pub(crate) use tool_defs::*;
-#[allow(unused_imports)]
 pub(crate) use tool_exec::*;
-#[allow(unused_imports)]
 pub(crate) use mcp::*;
-#[allow(unused_imports)]
 pub(crate) use claude::*;
-#[allow(unused_imports)]
 pub(crate) use agent::*;
-#[allow(unused_imports)]
 pub(crate) use bridges::*;
-#[allow(unused_imports)]
 pub(crate) use services::*;
-#[allow(unused_imports)]
 pub(crate) use agent_log::*;
-#[allow(unused_imports)]
 pub(crate) use config_file::*;
-#[allow(unused_imports)]
 pub(crate) use skill_registry::*;
 
 // External crate imports used directly in main()
