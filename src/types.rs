@@ -126,15 +126,18 @@ pub(crate) struct AgentLogEntry {
     pub(crate) ts_utc: Option<i64>,
 }
 
-/// Derive the JSONL agent log path from the vault path.
-/// e.g. /root/.aethervault/memory.mv2 -> /root/.aethervault/logs/agent-turns.jsonl
+/// Legacy: derive the JSONL agent log path from the vault path.
+/// Superseded by date-based logs in agent_log.rs (workspace/logs/agent-YYYY-MM-DD.jsonl).
+#[allow(dead_code)]
 pub(crate) fn agent_log_path(mv2: &Path) -> PathBuf {
     let log_dir = mv2.parent().unwrap_or(Path::new(".")).join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
     log_dir.join("agent-turns.jsonl")
 }
 
-/// Append log entries to a JSONL file. Microsecond-fast, no index overhead.
+/// Legacy: append log entries to a single JSONL file.
+/// Superseded by append_log_jsonl in agent_log.rs.
+#[allow(dead_code)]
 pub(crate) fn flush_log_to_jsonl(path: &Path, buffer: &mut Vec<AgentLogEntry>) -> Result<(), Box<dyn std::error::Error>> {
     if buffer.is_empty() {
         return Ok(());
@@ -151,7 +154,9 @@ pub(crate) fn flush_log_to_jsonl(path: &Path, buffer: &mut Vec<AgentLogEntry>) -
     Ok(())
 }
 
-/// Rotate the log file when it exceeds max_bytes. Keeps one backup.
+/// Legacy: rotate the log file when it exceeds max_bytes.
+/// Superseded by date-based log partitioning in agent_log.rs.
+#[allow(dead_code)]
 pub(crate) fn rotate_log_if_needed(path: &Path, max_bytes: u64) {
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > max_bytes {
@@ -210,8 +215,6 @@ pub(crate) struct QueryArgs {
     pub(crate) before: Option<String>,
     pub(crate) after: Option<String>,
     pub(crate) feedback_weight: f32,
-    pub(crate) vault_path: Option<std::path::PathBuf>,
-    pub(crate) parallel_lanes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -407,10 +410,6 @@ pub(crate) struct AgentHookResponse {
     pub(crate) message: AgentMessage,
 }
 
-pub(crate) trait ProgressStream: Send + Sync {
-    fn emit(&self, milestone: &str, percent: u8, message: &str);
-}
-
 #[derive(Debug, Serialize)]
 pub(crate) struct AgentToolResult {
     pub(crate) id: String,
@@ -440,8 +439,6 @@ pub(crate) struct AgentProgress {
     pub(crate) step: usize,
     pub(crate) max_steps: usize,
     pub(crate) phase: String,
-    pub(crate) milestone: String,
-    pub(crate) percent: u8,
     pub(crate) text_preview: Option<String>,
     pub(crate) started_at: std::time::Instant,
     /// Tools invoked so far (name -> count)
@@ -456,17 +453,6 @@ pub(crate) struct AgentProgress {
     pub(crate) interim_messages: Vec<String>,
     /// Whether the first interim/acknowledgment has been sent
     pub(crate) first_ack_sent: bool,
-}
-
-impl ProgressStream for Arc<Mutex<AgentProgress>> {
-    fn emit(&self, milestone: &str, percent: u8, message: &str) {
-        if let Ok(mut progress) = self.lock() {
-            progress.milestone = milestone.to_string();
-            progress.percent = percent.min(100);
-            progress.text_preview = Some(message.to_string());
-            progress.started_at = progress.started_at; // keep last started_at stable
-        }
-    }
 }
 
 pub(crate) struct CompletionEvent {

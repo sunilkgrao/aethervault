@@ -17,13 +17,13 @@ use serde_json;
 
 use crate::claude::{call_agent_hook, call_claude, call_critic};
 use crate::{
-    agent_log_path, base_tool_names, build_context_pack, build_kg_context,
+    append_log_jsonl, base_tool_names, build_context_pack, build_kg_context,
     collect_mid_loop_reminders, compute_drift_score, critic_should_fire, env_optional,
-    execute_tool_with_handles, find_kg_entities, flush_log_to_jsonl,
+    execute_tool_with_handles, find_kg_entities, log_dir_path,
     config_file_path, format_tool_message_content, load_capsule_config, load_config_from_file,
     load_kg_graph, load_session_turns, load_workspace_context, requires_approval,
     resolve_hook_spec, resolve_workspace,
-    rotate_log_if_needed, save_session_turns, tool_catalog_map, tool_definitions_json,
+    save_session_turns, tool_catalog_map, tool_definitions_json,
     tools_from_active, with_write_mem, AgentHookRequest, AgentLogEntry, AgentMessage,
     AgentProgress, AgentRunOutput, AgentSession, AgentToolCall, AgentToolResult,
     DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
@@ -347,7 +347,7 @@ pub(crate) fn run_agent_with_prompt(
     context_results: usize,
     context_max_bytes: usize,
     max_steps: usize,
-    log_commit_interval: usize,
+    _log_commit_interval: usize,
     log: bool,
     progress: Option<Arc<Mutex<AgentProgress>>>,
 ) -> Result<AgentRunOutput, Box<dyn std::error::Error>> {
@@ -430,10 +430,6 @@ pub(crate) fn run_agent_with_prompt(
 
     let mut context_pack = None;
     let effective_max_steps = agent_cfg.max_steps.unwrap_or(max_steps);
-    let effective_log_commit_interval = agent_cfg
-        .log_commit_interval
-        .unwrap_or(log_commit_interval)
-        .max(1);
     if !no_memory {
         let query = context_query
             .or(agent_cfg.context_query)
@@ -463,8 +459,6 @@ pub(crate) fn run_agent_with_prompt(
             before: None,
             after: None,
             feedback_weight: 0.15,
-            vault_path: Some(mv2.clone()),
-            parallel_lanes: true,
         };
         if let Ok(pack) = build_context_pack(
             mem_read.as_mut().unwrap(),
@@ -634,23 +628,20 @@ pub(crate) fn run_agent_with_prompt(
     let should_log = log || agent_cfg.log.unwrap_or(false);
     let mut final_text = None;
 
-    // Agent logs go to a JSONL file — not the vault. This avoids Tantivy index bloat
-    // that caused the vault to grow from 616KB to 7.5GB. JSONL appends are microsecond-fast,
-    // require no index updates, and support trivial rotation.
-    let log_path = agent_log_path(&mv2);
-    let log_max_bytes: u64 = std::env::var("AGENT_LOG_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50_000_000); // 50MB default
-    let mut log_buffer: Vec<AgentLogEntry> = Vec::new();
+    // Agent logs go to date-based JSONL files in workspace/logs/agent-YYYY-MM-DD.jsonl.
+    // This avoids Tantivy index bloat and naturally partitions logs by day.
+    // Resolve workspace from env var (already computed earlier) or agent config.
+    let log_dir = workspace_env.as_ref()
+        .cloned()
+        .or_else(|| agent_cfg.workspace.as_ref().map(PathBuf::from))
+        .map(|ws| log_dir_path(&ws))
+        .unwrap_or_else(|| {
+            // Fallback: derive from vault parent (legacy path)
+            let dir = mv2.parent().unwrap_or(Path::new(".")).join("logs");
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        });
     let mut mem_write: Option<Vault> = None;
-
-    let flush_log = |path: &Path, buffer: &mut Vec<AgentLogEntry>, max_bytes: u64| {
-        rotate_log_if_needed(path, max_bytes);
-        if let Err(e) = flush_log_to_jsonl(path, buffer) {
-            eprintln!("[harness] failed to write agent log: {e}");
-        }
-    };
 
     if should_log {
         let entry = AgentLogEntry {
@@ -660,9 +651,8 @@ pub(crate) fn run_agent_with_prompt(
             meta: None,
             ts_utc: Some(Utc::now().timestamp()),
         };
-        log_buffer.push(entry);
-        if log_buffer.len() >= effective_log_commit_interval {
-            flush_log(&log_path, &mut log_buffer, log_max_bytes);
+        if let Err(e) = append_log_jsonl(&log_dir, &entry) {
+            eprintln!("[harness] failed to write agent log: {e}");
         }
     }
 
@@ -751,9 +741,8 @@ pub(crate) fn run_agent_with_prompt(
                     meta: None,
                     ts_utc: Some(Utc::now().timestamp()),
                 };
-                log_buffer.push(entry);
-                if log_buffer.len() >= effective_log_commit_interval {
-                    flush_log(&log_path, &mut log_buffer, log_max_bytes);
+                if let Err(e) = append_log_jsonl(&log_dir, &entry) {
+                    eprintln!("[harness] failed to write agent log: {e}");
                 }
             }
 
@@ -823,6 +812,11 @@ pub(crate) fn run_agent_with_prompt(
                                         &mv2_clone,
                                         true,
                                         |mem| {
+                                            // Cross-session dedup: skip if URI already persisted
+                                            if mem.frame_by_uri(&uri).is_ok() {
+                                                eprintln!("[observation-dedup] cross-session duplicate skipped");
+                                                return Ok(());
+                                            }
                                             let mut opts = PutOptions::default();
                                             opts.uri = Some(uri.clone());
                                             opts.kind = Some("text/markdown".to_string());
@@ -831,6 +825,8 @@ pub(crate) fn run_agent_with_prompt(
                                             opts.search_text = Some(facts.clone());
                                             mem.put_bytes_with_options(facts.as_bytes(), opts)
                                                 .map(|_| ())
+                                                .map_err(|e| e.to_string())?;
+                                            mem.commit()
                                                 .map_err(|e| e.to_string())
                                         },
                                     );
@@ -976,15 +972,15 @@ pub(crate) fn run_agent_with_prompt(
             }
 
             if should_log {
-                log_buffer.push(AgentLogEntry {
+                let entry = AgentLogEntry {
                     session: session.clone(),
                     role: "tool".to_string(),
                     text: result.output,
                     meta: Some(result.details),
                     ts_utc: Some(Utc::now().timestamp()),
-                });
-                if log_buffer.len() >= effective_log_commit_interval {
-                    flush_log(&log_path, &mut log_buffer, log_max_bytes);
+                };
+                if let Err(e) = append_log_jsonl(&log_dir, &entry) {
+                    eprintln!("[harness] failed to write agent log: {e}");
                 }
             }
 
@@ -1010,10 +1006,6 @@ pub(crate) fn run_agent_with_prompt(
                 reminder_state.sequential_read_ops += 1;
             } else {
                 reminder_state.sequential_read_ops = 0;
-            }
-
-            if matches!(call.name.as_str(), "put" | "log" | "feedback") && !result.is_error {
-                flush_log(&log_path, &mut log_buffer, log_max_bytes);
             }
         } else {
             // Multiple tool calls — execute in parallel (non-MCP), MCP calls sequentially
@@ -1152,15 +1144,15 @@ pub(crate) fn run_agent_with_prompt(
                 }
 
                 if should_log {
-                    log_buffer.push(AgentLogEntry {
+                    let entry = AgentLogEntry {
                         session: session.clone(),
                         role: "tool".to_string(),
                         text: result.output,
                         meta: Some(result.details),
                         ts_utc: Some(Utc::now().timestamp()),
-                    });
-                    if log_buffer.len() >= effective_log_commit_interval {
-                        flush_log(&log_path, &mut log_buffer, log_max_bytes);
+                    };
+                    if let Err(e) = append_log_jsonl(&log_dir, &entry) {
+                        eprintln!("[harness] failed to write agent log: {e}");
                     }
                 }
 
@@ -1174,10 +1166,6 @@ pub(crate) fn run_agent_with_prompt(
                     }
                 } else {
                     reminder_state.no_progress_streak = 0;
-                }
-
-                if matches!(call.name.as_str(), "put" | "log" | "feedback") && !result.is_error {
-                    flush_log(&log_path, &mut log_buffer, log_max_bytes);
                 }
             }
         }
@@ -1235,10 +1223,6 @@ pub(crate) fn run_agent_with_prompt(
             });
         }
         step += 1;
-    }
-
-    if should_log {
-        flush_log(&log_path, &mut log_buffer, log_max_bytes);
     }
 
     if !completed {

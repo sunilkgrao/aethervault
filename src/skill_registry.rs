@@ -46,8 +46,14 @@ pub(crate) fn upsert_skill(
     let tools_json = serde_json::to_string(&skill.tools)?;
     let contexts_json = serde_json::to_string(&skill.contexts)?;
     conn.execute(
-        "INSERT OR REPLACE INTO skills (name, trigger, steps, tools, notes, success_rate, times_used, times_succeeded, last_used, created_at, contexts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO skills (name, trigger, steps, tools, notes, success_rate, times_used, times_succeeded, last_used, created_at, contexts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(name) DO UPDATE SET
+           trigger = excluded.trigger,
+           steps = excluded.steps,
+           tools = excluded.tools,
+           notes = excluded.notes,
+           contexts = excluded.contexts",
         params![
             skill.name,
             skill.trigger,

@@ -797,13 +797,6 @@ pub(crate) fn append_agent_log(
     append_agent_log_with_commit(mem, entry, true)
 }
 
-pub(crate) fn append_agent_log_uncommitted(
-    mem: &mut Vault,
-    entry: &AgentLogEntry,
-) -> Result<String, Box<dyn std::error::Error>> {
-    append_agent_log_with_commit(mem, entry, false)
-}
-
 pub(crate) fn append_agent_log_with_commit(
     _mem: &mut Vault,
     entry: &AgentLogEntry,
@@ -811,9 +804,8 @@ pub(crate) fn append_agent_log_with_commit(
 ) -> Result<String, Box<dyn std::error::Error>> {
     // JSONL-only: agent logs are audit trail, not searchable knowledge.
     // MV2 capsule write removed to avoid waste — JSONL is the single destination.
-    let workspace = std::env::var("AETHERVAULT_WORKSPACE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_WORKSPACE_DIR));
+    let workspace = resolve_workspace(None, &AgentConfig::default())
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_WORKSPACE_DIR));
     let log_dir = log_dir_path(&workspace);
     if let Err(e) = append_log_jsonl(&log_dir, entry) {
         eprintln!("[agent-log] JSONL write failed: {e}");

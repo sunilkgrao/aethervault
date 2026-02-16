@@ -600,8 +600,6 @@ pub(crate) fn spawn_agent_run(
         checkpoint_response: None,
         extended_max_steps: None,
         interim_messages: Vec::new(),
-        milestone: String::new(),
-        percent: 0,
         first_ack_sent: false,
     }));
 

@@ -26,7 +26,7 @@ use crate::{
     env_optional, tool_autonomy_for, ToolAutonomyLevel, ApprovalEntry, TriggerEntry,
     AgentConfig, CapsuleConfig, CronExpr, load_capsule_config, load_config_from_file,
     config_file_path, resolve_workspace, build_bridge_agent_config, run_agent_for_bridge,
-    telegram_send_message,
+    telegram_send_message, load_file_config, save_config_to_file,
 };
 use tiny_http::{Response, Server};
 use walkdir::WalkDir;
@@ -336,9 +336,14 @@ pub(crate) fn run_oauth_broker(
         let token =
             exchange_oauth_code(&token_url, &client_id, &client_secret, &redirect_uri, &code)?;
         let key = format!("oauth.{provider}");
-        let payload = serde_json::to_vec_pretty(&token)?;
-        let mut mem = open_or_create(&mv2)?;
-        let _ = save_config_entry(&mut mem, &key, &payload)?;
+        // Primary: flat file config
+        if let Some(ws) = flat_file_workspace() {
+            save_config_to_file(&ws, &key, token.clone())?;
+        } else {
+            let payload = serde_json::to_vec_pretty(&token)?;
+            let mut mem = open_or_create(&mv2)?;
+            let _ = save_config_entry(&mut mem, &key, &payload)?;
+        }
         let response = Response::from_string("Authorized. You can close this tab.");
         let _ = request.respond(response);
         println!("Stored token in config key: {key}");
@@ -360,16 +365,40 @@ pub(crate) fn approval_hash(tool: &str, args: &serde_json::Value) -> String {
     blake3_hash(&bytes).to_hex().to_string()
 }
 
-pub(crate) fn load_approvals(mem: &mut Vault) -> Vec<ApprovalEntry> {
-    load_config_json(mem, "approvals")
+/// Resolve workspace path from AETHERVAULT_WORKSPACE env var (used by flat-file config helpers).
+fn flat_file_workspace() -> Option<PathBuf> {
+    env_optional("AETHERVAULT_WORKSPACE")
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+pub(crate) fn load_approvals(_mem: &mut Vault) -> Vec<ApprovalEntry> {
+    // Primary: flat file config
+    if let Some(ws) = flat_file_workspace() {
+        let cfg_path = config_file_path(&ws);
+        if cfg_path.exists() {
+            let fc = load_file_config(&cfg_path);
+            if !fc.approvals.is_empty() {
+                return fc.approvals;
+            }
+        }
+    }
+    // Fallback: capsule
+    load_config_json(_mem, "approvals")
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
 }
 
-pub(crate) fn save_approvals(mem: &mut Vault, approvals: &[ApprovalEntry]) -> Result<(), String> {
+pub(crate) fn save_approvals(_mem: &mut Vault, approvals: &[ApprovalEntry]) -> Result<(), String> {
+    // Primary: flat file config
+    if let Some(ws) = flat_file_workspace() {
+        let value = serde_json::to_value(approvals).map_err(|e| e.to_string())?;
+        return save_config_to_file(&ws, "approvals", value).map_err(|e| e.to_string());
+    }
+    // Fallback: capsule
     let json = serde_json::to_value(approvals).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?;
-    save_config_entry(mem, "approvals", &bytes).map_err(|e| e.to_string())?;
+    save_config_entry(_mem, "approvals", &bytes).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -489,16 +518,33 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
 
 // ── Triggers ────────────────────────────────────────────────────────────
 
-pub(crate) fn load_triggers(mem: &mut Vault) -> Vec<TriggerEntry> {
-    load_config_json(mem, "triggers")
+pub(crate) fn load_triggers(_mem: &mut Vault) -> Vec<TriggerEntry> {
+    // Primary: flat file config
+    if let Some(ws) = flat_file_workspace() {
+        let cfg_path = config_file_path(&ws);
+        if cfg_path.exists() {
+            let fc = load_file_config(&cfg_path);
+            if !fc.triggers.is_empty() {
+                return fc.triggers;
+            }
+        }
+    }
+    // Fallback: capsule
+    load_config_json(_mem, "triggers")
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
 }
 
-pub(crate) fn save_triggers(mem: &mut Vault, triggers: &[TriggerEntry]) -> Result<(), String> {
+pub(crate) fn save_triggers(_mem: &mut Vault, triggers: &[TriggerEntry]) -> Result<(), String> {
+    // Primary: flat file config
+    if let Some(ws) = flat_file_workspace() {
+        let value = serde_json::to_value(triggers).map_err(|e| e.to_string())?;
+        return save_config_to_file(&ws, "triggers", value).map_err(|e| e.to_string());
+    }
+    // Fallback: capsule
     let json = serde_json::to_value(triggers).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?;
-    save_config_entry(mem, "triggers", &bytes).map_err(|e| e.to_string())?;
+    save_config_entry(_mem, "triggers", &bytes).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -588,9 +634,14 @@ pub(crate) fn refresh_google_token(
             new_token["refresh_token"] = rt.clone();
         }
     }
-    let mut mem = open_or_create(mv2)?;
-    let bytes = serde_json::to_vec_pretty(&new_token)?;
-    let _ = save_config_entry(&mut mem, "oauth.google", &bytes)?;
+    // Primary: flat file config
+    if let Some(ws) = flat_file_workspace() {
+        save_config_to_file(&ws, "oauth.google", new_token.clone())?;
+    } else {
+        let mut mem = open_or_create(mv2)?;
+        let bytes = serde_json::to_vec_pretty(&new_token)?;
+        let _ = save_config_entry(&mut mem, "oauth.google", &bytes)?;
+    }
     Ok(new_token)
 }
 
@@ -634,16 +685,36 @@ pub(crate) fn refresh_microsoft_token(
             new_token["refresh_token"] = rt.clone();
         }
     }
-    let mut mem = open_or_create(mv2)?;
-    let bytes = serde_json::to_vec_pretty(&new_token)?;
-    let _ = save_config_entry(&mut mem, "oauth.microsoft", &bytes)?;
+    // Primary: flat file config
+    if let Some(ws) = flat_file_workspace() {
+        save_config_to_file(&ws, "oauth.microsoft", new_token.clone())?;
+    } else {
+        let mut mem = open_or_create(mv2)?;
+        let bytes = serde_json::to_vec_pretty(&new_token)?;
+        let _ = save_config_entry(&mut mem, "oauth.microsoft", &bytes)?;
+    }
     Ok(new_token)
 }
 
 pub(crate) fn get_oauth_token(mv2: &Path, provider: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mut mem = Vault::open_read_only(mv2)?;
     let key = format!("oauth.{provider}");
-    let token = load_config_json(&mut mem, &key).ok_or("missing oauth token")?;
+    // Primary: try flat file config
+    let flat_token = flat_file_workspace().and_then(|ws| {
+        let cfg_path = config_file_path(&ws);
+        if !cfg_path.exists() { return None; }
+        let fc = load_file_config(&cfg_path);
+        match provider {
+            "google" => fc.oauth_google,
+            "microsoft" => fc.oauth_microsoft,
+            _ => None,
+        }
+    });
+    let token = if let Some(t) = flat_token {
+        t
+    } else {
+        let mut mem = Vault::open_read_only(mv2)?;
+        load_config_json(&mut mem, &key).ok_or("missing oauth token")?
+    };
     let access = token.get("access_token").and_then(|v| v.as_str());
     if let Some(access) = access {
         return Ok(access.to_string());

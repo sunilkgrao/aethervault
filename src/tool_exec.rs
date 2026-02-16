@@ -146,6 +146,8 @@ use crate::{
     SkillRecord,
     log_dir_path,
     load_session_logs,
+    resolve_workspace,
+    AgentConfig,
 };
 
 const EXEC_BACKGROUND_THRESHOLD_MS: u64 = 300_000;
@@ -240,7 +242,7 @@ pub(crate) fn execute_tool_with_handles(
     if read_only && is_write {
         return Err("tool disabled in read-only mode".into());
     }
-    let workspace_override = env_optional("AETHERVAULT_WORKSPACE").map(PathBuf::from);
+    let workspace_override = resolve_workspace(None, &AgentConfig::default());
     if requires_approval(name, &args) {
         if read_only {
             return Err("approval required but tool disabled in read-only mode".into());
@@ -325,8 +327,6 @@ pub(crate) fn execute_tool_with_handles(
                     before: parsed.before,
                     after: parsed.after,
                     feedback_weight: parsed.feedback_weight.unwrap_or(0.15),
-                    vault_path: Some(mv2.to_path_buf()),
-                    parallel_lanes: true,
                 };
                 let response = execute_query(mem, qargs).map_err(|e| e.to_string())?;
                 let mut lines = Vec::new();
@@ -375,8 +375,6 @@ pub(crate) fn execute_tool_with_handles(
                     before: parsed.before,
                     after: parsed.after,
                     feedback_weight: parsed.feedback_weight.unwrap_or(0.15),
-                    vault_path: Some(mv2.to_path_buf()),
-                    parallel_lanes: true,
                 };
                 let pack = build_context_pack(
                     mem,
@@ -1508,7 +1506,7 @@ pub(crate) fn execute_tool_with_handles(
             // Try JSONL logs first, fall back to MV2 capsule
             let workspace = workspace_override
                 .clone()
-                .unwrap_or_else(|| mv2.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR)));
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
             let log_dir = log_dir_path(&workspace);
             let jsonl_entries = load_session_logs(&log_dir, &parsed.session, limit);
             if !jsonl_entries.is_empty() {
@@ -1620,7 +1618,7 @@ pub(crate) fn execute_tool_with_handles(
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let workspace = workspace_override
                 .clone()
-                .unwrap_or_else(|| mv2.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR)));
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
             let db_path = workspace.join("skills.sqlite");
             let conn = open_skill_db(&db_path).map_err(|e| format!("skill db: {e}"))?;
             let now = Utc::now().to_rfc3339();
@@ -1649,7 +1647,7 @@ pub(crate) fn execute_tool_with_handles(
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let workspace = workspace_override
                 .clone()
-                .unwrap_or_else(|| mv2.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR)));
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
             let db_path = workspace.join("skills.sqlite");
             let limit = parsed.limit.unwrap_or(10);
             let conn = open_skill_db(&db_path).map_err(|e| format!("skill db: {e}"))?;

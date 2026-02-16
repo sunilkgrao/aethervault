@@ -13,9 +13,7 @@ mod agent;
 mod bridges;
 mod services;
 mod agent_log;
-#[allow(dead_code)]
 mod config_file;
-#[allow(dead_code)]
 mod skill_registry;
 
 // Re-export all module items at crate root so cross-module references work.
@@ -512,8 +510,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 before,
                 after,
                 feedback_weight,
-                vault_path: Some(mv2.clone()),
-                parallel_lanes: !log,
             };
 
             let response = execute_query(&mut mem, args)?;
@@ -637,8 +633,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 before,
                 after,
                 feedback_weight,
-                vault_path: Some(mv2.clone()),
-                parallel_lanes: true,
             };
 
             let pack = build_context_pack(&mut mem, args, max_bytes, full)?;

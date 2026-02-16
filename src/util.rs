@@ -2,7 +2,6 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -356,13 +355,3 @@ pub(crate) fn resolve_workspace(cli: Option<PathBuf>, agent_cfg: &AgentConfig) -
     Some(PathBuf::from(DEFAULT_WORKSPACE_DIR))
 }
 
-#[allow(dead_code)]
-pub(crate) fn read_optional_file(path: &Path) -> Option<String> {
-    fs::read_to_string(path).ok().and_then(|text| {
-        if text.trim().is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    })
-}
