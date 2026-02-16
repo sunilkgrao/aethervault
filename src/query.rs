@@ -4,7 +4,7 @@ use std::path::Path;
 
 use aether_core::types::{Frame, FrameStatus, SearchHit, SearchRequest, TemporalFilter};
 use aether_core::{PutOptions, Vault};
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use serde_json;
 
 #[allow(unused_imports)]
@@ -805,11 +805,12 @@ pub(crate) fn append_agent_log_uncommitted(
 }
 
 pub(crate) fn append_agent_log_with_commit(
-    mem: &mut Vault,
+    _mem: &mut Vault,
     entry: &AgentLogEntry,
-    commit: bool,
+    _commit: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // Dual-write: JSONL file (primary) + MV2 capsule (legacy)
+    // JSONL-only: agent logs are audit trail, not searchable knowledge.
+    // MV2 capsule write removed to avoid waste — JSONL is the single destination.
     let workspace = std::env::var("AETHERVAULT_WORKSPACE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_WORKSPACE_DIR));
@@ -818,6 +819,7 @@ pub(crate) fn append_agent_log_with_commit(
         eprintln!("[agent-log] JSONL write failed: {e}");
     }
 
+    // Compute a synthetic URI for backward compatibility with callers.
     let bytes = serde_json::to_vec(entry)?;
     let ts = Utc::now().timestamp();
     let hash = blake3_hash(&bytes);
@@ -830,23 +832,6 @@ pub(crate) fn append_agent_log_with_commit(
         hash.to_hex()
     );
 
-    let mut options = PutOptions::default();
-    options.uri = Some(uri.clone());
-    options.title = Some(format!("agent log ({})", entry.role));
-    options.kind = Some("application/json".to_string());
-    options.track = Some("aethervault.agent".to_string());
-    options.search_text = Some(entry.text.clone());
-    options
-        .extra_metadata
-        .insert("session".into(), session_slug);
-    options
-        .extra_metadata
-        .insert("role".into(), entry.role.clone());
-
-    mem.put_bytes_with_options(&bytes, options)?;
-    if commit {
-        mem.commit()?;
-    }
     Ok(uri)
 }
 

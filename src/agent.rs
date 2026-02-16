@@ -4,7 +4,7 @@ use std::fs;
 #[allow(unused_imports)]
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,14 +20,51 @@ use crate::{
     agent_log_path, base_tool_names, build_context_pack, build_kg_context,
     collect_mid_loop_reminders, compute_drift_score, critic_should_fire, env_optional,
     execute_tool_with_handles, find_kg_entities, flush_log_to_jsonl,
-    format_tool_message_content, load_capsule_config, load_kg_graph, load_session_turns,
-    load_workspace_context, requires_approval, resolve_hook_spec, resolve_workspace,
+    config_file_path, format_tool_message_content, load_capsule_config, load_config_from_file,
+    load_kg_graph, load_session_turns, load_workspace_context, requires_approval,
+    resolve_hook_spec, resolve_workspace,
     rotate_log_if_needed, save_session_turns, tool_catalog_map, tool_definitions_json,
     tools_from_active, with_write_mem, AgentHookRequest, AgentLogEntry, AgentMessage,
     AgentProgress, AgentRunOutput, AgentSession, AgentToolCall, AgentToolResult,
     DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
     ToolExecution,
 };
+
+/// Tracks blake3 hashes of observations already written this process lifetime.
+static OBSERVATION_DEDUP: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Check capsule file size and log warnings if it is getting large.
+/// Thresholds are configurable via CAPSULE_WARN_MB (default 50) and CAPSULE_MAX_MB (default 100).
+fn check_capsule_health(mv2: &Path) {
+    let warn_mb: u64 = std::env::var("CAPSULE_WARN_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let max_mb: u64 = std::env::var("CAPSULE_MAX_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+
+    let size_bytes = match fs::metadata(mv2) {
+        Ok(meta) => meta.len(),
+        Err(_) => return, // file doesn't exist yet or unreadable; nothing to check
+    };
+
+    let size_mb = size_bytes / (1024 * 1024);
+
+    if size_bytes > max_mb * 1024 * 1024 {
+        eprintln!(
+            "[capsule-health] ERROR: capsule is {size_mb}MB (>{max_mb}MB). \
+             Consider running `aethervault doctor --compact` to reclaim space."
+        );
+    } else if size_bytes > warn_mb * 1024 * 1024 {
+        eprintln!(
+            "[capsule-health] WARNING: capsule is {size_mb}MB (>{warn_mb}MB threshold). \
+             Monitor growth; compact if it keeps increasing."
+        );
+    }
+}
 
 /// Returns true if an observation is worth persisting to long-term memory.
 fn observation_is_useful(text: &str) -> bool {
@@ -318,9 +355,24 @@ pub(crate) fn run_agent_with_prompt(
         return Err("agent prompt is empty".into());
     }
 
+    // One-time capsule size check at session start
+    check_capsule_health(&mv2);
+
     // No external lock — Vault handles shared/exclusive internally.
     let mut mem_read = Some(Vault::open_read_only(&mv2)?);
-    let config = load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default();
+
+    // Try flat file config first (workspace/config.json), fall back to capsule.
+    let workspace_env = std::env::var("AETHERVAULT_WORKSPACE").ok().map(PathBuf::from);
+    let config = if let Some(ref ws) = workspace_env {
+        let cfg_path = config_file_path(ws);
+        if cfg_path.exists() {
+            load_config_from_file(ws)
+        } else {
+            load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default()
+        }
+    } else {
+        load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default()
+    };
     let agent_cfg = config.agent.clone().unwrap_or_default();
     let hook_cfg = config.hooks.clone().unwrap_or_default();
     let model_spec = resolve_hook_spec(
@@ -750,6 +802,15 @@ pub(crate) fn run_agent_with_prompt(
                         if let Ok(response) = call_claude(&extract_request) {
                             if let Some(facts) = response.message.content {
                                 if !facts.trim().is_empty() && observation_is_useful(&facts) {
+                                    // Dedup guard: skip if we already wrote identical observation this session
+                                    let hash = blake3::hash(facts.as_bytes()).to_hex().to_string();
+                                    {
+                                        let mut seen = OBSERVATION_DEDUP.lock().unwrap();
+                                        if !seen.insert(hash) {
+                                            eprintln!("[observation-dedup] skipped duplicate: {}...", &facts.chars().take(60).collect::<String>());
+                                            return;
+                                        }
+                                    }
                                     let uri = format!(
                                         "aethervault://memory/observation/{}",
                                         Utc::now().timestamp()

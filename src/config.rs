@@ -12,9 +12,12 @@ use std::time::Instant;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use std::path::Path;
+
 use super::{
-    build_external_command, dedup_keep_order, CapsuleConfig, CommandSpec, ConfigEntry,
-    ExpansionHookInput, ExpansionHookOutput, HookSpec, RerankHookInput, RerankHookOutput,
+    build_external_command, config_file_path, dedup_keep_order, load_file_config,
+    save_file_config, CapsuleConfig, CommandSpec, ConfigEntry, ExpansionHookInput,
+    ExpansionHookOutput, FileConfig, HookSpec, RerankHookInput, RerankHookOutput,
 };
 
 const NO_DEADLINE_TIMEOUT_MS: u64 = u64::MAX;
@@ -71,6 +74,69 @@ pub(crate) fn save_config_entry(
     let id = mem.put_bytes_with_options(bytes, options)?;
     mem.commit()?;
     Ok(id)
+}
+
+/// Load CapsuleConfig from flat file (config.json in workspace).
+/// Maps FileConfig fields into CapsuleConfig structure.
+pub(crate) fn load_config_from_file(workspace: &Path) -> CapsuleConfig {
+    let path = config_file_path(workspace);
+    let fc = load_file_config(&path);
+    file_config_to_capsule_config(&fc)
+}
+
+/// Save a config key/value to the flat file (config.json in workspace).
+/// Loads existing FileConfig, merges the key, and writes back atomically.
+pub(crate) fn save_config_to_file(
+    workspace: &Path,
+    key: &str,
+    value: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = config_file_path(workspace);
+    let mut fc = load_file_config(&path);
+    match key {
+        "index" => {
+            // The "index" key contains a full CapsuleConfig JSON.
+            // Extract the agent field and merge it into FileConfig.
+            if let Ok(cc) = serde_json::from_value::<CapsuleConfig>(value) {
+                if let Some(agent) = cc.agent {
+                    fc.agent = agent;
+                }
+            }
+        }
+        "approvals" => {
+            if let Ok(approvals) = serde_json::from_value(value) {
+                fc.approvals = approvals;
+            }
+        }
+        "triggers" => {
+            if let Ok(triggers) = serde_json::from_value(value) {
+                fc.triggers = triggers;
+            }
+        }
+        "oauth.google" => {
+            fc.oauth_google = Some(value);
+        }
+        "oauth.microsoft" => {
+            fc.oauth_microsoft = Some(value);
+        }
+        _ => {
+            // For arbitrary keys, store in agent config or log a warning.
+            eprintln!("[config] unknown config key '{key}', storing in index");
+        }
+    }
+    save_file_config(&path, &fc)?;
+    Ok(())
+}
+
+/// Convert a FileConfig into a CapsuleConfig for code that expects the old type.
+fn file_config_to_capsule_config(fc: &FileConfig) -> CapsuleConfig {
+    CapsuleConfig {
+        context: None,
+        collections: HashMap::new(),
+        hooks: None,
+        agent: Some(fc.agent.clone()),
+        extra: HashMap::new(),
+    }
 }
 
 pub(crate) fn list_config_entries(mem: &mut Vault) -> Vec<ConfigEntry> {

@@ -9,8 +9,8 @@ use url::form_urlencoded;
 
 use aether_core::Vault;
 use crate::{
-    load_capsule_config, load_subagents_from_config, try_handle_approval_chat,
-    BridgeAgentConfig,
+    config_file_path, env_optional, load_capsule_config, load_config_from_file,
+    load_subagents_from_config, try_handle_approval_chat, BridgeAgentConfig,
 };
 use crate::bridges::run_agent_for_bridge;
 
@@ -39,8 +39,20 @@ pub(crate) fn run_whatsapp_bridge(
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("server: {e}")))?;
     eprintln!("WhatsApp bridge listening on http://{addr}");
     let (_config, _subagent_specs) = {
-        let mut mem = Vault::open_read_only(&agent_config.mv2)?;
-        let config = load_capsule_config(&mut mem).unwrap_or_default();
+        // Try flat file config first, fall back to capsule.
+        let ws_env = env_optional("AETHERVAULT_WORKSPACE").map(std::path::PathBuf::from);
+        let config = if let Some(ref ws) = ws_env {
+            let cfg_path = config_file_path(ws);
+            if cfg_path.exists() {
+                load_config_from_file(ws)
+            } else {
+                let mut mem = Vault::open_read_only(&agent_config.mv2)?;
+                load_capsule_config(&mut mem).unwrap_or_default()
+            }
+        } else {
+            let mut mem = Vault::open_read_only(&agent_config.mv2)?;
+            load_capsule_config(&mut mem).unwrap_or_default()
+        };
         let subagent_specs = load_subagents_from_config(&config);
         (config, subagent_specs)
     };

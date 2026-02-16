@@ -65,7 +65,7 @@ use crate::{
     build_context_pack,
     append_agent_log,
     append_feedback,
-    save_config_entry,
+    save_config_to_file,
     sync_workspace_memory,
     export_capsule_memory,
     load_triggers,
@@ -539,18 +539,16 @@ pub(crate) fn execute_tool_with_handles(
         "config_set" => {
             let parsed: ToolConfigSetArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let payload = serde_json::to_vec(&parsed.json).map_err(|e| format!("json: {e}"))?;
-            let result = with_write_mem(mem_read, mem_write, mv2, true, |mem| {
-                let id =
-                    save_config_entry(mem, &parsed.key, &payload).map_err(|e| e.to_string())?;
-                Ok(ToolExecution {
-                    output: format!("Config saved ({})", parsed.key),
-                    details: serde_json::json!({ "frame_id": id }),
-                    is_error: false,
-                })
-            })?;
-            *mem_read = None;
-            Ok(result)
+            let workspace = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            save_config_to_file(&workspace, &parsed.key, parsed.json.clone())
+                .map_err(|e| e.to_string())?;
+            Ok(ToolExecution {
+                output: format!("Config saved to file ({})", parsed.key),
+                details: serde_json::json!({ "file": workspace.join("config.json") }),
+                is_error: false,
+            })
         }
         "memory_sync" => {
             let parsed: ToolMemorySyncArgs =
@@ -1677,21 +1675,39 @@ pub(crate) fn execute_tool_with_handles(
                 is_error: false,
             })
         }
-        "subagent_list" => with_read_mem(mem_read, mem_write, mv2, |mem| {
-            let config = load_capsule_config(mem).unwrap_or_default();
+        "subagent_list" => {
+            let ws = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let cfg_path = crate::config_file_path(&ws);
+            let config = if cfg_path.exists() {
+                crate::load_config_from_file(&ws)
+            } else {
+                with_read_mem(mem_read, mem_write, mv2, |mem| {
+                    Ok(load_capsule_config(mem).unwrap_or_default())
+                })?
+            };
             let subagents = load_subagents_from_config(&config);
             Ok(ToolExecution {
                 output: format!("{} subagents.", subagents.len()),
                 details: serde_json::json!({ "subagents": subagents }),
                 is_error: false,
             })
-        }),
+        }
         "subagent_invoke" => {
             let parsed: ToolSubagentInvokeArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let config = with_read_mem(mem_read, mem_write, mv2, |mem| {
-                Ok(load_capsule_config(mem).unwrap_or_default())
-            })?;
+            let ws = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let cfg_path = crate::config_file_path(&ws);
+            let config = if cfg_path.exists() {
+                crate::load_config_from_file(&ws)
+            } else {
+                with_read_mem(mem_read, mem_write, mv2, |mem| {
+                    Ok(load_capsule_config(mem).unwrap_or_default())
+                })?
+            };
             let subagents = load_subagents_from_config(&config);
             let mut system = parsed.system.clone();
             let mut model_hook = parsed.model_hook.clone();
@@ -1737,9 +1753,17 @@ pub(crate) fn execute_tool_with_handles(
             if parsed.invocations.is_empty() {
                 return Err("subagent_batch requires at least one invocation".into());
             }
-            let config_snapshot = with_read_mem(mem_read, mem_write, mv2, |mem| {
-                Ok(load_capsule_config(mem).unwrap_or_default())
-            })?;
+            let ws = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let cfg_path = crate::config_file_path(&ws);
+            let config_snapshot = if cfg_path.exists() {
+                crate::load_config_from_file(&ws)
+            } else {
+                with_read_mem(mem_read, mem_write, mv2, |mem| {
+                    Ok(load_capsule_config(mem).unwrap_or_default())
+                })?
+            };
             let subagents = load_subagents_from_config(&config_snapshot);
             let ts = Utc::now().timestamp();
 

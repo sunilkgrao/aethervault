@@ -24,8 +24,9 @@ use aether_core::types::EmbeddingProvider;
 use crate::{
     open_or_create, save_config_entry, load_config_entry, blake3_hash, execute_tool,
     env_optional, tool_autonomy_for, ToolAutonomyLevel, ApprovalEntry, TriggerEntry,
-    AgentConfig, CronExpr, load_capsule_config, resolve_workspace,
-    build_bridge_agent_config, run_agent_for_bridge, telegram_send_message,
+    AgentConfig, CapsuleConfig, CronExpr, load_capsule_config, load_config_from_file,
+    config_file_path, resolve_workspace, build_bridge_agent_config, run_agent_for_bridge,
+    telegram_send_message,
 };
 use tiny_http::{Response, Server};
 use walkdir::WalkDir;
@@ -925,15 +926,26 @@ pub(crate) fn bootstrap_workspace(
     create_file(&memory_path, memory_template)?;
     create_file(&daily_path, daily_template)?;
 
-    let mut mem = open_or_create(mv2)?;
-    let mut config = load_capsule_config(&mut mem).unwrap_or_default();
-    let mut agent_cfg = config.agent.unwrap_or_default();
+    // Write config to flat file (primary) and capsule (fallback).
+    let mut agent_cfg = AgentConfig::default();
     agent_cfg.workspace = Some(workspace.display().to_string());
     agent_cfg.onboarding_complete = Some(false);
     if timezone.is_some() {
         agent_cfg.timezone = timezone;
     }
-    config.agent = Some(agent_cfg);
+    let mut config = CapsuleConfig::default();
+    config.agent = Some(agent_cfg.clone());
+
+    // Write to flat file
+    let fc = crate::FileConfig {
+        agent: agent_cfg,
+        ..Default::default()
+    };
+    let cfg_path = config_file_path(workspace);
+    crate::save_file_config(&cfg_path, &fc)?;
+
+    // Also write to capsule for backwards compatibility
+    let mut mem = open_or_create(mv2)?;
     let bytes = serde_json::to_vec_pretty(&config)?;
     let _ = save_config_entry(&mut mem, "index", &bytes)?;
     Ok(())
@@ -1023,10 +1035,20 @@ pub(crate) fn run_schedule_loop(
     log: bool,
     log_commit_interval: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // No external lock — Vault::open_read_only acquires a shared flock() on the .mv2
-    // which allows concurrent readers. Writes upgrade to exclusive automatically.
-    let mut mem_read = Some(Vault::open_read_only(&mv2)?);
-    let config = load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default();
+    // Try flat file config first, fall back to capsule.
+    let ws_env = env_optional("AETHERVAULT_WORKSPACE").map(PathBuf::from);
+    let config = if let Some(ref ws) = ws_env {
+        let cfg_path = config_file_path(ws);
+        if cfg_path.exists() {
+            load_config_from_file(ws)
+        } else {
+            let mut mem_read = Some(Vault::open_read_only(&mv2)?);
+            load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default()
+        }
+    } else {
+        let mut mem_read = Some(Vault::open_read_only(&mv2)?);
+        load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default()
+    };
     let agent_cfg = config.agent.clone().unwrap_or_default();
     let tz = resolve_timezone(&agent_cfg, timezone);
     let workspace = resolve_workspace(workspace, &agent_cfg);
@@ -1114,8 +1136,20 @@ pub(crate) fn run_watch_loop(
     log_commit_interval: usize,
     poll_seconds: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut mem_read = Some(Vault::open_read_only(&mv2)?);
-    let config = load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default();
+    // Try flat file config first, fall back to capsule.
+    let ws_env2 = env_optional("AETHERVAULT_WORKSPACE").map(PathBuf::from);
+    let config = if let Some(ref ws) = ws_env2 {
+        let cfg_path = config_file_path(ws);
+        if cfg_path.exists() {
+            load_config_from_file(ws)
+        } else {
+            let mut mr = Some(Vault::open_read_only(&mv2)?);
+            load_capsule_config(mr.as_mut().unwrap()).unwrap_or_default()
+        }
+    } else {
+        let mut mr = Some(Vault::open_read_only(&mv2)?);
+        load_capsule_config(mr.as_mut().unwrap()).unwrap_or_default()
+    };
     let agent_cfg = config.agent.clone().unwrap_or_default();
     let tz = resolve_timezone(&agent_cfg, timezone);
     let workspace = resolve_workspace(workspace, &agent_cfg);
