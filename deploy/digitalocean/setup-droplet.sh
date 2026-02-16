@@ -120,6 +120,12 @@ log_info "Installing Tailscale..."
 curl -fsSL https://tailscale.com/install.sh | sh
 log_info "Tailscale installed. Run 'sudo tailscale up' to connect to your tailnet."
 
+# Install agent-browser (browser automation CLI used by aethervault's browser tool)
+log_info "Installing agent-browser..."
+npm install -g agent-browser
+agent-browser install
+log_info "agent-browser $(agent-browser --version 2>/dev/null || echo 'unknown') installed"
+
 # System optimizations
 log_info "Applying system optimizations..."
 cat >> /etc/sysctl.conf << 'EOF'

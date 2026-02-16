@@ -1286,7 +1286,7 @@ pub(crate) fn execute_tool_with_handles(
             let browser_timeout_ms = parsed.timeout_ms.unwrap_or(NO_TIMEOUT_MS);
             let session = parsed.session.unwrap_or_else(|| "default".to_string());
 
-            let mut cmd_args: Vec<String> = vec!["--session".to_string(), session, "--".to_string()];
+            let mut cmd_args: Vec<String> = vec!["--session".to_string(), session];
             let parts = shlex::split(&parsed.command)
                 .ok_or_else(|| "browser: malformed command (unmatched quotes)".to_string())?;
             if parts.is_empty() {

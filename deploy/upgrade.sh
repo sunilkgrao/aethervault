@@ -93,6 +93,22 @@ cp "$BUILT_BINARY" "${DEPLOY_DIR}/${INACTIVE}/aethervault"
 chmod +x "${DEPLOY_DIR}/${INACTIVE}/aethervault"
 log "Binary copied to ${INACTIVE} slot"
 
+# Step 2b: Ensure runtime dependencies (npm tools the binary shells out to)
+log "Checking runtime dependencies..."
+if ! command -v agent-browser &>/dev/null; then
+    log "Installing agent-browser (browser automation CLI)..."
+    npm install -g agent-browser 2>&1 | tail -3 | tee -a "$LOG_FILE"
+    agent-browser install 2>&1 | tail -3 | tee -a "$LOG_FILE"
+    log "agent-browser installed: $(agent-browser --version 2>/dev/null || echo 'unknown')"
+else
+    # Ensure browser binaries are present even if the npm package is installed
+    if ! agent-browser --session _healthcheck open about:blank &>/dev/null; then
+        log "agent-browser installed but browser missing, reinstalling..."
+        agent-browser install 2>&1 | tail -3 | tee -a "$LOG_FILE"
+    fi
+    log "agent-browser OK: $(agent-browser --version 2>/dev/null)"
+fi
+
 # Step 3: Smoke test
 if [[ "$SKIP_TESTS" == "false" ]]; then
     log "Running smoke test..."
