@@ -18,7 +18,8 @@ use crate::{
     run_agent_with_prompt, try_handle_approval_chat, env_optional,
 };
 
-const NO_TIMEOUT_MS: u64 = u64::MAX;
+// 2 minutes — prevents hanging on unresponsive external services
+const NO_TIMEOUT_MS: u64 = 120_000;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TelegramUpdateResponse {

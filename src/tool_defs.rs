@@ -197,7 +197,7 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
                 "properties": {
                     "account": { "type": "string" },
                     "folder": { "type": "string" },
-                    "limit": { "type": "number" }
+                    "limit": { "type": "integer" }
                 }
             }
         }),
@@ -484,42 +484,48 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "subagent_list",
-            "description": "List configured subagents.",
+            "description": "List configured subagents with their names, descriptions, and capabilities. Call this first to see what specialists are available before using subagent_invoke or subagent_batch.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         serde_json::json!({
             "name": "subagent_invoke",
-            "description": "Invoke a named subagent with a prompt.",
+            "description": "Invoke a named subagent with a prompt. The subagent runs in its own session with independent memory access. Use subagent_list first to see available subagents and their descriptions.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string" },
-                    "prompt": { "type": "string" },
-                    "system": { "type": "string" },
-                    "model_hook": { "type": "string" }
+                    "name": { "type": "string", "description": "Name of a configured subagent (from subagent_list)" },
+                    "prompt": { "type": "string", "description": "The task/prompt to send to the subagent" },
+                    "system": { "type": "string", "description": "Override the subagent's system prompt" },
+                    "model_hook": { "type": "string", "description": "Override the subagent's model hook" },
+                    "max_steps": { "type": "integer", "description": "Override max agent loop iterations" },
+                    "timeout_secs": { "type": "integer", "description": "Hard timeout in seconds" }
                 },
                 "required": ["name", "prompt"]
             }
         }),
         serde_json::json!({
             "name": "subagent_batch",
-            "description": "Invoke multiple subagents concurrently. Each invocation runs in its own thread with independent capsule access. Returns all results once every subagent completes.",
+            "description": "Invoke multiple subagents concurrently. Each runs in its own thread with independent memory access. Returns all results once every subagent completes. Use for parallel fan-out of independent tasks.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "invocations": {
                         "type": "array",
+                        "description": "Array of subagent invocations to run concurrently",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "name": { "type": "string" },
-                                "prompt": { "type": "string" },
+                                "name": { "type": "string", "description": "Name of a configured subagent" },
+                                "prompt": { "type": "string", "description": "Task/prompt for this subagent" },
                                 "system": { "type": "string" },
-                                "model_hook": { "type": "string" }
+                                "model_hook": { "type": "string" },
+                                "max_steps": { "type": "integer" },
+                                "timeout_secs": { "type": "integer" }
                             },
                             "required": ["name", "prompt"]
                         }
-                    }
+                    },
+                    "max_concurrent": { "type": "integer", "description": "Max threads to run at once (default: all)" }
                 },
                 "required": ["invocations"]
             }
@@ -705,6 +711,9 @@ pub(crate) fn base_tool_names() -> HashSet<String> {
         "context",
         "search",
         "get",
+        "put",
+        "log",
+        "feedback",
         "session_context",
         "config_set",
         "memory_append_daily",
@@ -722,6 +731,12 @@ pub(crate) fn base_tool_names() -> HashSet<String> {
         "subagent_invoke",
         "subagent_batch",
         "approval_list",
+        "exec",
+        "notify",
+        "http_request",
+        "fs_list",
+        "fs_read",
+        "fs_write",
         "scale",
         "self_upgrade",
         "browser",

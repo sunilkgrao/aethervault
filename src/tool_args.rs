@@ -338,7 +338,7 @@ pub(crate) struct ToolSkillSearchArgs {
     pub(crate) limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct ToolSubagentInvokeArgs {
     pub(crate) name: String,
     pub(crate) prompt: String,
@@ -346,12 +346,21 @@ pub(crate) struct ToolSubagentInvokeArgs {
     pub(crate) system: Option<String>,
     #[serde(default)]
     pub(crate) model_hook: Option<String>,
+    /// Override max_steps for this invocation.
+    #[serde(default)]
+    pub(crate) max_steps: Option<usize>,
+    /// Hard timeout in seconds for this invocation.
+    #[serde(default)]
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ToolSubagentBatchArgs {
     /// Array of subagent invocations to run concurrently.
     pub(crate) invocations: Vec<ToolSubagentInvokeArgs>,
+    /// Maximum concurrent threads (default: all at once).
+    #[serde(default)]
+    pub(crate) max_concurrent: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

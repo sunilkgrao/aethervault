@@ -503,10 +503,28 @@ pub(crate) struct BridgeAgentConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct SubagentSpec {
     pub(crate) name: String,
+    /// Human-readable description used for auto-routing.
+    /// The orchestrator matches user intent against descriptions
+    /// to decide which subagent to invoke.
+    #[serde(default)]
+    pub(crate) description: Option<String>,
     #[serde(default)]
     pub(crate) system: Option<String>,
     #[serde(default)]
     pub(crate) model_hook: Option<String>,
+    /// Allowlist of tool names this subagent can use.
+    /// If empty, inherits all tools from parent.
+    #[serde(default)]
+    pub(crate) tools: Vec<String>,
+    /// Denylist of tool names to exclude.
+    #[serde(default)]
+    pub(crate) disallowed_tools: Vec<String>,
+    /// Maximum agent loop iterations (default: parent's max_steps).
+    #[serde(default)]
+    pub(crate) max_steps: Option<usize>,
+    /// Hard timeout in seconds (default: none — bounded by max_steps).
+    #[serde(default)]
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 #[derive(Debug)]

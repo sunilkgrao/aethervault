@@ -17,6 +17,8 @@ use url::form_urlencoded;
 use aether_core::text_embed::{LocalTextEmbedder, TextEmbedConfig};
 #[cfg(feature = "vec")]
 use aether_core::types::EmbeddingProvider;
+#[cfg(feature = "vec")]
+use aether_core::types::FrameStatus;
 
 // Re-imports from main (crate-internal helpers and types)
 use crate::{
@@ -29,7 +31,8 @@ use crate::{
 use tiny_http::{Response, Server};
 use walkdir::WalkDir;
 
-const NO_TIMEOUT_MS: u64 = u64::MAX;
+// 2 minutes — prevents hanging on unresponsive external services
+const NO_TIMEOUT_MS: u64 = 120_000;
 
 // ── Memory helpers ──────────────────────────────────────────────────────
 

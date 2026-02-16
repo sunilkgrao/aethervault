@@ -132,7 +132,7 @@ fn file_config_to_capsule_config(fc: &FileConfig) -> CapsuleConfig {
     CapsuleConfig {
         context: None,
         collections: HashMap::new(),
-        hooks: None,
+        hooks: fc.hooks.clone(),
         agent: Some(fc.agent.clone()),
         extra: HashMap::new(),
     }

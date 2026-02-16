@@ -2,12 +2,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentConfig, ApprovalEntry, TriggerEntry};
+use crate::{AgentConfig, ApprovalEntry, HookConfig, TriggerEntry};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct FileConfig {
     #[serde(default)]
     pub(crate) agent: AgentConfig,
+    #[serde(default)]
+    pub(crate) hooks: Option<HookConfig>,
     #[serde(default)]
     pub(crate) approvals: Vec<ApprovalEntry>,
     #[serde(default)]

@@ -1821,9 +1821,23 @@ pub(crate) fn execute_tool_with_handles(
                 })?
             };
             let subagents = load_subagents_from_config(&config);
+            let details: Vec<serde_json::Value> = subagents.iter().map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "tools": s.tools,
+                    "disallowed_tools": s.disallowed_tools,
+                    "max_steps": s.max_steps,
+                    "timeout_secs": s.timeout_secs,
+                })
+            }).collect();
             Ok(ToolExecution {
-                output: format!("{} subagents.", subagents.len()),
-                details: serde_json::json!({ "subagents": subagents }),
+                output: if details.is_empty() {
+                    "No subagents configured. Define them in workspace config.json under agent.subagents.".to_string()
+                } else {
+                    format!("{} subagents available.", details.len())
+                },
+                details: serde_json::json!({ "subagents": details }),
                 is_error: false,
             })
         }
@@ -1844,7 +1858,8 @@ pub(crate) fn execute_tool_with_handles(
             let subagents = load_subagents_from_config(&config);
             let mut system = parsed.system.clone();
             let mut model_hook = parsed.model_hook.clone();
-            if let Some(spec) = subagents.iter().find(|s| s.name == parsed.name) {
+            let spec = subagents.iter().find(|s| s.name == parsed.name);
+            if let Some(spec) = spec {
                 if system.is_none() {
                     system = spec.system.clone();
                 }
@@ -1854,6 +1869,16 @@ pub(crate) fn execute_tool_with_handles(
             } else if system.is_none() && model_hook.is_none() {
                 return Err(format!("unknown subagent: {}", parsed.name));
             }
+
+            // Resolve max_steps: invocation arg > spec > default 64
+            let max_steps = parsed.max_steps
+                .or(spec.and_then(|s| s.max_steps))
+                .unwrap_or(64);
+
+            // Resolve timeout: invocation arg > spec > none
+            let timeout_secs = parsed.timeout_secs
+                .or(spec.and_then(|s| s.timeout_secs));
+
             let cfg = build_bridge_agent_config(
                 mv2.to_path_buf(),
                 model_hook,
@@ -1862,7 +1887,7 @@ pub(crate) fn execute_tool_with_handles(
                 None,
                 8,
                 12_000,
-                64,
+                max_steps,
                 true,
                 8,
             )
@@ -1872,8 +1897,26 @@ pub(crate) fn execute_tool_with_handles(
             *mem_read = None;
             *mem_write = None;
             let session = format!("subagent:{}:{}", parsed.name, Utc::now().timestamp());
-            let result = run_agent_for_bridge(&cfg, &parsed.prompt, session, None, None, None)
-                .map_err(|e| e.to_string())?;
+            let prompt = parsed.prompt.clone();
+            let name_for_err = parsed.name.clone();
+
+            // Spawn the bridge agent in a thread so we can apply a timeout if configured.
+            let (tx, rx) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let r = run_agent_for_bridge(&cfg, &prompt, session, None, None, None);
+                let _ = tx.send(r);
+            });
+
+            let result = if let Some(t) = timeout_secs {
+                rx.recv_timeout(std::time::Duration::from_secs(t))
+                    .map_err(|_| format!("subagent '{}' timed out after {}s", name_for_err, t))?
+                    .map_err(|e| e.to_string())?
+            } else {
+                rx.recv()
+                    .map_err(|e| format!("channel error: {e}"))?
+                    .map_err(|e| e.to_string())?
+            };
+
             Ok(ToolExecution {
                 output: result.final_text.unwrap_or_default(),
                 details: serde_json::json!({ "session": result.session, "messages": result.messages.len() }),
@@ -1905,12 +1948,22 @@ pub(crate) fn execute_tool_with_handles(
             *mem_read = None;
             *mem_write = None;
 
-            // Build configs for each invocation and spawn threads.
-            let mut handles: Vec<(String, std::thread::JoinHandle<Result<AgentRunOutput, String>>)> = Vec::new();
+            let max_conc = parsed.max_concurrent.unwrap_or(parsed.invocations.len());
+            let max_conc = max_conc.max(1); // ensure at least 1
+
+            // Prepare each invocation: resolve spec fields, build config.
+            struct PreparedInvocation {
+                name: String,
+                prompt: String,
+                cfg: Result<crate::types::BridgeAgentConfig, String>,
+                index: usize,
+            }
+            let mut prepared: Vec<PreparedInvocation> = Vec::new();
             for (i, inv) in parsed.invocations.into_iter().enumerate() {
                 let mut system = inv.system.clone();
                 let mut model_hook = inv.model_hook.clone();
-                if let Some(spec) = subagents.iter().find(|s| s.name == inv.name) {
+                let spec = subagents.iter().find(|s| s.name == inv.name);
+                if let Some(spec) = spec {
                     if system.is_none() {
                         system = spec.system.clone();
                     }
@@ -1918,11 +1971,20 @@ pub(crate) fn execute_tool_with_handles(
                         model_hook = spec.model_hook.clone();
                     }
                 } else if system.is_none() && model_hook.is_none() {
-                    handles.push((inv.name.clone(), thread::spawn(move || {
-                        Err(format!("unknown subagent: {}", inv.name))
-                    })));
+                    prepared.push(PreparedInvocation {
+                        name: inv.name.clone(),
+                        prompt: inv.prompt.clone(),
+                        cfg: Err(format!("unknown subagent: {}", inv.name)),
+                        index: i,
+                    });
                     continue;
                 }
+
+                // Resolve max_steps: invocation arg > spec > default 64
+                let max_steps = inv.max_steps
+                    .or(spec.and_then(|s| s.max_steps))
+                    .unwrap_or(64);
+
                 let cfg = build_bridge_agent_config(
                     mv2.to_path_buf(),
                     model_hook,
@@ -1931,61 +1993,85 @@ pub(crate) fn execute_tool_with_handles(
                     None,
                     8,
                     12_000,
-                    64,
+                    max_steps,
                     true,
                     8,
                 )
-                .map_err(|e| e.to_string())?;
-                let session = format!("subagent:{}:{}:{}", inv.name, ts, i);
-                let prompt = inv.prompt.clone();
-                let name = inv.name.clone();
-                handles.push((name, thread::spawn(move || {
-                    run_agent_for_bridge(&cfg, &prompt, session, None, None, None)
-                })));
+                .map_err(|e| e.to_string());
+                prepared.push(PreparedInvocation {
+                    name: inv.name.clone(),
+                    prompt: inv.prompt.clone(),
+                    cfg,
+                    index: i,
+                });
             }
 
-            // Collect results from all threads.
-            let mut results = Vec::new();
+            // Process invocations in chunks of max_conc for concurrency limiting.
+            let mut all_results: Vec<serde_json::Value> = Vec::new();
             let mut all_ok = true;
-            for (name, handle) in handles {
-                match handle.join() {
-                    Ok(Ok(output)) => {
-                        results.push(serde_json::json!({
-                            "name": name,
-                            "status": "ok",
-                            "output": output.final_text.unwrap_or_default(),
-                            "session": output.session,
-                            "messages": output.messages.len(),
-                        }));
+
+            for chunk in prepared.chunks(max_conc) {
+                let mut handles: Vec<(String, std::thread::JoinHandle<Result<AgentRunOutput, String>>)> = Vec::new();
+                for item in chunk {
+                    let name = item.name.clone();
+                    match &item.cfg {
+                        Err(err) => {
+                            let err = err.clone();
+                            handles.push((name, thread::spawn(move || Err(err))));
+                        }
+                        Ok(cfg) => {
+                            let cfg = cfg.clone();
+                            let session = format!("subagent:{}:{}:{}", item.name, ts, item.index);
+                            let prompt = item.prompt.clone();
+                            handles.push((name, thread::spawn(move || {
+                                run_agent_for_bridge(&cfg, &prompt, session, None, None, None)
+                            })));
+                        }
                     }
-                    Ok(Err(err)) => {
-                        all_ok = false;
-                        results.push(serde_json::json!({
-                            "name": name,
-                            "status": "error",
-                            "error": err,
-                        }));
-                    }
-                    Err(_) => {
-                        all_ok = false;
-                        results.push(serde_json::json!({
-                            "name": name,
-                            "status": "error",
-                            "error": "subagent thread panicked",
-                        }));
+                }
+
+                // Collect results from this chunk before starting the next.
+                for (name, handle) in handles {
+                    match handle.join() {
+                        Ok(Ok(output)) => {
+                            all_results.push(serde_json::json!({
+                                "name": name,
+                                "status": "ok",
+                                "output": output.final_text.unwrap_or_default(),
+                                "session": output.session,
+                                "messages": output.messages.len(),
+                            }));
+                        }
+                        Ok(Err(err)) => {
+                            all_ok = false;
+                            all_results.push(serde_json::json!({
+                                "name": name,
+                                "status": "error",
+                                "error": err,
+                            }));
+                        }
+                        Err(_) => {
+                            all_ok = false;
+                            all_results.push(serde_json::json!({
+                                "name": name,
+                                "status": "error",
+                                "error": "subagent thread panicked",
+                            }));
+                        }
                     }
                 }
             }
+
             let summary = if all_ok {
-                format!("{} subagents completed successfully.", results.len())
+                format!("{} subagents completed successfully.", all_results.len())
             } else {
-                let ok_count = results.iter().filter(|r| r["status"] == "ok").count();
-                let err_count = results.len() - ok_count;
+                let ok_count = all_results.iter().filter(|r| r["status"] == "ok").count();
+                let err_count = all_results.len() - ok_count;
                 format!("{} subagents completed, {} failed.", ok_count, err_count)
             };
             Ok(ToolExecution {
                 output: summary,
-                details: serde_json::json!({ "results": results }),
+                details: serde_json::json!({ "results": all_results }),
                 is_error: !all_ok,
             })
         }
