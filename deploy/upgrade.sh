@@ -146,11 +146,26 @@ setsid bash -c "
         echo \"\$msg\" >> \"\$LOG_FILE\"
     }
 
-    # Wait 5s so the agent can send its response before we kill the service
-    log 'Waiting 5s for agent to finish responding...'
-    sleep 5
-    log 'Restarting aethervault service...'
-    systemctl restart aethervault
+    # Graceful shutdown: send SIGTERM and wait for in-progress agent runs
+    # to finish their capsule commits. The bridge catches SIGTERM, stops
+    # accepting new messages, waits up to 60s for active runs, then exits.
+    # This prevents mid-commit capsule corruption.
+    log 'Sending SIGTERM for graceful shutdown (up to 90s)...'
+    systemctl stop aethervault --no-block
+    # Wait for the service to stop gracefully (up to 90s)
+    STOP_WAIT=0
+    while systemctl is-active --quiet aethervault && [[ \$STOP_WAIT -lt 90 ]]; do
+        sleep 2
+        STOP_WAIT=\$((STOP_WAIT + 2))
+        log \"Waiting for graceful shutdown... \${STOP_WAIT}s\"
+    done
+    if systemctl is-active --quiet aethervault; then
+        log 'Service did not stop gracefully after 90s, force killing...'
+        systemctl kill -s SIGKILL aethervault
+        sleep 1
+    fi
+    log 'Service stopped. Starting with new binary...'
+    systemctl start aethervault
 
     log \"Monitoring for \${HEALTH_CHECK_SECONDS}s...\"
     ELAPSED=0

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -908,6 +909,48 @@ pub(crate) fn run_telegram_bridge(
         }
     }
 
+    // Startup capsule health check: run `doctor` to detect and auto-repair
+    // corruption from previous crashes (e.g., mid-commit SIGKILL during deploy).
+    {
+        let vault_path = &agent_config.mv2;
+        if vault_path.exists() {
+            eprintln!("[bridge] running startup capsule health check...");
+            match std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "aethervault".into()))
+                .args(["doctor", &vault_path.to_string_lossy()])
+                .output()
+            {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if stdout.contains("status: Clean") || stdout.contains("verification: Passed") {
+                        eprintln!("[bridge] capsule health: OK");
+                    } else {
+                        eprintln!("[bridge] capsule health issue detected:\n{}", &stdout[..stdout.len().min(500)]);
+                        // The doctor attempts Tier 2 repair automatically.
+                        // If it still fails, log but continue — the agent can still
+                        // function with read-only access to memory.
+                        if stdout.contains("status: Failed") {
+                            eprintln!("[bridge] WARNING: capsule repair failed — memory writes may be unavailable");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[bridge] capsule health check failed to run: {e}");
+                }
+            }
+        }
+    }
+
+    // --- SIGTERM graceful shutdown ---
+    // When systemd sends SIGTERM (e.g., during deploy), we stop accepting new messages
+    // and wait for in-progress agent runs to finish their capsule commits before exiting.
+    // This prevents the mid-commit crash that causes capsule corruption.
+    static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+    extern "C" fn sigterm_handler(_: libc::c_int) {
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    }
+    unsafe { libc::signal(libc::SIGTERM, sigterm_handler as libc::sighandler_t); }
+    eprintln!("[bridge] SIGTERM handler installed for graceful shutdown");
+
     let mut active_runs: HashMap<i64, ActiveRun> = HashMap::new();
     let (completion_tx, completion_rx) = mpsc::channel::<CompletionEvent>();
 
@@ -915,6 +958,40 @@ pub(crate) fn run_telegram_bridge(
     let mut last_vault_check = std::time::Instant::now();
     let vault_check_interval = Duration::from_secs(300); // every 5 min
     loop {
+        // Check for SIGTERM — drain active runs, then exit cleanly
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            if active_runs.is_empty() {
+                eprintln!("[bridge] SIGTERM received, no active runs — exiting cleanly");
+                return Ok(());
+            }
+            eprintln!(
+                "[bridge] SIGTERM received, waiting for {} active run(s) to finish...",
+                active_runs.len()
+            );
+            // Drain completions with a hard deadline of 60 seconds
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !active_runs.is_empty() && std::time::Instant::now() < deadline {
+                if let Ok(event) = completion_rx.recv_timeout(Duration::from_secs(2)) {
+                    handle_telegram_completion(
+                        event,
+                        &http_agent,
+                        &base_url,
+                        &agent_config,
+                        &mut active_runs,
+                        &completion_tx,
+                    );
+                }
+            }
+            if !active_runs.is_empty() {
+                eprintln!(
+                    "[bridge] SIGTERM deadline: {} run(s) still active, forcing exit",
+                    active_runs.len()
+                );
+            } else {
+                eprintln!("[bridge] SIGTERM: all runs completed, exiting cleanly");
+            }
+            return Ok(());
+        }
         // 0. Periodic vault health check
         if last_vault_check.elapsed() >= vault_check_interval {
             last_vault_check = std::time::Instant::now();
