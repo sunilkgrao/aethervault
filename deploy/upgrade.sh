@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Blue-Green Binary Upgrade for AetherVault
-# Compiles to the inactive slot, smoke tests, swaps symlink, restarts.
+#
+# MANDATORY PIPELINE (no exceptions):
+#   1. All changes MUST be committed and pushed to GitHub FIRST
+#   2. This script pulls from the remote repo (source of truth)
+#   3. Refuses to build if local repo has uncommitted changes
+#   4. Binary is ALWAYS built from the clean repo state
+#   5. Swap binary, graceful restart, health check
+#
 # The restart + health check run in a detached background process so they
 # survive the service restart (which kills the calling agent process).
 # Usage: upgrade.sh [--branch BRANCH] [--skip-tests]
@@ -71,9 +78,22 @@ cd "$REPO_DIR"
 git fetch origin "$BRANCH" || die "git fetch failed"
 git checkout "$BRANCH" || die "git checkout failed"
 git reset --hard "origin/$BRANCH" || die "git reset failed"
-log "Git pull complete: $(git rev-parse --short HEAD)"
 
-# Step 2: Compile to inactive slot
+LOCAL_HEAD=$(git rev-parse HEAD)
+REMOTE_HEAD=$(git rev-parse "origin/$BRANCH")
+if [[ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]]; then
+    die "Local HEAD ($LOCAL_HEAD) != remote ($REMOTE_HEAD). Commit and push first!"
+fi
+
+# Verify repo is clean — refuse to build from dirty state
+DIRTY=$(git status --porcelain 2>/dev/null)
+if [[ -n "$DIRTY" ]]; then
+    die "Repo has uncommitted changes. Commit and push to GitHub first!\n$DIRTY"
+fi
+
+log "Git sync verified: $(git rev-parse --short HEAD) (clean, matches origin/$BRANCH)"
+
+# Step 2: Compile from clean repo (NEVER from local modifications)
 log "Building release binary..."
 cargo build --release 2>&1 | tail -20 | tee -a "$LOG_FILE"
 if [[ ${PIPESTATUS[0]} -ne 0 ]]; then

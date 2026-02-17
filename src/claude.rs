@@ -870,7 +870,7 @@ pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Re
     }
 
     let cmd = command_spec_to_vec(&hook.command);
-    let timeout = hook.timeout_ms.unwrap_or(300_000); // 5 min default safety net
+    let timeout = hook.timeout_ms.unwrap_or(u64::MAX); // No timeout — zombie detection handles stuck processes
     let value = serde_json::to_value(request).map_err(|e| format!("hook input: {e}"))?;
 
     let max_retries: usize = std::env::var("HOOK_MAX_RETRIES")
@@ -919,7 +919,7 @@ pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Re
 fn is_hook_error_retryable(err: &str) -> bool {
     [
         "write stdin",
-        "timed out",
+        "zombie",
         "hook exited",
         "spawn failed",
         "hook wait failed",

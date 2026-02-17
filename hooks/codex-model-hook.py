@@ -20,7 +20,7 @@ import time
 import urllib.request
 import urllib.error
 
-CODEX_TIMEOUT = 900  # 15 minutes max per Codex run
+CODEX_TIMEOUT = None  # No timeout — Codex tasks can run for hours/days
 PROGRESS_INTERVAL = 60  # Check every 60 seconds
 TEXT_UPDATE_INTERVAL = 120  # Send text update every 2 minutes
 PROGRESS_BAR_WIDTH = 14
@@ -344,25 +344,9 @@ def run_codex(prompt):
                 cwd="/root/quake",
             )
 
-        try:
-            proc.wait(timeout=CODEX_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-
-            elapsed = time.time() - start_time
-            line_count, _ = count_output_stats(output_path)
-            send_telegram(
-                f"[Codex] Timed out after {format_elapsed(elapsed)}\n"
-                f"Output: {line_count} lines before timeout\n\n"
-                f"Prompt:\n{prompt[:500]}\n\n"
-                f"Last activity:\n{tail_file(output_path, n_lines=5, max_chars=400)}"
-            )
-            try:
-                partial = parse_codex_jsonl(output_path)
-                return partial or f"(Codex timed out after {CODEX_TIMEOUT // 60} minutes)"
-            except OSError:
-                return f"(Codex timed out after {CODEX_TIMEOUT // 60} minutes)"
+        # No timeout — Codex tasks can run for hours or days.
+        # The Rust caller handles zombie detection; we just wait.
+        proc.wait()
 
         output = parse_codex_jsonl(output_path)
 

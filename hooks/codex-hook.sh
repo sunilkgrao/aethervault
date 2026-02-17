@@ -2,14 +2,13 @@
 # AetherVault model_hook wrapper for Codex CLI
 # Reads AgentHookRequest JSON from stdin, passes to Python hook.
 #
-# Safety: enforces a hard timeout, traps signals to clean up children,
-# and exits cleanly on any failure.
+# NO hard timeout. Codex tasks can run for hours or days.
+# The Rust caller monitors for zombie processes; this script just
+# forwards signals and lets the Python hook run until it finishes.
 
 set -euo pipefail
 
-HOOK_TIMEOUT=${CODEX_HOOK_TIMEOUT:-150}  # 2.5 min default
 PYTHON_HOOK="/root/.aethervault/hooks/codex-model-hook.py"
-LOG_TAG="[codex-hook]"
 
 # --- Signal handling: forward signals to child, then exit ---
 CHILD_PID=""
@@ -36,13 +35,12 @@ if [ ! -f "$PYTHON_HOOK" ]; then
     exit 1
 fi
 
-# --- Buffer stdin first, then pipe to Python ---
-# setsid + background disconnects stdin from the child. Instead, read stdin
-# into a variable and pipe it explicitly. This preserves process-group
-# isolation for clean kills while keeping the data flowing.
+# --- Buffer stdin first, then pipe to Python (no timeout) ---
 INPUT=$(cat)
 
-echo "$INPUT" | timeout --signal=KILL "$HOOK_TIMEOUT" python3 "$PYTHON_HOOK"
+echo "$INPUT" | python3 "$PYTHON_HOOK" &
+CHILD_PID=$!
+wait "$CHILD_PID"
 EXIT_CODE=$?
 
 # If killed by signal, emit a valid JSON error response

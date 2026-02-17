@@ -193,7 +193,7 @@ pub(crate) fn command_spec_to_vec(spec: &CommandSpec) -> Vec<String> {
 pub(crate) fn run_hook_command(
     command: &[String],
     input: &serde_json::Value,
-    timeout_ms: u64,
+    _timeout_ms: u64, // Unused — no hard timeouts. Zombie detection handles stuck processes.
     kind: &str,
 ) -> Result<String, String> {
     if command.is_empty() {
@@ -223,35 +223,53 @@ pub(crate) fn run_hook_command(
         None
     };
 
-    // Real wall-clock deadline enforcement using Instant.
+    // No wall-clock timeout — hooks (especially Codex) can run for hours.
+    // Instead, detect zombie/stuck processes by checking /proc/<pid>/stat
+    // for zombie state (Z). Only kill if the process is truly dead.
     let start = Instant::now();
-    let deadline = if timeout_ms < u64::MAX {
-        Some(Duration::from_millis(timeout_ms))
-    } else {
-        None
-    };
     let pid = child.id();
     let mut last_log = Instant::now();
+    let zombie_check_interval = Duration::from_secs(30);
 
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
-                if let Some(dl) = deadline {
-                    if start.elapsed() >= dl {
-                        eprintln!("[hook:{kind}] pid={pid} exceeded {timeout_ms}ms deadline, killing");
+                if last_log.elapsed() >= zombie_check_interval {
+                    let elapsed_secs = start.elapsed().as_secs();
+                    // Check for zombie state on Linux via /proc
+                    let is_zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                        .map(|s| {
+                            // /proc/<pid>/stat format: pid (comm) state ...
+                            // state is the character after the last ')'
+                            s.rfind(')')
+                                .and_then(|i| s.get(i + 1..))
+                                .map(|rest| rest.trim_start().starts_with('Z'))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false); // non-Linux or /proc unavailable = not zombie
+
+                    if is_zombie {
+                        eprintln!("[hook:{kind}] pid={pid} is ZOMBIE after {elapsed_secs}s, killing process tree");
                         crate::kill_process_tree(&mut child);
-                        return Err(format!("hook '{kind}' timed out after {timeout_ms}ms"));
+                        return Err(format!("hook '{kind}' pid={pid} became zombie after {elapsed_secs}s"));
+                    }
+
+                    // Log at escalating intervals: every 30s for first 5m, then every 5m
+                    let log_interval = if elapsed_secs < 300 { 30 } else { 300 };
+                    if last_log.elapsed() >= Duration::from_secs(log_interval) {
+                        let h = elapsed_secs / 3600;
+                        let m = (elapsed_secs % 3600) / 60;
+                        let s = elapsed_secs % 60;
+                        if h > 0 {
+                            eprintln!("[hook:{kind}] pid={pid} running {h}h {m}m {s}s");
+                        } else {
+                            eprintln!("[hook:{kind}] pid={pid} running {m}m {s}s");
+                        }
+                        last_log = Instant::now();
                     }
                 }
-                if last_log.elapsed() >= Duration::from_secs(30) {
-                    eprintln!(
-                        "[hook:{kind}] pid={pid} still running ({:.0}s elapsed)",
-                        start.elapsed().as_secs_f64()
-                    );
-                    last_log = Instant::now();
-                }
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(200));
             }
             Err(e) => {
                 crate::kill_process_tree(&mut child);
