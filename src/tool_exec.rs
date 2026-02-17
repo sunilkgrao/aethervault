@@ -17,28 +17,62 @@ use walkdir::WalkDir;
 use std::sync::mpsc;
 
 const NO_TIMEOUT_MS: u64 = u64::MAX;
-const DEFAULT_EXEC_TIMEOUT_MS: u64 = 120_000;  // 2 minutes default
-const MAX_EXEC_TIMEOUT_MS: u64 = 600_000;       // 10 minutes ceiling
 const PROCESS_POLL_MS: u64 = 250;
 const STATUS_REPORT_MS: u64 = 3_000;
-/// Kill a process after this long with zero stdout/stderr output.
-/// This catches hung SSH, stuck network calls, etc. while allowing
-/// legitimately long processes (Codex, cargo build) that produce output.
-/// Reduced from 10 minutes now that we have proper per-command timeouts.
-const STALE_OUTPUT_THRESHOLD_MS: u64 = 180_000; // 3 minutes
 
-/// Classify a command and return an appropriate default timeout in milliseconds.
-/// Build tools and Codex get longer; network commands get shorter.
-fn classify_exec_timeout(command: &str) -> u64 {
+/// Execution monitoring policy for a child process.
+/// Different command classes get different kill thresholds.
+struct ExecPolicy {
+    /// Wall-clock deadline. NO_TIMEOUT_MS = no hard timeout.
+    hard_timeout_ms: u64,
+    /// Kill after this many ms with no stdout/stderr output.
+    /// NO_TIMEOUT_MS = never kill for staleness.
+    stale_threshold_ms: u64,
+}
+
+/// Classify a command and return an appropriate monitoring policy.
+fn classify_exec_policy(command: &str) -> ExecPolicy {
     let cmd = command.to_ascii_lowercase();
-    if cmd.starts_with("ssh ") || cmd.contains("| ssh ") { return 60_000; }
-    if cmd.starts_with("curl ") || cmd.starts_with("wget ") { return 30_000; }
-    if cmd.starts_with("cargo build") || cmd.starts_with("cargo test") || cmd.starts_with("cargo check")
-        || cmd.starts_with("npm install") || cmd.starts_with("npm run build") || cmd.starts_with("make") {
-        return 300_000;
+
+    // Codex CLI: immortal — legitimate multi-hour sessions
+    if cmd.starts_with("codex ") || cmd.starts_with("codex-") {
+        return ExecPolicy {
+            hard_timeout_ms: NO_TIMEOUT_MS,
+            stale_threshold_ms: NO_TIMEOUT_MS,
+        };
     }
-    if cmd.contains("codex") { return 600_000; }
-    DEFAULT_EXEC_TIMEOUT_MS
+
+    // Build tools: no hard timeout, stale kill at 5 minutes
+    if cmd.starts_with("cargo build") || cmd.starts_with("cargo test")
+        || cmd.starts_with("cargo check") || cmd.starts_with("cargo install")
+        || cmd.starts_with("npm install") || cmd.starts_with("npm run")
+        || cmd.starts_with("make") || cmd.starts_with("docker build")
+    {
+        return ExecPolicy {
+            hard_timeout_ms: NO_TIMEOUT_MS,
+            stale_threshold_ms: 300_000,  // 5 minutes
+        };
+    }
+
+    // Network commands: strict timeouts
+    if cmd.starts_with("ssh ") || cmd.contains("| ssh ") {
+        return ExecPolicy {
+            hard_timeout_ms: 120_000,     // 2 minutes
+            stale_threshold_ms: 60_000,   // 1 minute
+        };
+    }
+    if cmd.starts_with("curl ") || cmd.starts_with("wget ") {
+        return ExecPolicy {
+            hard_timeout_ms: 60_000,      // 1 minute
+            stale_threshold_ms: 30_000,   // 30 seconds
+        };
+    }
+
+    // Default: 10 minute hard cap, 3 minute stale detection
+    ExecPolicy {
+        hard_timeout_ms: 600_000,
+        stale_threshold_ms: 180_000,
+    }
 }
 
 /// Inject SSH safety flags (ConnectTimeout, ServerAliveInterval, BatchMode)
@@ -62,17 +96,13 @@ struct ChildResult {
 }
 
 /// Waits for a child process while monitoring stdout/stderr activity.
-/// If the process produces no output for STALE_OUTPUT_THRESHOLD_MS, it is
-/// killed and a descriptive error is returned so the agent can inform the user.
-/// Long-running processes that actively produce output are never interrupted.
-///
-/// `timeout_ms` enforces a hard wall-clock deadline. Pass `NO_TIMEOUT_MS` to
-/// disable the hard timeout (stale-output detection still applies).
+/// Uses the provided `ExecPolicy` to enforce both hard wall-clock deadlines
+/// and stale-output detection independently per command class.
 fn wait_for_child_monitored(
     child: &mut std::process::Child,
     label: &str,
     cancel_token: &Arc<AtomicBool>,
-    timeout_ms: u64,
+    policy: &ExecPolicy,
 ) -> Result<ChildResult, String> {
     let pid = child.id();
     let start = Instant::now();
@@ -162,11 +192,12 @@ fn wait_for_child_monitored(
                 let idle_ms = now_ms - last_ms;
 
                 // Hard timeout enforcement: wall-clock deadline exceeded → kill
-                if timeout_ms != NO_TIMEOUT_MS && now_ms >= timeout_ms {
+                if policy.hard_timeout_ms != NO_TIMEOUT_MS && now_ms >= policy.hard_timeout_ms {
                     let total_s = now_ms / 1000;
+                    let hard = policy.hard_timeout_ms;
                     eprintln!(
                         "[tool:{label}] pid={pid} timeout-killed: \
-                         exceeded {timeout_ms}ms deadline (ran {total_s}s)"
+                         exceeded {hard}ms deadline (ran {total_s}s)"
                     );
                     crate::kill_process_tree(child);
                     thread::sleep(Duration::from_millis(100));
@@ -189,7 +220,7 @@ fn wait_for_child_monitored(
                         &stderr
                     };
                     return Err(format!(
-                        "Process timed out (pid {pid}): exceeded {timeout_ms}ms deadline \
+                        "Process timed out (pid {pid}): exceeded {hard}ms deadline \
                          (ran {total_s}s). Consider increasing timeout_ms or using \
                          background execution.\n\
                          --- last stdout ---\n{stdout_tail}\n\
@@ -198,7 +229,7 @@ fn wait_for_child_monitored(
                 }
 
                 // Stale-process detection: no output for threshold → kill
-                if idle_ms >= STALE_OUTPUT_THRESHOLD_MS {
+                if policy.stale_threshold_ms != NO_TIMEOUT_MS && idle_ms >= policy.stale_threshold_ms {
                     let idle_min = idle_ms / 60_000;
                     let total_min = now_ms / 60_000;
                     eprintln!(
@@ -248,7 +279,12 @@ fn wait_for_child_monitored(
                         .unwrap_or(0);
                     eprintln!(
                         "[tool:{label}] pid={pid} running {elapsed_s}s \
-                         (idle {idle_s}s, stdout={stdout_len}B stderr={stderr_len}B)"
+                         (idle {idle_s}s, stdout={stdout_len}B stderr={stderr_len}B, \
+                         hard={}ms stale={}ms)",
+                        if policy.hard_timeout_ms == NO_TIMEOUT_MS { "none".to_string() }
+                        else { policy.hard_timeout_ms.to_string() },
+                        if policy.stale_threshold_ms == NO_TIMEOUT_MS { "none".to_string() }
+                        else { policy.stale_threshold_ms.to_string() },
                     );
                     last_report = Instant::now();
                 }
@@ -1043,12 +1079,15 @@ pub(crate) fn execute_tool_with_handles(
         "exec" => {
             let parsed: ToolExecArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let timeout_ms = parsed.timeout_ms
-                .unwrap_or_else(|| classify_exec_timeout(&parsed.command))
-                .min(MAX_EXEC_TIMEOUT_MS)
-                .max(1);
-            let estimated_ms = parsed.estimated_ms.unwrap_or(timeout_ms);
-            let is_codex_session = parsed.command.to_ascii_lowercase().contains("codex");
+            let policy = match parsed.timeout_ms {
+                Some(ms) => ExecPolicy {
+                    hard_timeout_ms: ms,
+                    stale_threshold_ms: 180_000,  // default stale for explicit timeout
+                },
+                None => classify_exec_policy(&parsed.command),
+            };
+            let estimated_ms = parsed.estimated_ms.unwrap_or(policy.hard_timeout_ms);
+            let is_codex_session = parsed.command.to_ascii_lowercase().starts_with("codex ");
             let should_background = parsed.background.unwrap_or(false)
                 || (is_codex_session && estimated_ms >= EXEC_BACKGROUND_THRESHOLD_MS);
 
@@ -1063,7 +1102,7 @@ pub(crate) fn execute_tool_with_handles(
                 let response = submit_exec_background_job(
                     &parsed.command,
                     parsed.cwd.as_ref(),
-                    timeout_ms,
+                    policy.hard_timeout_ms,
                     estimated_ms,
                 )?;
                 let job_id = response
@@ -1080,7 +1119,7 @@ pub(crate) fn execute_tool_with_handles(
                     "job_id": job_id,
                     "status_url": status_url,
                     "estimated_ms": estimated_ms,
-                    "timeout_ms": timeout_ms
+                    "timeout_ms": policy.hard_timeout_ms
                 });
                 let mut output = format!("background job started: {job_id}");
                 if let Some(warning) = codex_warning {
@@ -1110,7 +1149,7 @@ pub(crate) fn execute_tool_with_handles(
                 .stderr(Stdio::piped());
             let mut child = cmd.spawn().map_err(|e| format!("exec spawn: {e}"))?;
             let cancel_token = Arc::new(AtomicBool::new(false));
-            let result = wait_for_child_monitored(&mut child, "exec", &cancel_token, timeout_ms)?;
+            let result = wait_for_child_monitored(&mut child, "exec", &cancel_token, &policy)?;
             let stdout = result.stdout;
             let stderr = result.stderr;
             let is_error = !result.status.success();
@@ -1301,7 +1340,11 @@ pub(crate) fn execute_tool_with_handles(
 
             let mut child = cmd.spawn().map_err(|e| format!("browser spawn: {e}"))?;
             let cancel_token = Arc::new(AtomicBool::new(false));
-            let result = wait_for_child_monitored(&mut child, "browser", &cancel_token, browser_timeout_ms)?;
+            let browser_policy = ExecPolicy {
+                hard_timeout_ms: browser_timeout_ms,
+                stale_threshold_ms: 180_000,  // 3 min stale for browser
+            };
+            let result = wait_for_child_monitored(&mut child, "browser", &cancel_token, &browser_policy)?;
             let stdout = result.stdout;
             let stderr = result.stderr;
             let is_error = !result.status.success();
