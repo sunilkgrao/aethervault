@@ -948,7 +948,7 @@ pub(crate) fn run_telegram_bridge(
     extern "C" fn sigterm_handler(_: libc::c_int) {
         SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     }
-    unsafe { libc::signal(libc::SIGTERM, sigterm_handler as libc::sighandler_t); }
+    unsafe { libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t); }
     eprintln!("[bridge] SIGTERM handler installed for graceful shutdown");
 
     let mut active_runs: HashMap<i64, ActiveRun> = HashMap::new();
