@@ -688,14 +688,19 @@ pub(crate) enum BridgeCommand {
         #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
     },
-    /// Slack events bridge (webhook receiver).
+    /// Slack Socket Mode bridge.
     Slack {
         #[arg(long)]
         mv2: Option<PathBuf>,
-        #[arg(long, default_value = "0.0.0.0")]
-        bind: String,
-        #[arg(long, default_value_t = 8081)]
-        port: u16,
+        /// Slack bot token (env: SLACK_BOT_TOKEN)
+        #[arg(long)]
+        bot_token: Option<String>,
+        /// Slack app token for Socket Mode (env: SLACK_APP_TOKEN)
+        #[arg(long)]
+        app_token: Option<String>,
+        /// Slack signing secret (env: SLACK_SIGNING_SECRET)
+        #[arg(long)]
+        signing_secret: Option<String>,
         #[arg(long)]
         model_hook: Option<String>,
         #[arg(long)]

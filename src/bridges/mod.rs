@@ -1,3 +1,4 @@
+pub(crate) mod slack;
 pub(crate) mod telegram;
 pub(crate) mod whatsapp;
 pub(crate) mod webhook;
@@ -17,9 +18,10 @@ use crate::{
 };
 use self::telegram::run_telegram_bridge;
 use self::whatsapp::run_whatsapp_bridge;
+use self::slack::run_slack_bridge;
 use self::webhook::{
     extract_discord_event, extract_imessage_event, extract_matrix_event, extract_signal_event,
-    extract_slack_event, extract_teams_event, reply_none, reply_slack, run_webhook_bridge,
+    extract_teams_event, reply_none, run_webhook_bridge,
 };
 
 pub(crate) fn resolve_mv2_path(cli_mv2: Option<PathBuf>) -> PathBuf {
@@ -407,8 +409,9 @@ pub(crate) fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::erro
         }
         BridgeCommand::Slack {
             mv2,
-            bind,
-            port,
+            bot_token,
+            app_token,
+            signing_secret,
             model_hook,
             system,
             no_memory,
@@ -432,14 +435,7 @@ pub(crate) fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::erro
                 log,
                 log_commit_interval,
             )?;
-            run_webhook_bridge(
-                "slack",
-                bind,
-                port,
-                config,
-                extract_slack_event,
-                reply_slack,
-            )
+            run_slack_bridge(config, bot_token, app_token, signing_secret)
         }
         BridgeCommand::Discord {
             mv2,

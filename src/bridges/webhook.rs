@@ -81,6 +81,7 @@ pub(crate) fn payload_session_fallback(prefix: &str, payload: &serde_json::Value
     format!("{prefix}:{}", blake3_hash(&bytes).to_hex())
 }
 
+#[allow(dead_code)] // Kept as fallback; primary Slack bridge uses Socket Mode
 pub(crate) fn extract_slack_event(payload: &serde_json::Value) -> Option<(String, String)> {
     let text = payload
         .get("event")
@@ -212,6 +213,7 @@ pub(crate) fn reply_none(_: &BridgeAgentConfig, _: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 pub(crate) fn reply_slack(_: &BridgeAgentConfig, text: &str) -> Option<String> {
     Some(serde_json::json!({ "text": text }).to_string())
 }
