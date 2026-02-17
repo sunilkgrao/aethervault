@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,7 +13,7 @@ use tungstenite::{connect, Message};
 
 use crate::{
     run_agent_for_bridge, load_session_turns, save_session_turns, try_handle_approval_chat,
-    AgentRunOutput, BridgeAgentConfig, SessionTurn,
+    AgentProgress, AgentRunOutput, BridgeAgentConfig, SessionTurn,
 };
 
 const NO_TIMEOUT_MS: u64 = u64::MAX;
@@ -38,9 +38,9 @@ struct SlackCompletionEvent {
     result: Result<AgentRunOutput, String>,
 }
 
-#[derive(Debug)]
 struct SlackRunState {
     queued_messages: Vec<(String, Option<String>)>,
+    progress: Arc<Mutex<AgentProgress>>,
 }
 
 #[derive(Debug)]
@@ -669,6 +669,81 @@ fn generate_voice_audio(http_agent: &ureq::Agent, directive: &VoiceDirective) ->
     Ok(bytes)
 }
 
+fn upload_file_to_slack(
+    upload_client: &Client,
+    http_agent: &ureq::Agent,
+    bot_token: &str,
+    channel_id: &str,
+    thread_ts: Option<&str>,
+    file_bytes: &[u8],
+    filename: &str,
+    _mime_type: &str,
+    initial_comment: &str,
+) -> Result<(), String> {
+    if file_bytes.is_empty() {
+        return Err("empty file".to_string());
+    }
+
+    // Step 1: Get pre-signed upload URL
+    let get_url_payload = serde_json::json!({
+        "filename": filename,
+        "length": file_bytes.len(),
+    });
+    let get_url_resp = slack_api_post_json(
+        http_agent,
+        bot_token,
+        "files.getUploadURLExternal",
+        &get_url_payload,
+    )?;
+
+    let upload_url = get_url_resp
+        .get("upload_url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "files.getUploadURLExternal: missing upload_url".to_string())?
+        .to_string();
+    let file_id = get_url_resp
+        .get("file_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "files.getUploadURLExternal: missing file_id".to_string())?
+        .to_string();
+
+    // Step 2: PUT binary to pre-signed URL
+    let put_resp = upload_client
+        .put(&upload_url)
+        .body(file_bytes.to_vec())
+        .send()
+        .map_err(|e| format!("file PUT upload error: {e}"))?;
+
+    if !put_resp.status().is_success() {
+        return Err(format!(
+            "file PUT upload returned status {}",
+            put_resp.status()
+        ));
+    }
+
+    // Step 3: Complete the upload and share to channel
+    let mut complete_payload = serde_json::json!({
+        "files": [{"id": file_id, "title": filename}],
+        "channel_id": channel_id,
+    });
+    if let Some(ts) = thread_ts {
+        complete_payload["thread_ts"] = serde_json::json!(ts);
+    }
+    if !initial_comment.trim().is_empty() {
+        complete_payload["initial_comment"] = serde_json::json!(initial_comment);
+    }
+
+    slack_api_post_json(
+        http_agent,
+        bot_token,
+        "files.completeUploadExternal",
+        &complete_payload,
+    )?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
 fn upload_voice_note(
     upload_client: &Client,
     bot_token: &str,
@@ -729,18 +804,193 @@ fn spawn_slack_run(
     channel_id: String,
     thread_ts: Option<String>,
     text: String,
-) {
-    let config = Arc::clone(config);
+    http_agent: &ureq::Agent,
+    bot_token: &str,
+) -> Arc<Mutex<AgentProgress>> {
+    let progress = Arc::new(Mutex::new(AgentProgress {
+        step: 0,
+        max_steps: config.max_steps,
+        phase: "starting".to_string(),
+        text_preview: None,
+        started_at: std::time::Instant::now(),
+        tools_used: HashMap::new(),
+        checkpoint_sent: false,
+        checkpoint_response: None,
+        extended_max_steps: None,
+        interim_messages: Vec::new(),
+        first_ack_sent: false,
+        opus_steps: 0,
+        delegated_steps: 0,
+        steering_messages: Vec::new(),
+    }));
+
+    // Worker thread — runs the agent
+    let worker_progress = progress.clone();
+    let config_clone = Arc::clone(config);
+    let session_key_clone = session_key.clone();
+    let channel_id_clone = channel_id.clone();
+    let thread_ts_clone = thread_ts.clone();
+    // Inject platform context so the agent knows it's on Slack
+    let augmented_text = format!("[Platform: Slack | Channel: {channel_id}]\n{text}");
     thread::spawn(move || {
-        let session = format!("{}slack:{session_key}", config.session_prefix);
-        let result = run_agent_for_bridge(&config, &text, session, None, None, None);
+        let session = format!("{}slack:{session_key_clone}", config_clone.session_prefix);
+        let result = run_agent_for_bridge(
+            &config_clone,
+            &augmented_text,
+            session,
+            None,
+            None,
+            Some(worker_progress.clone()),
+        );
+        if let Ok(mut p) = worker_progress.lock() {
+            p.phase = "done".to_string();
+        }
         let _ = completion_tx.send(SlackCompletionEvent {
-            session_key,
-            channel_id,
-            thread_ts,
+            session_key: session_key_clone,
+            channel_id: channel_id_clone,
+            thread_ts: thread_ts_clone,
             result,
         });
     });
+
+    // Progress reporter thread — interim messages + first ack + checkpoint
+    let prog_ref = progress.clone();
+    let prog_agent = http_agent.clone();
+    let prog_token = bot_token.to_string();
+    let prog_channel = channel_id.clone();
+    let prog_thread = thread_ts.clone();
+    let prog_max_steps = config.max_steps;
+    thread::spawn(move || {
+        let mut tick_count: usize = 0;
+        loop {
+            thread::sleep(Duration::from_secs(4));
+            tick_count += 1;
+
+            // Drain and send any interim messages from the agent
+            let pending: Vec<String> = {
+                let mut guard = match prog_ref.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                guard.interim_messages.drain(..).collect()
+            };
+            for msg in &pending {
+                let _ = send_slack_message(
+                    &prog_agent,
+                    &prog_token,
+                    &prog_channel,
+                    prog_thread.as_deref(),
+                    msg,
+                );
+                if let Ok(mut guard) = prog_ref.lock() {
+                    guard.first_ack_sent = true;
+                }
+            }
+
+            let (done, should_checkpoint, first_ack_needed) = {
+                let guard = match prog_ref.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                let done = guard.phase == "done";
+                let effective_max = guard.extended_max_steps.unwrap_or(guard.max_steps);
+                let at_checkpoint = guard.step >= effective_max * 3 / 4
+                    && !guard.checkpoint_sent
+                    && effective_max > 4;
+                let needs_first_ack = !guard.first_ack_sent
+                    && tick_count >= 3 // ~12 seconds
+                    && guard.step > 0
+                    && !done;
+                (done, at_checkpoint, needs_first_ack)
+            };
+
+            if done {
+                break;
+            }
+
+            // First-response acknowledgment after ~12s of silence
+            if first_ack_needed {
+                let ack_msg = {
+                    let guard = match prog_ref.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    let tools: Vec<String> = guard.tools_used.keys().take(3).cloned().collect();
+                    if tools.is_empty() {
+                        "Working on it...".to_string()
+                    } else {
+                        format!("On it \u{2014} using {}...", tools.join(", "))
+                    }
+                };
+                let _ = send_slack_message(
+                    &prog_agent,
+                    &prog_token,
+                    &prog_channel,
+                    prog_thread.as_deref(),
+                    &ack_msg,
+                );
+                if let Ok(mut guard) = prog_ref.lock() {
+                    guard.first_ack_sent = true;
+                }
+            }
+
+            if should_checkpoint {
+                let (step, max, tools, preview, elapsed) = {
+                    let mut guard = match prog_ref.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    guard.checkpoint_sent = true;
+                    let elapsed = guard.started_at.elapsed().as_secs();
+                    let tools: Vec<String> = {
+                        let mut sorted: Vec<_> = guard
+                            .tools_used
+                            .iter()
+                            .map(|(k, v)| (k.clone(), *v))
+                            .collect();
+                        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                        sorted
+                            .into_iter()
+                            .take(5)
+                            .map(|(k, v)| format!("{k} ({v}x)"))
+                            .collect()
+                    };
+                    (
+                        guard.step,
+                        guard.extended_max_steps.unwrap_or(guard.max_steps),
+                        tools,
+                        guard.text_preview.clone(),
+                        elapsed,
+                    )
+                };
+                let tools_str = if tools.is_empty() {
+                    "none yet".to_string()
+                } else {
+                    tools.join(", ")
+                };
+                let preview_str = preview
+                    .map(|p| format!("\nLast update: {p}"))
+                    .unwrap_or_default();
+                let mins = elapsed / 60;
+                let secs = elapsed % 60;
+                let msg = format!(
+                    "I'm at step {step}/{max} ({mins}m{secs}s elapsed).{preview_str}\n\
+                     Tools used: {tools_str}\n\n\
+                     Reply \"continue\" to extend by {prog_max_steps} more steps, \
+                     or \"wrap up\" to finish with what I have."
+                );
+                let _ = send_slack_message(
+                    &prog_agent,
+                    &prog_token,
+                    &prog_channel,
+                    prog_thread.as_deref(),
+                    &msg,
+                );
+            }
+        }
+    });
+
+    progress
 }
 
 fn handle_slack_completion(
@@ -773,12 +1023,19 @@ fn handle_slack_completion(
 
         match generate_voice_audio(http_agent, &voice) {
             Ok(audio) => {
-                if let Err(err) = upload_voice_note(
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                if let Err(err) = upload_file_to_slack(
                     upload_client,
+                    http_agent,
                     bot_token,
                     &completion.channel_id,
                     completion.thread_ts.as_deref(),
                     &audio,
+                    &format!("voice-{now}.wav"),
+                    "audio/wav",
                     "Voice note generated by AetherVault",
                 ) {
                     let _ = send_slack_message(
@@ -810,11 +1067,10 @@ fn handle_slack_completion(
         eprintln!("Slack send error: {err}");
     }
 
-    let mut state = match active_runs.remove(&completion.session_key) {
+    // Drain queued messages and spawn next run if needed
+    let state = match active_runs.remove(&completion.session_key) {
         Some(state) => state,
-        None => {
-            return;
-        }
+        None => return,
     };
 
     if state.queued_messages.is_empty() {
@@ -835,23 +1091,25 @@ fn handle_slack_completion(
         .queued_messages
         .last()
         .and_then(|(_, thread_ts)| thread_ts.clone());
-    state.queued_messages.clear();
     append_session_turn(&completion.session_key, "user", &merged, config);
 
-    active_runs.insert(
-        completion.session_key.clone(),
-        SlackRunState {
-            queued_messages: Vec::new(),
-        },
-    );
-
-    spawn_slack_run(
+    let progress = spawn_slack_run(
         config,
         completion_tx.clone(),
-        completion.session_key,
+        completion.session_key.clone(),
         completion.channel_id,
         merged_thread,
         merged,
+        http_agent,
+        bot_token,
+    );
+
+    active_runs.insert(
+        completion.session_key,
+        SlackRunState {
+            queued_messages: Vec::new(),
+            progress,
+        },
     );
 }
 
@@ -863,6 +1121,7 @@ fn handle_incoming_message(
     active_runs: &mut HashMap<String, SlackRunState>,
     completion_tx: &mpsc::Sender<SlackCompletionEvent>,
 ) {
+    // Handle approval commands
     if let Some(output) = try_handle_approval_chat(&config.mv2, &incoming.text) {
         if let Err(err) = send_slack_message(
             http_agent,
@@ -876,7 +1135,46 @@ fn handle_incoming_message(
         return;
     }
 
+    // Handle "continue" / "wrap up" for active runs with checkpoints
     if let Some(state) = active_runs.get_mut(&incoming.session_key) {
+        let lower = incoming.text.trim().to_lowercase();
+        if lower == "continue" || lower == "keep going" || lower == "more" {
+            if let Ok(mut guard) = state.progress.lock() {
+                let new_max = guard.extended_max_steps.unwrap_or(guard.max_steps) + guard.max_steps;
+                guard.extended_max_steps = Some(new_max);
+                guard.checkpoint_response = Some(true);
+                guard.checkpoint_sent = false; // allow another checkpoint later
+                drop(guard);
+                let _ = send_slack_message(
+                    http_agent,
+                    bot_token,
+                    &incoming.channel_id,
+                    incoming.thread_ts.as_deref(),
+                    &format!("Got it, extending to {new_max} steps."),
+                );
+            }
+            return;
+        }
+        if lower == "wrap up" || lower == "stop" || lower == "finish" {
+            if let Ok(mut guard) = state.progress.lock() {
+                guard.checkpoint_response = Some(false);
+                guard.extended_max_steps = Some(guard.step + 1);
+                drop(guard);
+                let _ = send_slack_message(
+                    http_agent,
+                    bot_token,
+                    &incoming.channel_id,
+                    incoming.thread_ts.as_deref(),
+                    "Wrapping up with what I have...",
+                );
+            }
+            return;
+        }
+
+        // Inject as steering message for mid-run context, and queue for next run
+        if let Ok(mut guard) = state.progress.lock() {
+            guard.steering_messages.push(incoming.text.clone());
+        }
         if state.queued_messages.len() < MAX_QUEUED_PER_SESSION {
             state.queued_messages
                 .push((incoming.text, incoming.thread_ts));
@@ -884,20 +1182,26 @@ fn handle_incoming_message(
         return;
     }
 
+    // No active run — start a new one
     append_session_turn(&incoming.session_key, "user", &incoming.text, config);
-    active_runs.insert(
-        incoming.session_key.clone(),
-        SlackRunState {
-            queued_messages: Vec::new(),
-        },
-    );
-    spawn_slack_run(
+
+    let progress = spawn_slack_run(
         config,
         completion_tx.clone(),
-        incoming.session_key,
-        incoming.channel_id,
-        incoming.thread_ts,
+        incoming.session_key.clone(),
+        incoming.channel_id.clone(),
+        incoming.thread_ts.clone(),
         incoming.text,
+        http_agent,
+        bot_token,
+    );
+
+    active_runs.insert(
+        incoming.session_key,
+        SlackRunState {
+            queued_messages: Vec::new(),
+            progress,
+        },
     );
 }
 
