@@ -489,38 +489,36 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "subagent_invoke",
-            "description": "Invoke a named subagent to perform a task. PREFERRED method for delegating work — use this instead of exec for any LLM/AI delegation. The subagent runs with its own session, tools, and memory. Example: subagent_invoke(name='coder', prompt='Write a Python script that...') delegates to the Codex-powered coding agent. Call subagent_list first to see available agents.",
+            "description": "Invoke a subagent to perform a task. Can use pre-configured agents (from subagent_list) or spawn ad-hoc agents with any name — unknown names use the default Codex hook. The subagent runs with its own session, tools, and memory. Use any descriptive name (e.g., 'frontend-builder', 'api-researcher', 'test-writer').",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "Name of the subagent to invoke. Must match a configured subagent from subagent_list." },
+                    "name": { "type": "string", "description": "Name for this subagent. Use a pre-configured name (from subagent_list) to inherit its config, or any descriptive name for an ad-hoc agent using the default hook." },
                     "prompt": { "type": "string", "description": "Detailed task description for the subagent. Be specific — the subagent has its own context." },
                     "system": { "type": "string", "description": "Override the subagent's system prompt" },
                     "model_hook": { "type": "string", "description": "Override the subagent's model hook" },
-                    "max_steps": { "type": "integer", "description": "Override max reasoning steps for this invocation. Default: from subagent config, fallback 64." },
-                    "timeout_secs": { "type": "integer", "description": "Hard timeout in seconds. Default: from subagent config. The invocation is killed if exceeded." }
+                    "max_steps": { "type": "integer", "description": "Override max reasoning steps for this invocation. Default: from subagent config, fallback 64." }
                 },
                 "required": ["name", "prompt"]
             }
         }),
         serde_json::json!({
             "name": "subagent_batch",
-            "description": "Invoke multiple subagents concurrently for parallel fan-out. PREFERRED over multiple exec calls for parallel LLM work. Each invocation runs independently. Example: fan out research to 'researcher' and coding to 'coder' simultaneously. Use max_concurrent to limit parallelism.",
+            "description": "Invoke multiple subagents concurrently for parallel work. You can spawn ANY number of agents — use the same name multiple times for parallel instances (e.g., 5 coders working on different files), or mix different names. Each invocation runs independently with its own session. Use max_concurrent to limit parallelism.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "invocations": {
                         "type": "array",
-                        "description": "Array of subagent invocations to run concurrently. Each has name, prompt, and optional overrides.",
+                        "description": "Array of subagent invocations to run concurrently. Each has name, prompt, and optional overrides. Use any name — pre-configured or ad-hoc.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "name": { "type": "string", "description": "Name of a configured subagent" },
+                                "name": { "type": "string", "description": "Name for this subagent. Pre-configured names inherit config; any other name uses the default hook." },
                                 "prompt": { "type": "string", "description": "Task/prompt for this subagent" },
                                 "system": { "type": "string" },
                                 "model_hook": { "type": "string" },
-                                "max_steps": { "type": "integer" },
-                                "timeout_secs": { "type": "integer" }
+                                "max_steps": { "type": "integer" }
                             },
                             "required": ["name", "prompt"]
                         }

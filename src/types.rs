@@ -237,6 +237,10 @@ pub(crate) struct AgentConfig {
     pub(crate) model_hook: Option<HookSpec>,
     #[serde(default)]
     pub(crate) subagents: Vec<SubagentSpec>,
+    /// Default model hook for dynamically spawned subagents that don't match
+    /// a named config entry. Enables ad-hoc agent creation without pre-configuration.
+    #[serde(default)]
+    pub(crate) default_subagent_hook: Option<String>,
     /// MCP servers to spawn as long-lived sidecars (generic plugin system)
     #[serde(default)]
     pub(crate) mcp_servers: Vec<McpServerConfig>,

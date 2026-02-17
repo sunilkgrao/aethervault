@@ -349,9 +349,6 @@ pub(crate) struct ToolSubagentInvokeArgs {
     /// Override max_steps for this invocation.
     #[serde(default)]
     pub(crate) max_steps: Option<usize>,
-    /// Hard timeout in seconds for this invocation.
-    #[serde(default)]
-    pub(crate) timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

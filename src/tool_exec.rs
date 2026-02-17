@@ -1914,7 +1914,6 @@ pub(crate) fn execute_tool_with_handles(
                     "tools": s.tools,
                     "disallowed_tools": s.disallowed_tools,
                     "max_steps": s.max_steps,
-                    "timeout_secs": s.timeout_secs,
                 })
             }).collect();
             Ok(ToolExecution {
@@ -1953,17 +1952,25 @@ pub(crate) fn execute_tool_with_handles(
                     model_hook = spec.model_hook.clone();
                 }
             } else if system.is_none() && model_hook.is_none() {
-                return Err(format!("unknown subagent: {}", parsed.name));
+                // Dynamic subagent: use default_subagent_hook from config
+                let default_hook = config.agent.as_ref()
+                    .and_then(|a| a.default_subagent_hook.clone());
+                if let Some(hook) = default_hook {
+                    model_hook = Some(hook);
+                    eprintln!("[subagent] '{}' not in config, using default hook", parsed.name);
+                } else {
+                    return Err(format!(
+                        "unknown subagent '{}' and no default_subagent_hook configured. \
+                         Either add it to config.json subagents[] or set default_subagent_hook.",
+                        parsed.name
+                    ));
+                }
             }
 
             // Resolve max_steps: invocation arg > spec > default 64
             let max_steps = parsed.max_steps
                 .or(spec.and_then(|s| s.max_steps))
                 .unwrap_or(64);
-
-            // Resolve timeout: invocation arg > spec > none
-            let timeout_secs = parsed.timeout_secs
-                .or(spec.and_then(|s| s.timeout_secs));
 
             let cfg = build_bridge_agent_config(
                 mv2.to_path_buf(),
@@ -1984,24 +1991,18 @@ pub(crate) fn execute_tool_with_handles(
             *mem_write = None;
             let session = format!("subagent:{}:{}", parsed.name, Utc::now().timestamp());
             let prompt = parsed.prompt.clone();
-            let name_for_err = parsed.name.clone();
 
-            // Spawn the bridge agent in a thread so we can apply a timeout if configured.
+            // Spawn the bridge agent in a background thread.
             let (tx, rx) = std::sync::mpsc::channel();
             thread::spawn(move || {
                 let r = run_agent_for_bridge(&cfg, &prompt, session, None, None, None);
                 let _ = tx.send(r);
             });
 
-            let result = if let Some(t) = timeout_secs {
-                rx.recv_timeout(std::time::Duration::from_secs(t))
-                    .map_err(|_| format!("subagent '{}' timed out after {}s", name_for_err, t))?
-                    .map_err(|e| e.to_string())?
-            } else {
-                rx.recv()
-                    .map_err(|e| format!("channel error: {e}"))?
-                    .map_err(|e| e.to_string())?
-            };
+            // No timeout — zombie detection handles stuck processes
+            let result = rx.recv()
+                .map_err(|e| format!("channel error: {e}"))?
+                .map_err(|e| e.to_string())?;
 
             Ok(ToolExecution {
                 output: result.final_text.unwrap_or_default(),
@@ -2057,13 +2058,20 @@ pub(crate) fn execute_tool_with_handles(
                         model_hook = spec.model_hook.clone();
                     }
                 } else if system.is_none() && model_hook.is_none() {
-                    prepared.push(PreparedInvocation {
-                        name: inv.name.clone(),
-                        prompt: inv.prompt.clone(),
-                        cfg: Err(format!("unknown subagent: {}", inv.name)),
-                        index: i,
-                    });
-                    continue;
+                    let default_hook = config_snapshot.agent.as_ref()
+                        .and_then(|a| a.default_subagent_hook.clone());
+                    if let Some(hook) = default_hook {
+                        model_hook = Some(hook);
+                        eprintln!("[subagent_batch] '{}' not in config, using default hook", inv.name);
+                    } else {
+                        prepared.push(PreparedInvocation {
+                            name: inv.name.clone(),
+                            prompt: inv.prompt.clone(),
+                            cfg: Err(format!("unknown subagent '{}' and no default_subagent_hook", inv.name)),
+                            index: i,
+                        });
+                        continue;
+                    }
                 }
 
                 // Resolve max_steps: invocation arg > spec > default 64
