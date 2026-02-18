@@ -475,7 +475,7 @@ pub(crate) struct ReminderState {
 
 /// Tracks a single critic correction event within an agent session.
 /// Used to build a history of corrections for escalation and audit.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CriticCorrection {
     pub(crate) step: usize,
     pub(crate) issues: Vec<String>,
@@ -483,7 +483,7 @@ pub(crate) struct CriticCorrection {
     pub(crate) acknowledged: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub(crate) struct DriftState {
     pub(crate) ema: f32,
     pub(crate) turns: usize,

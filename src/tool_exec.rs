@@ -17,17 +17,19 @@ use walkdir::WalkDir;
 use std::sync::mpsc;
 use std::process::Command;
 
-const NO_TIMEOUT_MS: u64 = u64::MAX;
+const DEFAULT_HTTP_TIMEOUT_MS: u64 = 120_000;
+/// Sentinel: disable timeout for exec policies (Codex CLI, builds).
+const EXEC_NO_TIMEOUT: u64 = u64::MAX;
 const PROCESS_POLL_MS: u64 = 250;
 const STATUS_REPORT_MS: u64 = 3_000;
 
 /// Execution monitoring policy for a child process.
 /// Different command classes get different kill thresholds.
 struct ExecPolicy {
-    /// Wall-clock deadline. NO_TIMEOUT_MS = no hard timeout.
+    /// Wall-clock deadline. EXEC_NO_TIMEOUT = no hard timeout.
     hard_timeout_ms: u64,
     /// Kill after this many ms with no stdout/stderr output.
-    /// NO_TIMEOUT_MS = never kill for staleness.
+    /// EXEC_NO_TIMEOUT = never kill for staleness.
     stale_threshold_ms: u64,
 }
 
@@ -38,8 +40,8 @@ fn classify_exec_policy(command: &str) -> ExecPolicy {
     // Codex CLI: immortal — legitimate multi-hour sessions
     if cmd.starts_with("codex ") || cmd.starts_with("codex-") {
         return ExecPolicy {
-            hard_timeout_ms: NO_TIMEOUT_MS,
-            stale_threshold_ms: NO_TIMEOUT_MS,
+            hard_timeout_ms: EXEC_NO_TIMEOUT,
+            stale_threshold_ms: EXEC_NO_TIMEOUT,
         };
     }
 
@@ -50,7 +52,7 @@ fn classify_exec_policy(command: &str) -> ExecPolicy {
         || cmd.starts_with("make") || cmd.starts_with("docker build")
     {
         return ExecPolicy {
-            hard_timeout_ms: NO_TIMEOUT_MS,
+            hard_timeout_ms: EXEC_NO_TIMEOUT,
             stale_threshold_ms: 300_000,  // 5 minutes
         };
     }
@@ -193,7 +195,7 @@ fn wait_for_child_monitored(
                 let idle_ms = now_ms - last_ms;
 
                 // Hard timeout enforcement: wall-clock deadline exceeded → kill
-                if policy.hard_timeout_ms != NO_TIMEOUT_MS && now_ms >= policy.hard_timeout_ms {
+                if policy.hard_timeout_ms != EXEC_NO_TIMEOUT && now_ms >= policy.hard_timeout_ms {
                     let total_s = now_ms / 1000;
                     let hard = policy.hard_timeout_ms;
                     eprintln!(
@@ -230,7 +232,7 @@ fn wait_for_child_monitored(
                 }
 
                 // Stale-process detection: no output for threshold → kill
-                if policy.stale_threshold_ms != NO_TIMEOUT_MS && idle_ms >= policy.stale_threshold_ms {
+                if policy.stale_threshold_ms != EXEC_NO_TIMEOUT && idle_ms >= policy.stale_threshold_ms {
                     let idle_min = idle_ms / 60_000;
                     let total_min = now_ms / 60_000;
                     eprintln!(
@@ -282,9 +284,9 @@ fn wait_for_child_monitored(
                         "[tool:{label}] pid={pid} running {elapsed_s}s \
                          (idle {idle_s}s, stdout={stdout_len}B stderr={stderr_len}B, \
                          hard={}ms stale={}ms)",
-                        if policy.hard_timeout_ms == NO_TIMEOUT_MS { "none".to_string() }
+                        if policy.hard_timeout_ms == EXEC_NO_TIMEOUT { "none".to_string() }
                         else { policy.hard_timeout_ms.to_string() },
-                        if policy.stale_threshold_ms == NO_TIMEOUT_MS { "none".to_string() }
+                        if policy.stale_threshold_ms == EXEC_NO_TIMEOUT { "none".to_string() }
                         else { policy.stale_threshold_ms.to_string() },
                     );
                     last_report = Instant::now();
@@ -579,9 +581,9 @@ fn submit_exec_background_job(
     });
 
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_connect(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
+        .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
+        .timeout_write(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
         .build();
     let response = agent
         .post(&endpoint)
@@ -705,11 +707,11 @@ pub(crate) fn execute_tool_with_handles(
                     no_expand: parsed.no_expand.unwrap_or(false),
                     max_expansions: parsed.max_expansions.unwrap_or(2),
                     expand_hook: None,
-                    expand_hook_timeout_ms: NO_TIMEOUT_MS,
+                    expand_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
                     no_vector: parsed.no_vector.unwrap_or(false),
                     rerank: parsed.rerank.unwrap_or_else(|| "local".to_string()),
                     rerank_hook: None,
-                    rerank_hook_timeout_ms: NO_TIMEOUT_MS,
+                    rerank_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
                     rerank_hook_full_text: false,
                     embed_model: None,
                     embed_cache: 4096,
@@ -753,11 +755,11 @@ pub(crate) fn execute_tool_with_handles(
                     no_expand: parsed.no_expand.unwrap_or(false),
                     max_expansions: parsed.max_expansions.unwrap_or(2),
                     expand_hook: None,
-                    expand_hook_timeout_ms: NO_TIMEOUT_MS,
+                    expand_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
                     no_vector: parsed.no_vector.unwrap_or(false),
                     rerank: parsed.rerank.unwrap_or_else(|| "local".to_string()),
                     rerank_hook: None,
-                    rerank_hook_timeout_ms: NO_TIMEOUT_MS,
+                    rerank_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
                     rerank_hook_full_text: false,
                     embed_model: None,
                     embed_cache: 4096,
@@ -1339,9 +1341,9 @@ pub(crate) fn execute_tool_with_handles(
                 _ => serde_json::json!({ "text": parsed.text }),
             };
             let agent = ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
-                .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_connect(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
+                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
+                .timeout_write(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
                 .build();
             let response = agent
                 .post(&webhook)
@@ -1412,7 +1414,7 @@ pub(crate) fn execute_tool_with_handles(
                 .method
                 .unwrap_or_else(|| "GET".to_string())
                 .to_ascii_uppercase();
-            let timeout = parsed.timeout_ms.unwrap_or(NO_TIMEOUT_MS);
+            let timeout = parsed.timeout_ms.unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
             let agent = ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_millis(timeout))
                 .timeout_write(Duration::from_millis(timeout))
@@ -1471,7 +1473,7 @@ pub(crate) fn execute_tool_with_handles(
         "browser" => {
             let parsed: ToolBrowserArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let browser_timeout_ms = parsed.timeout_ms.unwrap_or(NO_TIMEOUT_MS);
+            let browser_timeout_ms = parsed.timeout_ms.unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
             let session = parsed.session.unwrap_or_else(|| "default".to_string());
 
             let mut cmd_args: Vec<String> = vec!["--session".to_string(), session];
@@ -2202,13 +2204,27 @@ pub(crate) fn execute_tool_with_handles(
                     "max_steps": s.max_steps,
                 })
             }).collect();
+            // Check if dynamic spawning is supported
+            let has_default_hook = config.agent.as_ref()
+                .and_then(|a| a.default_subagent_hook.as_ref())
+                .is_some();
+            let dynamic_note = if has_default_hook {
+                " Dynamic spawning is enabled — you can use ANY name with subagent_invoke, not just these. Use descriptive names like 'voice-debugger' or 'security-auditor'."
+            } else {
+                ""
+            };
             Ok(ToolExecution {
-                output: if details.is_empty() {
+                output: if details.is_empty() && !has_default_hook {
                     "No subagents configured. Define them in workspace config.json under agent.subagents.".to_string()
+                } else if details.is_empty() {
+                    "No predefined subagents, but dynamic spawning is enabled. Use subagent_invoke with any descriptive name.".to_string()
                 } else {
-                    format!("{} subagents available.", details.len())
+                    format!("{} predefined subagents available.{dynamic_note}", details.len())
                 },
-                details: serde_json::json!({ "subagents": details }),
+                details: serde_json::json!({
+                    "subagents": details,
+                    "dynamic_spawning": has_default_hook,
+                }),
                 is_error: false,
             })
         }
@@ -2256,6 +2272,32 @@ pub(crate) fn execute_tool_with_handles(
             }
             if model_hook.is_none() {
                 model_hook = spec.model_hook.clone();
+            }
+
+            // Enforce tool restrictions from SubagentSpec via system prompt
+            if !spec.tools.is_empty() {
+                let list = spec.tools.join(", ");
+                let restriction = format!(
+                    "\n\nIMPORTANT: You are ONLY allowed to use the following tools: {list}. \
+                     Do not attempt to use any other tools."
+                );
+                if let Some(ref mut sys) = system {
+                    sys.push_str(&restriction);
+                } else {
+                    system = Some(restriction);
+                }
+            }
+            if !spec.disallowed_tools.is_empty() {
+                let list = spec.disallowed_tools.join(", ");
+                let restriction = format!(
+                    "\n\nIMPORTANT: You are NOT allowed to use the following tools: {list}. \
+                     If you attempt to use them, the call will fail."
+                );
+                if let Some(ref mut sys) = system {
+                    sys.push_str(&restriction);
+                } else {
+                    system = Some(restriction);
+                }
             }
 
             // Resolve max_steps: invocation arg > spec > default 64
@@ -2466,7 +2508,7 @@ pub(crate) fn execute_tool_with_handles(
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
                 .build();
             let mut url = format!(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={}",
@@ -2501,7 +2543,7 @@ pub(crate) fn execute_tool_with_handles(
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
                 .build();
             let url = format!(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=full",
@@ -2543,7 +2585,7 @@ pub(crate) fn execute_tool_with_handles(
                 .to_string();
             let payload = serde_json::json!({ "raw": encoded });
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
@@ -2570,7 +2612,7 @@ pub(crate) fn execute_tool_with_handles(
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
                 .build();
             let url = format!(
                 "https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults={}",
@@ -2607,7 +2649,7 @@ pub(crate) fn execute_tool_with_handles(
                 "end": { "dateTime": parsed.end }
             });
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .post("https://www.googleapis.com/calendar/v3/calendars/primary/events")
@@ -2638,7 +2680,7 @@ pub(crate) fn execute_tool_with_handles(
                 parsed.top.unwrap_or(10)
             );
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .get(&url)
@@ -2666,7 +2708,7 @@ pub(crate) fn execute_tool_with_handles(
             let token = get_oauth_token(mv2, "microsoft").map_err(|e| e.to_string())?;
             let url = format!("https://graph.microsoft.com/v1.0/me/messages/{}", parsed.id);
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .get(&url)
@@ -2697,7 +2739,7 @@ pub(crate) fn execute_tool_with_handles(
                 parsed.top.unwrap_or(10)
             );
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .get(&url)
@@ -2733,7 +2775,7 @@ pub(crate) fn execute_tool_with_handles(
                 "end": { "dateTime": parsed.end, "timeZone": "UTC" }
             });
             let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
                 .build();
             let resp = agent
                 .post("https://graph.microsoft.com/v1.0/me/events")

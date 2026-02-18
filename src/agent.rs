@@ -342,6 +342,8 @@ pub(crate) fn compact_messages(
          PENDING: <what still needs to be done>\n\
          KEY_FILES: <important file paths mentioned>\n\
          AVOID: <mistakes made or approaches that failed>\n\
+         CORRECTIONS: <any grounding violations flagged by the critic, specific false claims made, and what the correct information was>\n\
+         SECURITY_INCIDENTS: <any API keys or secrets exposed, security warnings issued>\n\
          CONTEXT: <other important context>\n\n\
          {summary_text}"
     );
@@ -530,23 +532,29 @@ pub(crate) fn run_agent_with_prompt(
         system_prompt.push_str(concat!(
             "\n\n## Resource Guide — Long-Running Tasks\n",
             "You are the orchestrator. Subagents are your workforce. Delegate everything non-trivial.\n\n",
-            "### Delegation Hierarchy\n",
-            "- subagent_invoke(name=\"researcher\", prompt=\"...\") — research, analysis, exploration. Zero token cost.\n",
-            "- subagent_invoke(name=\"coder\", prompt=\"...\") — coding, debugging, implementation. Uses Codex internally. Zero token cost.\n",
-            "- subagent_invoke(name=\"critic\", prompt=\"...\") — review, audit, quality checking. Zero token cost.\n",
-            "- subagent_batch(invocations=[...]) — parallel fan-out of independent tasks. Massively parallel.\n\n",
+            "### Delegation — Dynamic Agents\n",
+            "You can spawn subagents with ANY name. Predefined types (researcher, coder, critic) have custom system prompts. ",
+            "Any other name creates a dynamic agent using the default hook — use descriptive names for your task:\n",
+            "- subagent_invoke(name=\"researcher\", prompt=\"...\") — predefined: research, analysis, exploration.\n",
+            "- subagent_invoke(name=\"coder\", prompt=\"...\") — predefined: coding, debugging, implementation via Codex.\n",
+            "- subagent_invoke(name=\"critic\", prompt=\"...\") — predefined: review, audit, quality checking.\n",
+            "- subagent_invoke(name=\"voice-debugger\", prompt=\"...\") — dynamic: create specialists for any domain.\n",
+            "- subagent_invoke(name=\"security-auditor\", prompt=\"...\") — dynamic: any descriptive name works.\n",
+            "- subagent_batch(invocations=[...]) — parallel fan-out. Mix predefined and dynamic agents freely.\n\n",
             "### Cost Model\n",
             "- YOUR main loop: Opus tokens. Expensive. Use for orchestration, auditing results, user communication.\n",
-            "- Subagents: Codex tokens. FREE. Use for ALL heavy lifting — research, coding, debugging, troubleshooting.\n",
-            "- A coder subagent can itself spawn Codex sub-workers, creating nested parallelism at zero marginal cost.\n\n",
+            "- Subagents: Codex tokens. Cheap (not free — each consumes compute). Use for ALL heavy lifting.\n",
+            "- Dynamic agents inherit the default Codex hook. Predefined agents may have custom hooks.\n",
+            "- A coder subagent can itself spawn sub-workers, creating nested parallelism.\n\n",
             "### Anti-Patterns (Do NOT)\n",
             "- Do NOT troubleshoot complex issues step-by-step in your main loop. Delegate to a subagent.\n",
             "- Do NOT read 5+ files sequentially to understand a codebase. Spawn a researcher subagent.\n",
             "- Do NOT write multi-file code changes yourself. Spawn a coder subagent.\n",
-            "- Do NOT use exec to invoke codex/ollama directly. Use subagent_invoke instead.\n\n",
+            "- Do NOT use exec to invoke codex/ollama directly. Use subagent_invoke instead.\n",
+            "- Do NOT limit yourself to researcher/coder/critic. Create domain-specific agents as needed.\n\n",
             "### Correct Pattern\n",
             "1. Decompose the task into independent subtasks.\n",
-            "2. Use subagent_batch to run them in parallel.\n",
+            "2. Use subagent_batch to run them in parallel — use descriptive names for each.\n",
             "3. Audit the results. Verify quality. Report to user.\n",
             "Reserve exec for: shell commands, file operations, service management — NOT for LLM work.\n",
         ));
@@ -788,6 +796,16 @@ pub(crate) fn run_agent_with_prompt(
 
     let mut reminder_state = ReminderState::default();
     let mut drift_state = DriftState::default();
+    // Load persisted violations from previous sessions
+    let drift_path = log_dir.join("drift_state.json");
+    if let Ok(data) = std::fs::read_to_string(&drift_path) {
+        if let Ok(persisted) = serde_json::from_str::<DriftState>(&data) {
+            drift_state.violations = persisted.violations;
+            drift_state.critic_history = persisted.critic_history;
+            eprintln!("[drift] loaded {} persisted violations",
+                drift_state.violations.get("critic_correction").copied().unwrap_or(0));
+        }
+    }
     let mut recent_actions: VecDeque<String> = VecDeque::with_capacity(30);
     let mut retrieved_skills: Vec<String> = Vec::new();
     let mut turns_since_fact_extract: usize = 0;
@@ -1552,6 +1570,10 @@ pub(crate) fn run_agent_with_prompt(
                 drift_state.violations.entry("critic_correction".to_string())
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
+                // Persist violations to disk
+                if let Ok(json) = serde_json::to_string(&drift_state) {
+                    let _ = std::fs::write(&drift_path, json);
+                }
 
                 // Progressive escalation based on violation count
                 let violation_count = drift_state.violations.get("critic_correction").copied().unwrap_or(0);
@@ -1579,6 +1601,10 @@ pub(crate) fn run_agent_with_prompt(
                             tool_call_id: None,
                             is_error: None,
                         });
+                        // Enforce: halve remaining step budget
+                        let remaining = current_max_steps.saturating_sub(step);
+                        current_max_steps = step + remaining / 2;
+                        eprintln!("[critic] LEVEL 3 enforcement: step budget reduced to {current_max_steps} (was {})", step + remaining);
                     }
                     _ => {
                         // Level 4: Log for potential session termination
@@ -1591,6 +1617,9 @@ pub(crate) fn run_agent_with_prompt(
                             tool_call_id: None,
                             is_error: None,
                         });
+                        // Enforce: force completion within 3 steps
+                        current_max_steps = step + 3;
+                        eprintln!("[critic] LEVEL 4 enforcement: forced completion in 3 steps (step={step}, max={current_max_steps})");
                     }
                 }
             }

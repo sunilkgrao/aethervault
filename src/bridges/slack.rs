@@ -16,7 +16,7 @@ use crate::{
     AgentRunOutput, BridgeAgentConfig, SessionTurn,
 };
 
-const NO_TIMEOUT_MS: u64 = u64::MAX;
+const DEFAULT_HTTP_TIMEOUT_MS: u64 = 120_000;
 const SLACK_API_BASE: &str = "https://slack.com/api";
 const VOICEBOX_API: &str = "http://raoDesktop:8000/generate";
 const MAX_QUEUED_PER_SESSION: usize = 5;
@@ -1073,9 +1073,9 @@ pub(crate) fn run_slack_bridge(
         .ok_or("Missing SLACK_SIGNING_SECRET")?;
 
     let http_agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_connect(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
+        .timeout_write(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
+        .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
         .build();
 
     let upload_client = Client::builder()
