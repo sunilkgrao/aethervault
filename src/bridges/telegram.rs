@@ -794,7 +794,7 @@ pub(crate) fn spawn_agent_run(
 
     // Worker thread -- calls run_agent_with_prompt directly (no middle thread)
     let worker_progress = progress.clone();
-    let mv2 = agent_config.mv2.clone();
+    let mv2 = agent_config.db_path.clone();
     let model_hook = agent_config.model_hook.clone();
     let system_text = agent_config.system.clone();
     let no_memory = agent_config.no_memory;
@@ -1070,7 +1070,7 @@ pub(crate) fn run_telegram_bridge(
     // Clean up orphaned vault temp files from previous crashes.
     // These are created during atomic writes and left behind if the process is killed.
     {
-        let vault_path = &agent_config.mv2;
+        let vault_path = &agent_config.db_path;
         if let Some(parent) = vault_path.parent() {
             if let Some(stem) = vault_path.file_name().and_then(|f| f.to_str()) {
                 let prefix = format!(".{}.", stem);
@@ -1098,15 +1098,15 @@ pub(crate) fn run_telegram_bridge(
         // 0. Periodic vault health check
         if last_vault_check.elapsed() >= vault_check_interval {
             last_vault_check = std::time::Instant::now();
-            if let Ok(meta) = std::fs::metadata(&agent_config.mv2) {
+            if let Ok(meta) = std::fs::metadata(&agent_config.db_path) {
                 let size_mb = meta.len() / 1_000_000;
                 if size_mb > 200 {
                     eprintln!("[bridge] WARNING: vault size {size_mb}MB \u{2014} approaching hard cap");
                 }
             }
             // Also clean temp files that may have accumulated during runtime
-            if let Some(parent) = agent_config.mv2.parent() {
-                if let Some(stem) = agent_config.mv2.file_name().and_then(|f| f.to_str()) {
+            if let Some(parent) = agent_config.db_path.parent() {
+                if let Some(stem) = agent_config.db_path.file_name().and_then(|f| f.to_str()) {
                     let prefix = format!(".{stem}.");
                     if let Ok(entries) = std::fs::read_dir(parent) {
                         for entry in entries.flatten() {
@@ -1189,7 +1189,7 @@ pub(crate) fn run_telegram_bridge(
             let Some((chat_id, reply_to_id, user_text)) = extract_telegram_content(&entry, &http_agent, &base_url) else {
                 continue;
             };
-            if let Some(output) = try_handle_approval_chat(&agent_config.mv2, &user_text) {
+            if let Some(output) = try_handle_approval_chat(&agent_config.db_path, &user_text) {
                 if let Err(err) = telegram_send_message(&http_agent, &base_url, chat_id, &output) {
                     eprintln!("Telegram send failed: {err}");
                 }

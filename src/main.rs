@@ -14,6 +14,7 @@ mod bridges;
 mod services;
 mod agent_log;
 mod config_file;
+mod memory_db;
 mod skill_registry;
 
 // Re-export all module items at crate root so cross-module references work.
@@ -42,17 +43,11 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use aether_core::types::{Frame, FrameStatus, SearchRequest};
-use aether_core::{DoctorOptions, PutOptions, Vault, VaultError};
+use crate::memory_db::{Frame, FrameStatus, MemoryDb, PutOptions, SearchRequest};
 use chrono::Utc;
 use clap::Parser;
 use serde::Serialize;
 use walkdir::WalkDir;
-
-#[cfg(feature = "vec")]
-use aether_core::text_embed::{LocalTextEmbedder, TextEmbedConfig};
-#[cfg(feature = "vec")]
-use aether_core::types::EmbeddingProvider;
 
 #[derive(Debug, Serialize)]
 struct ArchiveSummary {
@@ -173,11 +168,11 @@ fn to_sorted_stats(map: HashMap<String, usize>) -> Vec<(String, usize)> {
 }
 
 fn copy_frame_to_archive(
-    source: &mut Vault,
-    archive: &mut Vault,
+    source: &MemoryDb,
+    archive: &MemoryDb,
     frame: &Frame,
-) -> aether_core::Result<u64> {
-    let payload = source.frame_canonical_payload(frame.id)?;
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let payload = source.frame_canonical_payload(frame.id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     let mut options = PutOptions::default();
     options.timestamp = Some(frame.timestamp);
     options.track = frame.track.clone();
@@ -191,11 +186,11 @@ fn copy_frame_to_archive(
     options.extra_metadata = frame.extra_metadata.clone();
     options.role = frame.role;
     options.parent_id = frame.parent_id;
-    options.source_path = frame.source_path.clone();
     options.auto_tag = false;
     options.extract_dates = false;
     options.extract_triplets = false;
-    archive.put_bytes_with_options(&payload, options)
+    let id = archive.put_bytes_with_options(&payload, options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    Ok(id)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -207,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Refusing to overwrite existing file: {}", mv2.display());
                 std::process::exit(2);
             }
-            let _ = Vault::create(&mv2)?;
+            let _ = open_or_create_db(&mv2)?;
             println!("Created {}", mv2.display());
             Ok(())
         }
@@ -225,8 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(2);
             }
 
-            let mut mem = open_or_create(&mv2)?;
-            mem.enable_lex()?;
+            let db = open_or_create_db(&mv2)?;
 
             let mut scanned = 0usize;
             let mut ingested = 0usize;
@@ -257,7 +251,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let uri = uri_for_path(&collection, relative);
                 let title = infer_title(path, &bytes);
 
-                let existing_checksum = mem.frame_by_uri(&uri).ok().map(|frame| frame.checksum);
+                let existing_checksum = db.frame_by_uri(&uri).ok().map(|frame| frame.checksum);
 
                 if existing_checksum.is_some_and(|c| c == *file_hash.as_bytes()) {
                     skipped += 1;
@@ -306,7 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .insert("size_bytes".into(), size_bytes);
                 }
 
-                mem.put_bytes_with_options(&bytes, options)?;
+                db.put_bytes_with_options(&bytes, options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
                 if existing_checksum.is_some() {
                     updated += 1;
@@ -322,7 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            mem.commit()?;
+            db.commit().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             println!("Done: scanned={scanned} ingest={ingested} update={updated} skip={skipped}");
             Ok(())
         }
@@ -371,9 +365,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 options.search_text = Some(text);
             }
 
-            let mut mem = open_or_create(&mv2)?;
-            let frame_id = mem.put_bytes_with_options(&payload, options)?;
-            mem.commit()?;
+            let db = open_or_create_db(&mv2)?;
+            let frame_id = db.put_bytes_with_options(&payload, options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            db.commit().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
             if json {
                 let response = serde_json::json!({
@@ -395,7 +389,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             snippet_chars,
             json,
         } => {
-            let mut mem = Vault::open_read_only(&mv2)?;
+            let db = open_or_create_db(&mv2)?;
             let scope = collection.as_deref().map(scope_prefix);
 
             let request = SearchRequest {
@@ -411,7 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_sketch: false,
             };
 
-            let response = mem.search(request)?;
+            let response = db.search(request).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -463,11 +457,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             after,
             feedback_weight,
         } => {
-            let mut mem = if log {
-                Vault::open(&mv2)?
-            } else {
-                Vault::open_read_only(&mv2)?
-            };
+            let db = open_or_create_db(&mv2)?;
 
             let args = QueryArgs {
                 raw_query: query.clone(),
@@ -496,7 +486,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 feedback_weight,
             };
 
-            let response = execute_query(&mut mem, args)?;
+            let response = execute_query(&db, args)?;
 
             if log {
                 #[derive(Serialize)]
@@ -521,8 +511,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 options.kind = Some("application/json".to_string());
                 options.track = Some("aethervault.query".to_string());
                 options.search_text = Some(response.plan.cleaned_query.clone());
-                mem.put_bytes_with_options(&bytes, options)?;
-                mem.commit()?;
+                db.put_bytes_with_options(&bytes, options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                db.commit().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
 
             if !response.warnings.is_empty() && !json {
@@ -591,7 +581,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             after,
             feedback_weight,
         } => {
-            let mut mem = Vault::open_read_only(&mv2)?;
+            let db = open_or_create_db(&mv2)?;
             let args = QueryArgs {
                 raw_query: query.clone(),
                 collection,
@@ -619,7 +609,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 feedback_weight,
             };
 
-            let pack = build_context_pack(&mut mem, args, max_bytes, full)?;
+            let pack = build_context_pack(&db, args, max_bytes, full)?;
             if !pack.warnings.is_empty() {
                 for warning in &pack.warnings {
                     eprintln!("Warning: {warning}");
@@ -658,8 +648,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 meta: meta_value,
                 ts_utc: Some(Utc::now().timestamp()),
             };
-            let mut mem = Vault::open(&mv2)?;
-            let _ = append_agent_log(&mut mem, &entry)?;
+            let db = open_or_create_db(&mv2)?;
+            let _ = append_agent_log(&db, &entry)?;
             println!("Logged agent turn.");
             Ok(())
         }
@@ -679,8 +669,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 session: session.clone(),
                 ts_utc: Some(Utc::now().timestamp()),
             };
-            let mut mem = Vault::open(&mv2)?;
-            let _ = append_feedback(&mut mem, &event)?;
+            let db = open_or_create_db(&mv2)?;
+            let _ = append_feedback(&db, &event).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             println!("Feedback recorded.");
             Ok(())
         }
@@ -699,136 +689,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             #[cfg(feature = "vec")]
             {
-                let mut mem = Vault::open(&mv2)?;
-                mem.enable_vec()?;
-
-                let embed_config =
-                    build_embed_config(model.as_deref(), embed_cache, !embed_no_cache);
-                let embedder = LocalTextEmbedder::new(embed_config)?;
-                mem.set_vec_model(embedder.model())?;
-
-                let scope = collection.as_deref().map(scope_prefix);
-                let mut frame_ids = collect_active_frame_ids(&mem, scope.as_deref());
-                if limit > 0 && frame_ids.len() > limit {
-                    frame_ids.truncate(limit);
-                }
-
-                let batch_size = batch.max(1);
-                let mut embedded = 0usize;
-                let mut skipped = 0usize;
-                let mut failed = 0usize;
-
-                for chunk in frame_ids.chunks(batch_size) {
-                    let mut targets: Vec<(u64, String)> = Vec::new();
-                    for &frame_id in chunk {
-                        if !force {
-                            match mem.frame_embedding(frame_id) {
-                                Ok(Some(_)) => {
-                                    skipped += 1;
-                                    continue;
-                                }
-                                Ok(None) => {}
-                                Err(_) => {}
-                            }
-                        }
-
-                        let frame = match mem.frame_by_id(frame_id) {
-                            Ok(f) => f,
-                            Err(_) => {
-                                failed += 1;
-                                continue;
-                            }
-                        };
-                        let text = if let Some(search) = frame.search_text.clone() {
-                            search
-                        } else {
-                            match mem.frame_text_by_id(frame_id) {
-                                Ok(t) => t,
-                                Err(_) => {
-                                    failed += 1;
-                                    continue;
-                                }
-                            }
-                        };
-
-                        if text.trim().is_empty() {
-                            skipped += 1;
-                            continue;
-                        }
-                        targets.push((frame_id, text));
-                    }
-
-                    if targets.is_empty() {
-                        continue;
-                    }
-
-                    let refs: Vec<&str> = targets.iter().map(|(_, t)| t.as_str()).collect();
-                    let embeddings = match embedder.embed_batch(&refs) {
-                        Ok(e) => e,
-                        Err(err) => {
-                            eprintln!("Embedding batch failed: {err}");
-                            failed += targets.len();
-                            continue;
-                        }
-                    };
-
-                    for ((frame_id, _), embedding) in
-                        targets.into_iter().zip(embeddings.into_iter())
-                    {
-                        if dry_run {
-                            embedded += 1;
-                            continue;
-                        }
-                        let mut options = PutOptions::default();
-                        options.auto_tag = false;
-                        options.extract_dates = false;
-                        options.extract_triplets = false;
-                        options.instant_index = false;
-                        options.enable_embedding = false;
-                        if mem
-                            .update_frame(frame_id, None, options, Some(embedding))
-                            .is_ok()
-                        {
-                            embedded += 1;
-                        } else {
-                            failed += 1;
-                        }
-                    }
-                }
-
-                if !dry_run {
-                    mem.commit()?;
-                }
-
-                if json {
-                    #[derive(Serialize)]
-                    struct EmbedSummary {
-                        total: usize,
-                        embedded: usize,
-                        skipped: usize,
-                        failed: usize,
-                        dry_run: bool,
-                    }
-
-                    let summary = EmbedSummary {
-                        total: frame_ids.len(),
-                        embedded,
-                        skipped,
-                        failed,
-                        dry_run,
-                    };
-                    println!("{}", serde_json::to_string_pretty(&summary)?);
-                } else {
-                    println!(
-                        "Embedding complete: total={} embedded={} skipped={} failed={} dry_run={}",
-                        frame_ids.len(),
-                        embedded,
-                        skipped,
-                        failed,
-                        dry_run
-                    );
-                }
-                Ok(())
+                let _ = (mv2, collection, limit, batch, force, model, embed_cache, embed_no_cache, dry_run, json);
+                eprintln!("Local embedding is not supported with SQLite backend. Use Qdrant for vector search.");
+                std::process::exit(2);
             }
             #[cfg(not(feature = "vec"))]
             {
@@ -850,20 +713,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Get { mv2, id, json } => {
-            let mut mem = Vault::open_read_only(&mv2)?;
+            let db = open_or_create_db(&mv2)?;
 
             let (frame_id, frame) = if let Some(rest) = id.strip_prefix('#') {
-                let frame_id: u64 = rest.parse().map_err(|_| VaultError::InvalidQuery {
-                    reason: "invalid frame id (expected #123)".into(),
+                let frame_id: u64 = rest.parse().map_err(|_| -> Box<dyn std::error::Error> {
+                    "invalid frame id (expected #123)".into()
                 })?;
-                let frame = mem.frame_by_id(frame_id)?;
+                let frame = db.frame_by_id(frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 (frame_id, frame)
             } else {
-                let frame = mem.frame_by_uri(&id)?;
+                let frame = db.frame_by_uri(&id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 (frame.id, frame)
             };
 
-            let text = mem.frame_text_by_id(frame_id)?;
+            let text = db.frame_text_by_id(frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
             if json {
                 let payload = GetResponse {
@@ -881,11 +744,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Status { mv2, json } => {
-            let mem = Vault::open_read_only(&mv2)?;
+            let db = open_or_create_db(&mv2)?;
             let payload = StatusResponse {
                 mv2: mv2.display().to_string(),
-                frame_count: mem.frame_count(),
-                next_frame_id: mem.next_frame_id(),
+                frame_count: db.frame_count(),
+                next_frame_id: db.frame_count() as u64,
             };
 
             if json {
@@ -919,14 +782,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     serde_json::to_vec(&value)?
                 };
-                let mut mem = open_or_create(&mv2)?;
-                let frame_id = save_config_entry(&mut mem, &key, &payload)?;
-                println!("Stored config {key} at frame #{frame_id}");
+                let db = open_or_create_db(&mv2)?;
+                save_config_entry(&db, &key, &payload).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                println!("Stored config {key}");
                 Ok(())
             }
             ConfigCommand::Get { key, raw } => {
-                let mut mem = Vault::open_read_only(&mv2)?;
-                let Some(bytes) = load_config_entry(&mut mem, &key) else {
+                let db = open_or_create_db(&mv2)?;
+                let Some(bytes) = load_config_entry(&db, &key) else {
                     return Err("config not found".into());
                 };
                 if raw {
@@ -938,8 +801,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(())
             }
             ConfigCommand::List { json } => {
-                let mut mem = Vault::open_read_only(&mv2)?;
-                let entries = list_config_entries(&mut mem);
+                let db = open_or_create_db(&mv2)?;
+                let entries = list_config_entries(&db);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&entries)?);
                 } else {
@@ -958,10 +821,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             limit,
             json,
         } => {
-            let mut left_mem = Vault::open_read_only(&left)?;
-            let mut right_mem = Vault::open_read_only(&right)?;
-            let left_map = collect_latest_frames(&mut left_mem, all);
-            let right_map = collect_latest_frames(&mut right_mem, all);
+            let left_db = open_or_create_db(&left)?;
+            let right_db = open_or_create_db(&right)?;
+            let left_map = collect_latest_frames(&left_db, all);
+            let right_map = collect_latest_frames(&right_db, all);
 
             let mut only_left = Vec::new();
             let mut only_right = Vec::new();
@@ -1025,42 +888,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_dedup,
             json,
         } => {
-            if out.exists() {
-                if force {
-                    fs::remove_file(&out)?;
-                } else {
-                    return Err("output file exists (use --force to overwrite)".into());
-                }
-            }
-            let mut out_mem = Vault::create(&out)?;
-            let mut dedup_map: HashMap<String, u64> = HashMap::new();
-            let mut written = 0usize;
-            let mut deduped = 0usize;
-
-            let (w1, d1) = merge_capsule_into(&mut out_mem, &left, !no_dedup, &mut dedup_map)?;
-            written += w1;
-            deduped += d1;
-            let (w2, d2) = merge_capsule_into(&mut out_mem, &right, !no_dedup, &mut dedup_map)?;
-            written += w2;
-            deduped += d2;
-            out_mem.commit()?;
-
-            let report = MergeReport {
-                left: left.display().to_string(),
-                right: right.display().to_string(),
-                out: out.display().to_string(),
-                written,
-                deduped,
-            };
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                println!(
-                    "merged {} + {} -> {} (written={}, deduped={})",
-                    report.left, report.right, report.out, report.written, report.deduped
-                );
-            }
-            Ok(())
+            let _ = (left, right, out, force, no_dedup, json);
+            eprintln!("Merge is not supported with SQLite backend. Copy the .sqlite file instead.");
+            std::process::exit(2);
         }
 
         Command::Mcp { mv2, read_only } => run_mcp_server(mv2, read_only),
@@ -1197,19 +1027,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             quiet,
             json,
         } => {
-            let options = DoctorOptions {
-                rebuild_time_index: rebuild_time,
-                rebuild_lex_index: rebuild_lex,
-                rebuild_vec_index: rebuild_vec,
-                vacuum,
-                dry_run,
-                quiet,
-            };
-            let report = Vault::doctor(&mv2, options)?;
+            let _ = (rebuild_time, rebuild_vec, dry_run, quiet);
+            let db = open_or_create_db(&mv2)?;
+            if rebuild_lex {
+                db.rebuild_fts().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            }
+            if vacuum {
+                db.vacuum().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            }
+            let size = db.file_size(&mv2);
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                println!("{}", serde_json::json!({"status": "ok", "size_bytes": size}));
             } else {
-                print_doctor_report(&report);
+                println!("Doctor complete. Size: {} bytes", size);
             }
             Ok(())
         }
@@ -1220,19 +1050,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             quiet,
             json,
         } => {
-            let options = DoctorOptions {
-                rebuild_time_index: true,
-                rebuild_lex_index: true,
-                rebuild_vec_index: cfg!(feature = "vec"),
-                vacuum: true,
-                dry_run,
-                quiet,
-            };
-            let report = Vault::doctor(&mv2, options)?;
+            let _ = (dry_run, quiet);
+            let db = open_or_create_db(&mv2)?;
+            db.rebuild_fts().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            db.vacuum().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            let size = db.file_size(&mv2);
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                println!("{}", serde_json::json!({"status": "ok", "size_bytes": size}));
             } else {
-                print_doctor_report(&report);
+                println!("Compact complete. Size: {} bytes", size);
             }
             Ok(())
         }
@@ -1258,13 +1084,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("archive destination must differ from source".into());
             }
 
-            let mut source = Vault::open(&mv2)?;
-            let mut target_mem = if dry_run {
+            let source = open_or_create_db(&mv2)?;
+            let target_mem = if dry_run {
                 None
-            } else if target.exists() {
-                Some(Vault::open(&target)?)
             } else {
-                Some(Vault::create(&target)?)
+                Some(open_or_create_db(&target)?)
             };
 
             let mut scanned = 0usize;
@@ -1273,8 +1097,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut deleted = 0usize;
             let mut candidates = Vec::new();
 
-            for frame_id in 0..source.frame_count() {
-                let frame_id = frame_id as u64;
+            let all_ids = source.collect_active_frame_ids(None);
+            for &frame_id in &all_ids {
                 let frame = match source.frame_by_id(frame_id) {
                     Ok(frame) => frame,
                     Err(_) => continue,
@@ -1291,26 +1115,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if !dry_run {
                 for frame_id in candidates {
-                let frame = source.frame_by_id(frame_id)?;
+                let frame = source.frame_by_id(frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 if frame.status != FrameStatus::Active
                     || frame.timestamp >= cutoff
                     || !frame_matches_collection(&frame, &collection)
                 {
                     continue;
                 }
-                let target_mem = target_mem
-                    .as_mut()
-                    .expect("archive vault initialized");
-                copy_frame_to_archive(&mut source, target_mem, &frame)?;
-                source.delete_frame(frame_id)?;
+                copy_frame_to_archive(&source, target_mem.as_ref().unwrap(), &frame)?;
+                source.delete_frame(frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 archived += 1;
                 deleted += 1;
             }
                 target_mem
-                    .as_mut()
-                    .expect("archive vault initialized")
-                    .commit()?;
-                source.vacuum()?;
+                    .as_ref()
+                    .unwrap()
+                    .commit()
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                source.vacuum().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
 
             let report = ArchiveSummary {
@@ -1346,13 +1168,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dry_run,
         } => {
             let source_path = mv2.display().to_string();
-            let mut source = Vault::open(&mv2)?;
+            let source = open_or_create_db(&mv2)?;
 
             let mut by_uri_versions: HashMap<String, Vec<(i64, u64)>> = HashMap::new();
             let mut scanned = 0usize;
 
-            for frame_id in 0..source.frame_count() {
-                let frame_id = frame_id as u64;
+            let all_ids = source.collect_active_frame_ids(None);
+            for &frame_id in &all_ids {
                 let frame = match source.frame_by_id(frame_id) {
                     Ok(frame) => frame,
                     Err(_) => continue,
@@ -1386,9 +1208,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let deleted = duplicate_ids.len();
             if !dry_run {
                 for frame_id in &duplicate_ids {
-                    source.delete_frame(*frame_id)?;
+                    source.delete_frame(*frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 }
-                source.vacuum()?;
+                source.vacuum().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
 
             let report = DedupSummary {
@@ -1418,17 +1240,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Stats { mv2 } => {
             let source_path = mv2.display().to_string();
-            let source = Vault::open_read_only(&mv2)?;
-            let stats = source.stats()?;
+            let source = open_or_create_db(&mv2)?;
             let now = Utc::now().timestamp();
+            let total_frames = source.frame_count() as u64;
+            let active_frames = source.active_frame_count() as u64;
+            let file_size = source.file_size(&mv2);
 
             let mut by_collection: HashMap<String, usize> = HashMap::new();
             let mut by_age_days: HashMap<String, usize> = HashMap::new();
             let mut by_size: HashMap<String, usize> = HashMap::new();
             let mut uri_counts: HashMap<String, usize> = HashMap::new();
 
-            for frame_id in 0..source.frame_count() {
-                let frame_id = frame_id as u64;
+            let all_ids = source.collect_active_frame_ids(None);
+            for &frame_id in &all_ids {
                 let frame = match source.frame_by_id(frame_id) {
                     Ok(frame) => frame,
                     Err(_) => continue,
@@ -1444,8 +1268,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 *by_age_days
                     .entry(frame_age_bucket(age_days))
                     .or_insert(0) += 1;
+                let payload_size = source.frame_canonical_payload(frame.id).map(|p| p.len() as u64).unwrap_or(0);
                 *by_size
-                    .entry(frame_size_bucket(frame.payload_length))
+                    .entry(frame_size_bucket(payload_size))
                     .or_insert(0) += 1;
                 let uri_key = frame.uri.unwrap_or_else(|| "<no-uri>".to_string());
                 *uri_counts.entry(uri_key).or_insert(0) += 1;
@@ -1456,26 +1281,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .values()
                 .map(|count| count.saturating_sub(1))
                 .sum();
+            let deleted_frames = total_frames.saturating_sub(active_frames);
             let total_breakdown = vec![
-                ("total_frames".to_string(), stats.frame_count),
-                ("active_frames".to_string(), stats.active_frame_count),
-                (
-                    "deleted_frames".to_string(),
-                    stats.frame_count.saturating_sub(stats.active_frame_count),
-                ),
-                ("payload_bytes".to_string(), stats.payload_bytes),
-                ("logical_bytes".to_string(), stats.logical_bytes),
-                ("size_bytes".to_string(), stats.size_bytes),
-                ("wal_bytes".to_string(), stats.wal_bytes),
-                ("lex_index_bytes".to_string(), stats.lex_index_bytes),
-                ("vec_index_bytes".to_string(), stats.vec_index_bytes),
-                ("time_index_bytes".to_string(), stats.time_index_bytes),
+                ("total_frames".to_string(), total_frames),
+                ("active_frames".to_string(), active_frames),
+                ("deleted_frames".to_string(), deleted_frames),
+                ("size_bytes".to_string(), file_size),
             ];
 
             let report = StatsSummary {
                 source: source_path.clone(),
-                total_frames: stats.frame_count,
-                active_frames: stats.active_frame_count,
+                total_frames,
+                active_frames,
                 by_collection: to_sorted_stats(by_collection),
                 by_age_days: to_sorted_stats(by_age_days),
                 by_size: to_sorted_stats(by_size),

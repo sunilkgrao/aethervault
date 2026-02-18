@@ -55,7 +55,7 @@ pub(crate) fn run_whatsapp_bridge(
             continue;
         }
 
-        if let Some(output) = try_handle_approval_chat(&agent_config.mv2, &text) {
+        if let Some(output) = try_handle_approval_chat(&agent_config.db_path, &text) {
             let twiml = format!(
                 "<Response><Message>{}</Message></Response>",
                 escape_xml(&output)

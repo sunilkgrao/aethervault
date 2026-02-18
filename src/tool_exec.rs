@@ -8,8 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use aether_core::types::SearchRequest;
-use aether_core::{PutOptions, Vault};
+use crate::memory_db::{MemoryDb, SearchRequest, PutOptions};
 use base64::Engine;
 use chrono::Utc;
 use walkdir::WalkDir;
@@ -445,8 +444,6 @@ use crate::{
     env_optional,
     kill_process_tree,
     skill_db_path,
-    with_read_mem,
-    with_write_mem,
     load_approvals,
     save_approvals,
     approval_hash,
@@ -605,20 +602,8 @@ pub(crate) fn execute_tool(
     name: &str,
     args: serde_json::Value,
     mv2: &Path,
+    db: &MemoryDb,
     read_only: bool,
-) -> Result<ToolExecution, String> {
-    let mut mem_read = None;
-    let mut mem_write = None;
-    execute_tool_with_handles(name, args, mv2, read_only, &mut mem_read, &mut mem_write)
-}
-
-pub(crate) fn execute_tool_with_handles(
-    name: &str,
-    args: serde_json::Value,
-    mv2: &Path,
-    read_only: bool,
-    mem_read: &mut Option<Vault>,
-    mem_write: &mut Option<Vault>,
 ) -> Result<ToolExecution, String> {
     let is_write = matches!(
         name,
@@ -644,39 +629,36 @@ pub(crate) fn execute_tool_with_handles(
         let args_hash = approval_hash(name, &args);
         let mut approval_id: Option<String> = None;
         let mut approved = false;
-        with_write_mem(mem_read, mem_write, mv2, true, |mem| {
-            let mut approvals = load_approvals(mem);
+        {
+            let mut approvals = load_approvals(db);
             if let Some(pos) = approvals
                 .iter()
                 .position(|e| e.tool == name && e.args_hash == args_hash && e.status == "approved")
             {
                 approval_id = Some(approvals[pos].id.clone());
                 approvals.remove(pos);
-                save_approvals(mem, &approvals)?;
+                save_approvals(db, &approvals)?;
                 approved = true;
-                return Ok(());
-            }
-            if let Some(existing) = approvals
+            } else if let Some(existing) = approvals
                 .iter()
                 .find(|e| e.tool == name && e.args_hash == args_hash && e.status == "pending")
             {
                 approval_id = Some(existing.id.clone());
-                return Ok(());
+            } else {
+                let now = chrono::Utc::now().to_rfc3339();
+                let id = format!("apr_{}_{}", now.replace(':', ""), &args_hash[..8]);
+                approvals.push(ApprovalEntry {
+                    id: id.clone(),
+                    tool: name.to_string(),
+                    args_hash: args_hash.clone(),
+                    args: args.clone(),
+                    status: "pending".to_string(),
+                    created_at: now,
+                });
+                save_approvals(db, &approvals)?;
+                approval_id = Some(id);
             }
-            let now = chrono::Utc::now().to_rfc3339();
-            let id = format!("apr_{}_{}", now.replace(':', ""), &args_hash[..8]);
-            approvals.push(ApprovalEntry {
-                id: id.clone(),
-                tool: name.to_string(),
-                args_hash: args_hash.clone(),
-                args: args.clone(),
-                status: "pending".to_string(),
-                created_at: now,
-            });
-            save_approvals(mem, &approvals)?;
-            approval_id = Some(id);
-            Ok(())
-        })?;
+        }
         if !approved {
             let id = approval_id.clone().unwrap_or_else(|| "unknown".to_string());
             return Ok(ToolExecution {
@@ -695,162 +677,154 @@ pub(crate) fn execute_tool_with_handles(
         "query" => {
             let parsed: ToolQueryArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            with_read_mem(mem_read, mem_write, mv2, |mem| {
-                let qargs = QueryArgs {
-                    raw_query: parsed.query.clone(),
-                    collection: parsed.collection,
-                    limit: parsed.limit.unwrap_or(10),
-                    snippet_chars: parsed.snippet_chars.unwrap_or(300),
-                    no_expand: parsed.no_expand.unwrap_or(false),
-                    max_expansions: parsed.max_expansions.unwrap_or(2),
-                    expand_hook: None,
-                    expand_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
-                    no_vector: parsed.no_vector.unwrap_or(false),
-                    rerank: parsed.rerank.unwrap_or_else(|| "local".to_string()),
-                    rerank_hook: None,
-                    rerank_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
-                    rerank_hook_full_text: false,
-                    embed_model: None,
-                    embed_cache: 4096,
-                    embed_no_cache: false,
-                    rerank_docs: 40,
-                    rerank_chunk_chars: 1200,
-                    rerank_chunk_overlap: 200,
-                    plan: false,
-                    asof: parsed.asof,
-                    before: parsed.before,
-                    after: parsed.after,
-                    feedback_weight: parsed.feedback_weight.unwrap_or(0.15),
-                };
-                let response = execute_query(mem, qargs).map_err(|e| e.to_string())?;
-                let mut lines = Vec::new();
-                for r in response.results.iter().take(5) {
-                    lines.push(format!("{}. {} ({:.3})", r.rank, r.uri, r.score));
-                }
-                let output = if lines.is_empty() {
-                    "No results.".to_string()
-                } else {
-                    lines.join("\n")
-                };
-                let details = serde_json::to_value(response).map_err(|e| e.to_string())?;
-                Ok(ToolExecution {
-                    output,
-                    details,
-                    is_error: false,
-                })
+            let qargs = QueryArgs {
+                raw_query: parsed.query.clone(),
+                collection: parsed.collection,
+                limit: parsed.limit.unwrap_or(10),
+                snippet_chars: parsed.snippet_chars.unwrap_or(300),
+                no_expand: parsed.no_expand.unwrap_or(false),
+                max_expansions: parsed.max_expansions.unwrap_or(2),
+                expand_hook: None,
+                expand_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
+                no_vector: parsed.no_vector.unwrap_or(false),
+                rerank: parsed.rerank.unwrap_or_else(|| "local".to_string()),
+                rerank_hook: None,
+                rerank_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
+                rerank_hook_full_text: false,
+                embed_model: None,
+                embed_cache: 4096,
+                embed_no_cache: false,
+                rerank_docs: 40,
+                rerank_chunk_chars: 1200,
+                rerank_chunk_overlap: 200,
+                plan: false,
+                asof: parsed.asof,
+                before: parsed.before,
+                after: parsed.after,
+                feedback_weight: parsed.feedback_weight.unwrap_or(0.15),
+            };
+            let response = execute_query(db, qargs).map_err(|e| e.to_string())?;
+            let mut lines = Vec::new();
+            for r in response.results.iter().take(5) {
+                lines.push(format!("{}. {} ({:.3})", r.rank, r.uri, r.score));
+            }
+            let output = if lines.is_empty() {
+                "No results.".to_string()
+            } else {
+                lines.join("\n")
+            };
+            let details = serde_json::to_value(response).map_err(|e| e.to_string())?;
+            Ok(ToolExecution {
+                output,
+                details,
+                is_error: false,
             })
         }
         "context" => {
             let parsed: ToolContextArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            with_read_mem(mem_read, mem_write, mv2, |mem| {
-                let qargs = QueryArgs {
-                    raw_query: parsed.query.clone(),
-                    collection: parsed.collection,
-                    limit: parsed.limit.unwrap_or(10),
-                    snippet_chars: parsed.snippet_chars.unwrap_or(300),
-                    no_expand: parsed.no_expand.unwrap_or(false),
-                    max_expansions: parsed.max_expansions.unwrap_or(2),
-                    expand_hook: None,
-                    expand_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
-                    no_vector: parsed.no_vector.unwrap_or(false),
-                    rerank: parsed.rerank.unwrap_or_else(|| "local".to_string()),
-                    rerank_hook: None,
-                    rerank_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
-                    rerank_hook_full_text: false,
-                    embed_model: None,
-                    embed_cache: 4096,
-                    embed_no_cache: false,
-                    rerank_docs: parsed.limit.unwrap_or(10).max(20),
-                    rerank_chunk_chars: 1200,
-                    rerank_chunk_overlap: 200,
-                    plan: false,
-                    asof: parsed.asof,
-                    before: parsed.before,
-                    after: parsed.after,
-                    feedback_weight: parsed.feedback_weight.unwrap_or(0.15),
-                };
-                let pack = build_context_pack(
-                    mem,
-                    qargs,
-                    parsed.max_bytes.unwrap_or(12_000),
-                    parsed.full.unwrap_or(false),
-                )
-                .map_err(|e| e.to_string())?;
-                let output = pack.context.clone();
-                let details = serde_json::to_value(pack).map_err(|e| e.to_string())?;
-                Ok(ToolExecution {
-                    output,
-                    details,
-                    is_error: false,
-                })
+            let qargs = QueryArgs {
+                raw_query: parsed.query.clone(),
+                collection: parsed.collection,
+                limit: parsed.limit.unwrap_or(10),
+                snippet_chars: parsed.snippet_chars.unwrap_or(300),
+                no_expand: parsed.no_expand.unwrap_or(false),
+                max_expansions: parsed.max_expansions.unwrap_or(2),
+                expand_hook: None,
+                expand_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
+                no_vector: parsed.no_vector.unwrap_or(false),
+                rerank: parsed.rerank.unwrap_or_else(|| "local".to_string()),
+                rerank_hook: None,
+                rerank_hook_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
+                rerank_hook_full_text: false,
+                embed_model: None,
+                embed_cache: 4096,
+                embed_no_cache: false,
+                rerank_docs: parsed.limit.unwrap_or(10).max(20),
+                rerank_chunk_chars: 1200,
+                rerank_chunk_overlap: 200,
+                plan: false,
+                asof: parsed.asof,
+                before: parsed.before,
+                after: parsed.after,
+                feedback_weight: parsed.feedback_weight.unwrap_or(0.15),
+            };
+            let pack = build_context_pack(
+                db,
+                qargs,
+                parsed.max_bytes.unwrap_or(12_000),
+                parsed.full.unwrap_or(false),
+            )
+            .map_err(|e| e.to_string())?;
+            let output = pack.context.clone();
+            let details = serde_json::to_value(pack).map_err(|e| e.to_string())?;
+            Ok(ToolExecution {
+                output,
+                details,
+                is_error: false,
             })
         }
         "search" => {
             let parsed: ToolSearchArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            with_read_mem(mem_read, mem_write, mv2, |mem| {
-                let scope = parsed.collection.as_deref().map(scope_prefix);
-                let request = SearchRequest {
-                    query: parsed.query.clone(),
-                    top_k: parsed.limit.unwrap_or(10),
-                    snippet_chars: parsed.snippet_chars.unwrap_or(300),
-                    uri: None,
-                    scope,
-                    cursor: None,
-                    temporal: None,
-                    as_of_frame: None,
-                    as_of_ts: None,
-                    no_sketch: false,
-                };
-                let response = mem.search(request).map_err(|e| e.to_string())?;
-                let mut lines = Vec::new();
-                for hit in response.hits.iter().take(5) {
-                    let title = hit.title.clone().unwrap_or_default();
-                    lines.push(format!("{}. {} {}", hit.rank, hit.uri, title));
-                }
-                let output = if lines.is_empty() {
-                    "No results.".to_string()
-                } else {
-                    lines.join("\n")
-                };
-                let details = serde_json::to_value(response).map_err(|e| e.to_string())?;
-                Ok(ToolExecution {
-                    output,
-                    details,
-                    is_error: false,
-                })
+            let scope = parsed.collection.as_deref().map(scope_prefix);
+            let request = SearchRequest {
+                query: parsed.query.clone(),
+                top_k: parsed.limit.unwrap_or(10),
+                snippet_chars: parsed.snippet_chars.unwrap_or(300),
+                uri: None,
+                scope,
+                cursor: None,
+                temporal: None,
+                as_of_frame: None,
+                as_of_ts: None,
+                no_sketch: false,
+            };
+            let response = db.search(request).map_err(|e| e.to_string())?;
+            let mut lines = Vec::new();
+            for hit in response.hits.iter().take(5) {
+                let title = hit.title.clone().unwrap_or_default();
+                lines.push(format!("{}. {} {}", hit.rank, hit.uri, title));
+            }
+            let output = if lines.is_empty() {
+                "No results.".to_string()
+            } else {
+                lines.join("\n")
+            };
+            let details = serde_json::to_value(response).map_err(|e| e.to_string())?;
+            Ok(ToolExecution {
+                output,
+                details,
+                is_error: false,
             })
         }
         "get" => {
             let parsed: ToolGetArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            with_read_mem(mem_read, mem_write, mv2, |mem| {
-                let (frame_id, frame) = if let Some(rest) = parsed.id.strip_prefix('#') {
-                    let frame_id: u64 = rest.parse().map_err(|_| "invalid frame id")?;
-                    let frame = mem.frame_by_id(frame_id).map_err(|e| e.to_string())?;
-                    (frame_id, frame)
-                } else {
-                    let frame = mem.frame_by_uri(&parsed.id).map_err(|e| e.to_string())?;
-                    (frame.id, frame)
-                };
-                let text = mem.frame_text_by_id(frame_id).unwrap_or_default();
-                let details = serde_json::json!({
-                    "frame_id": frame_id,
-                    "uri": frame.uri,
-                    "title": frame.title,
-                    "text": text
-                });
-                let output = if details["text"].as_str().unwrap_or("").is_empty() {
-                    format!("Frame #{frame_id} (non-text payload)")
-                } else {
-                    details["text"].as_str().unwrap_or("").to_string()
-                };
-                Ok(ToolExecution {
-                    output,
-                    details,
-                    is_error: false,
-                })
+            let (frame_id, frame) = if let Some(rest) = parsed.id.strip_prefix('#') {
+                let frame_id: u64 = rest.parse().map_err(|_| "invalid frame id")?;
+                let frame = db.frame_by_id(frame_id).map_err(|e| e.to_string())?;
+                (frame_id, frame)
+            } else {
+                let frame = db.frame_by_uri(&parsed.id).map_err(|e| e.to_string())?;
+                (frame.id, frame)
+            };
+            let text = db.frame_text_by_id(frame_id).unwrap_or_default();
+            let details = serde_json::json!({
+                "frame_id": frame_id,
+                "uri": frame.uri,
+                "title": frame.title,
+                "text": text
+            });
+            let output = if details["text"].as_str().unwrap_or("").is_empty() {
+                format!("Frame #{frame_id} (non-text payload)")
+            } else {
+                details["text"].as_str().unwrap_or("").to_string()
+            };
+            Ok(ToolExecution {
+                output,
+                details,
+                is_error: false,
             })
         }
         "put" => {
@@ -859,30 +833,26 @@ pub(crate) fn execute_tool_with_handles(
             let Some(text) = parsed.text else {
                 return Err("put requires text".into());
             };
-            let result = with_write_mem(mem_read, mem_write, mv2, true, |mem| {
-                let mut options = PutOptions::default();
-                options.uri = Some(parsed.uri.clone());
-                options.title = Some(parsed.title.unwrap_or_else(|| parsed.uri.clone()));
-                options.track = parsed.track;
-                options.kind = parsed.kind;
-                options.search_text = Some(text.clone());
-                let frame_id = mem
-                    .put_bytes_with_options(text.as_bytes(), options)
-                    .map_err(|e| e.to_string())?;
-                mem.commit().map_err(|e| e.to_string())?;
-                let details = serde_json::json!({
-                    "frame_id": frame_id,
-                    "uri": parsed.uri
-                });
-                let output = format!("Stored frame #{frame_id}");
-                Ok(ToolExecution {
-                    output,
-                    details,
-                    is_error: false,
-                })
-            })?;
-            *mem_read = None;
-            Ok(result)
+            let mut options = PutOptions::default();
+            options.uri = Some(parsed.uri.clone());
+            options.title = Some(parsed.title.unwrap_or_else(|| parsed.uri.clone()));
+            options.track = parsed.track;
+            options.kind = parsed.kind;
+            options.search_text = Some(text.clone());
+            let frame_id = db
+                .put_bytes_with_options(text.as_bytes(), options)
+                .map_err(|e| e.to_string())?;
+            db.commit().map_err(|e| e.to_string())?;
+            let details = serde_json::json!({
+                "frame_id": frame_id,
+                "uri": parsed.uri
+            });
+            let output = format!("Stored frame #{frame_id}");
+            Ok(ToolExecution {
+                output,
+                details,
+                is_error: false,
+            })
         }
         "log" => {
             let parsed: ToolLogArgs =
@@ -894,17 +864,13 @@ pub(crate) fn execute_tool_with_handles(
                 meta: parsed.meta.clone(),
                 ts_utc: Some(Utc::now().timestamp()),
             };
-            let result = with_write_mem(mem_read, mem_write, mv2, false, |mem| {
-                let uri = append_agent_log(mem, &entry).map_err(|e| e.to_string())?;
-                let details = serde_json::json!({ "uri": uri });
-                Ok(ToolExecution {
-                    output: "Logged agent turn.".to_string(),
-                    details,
-                    is_error: false,
-                })
-            })?;
-            *mem_read = None;
-            Ok(result)
+            let uri = append_agent_log(db, &entry).map_err(|e| e.to_string())?;
+            let details = serde_json::json!({ "uri": uri });
+            Ok(ToolExecution {
+                output: "Logged agent turn.".to_string(),
+                details,
+                is_error: false,
+            })
         }
         "feedback" => {
             let parsed: ToolFeedbackArgs =
@@ -916,17 +882,13 @@ pub(crate) fn execute_tool_with_handles(
                 session: parsed.session.clone(),
                 ts_utc: Some(Utc::now().timestamp()),
             };
-            let result = with_write_mem(mem_read, mem_write, mv2, false, |mem| {
-                let uri_log = append_feedback(mem, &event).map_err(|e| e.to_string())?;
-                let details = serde_json::json!({ "uri": uri_log });
-                Ok(ToolExecution {
-                    output: "Feedback recorded.".to_string(),
-                    details,
-                    is_error: false,
-                })
-            })?;
-            *mem_read = None;
-            Ok(result)
+            let uri_log = append_feedback(db, &event)?;
+            let details = serde_json::json!({ "uri": uri_log });
+            Ok(ToolExecution {
+                output: "Feedback recorded.".to_string(),
+                details,
+                is_error: false,
+            })
         }
         "config_set" => {
             let parsed: ToolConfigSetArgs =
@@ -953,7 +915,6 @@ pub(crate) fn execute_tool_with_handles(
             let include_daily = parsed.include_daily.unwrap_or(true);
             let ids =
                 sync_workspace_memory(mv2, &workspace, include_daily).map_err(|e| e.to_string())?;
-            *mem_read = None;
             Ok(ToolExecution {
                 output: format!("Synced {} memory files.", ids.len()),
                 details: serde_json::json!({ "frame_ids": ids }),
@@ -980,36 +941,34 @@ pub(crate) fn execute_tool_with_handles(
         "memory_search" => {
             let parsed: ToolMemorySearchArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            with_read_mem(mem_read, mem_write, mv2, |mem| {
-                let request = SearchRequest {
-                    query: parsed.query.clone(),
-                    top_k: parsed.limit.unwrap_or(10),
-                    snippet_chars: 300,
-                    uri: None,
-                    scope: Some("aethervault://memory/".to_string()),
-                    cursor: None,
-                    temporal: None,
-                    as_of_frame: None,
-                    as_of_ts: None,
-                    no_sketch: false,
-                };
-                let response = mem.search(request).map_err(|e| e.to_string())?;
-                let mut lines = Vec::new();
-                for hit in response.hits.iter().take(5) {
-                    let title = hit.title.clone().unwrap_or_default();
-                    lines.push(format!("{}. {} {}", hit.rank, hit.uri, title));
-                }
-                let output = if lines.is_empty() {
-                    "No results.".to_string()
-                } else {
-                    lines.join("\n")
-                };
-                let details = serde_json::to_value(response).map_err(|e| e.to_string())?;
-                Ok(ToolExecution {
-                    output,
-                    details,
-                    is_error: false,
-                })
+            let request = SearchRequest {
+                query: parsed.query.clone(),
+                top_k: parsed.limit.unwrap_or(10),
+                snippet_chars: 300,
+                uri: None,
+                scope: Some("aethervault://memory/".to_string()),
+                cursor: None,
+                temporal: None,
+                as_of_frame: None,
+                as_of_ts: None,
+                no_sketch: false,
+            };
+            let response = db.search(request).map_err(|e| e.to_string())?;
+            let mut lines = Vec::new();
+            for hit in response.hits.iter().take(5) {
+                let title = hit.title.clone().unwrap_or_default();
+                lines.push(format!("{}. {} {}", hit.rank, hit.uri, title));
+            }
+            let output = if lines.is_empty() {
+                "No results.".to_string()
+            } else {
+                lines.join("\n")
+            };
+            let details = serde_json::to_value(response).map_err(|e| e.to_string())?;
+            Ok(ToolExecution {
+                output,
+                details,
+                is_error: false,
             })
         }
         "memory_append_daily" => {
@@ -1031,26 +990,22 @@ pub(crate) fn execute_tool_with_handles(
                 .map_err(|e| format!("memory open: {e}"))?;
             writeln!(file, "{}", parsed.text).map_err(|e| format!("memory write: {e}"))?;
             let uri = format!("aethervault://memory/daily/{date}.md");
-            let result = with_write_mem(mem_read, mem_write, mv2, true, |mem| {
-                let mut options = PutOptions::default();
-                options.uri = Some(uri.clone());
-                options.title = Some(format!("memory daily {date}"));
-                options.kind = Some("text/markdown".to_string());
-                options.track = Some("aethervault.memory".to_string());
-                options.search_text = Some(parsed.text.clone());
-                let frame_id = mem
-                    .put_bytes_with_options(parsed.text.as_bytes(), options)
-                    .map_err(|e| e.to_string())?;
-                mem.commit().map_err(|e| e.to_string())?;
-                Ok(frame_id)
-            })?;
-            *mem_read = None;
+            let mut options = PutOptions::default();
+            options.uri = Some(uri.clone());
+            options.title = Some(format!("memory daily {date}"));
+            options.kind = Some("text/markdown".to_string());
+            options.track = Some("aethervault.memory".to_string());
+            options.search_text = Some(parsed.text.clone());
+            let frame_id = db
+                .put_bytes_with_options(parsed.text.as_bytes(), options)
+                .map_err(|e| e.to_string())?;
+            db.commit().map_err(|e| e.to_string())?;
             Ok(ToolExecution {
                 output: format!("Appended to {}", path.display()),
                 details: serde_json::json!({
                     "path": path.display().to_string(),
                     "uri": uri,
-                    "frame_id": result
+                    "frame_id": frame_id
                 }),
                 is_error: false,
             })
@@ -1070,26 +1025,22 @@ pub(crate) fn execute_tool_with_handles(
                 .map_err(|e| format!("memory open: {e}"))?;
             writeln!(file, "{}", parsed.text).map_err(|e| format!("memory write: {e}"))?;
             let uri = "aethervault://memory/longterm.md".to_string();
-            let result = with_write_mem(mem_read, mem_write, mv2, true, |mem| {
-                let mut options = PutOptions::default();
-                options.uri = Some(uri.clone());
-                options.title = Some("memory longterm".to_string());
-                options.kind = Some("text/markdown".to_string());
-                options.track = Some("aethervault.memory".to_string());
-                options.search_text = Some(parsed.text.clone());
-                let frame_id = mem
-                    .put_bytes_with_options(parsed.text.as_bytes(), options)
-                    .map_err(|e| e.to_string())?;
-                mem.commit().map_err(|e| e.to_string())?;
-                Ok(frame_id)
-            })?;
-            *mem_read = None;
+            let mut options = PutOptions::default();
+            options.uri = Some(uri.clone());
+            options.title = Some("memory longterm".to_string());
+            options.kind = Some("text/markdown".to_string());
+            options.track = Some("aethervault.memory".to_string());
+            options.search_text = Some(parsed.text.clone());
+            let frame_id = db
+                .put_bytes_with_options(parsed.text.as_bytes(), options)
+                .map_err(|e| e.to_string())?;
+            db.commit().map_err(|e| e.to_string())?;
             Ok(ToolExecution {
                 output: format!("Appended to {}", path.display()),
                 details: serde_json::json!({
                     "path": path.display().to_string(),
                     "uri": uri,
-                    "frame_id": result
+                    "frame_id": frame_id
                 }),
                 is_error: false,
             })
@@ -1749,8 +1700,8 @@ pub(crate) fn execute_tool_with_handles(
                 is_error: false,
             })
         }
-        "approval_list" => with_read_mem(mem_read, mem_write, mv2, |mem| {
-            let approvals = load_approvals(mem);
+        "approval_list" => {
+            let approvals = load_approvals(db);
             let pending: Vec<ApprovalEntry> = approvals
                 .into_iter()
                 .filter(|a| a.status == "pending")
@@ -1760,112 +1711,108 @@ pub(crate) fn execute_tool_with_handles(
                 details: serde_json::json!({ "approvals": pending }),
                 is_error: false,
             })
-        }),
+        }
         "trigger_add" => {
             let parsed: ToolTriggerAddArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
-                let mut triggers = load_triggers(mem);
-                let id = format!(
-                    "trg_{}_{}",
-                    chrono::Utc::now().timestamp(),
-                    triggers.len() + 1
-                );
-                // Validate kind-specific required fields
-                match parsed.kind.as_str() {
-                    "cron" => {
-                        if parsed.cron.is_none() {
-                            return Err("kind=cron requires a 'cron' expression".into());
-                        }
-                    }
-                    "webhook" => {
-                        if parsed.webhook_url.is_none() {
-                            return Err("kind=webhook requires a 'webhook_url'".into());
-                        }
-                    }
-                    "email" | "calendar_free" => {}
-                    other => {
-                        return Err(format!("Unknown trigger kind: '{other}'"));
+            let mut triggers = load_triggers(db);
+            let id = format!(
+                "trg_{}_{}",
+                chrono::Utc::now().timestamp(),
+                triggers.len() + 1
+            );
+            // Validate kind-specific required fields
+            match parsed.kind.as_str() {
+                "cron" => {
+                    if parsed.cron.is_none() {
+                        return Err("kind=cron requires a 'cron' expression".into());
                     }
                 }
-                // Validate cron expression if provided
-                if let Some(ref cron_str) = parsed.cron {
-                    if let Err(e) = CronExpr::parse(cron_str) {
-                        return Err(format!("Invalid cron expression: {e}"));
+                "webhook" => {
+                    if parsed.webhook_url.is_none() {
+                        return Err("kind=webhook requires a 'webhook_url'".into());
                     }
                 }
-                // Validate webhook URL (SSRF protection)
-                if let Some(ref url) = parsed.webhook_url {
-                    if !url.starts_with("https://") && !url.starts_with("http://") {
-                        return Err("webhook_url must use http:// or https://".into());
-                    }
-                    let lower = url.to_lowercase();
-                    if lower.contains("localhost") || lower.contains("127.0.0.1")
-                        || lower.contains("[::1]") || lower.contains("169.254.169.254")
-                        || lower.contains("10.0.") || lower.contains("192.168.") {
-                        return Err("webhook_url cannot target private/internal addresses".into());
-                    }
+                "email" | "calendar_free" => {}
+                other => {
+                    return Err(format!("Unknown trigger kind: '{other}'"));
                 }
-                // Validate webhook method
-                if let Some(ref m) = parsed.webhook_method {
-                    let upper = m.to_uppercase();
-                    if upper != "GET" && upper != "POST" {
-                        return Err(format!("webhook_method must be GET or POST, got '{m}'"));
-                    }
+            }
+            // Validate cron expression if provided
+            if let Some(ref cron_str) = parsed.cron {
+                if let Err(e) = CronExpr::parse(cron_str) {
+                    return Err(format!("Invalid cron expression: {e}"));
                 }
-                let entry = TriggerEntry {
-                    id: id.clone(),
-                    kind: parsed.kind,
-                    name: parsed.name,
-                    query: parsed.query,
-                    prompt: parsed.prompt,
-                    start: parsed.start,
-                    end: parsed.end,
-                    enabled: parsed.enabled.unwrap_or(true),
-                    last_seen: None,
-                    last_fired: None,
-                    cron: parsed.cron,
-                    webhook_url: parsed.webhook_url,
-                    webhook_method: parsed.webhook_method,
-                    schedule_name: None,
-                };
-                triggers.push(entry);
-                save_triggers(mem, &triggers)?;
-                Ok(ToolExecution {
-                    output: "Trigger added.".to_string(),
-                    details: serde_json::json!({ "id": id }),
-                    is_error: false,
-                })
+            }
+            // Validate webhook URL (SSRF protection)
+            if let Some(ref url) = parsed.webhook_url {
+                if !url.starts_with("https://") && !url.starts_with("http://") {
+                    return Err("webhook_url must use http:// or https://".into());
+                }
+                let lower = url.to_lowercase();
+                if lower.contains("localhost") || lower.contains("127.0.0.1")
+                    || lower.contains("[::1]") || lower.contains("169.254.169.254")
+                    || lower.contains("10.0.") || lower.contains("192.168.") {
+                    return Err("webhook_url cannot target private/internal addresses".into());
+                }
+            }
+            // Validate webhook method
+            if let Some(ref m) = parsed.webhook_method {
+                let upper = m.to_uppercase();
+                if upper != "GET" && upper != "POST" {
+                    return Err(format!("webhook_method must be GET or POST, got '{m}'"));
+                }
+            }
+            let entry = TriggerEntry {
+                id: id.clone(),
+                kind: parsed.kind,
+                name: parsed.name,
+                query: parsed.query,
+                prompt: parsed.prompt,
+                start: parsed.start,
+                end: parsed.end,
+                enabled: parsed.enabled.unwrap_or(true),
+                last_seen: None,
+                last_fired: None,
+                cron: parsed.cron,
+                webhook_url: parsed.webhook_url,
+                webhook_method: parsed.webhook_method,
+                schedule_name: None,
+            };
+            triggers.push(entry);
+            save_triggers(db, &triggers)?;
+            Ok(ToolExecution {
+                output: "Trigger added.".to_string(),
+                details: serde_json::json!({ "id": id }),
+                is_error: false,
             })
         }
-        "trigger_list" => with_read_mem(mem_read, mem_write, mv2, |mem| {
-            let triggers = load_triggers(mem);
+        "trigger_list" => {
+            let triggers = load_triggers(db);
             Ok(ToolExecution {
                 output: format!("{} triggers.", triggers.len()),
                 details: serde_json::json!({ "triggers": triggers }),
                 is_error: false,
             })
-        }),
+        }
         "trigger_remove" => {
             let parsed: ToolTriggerRemoveArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
-                let mut triggers = load_triggers(mem);
-                let before = triggers.len();
-                triggers.retain(|t| t.id != parsed.id);
-                let updated = triggers.len() != before;
-                if updated {
-                    save_triggers(mem, &triggers)?;
-                }
-                Ok(ToolExecution {
-                    output: if updated {
-                        "Trigger removed.".to_string()
-                    } else {
-                        "Trigger not found.".to_string()
-                    },
-                    details: serde_json::json!({ "id": parsed.id, "updated": updated }),
-                    is_error: !updated,
-                })
+            let mut triggers = load_triggers(db);
+            let before = triggers.len();
+            triggers.retain(|t| t.id != parsed.id);
+            let updated = triggers.len() != before;
+            if updated {
+                save_triggers(db, &triggers)?;
+            }
+            Ok(ToolExecution {
+                output: if updated {
+                    "Trigger removed.".to_string()
+                } else {
+                    "Trigger not found.".to_string()
+                },
+                details: serde_json::json!({ "id": parsed.id, "updated": updated }),
+                is_error: !updated,
             })
         }
         "tool_search" => {
@@ -1915,7 +1862,7 @@ pub(crate) fn execute_tool_with_handles(
             let parsed: ToolSessionContextArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let limit = parsed.limit.unwrap_or(20);
-            // Try JSONL logs first, fall back to MV2 capsule
+            // Try JSONL logs first, fall back to db search
             let workspace = workspace_override
                 .clone()
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
@@ -1940,49 +1887,47 @@ pub(crate) fn execute_tool_with_handles(
                     is_error: false,
                 })
             } else {
-                // Fallback: search MV2 capsule for legacy data
+                // Fallback: search db for legacy data
                 let scope = format!("aethervault://agent-log/{}/", parsed.session);
-                with_read_mem(mem_read, mem_write, mv2, |mem| {
-                    let request = SearchRequest {
-                        query: parsed.session.clone(),
-                        top_k: 200,
-                        snippet_chars: 200,
-                        uri: None,
-                        scope: Some(scope),
-                        cursor: None,
-                        temporal: None,
-                        as_of_frame: None,
-                        as_of_ts: None,
-                        no_sketch: true,
-                    };
-                    let response = mem.search(request).map_err(|e| e.to_string())?;
-                    let mut entries = Vec::new();
-                    for hit in response.hits {
-                        let uri = hit.uri.clone();
-                        let ts = parse_log_ts_from_uri(&uri).unwrap_or_default();
-                        if let Ok(text) = mem.frame_text_by_id(hit.frame_id) {
-                            if let Ok(entry) = serde_json::from_str::<AgentLogEntry>(&text) {
-                                entries.push(serde_json::json!({
-                                    "ts": entry.ts_utc.unwrap_or(ts),
-                                    "role": entry.role,
-                                    "text": entry.text,
-                                    "meta": entry.meta,
-                                    "source": "capsule"
-                                }));
-                            }
+                let request = SearchRequest {
+                    query: parsed.session.clone(),
+                    top_k: 200,
+                    snippet_chars: 200,
+                    uri: None,
+                    scope: Some(scope),
+                    cursor: None,
+                    temporal: None,
+                    as_of_frame: None,
+                    as_of_ts: None,
+                    no_sketch: true,
+                };
+                let response = db.search(request).map_err(|e| e.to_string())?;
+                let mut entries = Vec::new();
+                for hit in response.hits {
+                    let uri = hit.uri.clone();
+                    let ts = parse_log_ts_from_uri(&uri).unwrap_or_default();
+                    if let Ok(text) = db.frame_text_by_id(hit.frame_id) {
+                        if let Ok(entry) = serde_json::from_str::<AgentLogEntry>(&text) {
+                            entries.push(serde_json::json!({
+                                "ts": entry.ts_utc.unwrap_or(ts),
+                                "role": entry.role,
+                                "text": entry.text,
+                                "meta": entry.meta,
+                                "source": "db"
+                            }));
                         }
                     }
-                    entries.sort_by(|a, b| {
-                        b.get("ts")
-                            .and_then(|v| v.as_i64())
-                            .cmp(&a.get("ts").and_then(|v| v.as_i64()))
-                    });
-                    let results: Vec<serde_json::Value> = entries.into_iter().take(limit).collect();
-                    Ok(ToolExecution {
-                        output: format!("Loaded {} entries from capsule.", results.len()),
-                        details: serde_json::json!({ "entries": results }),
-                        is_error: false,
-                    })
+                }
+                entries.sort_by(|a, b| {
+                    b.get("ts")
+                        .and_then(|v| v.as_i64())
+                        .cmp(&a.get("ts").and_then(|v| v.as_i64()))
+                });
+                let results: Vec<serde_json::Value> = entries.into_iter().take(limit).collect();
+                Ok(ToolExecution {
+                    output: format!("Loaded {} entries from db.", results.len()),
+                    details: serde_json::json!({ "entries": results }),
+                    is_error: false,
                 })
             }
         }
@@ -2008,22 +1953,22 @@ pub(crate) fn execute_tool_with_handles(
                 ts,
                 hash.to_hex()
             );
-            with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+            {
                 let mut options = PutOptions::default();
                 options.uri = Some(uri.clone());
                 options.title = Some("reflection".to_string());
                 options.kind = Some("application/json".to_string());
                 options.track = Some("aethervault.reflection".to_string());
                 options.search_text = Some(payload.to_string());
-                mem.put_bytes_with_options(&bytes, options)
+                db.put_bytes_with_options(&bytes, options)
                     .map_err(|e| e.to_string())?;
-                mem.commit().map_err(|e| e.to_string())?;
+                db.commit().map_err(|e| e.to_string())?;
                 Ok(ToolExecution {
                     output: "Reflection stored.".to_string(),
                     details: serde_json::json!({ "uri": uri }),
                     is_error: false,
                 })
-            })
+            }
         }
         "skill_store" => {
             let parsed: ToolSkillStoreArgs =
@@ -2080,30 +2025,30 @@ pub(crate) fn execute_tool_with_handles(
                 "name": parsed.name,
                 "db": db_path.display().to_string(),
             });
-            let capsule_write = with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+            let capsule_write = (|| -> Result<(), String> {
                 let mut options = PutOptions::default();
                 options.uri = Some(details["uri"].as_str().unwrap_or_default().to_string());
                 options.title = Some("skill".to_string());
                 options.kind = Some("application/json".to_string());
                 options.track = Some("aethervault.skill".to_string());
                 options.search_text = Some(payload.to_string());
-                mem.put_bytes_with_options(&bytes, options)
+                db.put_bytes_with_options(&bytes, options)
                     .map_err(|e| e.to_string())?;
-                mem.commit().map_err(|e| e.to_string())?;
+                db.commit().map_err(|e| e.to_string())?;
                 Ok(())
-            });
+            })();
             if let Some(obj) = details.as_object_mut() {
                 obj.insert(
-                    "stored_in_capsule".into(),
+                    "stored_in_db".into(),
                     serde_json::Value::Bool(capsule_write.is_ok()),
                 );
             }
             if let Err(err) = &capsule_write {
                 if let Some(obj) = details.as_object_mut() {
                     obj.insert(
-                        "capsule_error".into(),
+                        "db_error".into(),
                         serde_json::Value::String(format!(
-                            "Capsule write skipped after SQLite upsert: {err}"
+                            "DB write skipped after SQLite upsert: {err}"
                         )),
                     );
                 }
@@ -2112,7 +2057,7 @@ pub(crate) fn execute_tool_with_handles(
                 output: if capsule_write.is_ok() {
                     "Skill stored.".to_string()
                 } else {
-                    "Skill stored in SQLite; capsule write skipped.".to_string()
+                    "Skill stored in SQLite; db write skipped.".to_string()
                 },
                 details,
                 is_error: false,
@@ -2146,21 +2091,18 @@ pub(crate) fn execute_tool_with_handles(
 
             if let Ok(mut out_skill_db) = search_skill_db(mv2, &parsed.query, limit) {
                 out.append(&mut out_skill_db);
-            } else if let Ok(mem_out) = with_read_mem(mem_read, mem_write, mv2, |mem| {
-                let request = SearchRequest {
-                    query: parsed.query.clone(),
-                    top_k: limit,
-                    snippet_chars: 200,
-                    uri: None,
-                    scope: Some("aethervault://skills/".to_string()),
-                    cursor: None,
-                    temporal: None,
-                    as_of_frame: None,
-                    as_of_ts: None,
-                    no_sketch: true,
-                };
-                let response = mem.search(request).map_err(|e| e.to_string())?;
-                let mut out = Vec::new();
+            } else if let Ok(response) = db.search(SearchRequest {
+                query: parsed.query.clone(),
+                top_k: limit,
+                snippet_chars: 200,
+                uri: None,
+                scope: Some("aethervault://skills/".to_string()),
+                cursor: None,
+                temporal: None,
+                as_of_frame: None,
+                as_of_ts: None,
+                no_sketch: true,
+            }) {
                 for hit in response.hits {
                     out.push(serde_json::json!({
                         "uri": hit.uri,
@@ -2169,9 +2111,6 @@ pub(crate) fn execute_tool_with_handles(
                         "score": hit.score
                     }));
                 }
-                Ok(out)
-            }) {
-                out.extend(mem_out);
             }
             Ok(ToolExecution {
                 output: format!("Found {} skills.", out.len()),
@@ -2187,9 +2126,7 @@ pub(crate) fn execute_tool_with_handles(
             let config = if cfg_path.exists() {
                 crate::load_config_from_file(&ws)
             } else {
-                with_read_mem(mem_read, mem_write, mv2, |mem| {
-                    Ok(load_capsule_config(mem).unwrap_or_default())
-                })?
+                load_capsule_config(db).unwrap_or_default()
             };
             let subagents = load_subagents_from_config(&config);
             let details: Vec<serde_json::Value> = subagents.iter().map(|s| {
@@ -2235,9 +2172,7 @@ pub(crate) fn execute_tool_with_handles(
             let config = if cfg_path.exists() {
                 crate::load_config_from_file(&ws)
             } else {
-                with_read_mem(mem_read, mem_write, mv2, |mem| {
-                    Ok(load_capsule_config(mem).unwrap_or_default())
-                })?
+                load_capsule_config(db).unwrap_or_default()
             };
             let subagents = load_subagents_from_config(&config);
             let default_hook = DEFAULT_SUBAGENT_HOOK.to_string();
@@ -2313,10 +2248,6 @@ pub(crate) fn execute_tool_with_handles(
                 8,
             )
             .map_err(|e| e.to_string())?;
-            // Release all capsule handles before spawning the subagent so it can
-            // acquire its own locks without contending with the parent session.
-            *mem_read = None;
-            *mem_write = None;
             let session = format!("subagent:{}:{}", parsed.name, Utc::now().timestamp());
             let prompt = parsed.prompt.clone();
 
@@ -2351,18 +2282,11 @@ pub(crate) fn execute_tool_with_handles(
             let config_snapshot = if cfg_path.exists() {
                 crate::load_config_from_file(&ws)
             } else {
-                with_read_mem(mem_read, mem_write, mv2, |mem| {
-                    Ok(load_capsule_config(mem).unwrap_or_default())
-                })?
+                load_capsule_config(db).unwrap_or_default()
             };
             let subagents = load_subagents_from_config(&config_snapshot);
             let default_hook = DEFAULT_SUBAGENT_HOOK.to_string();
             let ts = Utc::now().timestamp();
-
-            // Release all capsule handles before spawning subagent threads so they can
-            // each acquire their own locks without contending with the parent session.
-            *mem_read = None;
-            *mem_write = None;
 
             let max_conc = parsed.max_concurrent.unwrap_or(parsed.invocations.len());
             let max_conc = max_conc.max(1); // ensure at least 1

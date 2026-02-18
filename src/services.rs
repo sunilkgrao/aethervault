@@ -8,8 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 #[allow(unused_imports)]
-use aether_core::types::{FrameStatus, SearchHit};
-use aether_core::{PutOptions, Vault};
+use crate::memory_db::{FrameStatus, MemoryDb, PutOptions, SearchHit};
 use chrono::{Datelike, Timelike, Utc};
 use serde::Deserialize;
 use serde_json;
@@ -17,12 +16,10 @@ use url::form_urlencoded;
 
 #[cfg(feature = "vec")]
 use aether_core::text_embed::{LocalTextEmbedder, TextEmbedConfig};
-#[cfg(feature = "vec")]
-use aether_core::types::EmbeddingProvider;
 
 // Re-imports from main (crate-internal helpers and types)
 use crate::{
-    open_or_create, save_config_entry, load_config_entry, blake3_hash, execute_tool,
+    open_or_create_db, save_config_entry, load_config_entry, blake3_hash, execute_tool,
     env_optional, env_u64, tool_autonomy_for, ToolAutonomyLevel, ApprovalEntry, TriggerEntry,
     AgentConfig, CronExpr, load_capsule_config, resolve_workspace,
     build_bridge_agent_config, run_agent_for_bridge, telegram_send_message,
@@ -30,7 +27,8 @@ use crate::{
 use tiny_http::{Response, Server};
 use walkdir::WalkDir;
 
-const NO_TIMEOUT_MS: u64 = u64::MAX;
+#[allow(dead_code)]
+const NO_TIMEOUT_MS: u64 = 86_400_000;
 const DEFAULT_OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS: u64 = 10_000;
 const OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS_ENV: &str = "OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS";
 
@@ -46,7 +44,7 @@ pub(crate) fn read_optional_file(path: &Path) -> Option<String> {
     })
 }
 
-pub(crate) fn skill_db_path(mv2: &Path) -> PathBuf {
+pub(crate) fn skill_db_path(db_path: &Path) -> PathBuf {
     if let Some(workspace) = env_optional("AETHERVAULT_WORKSPACE") {
         let mut path = PathBuf::from(workspace);
         if path.is_dir() || (path.extension().and_then(|ext| ext.to_str()) != Some("sqlite")) {
@@ -54,7 +52,7 @@ pub(crate) fn skill_db_path(mv2: &Path) -> PathBuf {
         }
         return path;
     }
-    mv2.parent()
+    db_path.parent()
         .unwrap_or_else(|| Path::new("."))
         .join("workspace")
         .join("skills.sqlite")
@@ -74,7 +72,7 @@ pub(crate) fn memory_daily_uri(date: &str) -> String {
 }
 
 pub(crate) fn sync_memory_file(
-    mem: &mut Vault,
+    db: &MemoryDb,
     path: &Path,
     uri: String,
     title: &str,
@@ -87,8 +85,8 @@ pub(crate) fn sync_memory_file(
     options.kind = Some("text/markdown".to_string());
     options.track = Some(track.to_string());
     options.search_text = Some(text.clone());
-    let id = mem.put_bytes_with_options(text.as_bytes(), options)?;
-    mem.commit()?;
+    let id = db.put_bytes_with_options(text.as_bytes(), options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    db.commit().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     Ok(id)
 }
 
@@ -97,14 +95,14 @@ pub(crate) fn sync_workspace_memory(
     workspace: &Path,
     include_daily: bool,
 ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
-    let mut mem = open_or_create(mv2)?;
+    let db = open_or_create_db(mv2)?;
     let mut ids = Vec::new();
     let soul = workspace.join("SOUL.md");
     let user = workspace.join("USER.md");
     let memory = workspace.join("MEMORY.md");
     if soul.exists() {
         ids.push(sync_memory_file(
-            &mut mem,
+            &db,
             &soul,
             memory_uri("soul"),
             "memory soul",
@@ -113,7 +111,7 @@ pub(crate) fn sync_workspace_memory(
     }
     if user.exists() {
         ids.push(sync_memory_file(
-            &mut mem,
+            &db,
             &user,
             memory_uri("user"),
             "memory user",
@@ -122,7 +120,7 @@ pub(crate) fn sync_workspace_memory(
     }
     if memory.exists() {
         ids.push(sync_memory_file(
-            &mut mem,
+            &db,
             &memory,
             memory_uri("longterm"),
             "memory longterm",
@@ -147,7 +145,7 @@ pub(crate) fn sync_workspace_memory(
                 let uri = memory_daily_uri(stem);
                 let title = format!("memory daily {stem}");
                 ids.push(sync_memory_file(
-                    &mut mem,
+                    &db,
                     path,
                     uri,
                     &title,
@@ -164,7 +162,7 @@ pub(crate) fn export_capsule_memory(
     workspace: &Path,
     include_daily: bool,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut mem = Vault::open_read_only(mv2)?;
+    let db = open_or_create_db(mv2)?;
     let mut paths = Vec::new();
     let items = vec![
         (memory_uri("soul"), workspace.join("SOUL.md")),
@@ -172,8 +170,8 @@ pub(crate) fn export_capsule_memory(
         (memory_uri("longterm"), workspace.join("MEMORY.md")),
     ];
     for (uri, path) in items {
-        if let Ok(frame) = mem.frame_by_uri(&uri) {
-            if let Ok(text) = mem.frame_text_by_id(frame.id) {
+        if let Ok(frame) = db.frame_by_uri(&uri) {
+            if let Ok(text) = db.frame_text_by_id(frame.id) {
                 fs::create_dir_all(workspace)?;
                 fs::write(&path, text)?;
                 paths.push(path.display().to_string());
@@ -183,9 +181,9 @@ pub(crate) fn export_capsule_memory(
     if include_daily {
         let daily_dir = workspace.join("memory");
         fs::create_dir_all(&daily_dir)?;
-        let total = mem.frame_count() as u64;
+        let total = db.frame_count() as u64;
         for frame_id in 0..total {
-            let frame = match mem.frame_by_id(frame_id) {
+            let frame = match db.frame_by_id(frame_id) {
                 Ok(f) => f,
                 Err(_) => continue,
             };
@@ -197,7 +195,7 @@ pub(crate) fn export_capsule_memory(
             }
             if let Some(name) = uri.rsplit('/').next() {
                 let path = daily_dir.join(name);
-                if let Ok(text) = mem.frame_text_by_id(frame_id) {
+                if let Ok(text) = db.frame_text_by_id(frame_id) {
                     fs::write(&path, text)?;
                     paths.push(path.display().to_string());
                 }
@@ -359,8 +357,8 @@ pub(crate) fn run_oauth_broker(
             exchange_oauth_code(&token_url, &client_id, &client_secret, &redirect_uri, &code)?;
         let key = format!("oauth.{provider}");
         let payload = serde_json::to_vec_pretty(&token)?;
-        let mut mem = open_or_create(&mv2)?;
-        let _ = save_config_entry(&mut mem, &key, &payload)?;
+        let db = open_or_create_db(&mv2)?;
+        save_config_entry(&db, &key, &payload).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
         let response = Response::from_string("Authorized. You can close this tab.");
         let _ = request.respond(response);
         println!("Stored token in config key: {key}");
@@ -371,8 +369,8 @@ pub(crate) fn run_oauth_broker(
 
 // ── Config / Approvals ──────────────────────────────────────────────────
 
-pub(crate) fn load_config_json(mem: &mut Vault, key: &str) -> Option<serde_json::Value> {
-    let bytes = load_config_entry(mem, key)?;
+pub(crate) fn load_config_json(db: &MemoryDb, key: &str) -> Option<serde_json::Value> {
+    let bytes = load_config_entry(db, key)?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -382,16 +380,16 @@ pub(crate) fn approval_hash(tool: &str, args: &serde_json::Value) -> String {
     blake3_hash(&bytes).to_hex().to_string()
 }
 
-pub(crate) fn load_approvals(mem: &mut Vault) -> Vec<ApprovalEntry> {
-    load_config_json(mem, "approvals")
+pub(crate) fn load_approvals(db: &MemoryDb) -> Vec<ApprovalEntry> {
+    load_config_json(db, "approvals")
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
 }
 
-pub(crate) fn save_approvals(mem: &mut Vault, approvals: &[ApprovalEntry]) -> Result<(), String> {
+pub(crate) fn save_approvals(db: &MemoryDb, approvals: &[ApprovalEntry]) -> Result<(), String> {
     let json = serde_json::to_value(approvals).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?;
-    save_config_entry(mem, "approvals", &bytes).map_err(|e| e.to_string())?;
+    save_config_entry(db, "approvals", &bytes)?;
     Ok(())
 }
 
@@ -419,8 +417,8 @@ pub(crate) fn parse_approval_chat_command(text: &str) -> Option<ApprovalChatComm
 }
 
 pub(crate) fn approve_and_maybe_execute(mv2: &Path, id: &str, execute: bool) -> Result<String, String> {
-    let mut mem = open_or_create(mv2).map_err(|e| e.to_string())?;
-    let mut approvals = load_approvals(&mut mem);
+    let db = open_or_create_db(mv2).map_err(|e| e.to_string())?;
+    let mut approvals = load_approvals(&db);
     let mut entry: Option<ApprovalEntry> = None;
     for a in approvals.iter_mut() {
         if a.id == id {
@@ -432,14 +430,13 @@ pub(crate) fn approve_and_maybe_execute(mv2: &Path, id: &str, execute: bool) -> 
     if entry.is_none() {
         return Ok("Approval id not found.".to_string());
     }
-    save_approvals(&mut mem, &approvals)?;
-    mem.commit().map_err(|e| e.to_string())?;
+    save_approvals(&db, &approvals)?;
 
     if !execute {
         return Ok("Approved.".to_string());
     }
     let entry = entry.unwrap();
-    let result = execute_tool(&entry.tool, entry.args, mv2, false);
+    let result = execute_tool(&entry.tool, entry.args, mv2, &db, false);
     match result {
         Ok(exec) => Ok(exec.output),
         Err(err) => Ok(format!("Execution error: {err}")),
@@ -447,14 +444,13 @@ pub(crate) fn approve_and_maybe_execute(mv2: &Path, id: &str, execute: bool) -> 
 }
 
 pub(crate) fn reject_approval(mv2: &Path, id: &str) -> Result<String, String> {
-    let mut mem = open_or_create(mv2).map_err(|e| e.to_string())?;
-    let mut approvals = load_approvals(&mut mem);
+    let db = open_or_create_db(mv2).map_err(|e| e.to_string())?;
+    let mut approvals = load_approvals(&db);
     let before = approvals.len();
     approvals.retain(|a| a.id != id);
     let updated = approvals.len() != before;
     if updated {
-        save_approvals(&mut mem, &approvals)?;
-        mem.commit().map_err(|e| e.to_string())?;
+        save_approvals(&db, &approvals)?;
         Ok("Rejected.".to_string())
     } else {
         Ok("Approval id not found.".to_string())
@@ -511,16 +507,16 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
 
 // ── Triggers ────────────────────────────────────────────────────────────
 
-pub(crate) fn load_triggers(mem: &mut Vault) -> Vec<TriggerEntry> {
-    load_config_json(mem, "triggers")
+pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {
+    load_config_json(db, "triggers")
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
 }
 
-pub(crate) fn save_triggers(mem: &mut Vault, triggers: &[TriggerEntry]) -> Result<(), String> {
+pub(crate) fn save_triggers(db: &MemoryDb, triggers: &[TriggerEntry]) -> Result<(), String> {
     let json = serde_json::to_value(triggers).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?;
-    save_config_entry(mem, "triggers", &bytes).map_err(|e| e.to_string())?;
+    save_config_entry(db, "triggers", &bytes)?;
     Ok(())
 }
 
@@ -588,9 +584,9 @@ pub(crate) fn refresh_google_token(
         .append_pair("refresh_token", refresh_token)
         .finish();
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_connect(Duration::from_secs(86400))
+        .timeout_read(Duration::from_secs(86400))
+        .timeout_write(Duration::from_secs(86400))
         .build();
     let resp = agent
         .post("https://oauth2.googleapis.com/token")
@@ -610,9 +606,9 @@ pub(crate) fn refresh_google_token(
             new_token["refresh_token"] = rt.clone();
         }
     }
-    let mut mem = open_or_create(mv2)?;
+    let db = open_or_create_db(mv2)?;
     let bytes = serde_json::to_vec_pretty(&new_token)?;
-    let _ = save_config_entry(&mut mem, "oauth.google", &bytes)?;
+    save_config_entry(&db, "oauth.google", &bytes).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     Ok(new_token)
 }
 
@@ -634,9 +630,9 @@ pub(crate) fn refresh_microsoft_token(
         .append_pair("scope", "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Calendars.ReadWrite")
         .finish();
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_connect(Duration::from_secs(86400))
+        .timeout_read(Duration::from_secs(86400))
+        .timeout_write(Duration::from_secs(86400))
         .build();
     let resp = agent
         .post("https://login.microsoftonline.com/common/oauth2/v2.0/token")
@@ -656,16 +652,16 @@ pub(crate) fn refresh_microsoft_token(
             new_token["refresh_token"] = rt.clone();
         }
     }
-    let mut mem = open_or_create(mv2)?;
+    let db = open_or_create_db(mv2)?;
     let bytes = serde_json::to_vec_pretty(&new_token)?;
-    let _ = save_config_entry(&mut mem, "oauth.microsoft", &bytes)?;
+    save_config_entry(&db, "oauth.microsoft", &bytes).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     Ok(new_token)
 }
 
 pub(crate) fn get_oauth_token(mv2: &Path, provider: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mut mem = Vault::open_read_only(mv2)?;
+    let db = open_or_create_db(mv2)?;
     let key = format!("oauth.{provider}");
-    let token = load_config_json(&mut mem, &key).ok_or("missing oauth token")?;
+    let token = load_config_json(&db, &key).ok_or("missing oauth token")?;
     let access = token.get("access_token").and_then(|v| v.as_str());
     if let Some(access) = access {
         return Ok(access.to_string());
@@ -948,8 +944,8 @@ pub(crate) fn bootstrap_workspace(
     create_file(&memory_path, memory_template)?;
     create_file(&daily_path, daily_template)?;
 
-    let mut mem = open_or_create(mv2)?;
-    let mut config = load_capsule_config(&mut mem).unwrap_or_default();
+    let db = open_or_create_db(mv2)?;
+    let mut config = load_capsule_config(&db).unwrap_or_default();
     let mut agent_cfg = config.agent.unwrap_or_default();
     agent_cfg.workspace = Some(workspace.display().to_string());
     agent_cfg.onboarding_complete = Some(false);
@@ -958,7 +954,7 @@ pub(crate) fn bootstrap_workspace(
     }
     config.agent = Some(agent_cfg);
     let bytes = serde_json::to_vec_pretty(&config)?;
-    let _ = save_config_entry(&mut mem, "index", &bytes)?;
+    save_config_entry(&db, "index", &bytes).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     Ok(())
 }
 
@@ -1046,10 +1042,8 @@ pub(crate) fn run_schedule_loop(
     log: bool,
     log_commit_interval: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // No external lock — Vault::open_read_only acquires a shared flock() on the .mv2
-    // which allows concurrent readers. Writes upgrade to exclusive automatically.
-    let mut mem_read = Some(Vault::open_read_only(&mv2)?);
-    let config = load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default();
+    let db = open_or_create_db(&mv2)?;
+    let config = load_capsule_config(&db).unwrap_or_default();
     let agent_cfg = config.agent.clone().unwrap_or_default();
     let tz = resolve_timezone(&agent_cfg, timezone);
     let workspace = resolve_workspace(workspace, &agent_cfg);
@@ -1107,9 +1101,9 @@ pub(crate) fn run_schedule_loop(
                         (telegram_token.as_ref(), telegram_chat_id.as_ref())
                     {
                         let agent = ureq::AgentBuilder::new()
-                            .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-                            .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
-                            .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                            .timeout_connect(Duration::from_secs(86400))
+                            .timeout_write(Duration::from_secs(86400))
+                            .timeout_read(Duration::from_secs(86400))
                             .build();
                         let base_url = match std::env::var("TELEGRAM_API_BASE") {
     Ok(base) => format!("{base}/bot{token}"),
@@ -1137,8 +1131,8 @@ pub(crate) fn run_watch_loop(
     log_commit_interval: usize,
     poll_seconds: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut mem_read = Some(Vault::open_read_only(&mv2)?);
-    let config = load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default();
+    let db = open_or_create_db(&mv2)?;
+    let config = load_capsule_config(&db).unwrap_or_default();
     let agent_cfg = config.agent.clone().unwrap_or_default();
     let tz = resolve_timezone(&agent_cfg, timezone);
     let workspace = resolve_workspace(workspace, &agent_cfg);
@@ -1157,8 +1151,8 @@ pub(crate) fn run_watch_loop(
 
     loop {
         let now = chrono::Utc::now().with_timezone(&tz);
-        let mut mem = open_or_create(&mv2)?;
-        let mut triggers = load_triggers(&mut mem);
+        let db_loop = open_or_create_db(&mv2)?;
+        let mut triggers = load_triggers(&db_loop);
         let mut updated = false;
 
         for trigger in triggers.iter_mut() {
@@ -1176,8 +1170,8 @@ pub(crate) fn run_watch_loop(
                         Err(_) => continue,
                     };
                     let agent = ureq::AgentBuilder::new()
-                        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-                        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                        .timeout_connect(Duration::from_secs(86400))
+                        .timeout_read(Duration::from_secs(86400))
                         .build();
                     let mut url =
                         "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=1"
@@ -1233,8 +1227,8 @@ pub(crate) fn run_watch_loop(
                         Err(_) => continue,
                     };
                     let agent = ureq::AgentBuilder::new()
-                        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-                        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                        .timeout_connect(Duration::from_secs(86400))
+                        .timeout_read(Duration::from_secs(86400))
                         .build();
                     let url = format!(
                         "https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin={}&timeMax={}&maxResults=1&singleEvents=true",
@@ -1336,8 +1330,8 @@ pub(crate) fn run_watch_loop(
                     };
                     let method = trigger.webhook_method.as_deref().unwrap_or("GET").to_uppercase();
                     let agent = ureq::AgentBuilder::new()
-                        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-                        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+                        .timeout_connect(Duration::from_secs(86400))
+                        .timeout_read(Duration::from_secs(86400))
                         .build();
                     let resp = match method.as_str() {
                         "POST" => agent.post(&url).call(),
@@ -1386,7 +1380,7 @@ pub(crate) fn run_watch_loop(
         }
 
         if updated {
-            if let Err(e) = save_triggers(&mut mem, &triggers) {
+            if let Err(e) = save_triggers(&db_loop, &triggers) {
                 eprintln!("[watch] CRITICAL: failed to persist trigger state: {e}");
             }
         }
@@ -1395,34 +1389,6 @@ pub(crate) fn run_watch_loop(
 }
 
 // ── Qdrant / Vector DB ──────────────────────────────────────────────────
-
-#[cfg(feature = "vec")]
-pub(crate) fn collect_active_frame_ids(mem: &Vault, scope: Option<&str>) -> Vec<u64> {
-    let mut latest: HashMap<String, u64> = HashMap::new();
-    let count = mem.frame_count() as u64;
-    for frame_id in 0..count {
-        let frame = match mem.frame_by_id(frame_id) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let Some(uri) = frame.uri.clone() else {
-            continue;
-        };
-        if let Some(prefix) = scope {
-            if !uri.starts_with(prefix) {
-                continue;
-            }
-        }
-        if frame.status == FrameStatus::Active {
-            latest.insert(uri, frame.id);
-        } else {
-            latest.remove(&uri);
-        }
-    }
-    let mut ids: Vec<u64> = latest.values().copied().collect();
-    ids.sort();
-    ids
-}
 
 #[cfg(feature = "vec")]
 pub(crate) fn build_embed_config(
@@ -1474,8 +1440,8 @@ pub(crate) fn qdrant_search_text(
     });
 
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_connect(Duration::from_secs(86400))
+        .timeout_read(Duration::from_secs(86400))
         .build();
 
     let resp = agent.post(&url)
@@ -1557,9 +1523,9 @@ pub(crate) fn qdrant_upsert(
 
     let body = serde_json::json!({ "points": qdrant_points });
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_write(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_connect(Duration::from_secs(86400))
+        .timeout_read(Duration::from_secs(86400))
+        .timeout_write(Duration::from_secs(86400))
         .build();
 
     agent.put(&url)
@@ -1579,8 +1545,8 @@ pub(crate) fn qdrant_ensure_collection(
 ) -> Result<(), String> {
     let url = format!("{}/collections/{}", base_url.trim_end_matches('/'), collection);
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
-        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_connect(Duration::from_secs(86400))
+        .timeout_read(Duration::from_secs(86400))
         .build();
 
     // Check if collection exists

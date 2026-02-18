@@ -736,7 +736,7 @@ fn spawn_slack_run(
         let session = format!("{}slack:{session_key}", config.session_prefix);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_agent_with_prompt(
-                config.mv2.clone(),
+                config.db_path.clone(),
                 text,
                 Some(session),
                 config.model_hook.clone(),
@@ -896,7 +896,7 @@ fn handle_incoming_message(
     active_runs: &mut HashMap<String, SlackRunState>,
     completion_tx: &mpsc::Sender<SlackCompletionEvent>,
 ) {
-    if let Some(output) = try_handle_approval_chat(&config.mv2, &incoming.text) {
+    if let Some(output) = try_handle_approval_chat(&config.db_path, &incoming.text) {
         if let Err(err) = send_slack_message(
             http_agent,
             bot_token,
@@ -1090,8 +1090,8 @@ pub(crate) fn run_slack_bridge(
 
     // Best-effort cleanup of orphaned temp files from previous sessions.
     {
-        if let Some(parent) = agent_config.mv2.parent() {
-            if let Some(stem) = agent_config.mv2.file_name().and_then(|f| f.to_str()) {
+        if let Some(parent) = agent_config.db_path.parent() {
+            if let Some(stem) = agent_config.db_path.file_name().and_then(|f| f.to_str()) {
                 let prefix = format!(".{}.", stem);
                 if let Ok(entries) = std::fs::read_dir(parent) {
                     for entry in entries.flatten() {
@@ -1138,7 +1138,7 @@ pub(crate) fn run_slack_bridge(
         loop {
             if last_vault_check.elapsed() >= vault_check_interval {
                 last_vault_check = Instant::now();
-                if let Ok(meta) = std::fs::metadata(&config.mv2) {
+                if let Ok(meta) = std::fs::metadata(&config.db_path) {
                     let size_mb = meta.len() / 1_000_000;
                     if size_mb > 200 {
                         eprintln!(

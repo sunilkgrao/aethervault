@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aether_core::{PutOptions, Vault};
+use crate::memory_db::{MemoryDb, PutOptions};
 use chrono::Utc;
 use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -16,12 +16,12 @@ use crate::claude::{call_agent_hook, call_claude, call_critic};
 use crate::{
     append_log_jsonl, base_tool_names, build_context_pack, build_kg_context,
     collect_mid_loop_reminders, compute_drift_score, critic_should_fire, detect_cycle, env_optional,
-    execute_tool_with_handles, find_kg_entities, log_dir_path,
+    execute_tool, find_kg_entities, log_dir_path,
     config_file_path, format_tool_message_content, load_capsule_config, load_config_from_file,
-    load_kg_graph, load_session_turns, load_workspace_context, requires_approval,
+    load_kg_graph, load_session_turns, load_workspace_context, open_or_create_db, requires_approval,
     resolve_hook_spec, resolve_workspace,
     save_session_turns, tool_catalog_map, tool_definitions_json,
-    tools_from_active, with_write_mem, AgentHookRequest, AgentLogEntry, AgentMessage,
+    tools_from_active, AgentHookRequest, AgentLogEntry, AgentMessage,
     AgentProgress, AgentRunOutput, AgentSession, AgentToolCall, AgentToolResult,
     ContinuationCheckpoint,
     DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
@@ -423,8 +423,7 @@ pub(crate) fn run_agent_with_prompt(
     // One-time capsule size check at session start
     check_capsule_health(&mv2);
 
-    // No external lock — Vault handles shared/exclusive internally.
-    let mut mem_read = Some(Vault::open_read_only(&mv2)?);
+    let db = open_or_create_db(&mv2)?;
 
     // Try flat file config first (workspace/config.json), fall back to capsule.
     let workspace_env = std::env::var("AETHERVAULT_WORKSPACE").ok().map(PathBuf::from);
@@ -433,10 +432,10 @@ pub(crate) fn run_agent_with_prompt(
         if cfg_path.exists() {
             load_config_from_file(ws)
         } else {
-            load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default()
+            load_capsule_config(&db).unwrap_or_default()
         }
     } else {
-        load_capsule_config(mem_read.as_mut().unwrap()).unwrap_or_default()
+        load_capsule_config(&db).unwrap_or_default()
     };
     let agent_cfg = config.agent.clone().unwrap_or_default();
     let agent_workspace = resolve_workspace(None, &agent_cfg);
@@ -599,7 +598,7 @@ pub(crate) fn run_agent_with_prompt(
             feedback_weight: 0.15,
         };
         if let Ok(pack) = build_context_pack(
-            mem_read.as_mut().unwrap(),
+            &db,
             qargs,
             agent_cfg.max_context_bytes.unwrap_or(context_max_bytes),
             false,
@@ -612,11 +611,6 @@ pub(crate) fn run_agent_with_prompt(
         }
     }
 
-
-    // Release the read handle after initialization. Tool calls re-open on demand via
-    // with_read_mem/with_write_mem. This prevents a long-lived shared flock from blocking
-    // sibling subagents that need exclusive access for writes.
-    mem_read = None;
 
     // Knowledge Graph entity auto-injection
     let kg_path = std::path::PathBuf::from("/root/.aethervault/data/knowledge-graph.json");
@@ -779,8 +773,6 @@ pub(crate) fn run_agent_with_prompt(
             let _ = std::fs::create_dir_all(&dir);
             dir
         });
-    let mut mem_write: Option<Vault> = None;
-
     if should_log {
         let entry = AgentLogEntry {
             session: session.clone(),
@@ -1023,32 +1015,23 @@ pub(crate) fn run_agent_with_prompt(
                                         "aethervault://memory/observation/{}",
                                         Utc::now().timestamp()
                                     );
-                                    let mut mem_w: Option<Vault> = None;
-                                    let mut mem_r: Option<Vault> = None;
-                                    let _ = with_write_mem(
-                                        &mut mem_r,
-                                        &mut mem_w,
-                                        &mv2_clone,
-                                        true,
-                                        |mem| {
-                                            // Cross-session dedup: skip if URI already persisted
-                                            if mem.frame_by_uri(&uri).is_ok() {
-                                                eprintln!("[observation-dedup] cross-session duplicate skipped");
-                                                return Ok(());
-                                            }
+                                    if let Ok(obs_db) = open_or_create_db(&mv2_clone) {
+                                        if obs_db.frame_by_uri(&uri).is_ok() {
+                                            eprintln!("[observation-dedup] cross-session duplicate skipped");
+                                        } else {
                                             let mut opts = PutOptions::default();
                                             opts.uri = Some(uri.clone());
                                             opts.kind = Some("text/markdown".to_string());
-                                            opts.track =
-                                                Some("aethervault.observation".to_string());
+                                            opts.track = Some("aethervault.observation".to_string());
                                             opts.search_text = Some(facts.clone());
-                                            mem.put_bytes_with_options(facts.as_bytes(), opts)
-                                                .map(|_| ())
-                                                .map_err(|e| e.to_string())?;
-                                            mem.commit()
-                                                .map_err(|e| e.to_string())
-                                        },
-                                    );
+                                            if let Err(e) = obs_db.put_bytes_with_options(facts.as_bytes(), opts) {
+                                                eprintln!("[observation] put failed: {e}");
+                                            }
+                                            if let Err(e) = obs_db.commit() {
+                                                eprintln!("[observation] commit failed: {e}");
+                                            }
+                                        }
+                                    }
                                 } else if !facts.trim().is_empty() {
                                     eprintln!("[observation-gate] skipped: {}...", &facts.chars().take(60).collect::<String>());
                                 }
@@ -1134,13 +1117,12 @@ pub(crate) fn run_agent_with_prompt(
                     },
                 }
             } else {
-                match execute_tool_with_handles(
+                match execute_tool(
                     &call.name,
                     call.args.clone(),
                     &mv2,
+                    &db,
                     false,
-                    &mut mem_read,
-                    &mut mem_write,
                 ) {
                     Ok(result) => result,
                     Err(err) => ToolExecution {
@@ -1257,19 +1239,12 @@ pub(crate) fn run_agent_with_prompt(
 
             // Regular tools run in a bounded worker pool.
             if !regular_calls.is_empty() {
+                let mv2_ref = &mv2;
                 let execute_regular_call = |call: &&AgentToolCall| -> (AgentToolCall, ToolExecution) {
                     let call = *call;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut local_mem_read: Option<Vault> = None;
-                        let mut local_mem_write: Option<Vault> = None;
-                        execute_tool_with_handles(
-                            &call.name,
-                            call.args.clone(),
-                            &mv2,
-                            false,
-                            &mut local_mem_read,
-                            &mut local_mem_write,
-                        )
+                        let local_db = open_or_create_db(mv2_ref).map_err(|e| e.to_string())?;
+                        execute_tool(&call.name, call.args.clone(), mv2_ref, &local_db, false)
                     }));
 
                     let execution = match result {

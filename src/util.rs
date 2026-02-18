@@ -4,7 +4,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use aether_core::Vault;
 use blake3::Hash;
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
 
@@ -57,12 +56,96 @@ pub(crate) fn blake3_hash(bytes: &[u8]) -> Hash {
     blake3::hash(bytes)
 }
 
-pub(crate) fn open_or_create(mv2: &Path) -> aether_core::Result<Vault> {
-    if mv2.exists() {
-        Vault::open(mv2)
-    } else {
-        Vault::create(mv2)
+pub(crate) fn open_or_create_db(path: &Path) -> Result<crate::memory_db::MemoryDb, Box<dyn std::error::Error>> {
+    use crate::memory_db::MemoryDb;
+
+    // If the file doesn't exist yet, just create a fresh SQLite DB.
+    if !path.exists() {
+        return MemoryDb::open_or_create(path);
     }
+
+    // File exists — check whether it's already SQLite or an MV2 vault.
+    if is_sqlite_file(path) {
+        return MemoryDb::open_or_create(path);
+    }
+
+    // ── MV2 vault detected — auto-migrate to SQLite WAL ──────────────
+    eprintln!("[migrate] Detected MV2 vault at {}", path.display());
+    let file_size_mb = std::fs::metadata(path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+    eprintln!("[migrate] File size: {file_size_mb} MB — migrating to SQLite WAL...");
+
+    // Step 1: Rename original MV2 to a backup path (preserves it intact).
+    let backup = path.with_extension("mv2.pre-sqlite");
+    if backup.exists() {
+        return Err(format!(
+            "backup path already exists (previous failed migration?): {}",
+            backup.display()
+        ).into());
+    }
+    std::fs::rename(path, &backup)
+        .map_err(|e| format!("rename MV2 → backup: {e}"))?;
+    eprintln!("[migrate] Backed up MV2 to {}", backup.display());
+
+    // Step 2: Create fresh SQLite database at the original path.
+    let db = match MemoryDb::open_or_create(path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[migrate] FAILED to create SQLite DB: {e}");
+            eprintln!("[migrate] Rolling back — restoring original MV2");
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&backup, path)
+                .map_err(|e2| format!("rollback also failed: {e2} (original: {e})"))?;
+            return Err(e);
+        }
+    };
+
+    // Step 3: Migrate all data from the backed-up MV2 vault.
+    match db.migrate_from_vault(&backup) {
+        Ok(report) => {
+            eprintln!(
+                "[migrate] SUCCESS: {}/{} frames migrated, {} skipped",
+                report.migrated, report.total_frames, report.skipped
+            );
+            if !report.errors.is_empty() {
+                eprintln!("[migrate] {} non-fatal errors:", report.errors.len());
+                for (i, err) in report.errors.iter().enumerate().take(20) {
+                    eprintln!("[migrate]   {}: {err}", i + 1);
+                }
+                if report.errors.len() > 20 {
+                    eprintln!("[migrate]   ... and {} more", report.errors.len() - 20);
+                }
+            }
+            let new_size_mb = std::fs::metadata(path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+            eprintln!("[migrate] SQLite size: {new_size_mb} MB (was {file_size_mb} MB MV2)");
+            eprintln!("[migrate] Original MV2 preserved at: {}", backup.display());
+            Ok(db)
+        }
+        Err(e) => {
+            eprintln!("[migrate] MIGRATION FAILED: {e}");
+            eprintln!("[migrate] Rolling back — restoring original MV2");
+            drop(db);
+            let _ = std::fs::remove_file(path);
+            // Clean up WAL/SHM files SQLite may have created
+            let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+            let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+            std::fs::rename(&backup, path)
+                .map_err(|e2| format!("rollback also failed: {e2} (original: {e})"))?;
+            Err(format!("MV2 auto-migration failed: {e}").into())
+        }
+    }
+}
+
+fn is_sqlite_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = [0u8; 16];
+    if f.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    &buf == b"SQLite format 3\0"
 }
 
 pub(crate) fn is_extension_allowed(path: &Path, exts: &[String]) -> bool {

@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use aether_core::{DoctorReport, Vault};
+#[allow(unused_imports)]
+use crate::memory_db::MemoryDb;
 
 fn is_recoverable_mcp_error(msg: &str) -> bool {
     let msg = msg.to_ascii_lowercase();
@@ -577,29 +578,6 @@ fn read_mcp_message_strict(reader: &mut BufReader<impl Read>) -> io::Result<serd
     }
 }
 
-pub(crate) fn print_doctor_report(report: &DoctorReport) {
-    println!("status: {:?}", report.status);
-    println!(
-        "actions: executed={} skipped={}",
-        report.metrics.actions_completed, report.metrics.actions_skipped
-    );
-    println!("duration_ms: {}", report.metrics.total_duration_ms);
-    if let Some(verification) = &report.verification {
-        println!("verification: {:?}", verification.overall_status);
-    }
-    if report.findings.is_empty() {
-        println!("findings: none");
-    } else {
-        println!("findings:");
-        for finding in &report.findings {
-            println!(
-                "- {:?} {:?}: {}",
-                finding.severity, finding.code, finding.message
-            );
-        }
-    }
-}
-
 pub(crate) fn write_mcp_response(writer: &mut impl Write, value: &serde_json::Value) -> io::Result<()> {
     let payload = serde_json::to_vec(value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
@@ -612,8 +590,7 @@ pub(crate) fn run_mcp_server(mv2: PathBuf, read_only: bool) -> Result<(), Box<dy
     let mut reader = BufReader::new(io::stdin());
     let mut writer = io::stdout();
     let tools = super::tool_definitions_json();
-    let mut mem_read: Option<Vault> = None;
-    let mut mem_write: Option<Vault> = None;
+    let db = super::open_or_create_db(&mv2)?;
 
     loop {
         let Some(msg) = read_mcp_message(&mut reader)? else {
@@ -662,13 +639,12 @@ pub(crate) fn run_mcp_server(mv2: PathBuf, read_only: bool) -> Result<(), Box<dy
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                match super::execute_tool_with_handles(
+                match super::execute_tool(
                     name,
                     arguments,
                     &mv2,
+                    &db,
                     read_only,
-                    &mut mem_read,
-                    &mut mem_write,
                 ) {
                     Ok(result) => serde_json::json!({
                         "jsonrpc": "2.0",

@@ -58,7 +58,7 @@ pub(crate) fn run_webhook_bridge(
             let _ = request.respond(response);
             continue;
         };
-        if let Some(output) = try_handle_approval_chat(&agent_config.mv2, &text) {
+        if let Some(output) = try_handle_approval_chat(&agent_config.db_path, &text) {
             if let Some(response_text) = reply(&agent_config, &output) {
                 let response = Response::from_string(response_text);
                 let _ = request.respond(response);

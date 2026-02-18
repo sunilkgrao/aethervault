@@ -45,7 +45,7 @@ pub(crate) fn resolve_bridge_model_hook(cli: Option<String>) -> Option<String> {
 }
 
 pub(crate) fn build_bridge_agent_config(
-    mv2: PathBuf,
+    db_path: PathBuf,
     model_hook: Option<String>,
     system: Option<String>,
     no_memory: bool,
@@ -68,7 +68,7 @@ pub(crate) fn build_bridge_agent_config(
     let session_prefix = String::new();
 
     Ok(BridgeAgentConfig {
-        mv2,
+        db_path,
         model_hook,
         system,
         no_memory,
@@ -92,7 +92,7 @@ pub(crate) fn run_agent_for_bridge(
 ) -> Result<AgentRunOutput, String> {
     let (tx, rx) = mpsc::channel();
     let prompt_text = prompt.to_string();
-    let mv2 = config.mv2.clone();
+    let mv2 = config.db_path.clone();
     let model_hook = model_hook_override.or_else(|| config.model_hook.clone());
     let system_text = system_override.or_else(|| config.system.clone());
     let no_memory = config.no_memory;

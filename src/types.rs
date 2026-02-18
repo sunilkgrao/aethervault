@@ -2,11 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use aether_core::types::TemporalFilter;
-use aether_core::Vault;
+use crate::memory_db::{MemoryDb, TemporalFilter};
 use serde::{Deserialize, Serialize};
-
-use super::open_or_create;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct GetResponse {
@@ -512,7 +509,7 @@ impl Default for ToolAutonomyLevel {
 
 #[derive(Clone)]
 pub(crate) struct BridgeAgentConfig {
-    pub(crate) mv2: PathBuf,
+    pub(crate) db_path: PathBuf,
     pub(crate) model_hook: Option<String>,
     pub(crate) system: Option<String>,
     pub(crate) no_memory: bool,
@@ -760,66 +757,14 @@ pub(crate) fn format_tool_message_content(name: &str, output: &str, details: &se
     format!("{output}\n\n[details]\n{details_str}")
 }
 
-pub(crate) fn with_read_mem<F, R>(
-    mem_read: &mut Option<Vault>,
-    mem_write: &mut Option<Vault>,
-    mv2: &Path,
+/// Execute a closure with access to the MemoryDb.
+/// SQLite WAL mode handles concurrent reads/writes natively — no lock juggling needed.
+pub(crate) fn with_db<F, R>(
+    db: &MemoryDb,
     f: F,
 ) -> Result<R, String>
 where
-    F: FnOnce(&mut Vault) -> Result<R, String>,
+    F: FnOnce(&MemoryDb) -> Result<R, String>,
 {
-    if let Some(mem) = mem_write.as_mut() {
-        return f(mem);
-    }
-    // Open fresh each time -- don't hold a shared lock between tool calls.
-    // This allows concurrent subagents to acquire exclusive locks for writes.
-    let mut mem = Vault::open_read_only(mv2).map_err(|e| e.to_string())?;
-    let result = f(&mut mem);
-    // `mem` is dropped here, releasing the shared lock immediately.
-    *mem_read = None;
-    result
-}
-
-pub(crate) fn with_write_mem<F, R>(
-    mem_read: &mut Option<Vault>,
-    mem_write: &mut Option<Vault>,
-    mv2: &Path,
-    allow_create: bool,
-    f: F,
-) -> Result<R, String>
-where
-    F: FnOnce(&mut Vault) -> Result<R, String>,
-{
-    // Hard cap: refuse ALL writes if vault exceeds size limit (default 500MB).
-    // This is the single chokepoint for every vault write -- agent logs, tool puts,
-    // observational memory, feedback, everything. Prevents runaway index bloat.
-    let vault_hard_cap: u64 = std::env::var("VAULT_HARD_CAP_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(500_000_000);
-    if let Ok(meta) = std::fs::metadata(mv2) {
-        if meta.len() > vault_hard_cap {
-            return Err(format!(
-                "vault write blocked: size {}MB exceeds {}MB hard cap (set VAULT_HARD_CAP_BYTES to adjust)",
-                meta.len() / 1_000_000,
-                vault_hard_cap / 1_000_000
-            ));
-        }
-    }
-
-    // Always open fresh -- don't reuse a stale handle that holds a lock.
-    *mem_read = None;
-    *mem_write = None;
-    let opened = if allow_create {
-        open_or_create(mv2).map_err(|e| e.to_string())?
-    } else {
-        Vault::open(mv2).map_err(|e| e.to_string())?
-    };
-    *mem_write = Some(opened);
-    let result = f(mem_write.as_mut().unwrap());
-    // Drop the handle entirely so no lock (shared or exclusive) persists between calls.
-    // This allows concurrent subagents to acquire exclusive access for their own writes.
-    *mem_write = None;
-    result
+    f(db)
 }

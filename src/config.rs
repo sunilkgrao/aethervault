@@ -5,8 +5,6 @@ use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 
-use aether_core::{PutOptions, Vault};
-
 use std::collections::HashSet;
 use std::thread;
 use std::time::Instant;
@@ -15,6 +13,8 @@ use super::{
     build_external_command, dedup_keep_order, CapsuleConfig, CommandSpec, ConfigEntry,
     ExpansionHookInput, ExpansionHookOutput, HookSpec, RerankHookInput, RerankHookOutput,
 };
+
+use crate::memory_db::MemoryDb;
 
 const NO_DEADLINE_TIMEOUT_MS: u64 = u64::MAX;
 const HOOK_STREAM_CAP_BYTES: usize = 64 * 1024;
@@ -43,64 +43,32 @@ pub(crate) fn config_uri_to_key(uri: &str) -> Option<String> {
     if key.is_empty() { None } else { Some(key) }
 }
 
-pub(crate) fn load_config_entry(mem: &mut Vault, key: &str) -> Option<Vec<u8>> {
-    let uri = config_key_to_uri(key);
-    let frame = mem.frame_by_uri(&uri).ok()?;
-    mem.frame_canonical_payload(frame.id).ok()
+pub(crate) fn load_config_entry(db: &MemoryDb, key: &str) -> Option<Vec<u8>> {
+    db.config_get(key)
 }
 
-pub(crate) fn load_capsule_config(mem: &mut Vault) -> Option<CapsuleConfig> {
-    let bytes = load_config_entry(mem, "index")?;
+pub(crate) fn load_capsule_config(db: &MemoryDb) -> Option<CapsuleConfig> {
+    let bytes = load_config_entry(db, "index")?;
     serde_json::from_slice(&bytes).ok()
 }
 
 pub(crate) fn save_config_entry(
-    mem: &mut Vault,
+    db: &MemoryDb,
     key: &str,
     bytes: &[u8],
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let mut options = PutOptions::default();
-    options.uri = Some(config_key_to_uri(key));
-    options.title = Some(format!("config:{key}"));
-    options.kind = Some("application/json".to_string());
-    options.track = Some("aethervault.config".to_string());
-    options.search_text = Some(format!("config {key}"));
-    options.auto_tag = false;
-    options.extract_dates = false;
-    options.extract_triplets = false;
-    options.instant_index = true;
-    let id = mem.put_bytes_with_options(bytes, options)?;
-    mem.commit()?;
-    Ok(id)
+) -> Result<(), String> {
+    db.config_set(key, bytes)
 }
 
-pub(crate) fn list_config_entries(mem: &mut Vault) -> Vec<ConfigEntry> {
-    let mut seen = HashSet::new();
-    let mut entries = Vec::new();
-    let total = mem.frame_count() as i64;
-    for idx in (0..total).rev() {
-        let frame_id = idx as u64;
-        let frame = match mem.frame_by_id(frame_id) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let uri = match frame.uri.as_deref() {
-            Some(u) => u,
-            None => continue,
-        };
-        let key = match config_uri_to_key(uri) {
-            Some(k) => k,
-            None => continue,
-        };
-        if seen.insert(key.clone()) {
-            entries.push(ConfigEntry {
-                key,
-                frame_id: frame.id,
-                timestamp: frame.timestamp,
-            });
-        }
-    }
-    entries
+pub(crate) fn list_config_entries(db: &MemoryDb) -> Vec<ConfigEntry> {
+    db.config_list()
+        .into_iter()
+        .map(|(key, updated_at)| ConfigEntry {
+            key,
+            frame_id: 0,
+            timestamp: updated_at,
+        })
+        .collect()
 }
 
 pub(crate) fn command_spec_to_vec(spec: &CommandSpec) -> Vec<String> {

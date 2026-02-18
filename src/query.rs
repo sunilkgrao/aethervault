@@ -1,15 +1,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use aether_core::types::{Frame, FrameStatus, SearchHit, SearchRequest, TemporalFilter};
-use aether_core::{PutOptions, Vault};
+use crate::memory_db::{
+    Frame, FrameStatus, MemoryDb, SearchHit, SearchRequest, SearchResponse, TemporalFilter,
+};
 use chrono::Utc;
 use serde_json;
 
 use super::*;
-
-// TODO(tool_exec owner): STALE_OUTPUT_THRESHOLD_MS in tool_exec.rs should be
-// reduced from 600_000 to 180_000 (3 minutes instead of 10 minutes).
 
 pub(crate) fn frame_to_summary(frame: &Frame) -> Option<FrameSummary> {
     let uri = frame.uri.clone()?;
@@ -21,28 +19,16 @@ pub(crate) fn frame_to_summary(frame: &Frame) -> Option<FrameSummary> {
         title: frame.title.clone(),
         track: frame.track.clone(),
         kind: frame.kind.clone(),
-        status: format!("{:?}", frame.status).to_ascii_lowercase(),
+        status: frame.status.as_str().to_string(),
     })
 }
 
-pub(crate) fn collect_latest_frames(mem: &mut Vault, include_inactive: bool) -> HashMap<String, FrameSummary> {
+pub(crate) fn collect_latest_frames(db: &MemoryDb, include_inactive: bool) -> HashMap<String, FrameSummary> {
+    let frames = db.collect_latest_frames(include_inactive);
     let mut out = HashMap::new();
-    let total = mem.frame_count() as i64;
-    for idx in (0..total).rev() {
-        let frame_id = idx as u64;
-        let frame = match mem.frame_by_id(frame_id) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        if !include_inactive && frame.status != FrameStatus::Active {
-            continue;
-        }
-        let summary = match frame_to_summary(&frame) {
-            Some(s) => s,
-            None => continue,
-        };
-        if !out.contains_key(&summary.uri) {
-            out.insert(summary.uri.clone(), summary);
+    for (uri, frame) in frames {
+        if let Some(summary) = frame_to_summary(&frame) {
+            out.insert(uri, summary);
         }
     }
     out
@@ -231,55 +217,14 @@ pub(crate) fn print_plan(plan: &QueryPlan) {
 }
 
 pub(crate) fn load_feedback_scores(
-    mem: &mut Vault,
+    db: &MemoryDb,
     targets: &std::collections::HashSet<String>,
 ) -> HashMap<String, f32> {
-    let mut scores = HashMap::new();
-    if targets.is_empty() {
-        return scores;
-    }
-
-    // Use scoped search instead of O(n) linear scan over all frames.
-    // The Tantivy index supports track: field queries, and all feedback frames
-    // live under the aethervault://feedback/ URI prefix.
-    let request = SearchRequest {
-        query: "track:aethervault.feedback".to_string(),
-        top_k: targets.len().max(50),
-        snippet_chars: 0,
-        uri: None,
-        scope: Some("aethervault://feedback/".to_string()),
-        cursor: None,
-        temporal: None,
-        as_of_frame: None,
-        as_of_ts: None,
-        no_sketch: true,
-    };
-
-    if let Ok(response) = mem.search(request) {
-        let mut remaining = targets.clone();
-        for hit in &response.hits {
-            if remaining.is_empty() {
-                break;
-            }
-            let bytes = match mem.frame_canonical_payload(hit.frame_id) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let event: FeedbackEvent = match serde_json::from_slice(&bytes) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if remaining.remove(&event.uri) {
-                scores.insert(event.uri, event.score);
-            }
-        }
-    }
-
-    scores
+    db.load_feedback_scores(targets)
 }
 
 pub(crate) fn execute_query(
-    mem: &mut Vault,
+    db: &MemoryDb,
     args: QueryArgs,
 ) -> Result<QueryResponse, Box<dyn std::error::Error>> {
     let mut warnings = Vec::new();
@@ -289,10 +234,7 @@ pub(crate) fn execute_query(
         return Err("Query is empty after removing markup tokens.".into());
     }
 
-    #[cfg(not(feature = "vec"))]
-    let _ = (&args.embed_model, args.embed_cache, args.embed_no_cache);
-
-    let config = load_capsule_config(mem);
+    let config = load_capsule_config(db);
     let hook_config = config.as_ref().and_then(|c| c.hooks.clone());
     let expansion_hook = resolve_hook_spec(
         args.expand_hook.clone(),
@@ -359,7 +301,7 @@ pub(crate) fn execute_query(
             as_of_ts: asof_ts,
             no_sketch: false,
         };
-        match mem.search(probe_request) {
+        match db.search(probe_request) {
             Ok(resp) => {
                 strong_signal = has_strong_signal(&resp.hits);
             }
@@ -414,10 +356,9 @@ pub(crate) fn execute_query(
     if args.no_vector {
         vec_queries.clear();
     }
-    #[cfg(not(feature = "vec"))]
-    {
-        vec_queries.clear();
-    }
+    // Vector search via local HNSW is no longer supported after MV2 removal.
+    // Clear local vec queries unconditionally.
+    vec_queries.clear();
 
     let plan_obj = QueryPlan {
         cleaned_query: cleaned_query.clone(),
@@ -448,7 +389,7 @@ pub(crate) fn execute_query(
             as_of_ts: asof_ts,
             no_sketch: false,
         };
-        let hits = match mem.search(request) {
+        let hits = match db.search(request) {
             Ok(resp) => resp.hits,
             Err(err) => {
                 warnings.push(format!("lex search failed for '{q}': {err}"));
@@ -460,106 +401,7 @@ pub(crate) fn execute_query(
         }
     }
 
-    #[cfg(feature = "vec")]
-    if !args.no_vector {
-        let embed_config = build_embed_config(
-            args.embed_model.as_deref(),
-            args.embed_cache,
-            !args.embed_no_cache,
-        );
-        let embedder = match LocalTextEmbedder::new(embed_config) {
-            Ok(e) => Some(e),
-            Err(err) => {
-                warnings.push(format!("vector embedder unavailable: {err}"));
-                None
-            }
-        };
-
-        if let Some(embedder) = embedder {
-            let unique_vec_queries = dedup_keep_order(vec_queries.clone());
-            let mut embed_map: HashMap<String, Vec<f32>> = HashMap::new();
-            if !unique_vec_queries.is_empty() {
-                let refs: Vec<&str> = unique_vec_queries.iter().map(|q| q.as_str()).collect();
-                match embedder.embed_batch(&refs) {
-                    Ok(embeddings) => {
-                        for (q, emb) in unique_vec_queries
-                            .iter()
-                            .cloned()
-                            .zip(embeddings.into_iter())
-                        {
-                            embed_map.insert(q, emb);
-                        }
-                    }
-                    Err(err) => {
-                        warnings.push(format!(
-                            "embed batch failed ({err}), falling back to single embeddings"
-                        ));
-                        for q in &unique_vec_queries {
-                            match embedder.embed_text(q) {
-                                Ok(emb) => {
-                                    embed_map.insert(q.clone(), emb);
-                                }
-                                Err(err) => {
-                                    warnings.push(format!("embedding failed for '{q}': {err}"));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            for (i, q) in vec_queries.iter().enumerate() {
-                let Some(embedding) = embed_map.get(q) else {
-                    continue;
-                };
-
-                let mut resp = match mem.vec_search_with_embedding(
-                    q,
-                    embedding,
-                    lane_limit,
-                    args.snippet_chars,
-                    scope.as_deref(),
-                ) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        warnings.push(format!("vec search failed for '{q}': {err}"));
-                        continue;
-                    }
-                };
-
-                // Manual as-of / temporal filter for vector lane (best-effort).
-                // Batch-fetch timestamps for all hits in a single pass instead of
-                // calling frame_by_id() per-hit (avoids N+1 lookups).
-                if asof_ts.is_some() || before_ts.is_some() || after_ts.is_some() {
-                    let timestamps: HashMap<u64, i64> = resp.hits.iter()
-                        .filter_map(|hit| {
-                            mem.frame_by_id(hit.frame_id).ok().map(|f| (hit.frame_id, f.timestamp))
-                        })
-                        .collect();
-                    resp.hits.retain(|hit| {
-                        let Some(&ts) = timestamps.get(&hit.frame_id) else { return false };
-                        if let Some(asof) = asof_ts { if ts > asof { return false; } }
-                        if let Some(after) = after_ts { if ts < after { return false; } }
-                        if let Some(before) = before_ts { if ts > before { return false; } }
-                        true
-                    });
-                }
-
-                if !resp.hits.is_empty() {
-                    lists.push(build_ranked_list(LaneKind::Vec, q, i == 0, &resp.hits));
-                }
-            }
-        }
-    }
-
-    #[cfg(not(feature = "vec"))]
-    if !args.no_vector {
-        warnings.push("vector lane disabled (build with --features vec)".to_string());
-    }
-
     // --- Qdrant external vector lane ---
-    // When QDRANT_URL is set, query Qdrant for additional vector results.
-    // This supplements the local vec lane (if enabled) with a scalable external store.
     if !args.no_vector {
         if let Some(qdrant_url) = env_optional("QDRANT_URL") {
             let collection = env_optional("QDRANT_COLLECTION").unwrap_or_else(|| "aethervault".to_string());
@@ -567,7 +409,7 @@ pub(crate) fn execute_query(
                 Ok(hits) if !hits.is_empty() => {
                     lists.push(build_ranked_list(LaneKind::Vec, &args.raw_query, false, &hits));
                 }
-                Ok(_) => {} // no hits
+                Ok(_) => {}
                 Err(e) => {
                     warnings.push(format!("qdrant search failed: {e}"));
                 }
@@ -598,7 +440,7 @@ pub(crate) fn execute_query(
         "none" => {}
         "local" => {
             for cand in fused.iter().take(args.rerank_docs) {
-                let text = match mem.frame_text_by_id(cand.frame_id) {
+                let text = match db.frame_text_by_id(cand.frame_id) {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
@@ -622,7 +464,7 @@ pub(crate) fn execute_query(
                 let mut candidates = Vec::new();
                 for cand in fused.iter().take(args.rerank_docs) {
                     let text = if include_text {
-                        mem.frame_text_by_id(cand.frame_id).ok()
+                        db.frame_text_by_id(cand.frame_id).ok()
                     } else {
                         None
                     };
@@ -668,7 +510,7 @@ pub(crate) fn execute_query(
     if feedback_weight.abs() > 0.0 {
         let targets: std::collections::HashSet<String> =
             fused.iter().map(|c| c.uri.clone()).collect();
-        feedback_scores = load_feedback_scores(mem, &targets);
+        feedback_scores = load_feedback_scores(db, &targets);
     }
 
     let mut results: Vec<QueryResult> = Vec::new();
@@ -738,12 +580,12 @@ pub(crate) fn execute_query(
 }
 
 pub(crate) fn build_context_pack(
-    mem: &mut Vault,
+    db: &MemoryDb,
     args: QueryArgs,
     max_bytes: usize,
     full: bool,
 ) -> Result<ContextPack, Box<dyn std::error::Error>> {
-    let response = execute_query(mem, args)?;
+    let response = execute_query(db, args)?;
     let mut context = String::new();
     let mut citations = Vec::new();
 
@@ -758,7 +600,7 @@ pub(crate) fn build_context_pack(
             r.title.clone().unwrap_or_default()
         );
         let mut body = if full {
-            mem.frame_text_by_id(r.frame_id)
+            db.frame_text_by_id(r.frame_id)
                 .unwrap_or_else(|_| r.snippet.clone())
         } else {
             r.snippet.clone()
@@ -793,19 +635,10 @@ pub(crate) fn build_context_pack(
 }
 
 pub(crate) fn append_agent_log(
-    mem: &mut Vault,
+    _db: &MemoryDb,
     entry: &AgentLogEntry,
-) -> Result<String, Box<dyn std::error::Error>> {
-    append_agent_log_with_commit(mem, entry, true)
-}
-
-pub(crate) fn append_agent_log_with_commit(
-    _mem: &mut Vault,
-    entry: &AgentLogEntry,
-    _commit: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // JSONL-only: agent logs are audit trail, not searchable knowledge.
-    // MV2 capsule write removed to avoid waste — JSONL is the single destination.
     let workspace = resolve_workspace(None, &AgentConfig::default())
         .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_WORKSPACE_DIR));
     let log_dir = log_dir_path(&workspace);
@@ -813,7 +646,6 @@ pub(crate) fn append_agent_log_with_commit(
         eprintln!("[agent-log] JSONL write failed: {e}");
     }
 
-    // Compute a synthetic URI for backward compatibility with callers.
     let bytes = serde_json::to_vec(entry)?;
     let ts = Utc::now().timestamp();
     let hash = blake3_hash(&bytes);
@@ -830,99 +662,23 @@ pub(crate) fn append_agent_log_with_commit(
 }
 
 pub(crate) fn append_feedback(
-    mem: &mut Vault,
+    db: &MemoryDb,
     event: &FeedbackEvent,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let bytes = serde_json::to_vec(event)?;
+) -> Result<String, String> {
     let ts = Utc::now().timestamp();
+    let bytes = serde_json::to_vec(event).map_err(|e| format!("serialize feedback: {e}"))?;
     let hash = blake3_hash(&bytes);
     let uri_log = format!("aethervault://feedback/{ts}-{}", hash.to_hex());
 
-    let mut options = PutOptions::default();
-    options.uri = Some(uri_log.clone());
-    options.title = Some("aethervault feedback".to_string());
-    options.kind = Some("application/json".to_string());
-    options.track = Some("aethervault.feedback".to_string());
-    let mut search_text = event.uri.clone();
-    if let Some(note) = event.note.clone() {
-        search_text.push(' ');
-        search_text.push_str(&note);
-    }
-    options.search_text = Some(search_text);
-    mem.put_bytes_with_options(&bytes, options)?;
-    mem.commit()?;
+    db.append_feedback(
+        &event.uri,
+        event.score,
+        event.note.as_deref(),
+        event.session.as_deref(),
+    )
+    .map_err(|e| format!("append_feedback: {e}"))?;
+
     Ok(uri_log)
-}
-
-pub(crate) fn merge_capsule_into(
-    out: &mut Vault,
-    src_path: &Path,
-    dedup: bool,
-    dedup_map: &mut HashMap<String, u64>,
-) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-    let mut src = Vault::open_read_only(src_path)?;
-    let mut written = 0usize;
-    let mut deduped = 0usize;
-    let mut id_map: HashMap<u64, u64> = HashMap::new();
-    let total = src.frame_count() as u64;
-
-    for frame_id in 0..total {
-        let frame = match src.frame_by_id(frame_id) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        if frame.status != FrameStatus::Active {
-            continue;
-        }
-        let uri = frame.uri.clone().unwrap_or_default();
-        let key = format!(
-            "{}|{}|{}",
-            uri,
-            checksum_hex(&frame.checksum),
-            frame.timestamp
-        );
-        if dedup {
-            if let Some(existing) = dedup_map.get(&key).copied() {
-                id_map.insert(frame_id, existing);
-                deduped += 1;
-                continue;
-            }
-        }
-
-        let payload = match src.frame_canonical_payload(frame_id) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("merge: skipping corrupt frame {} ({})", frame_id, e);
-                deduped += 1;  // count as skipped
-                continue;
-            }
-        };
-        let mut options = PutOptions::default();
-        options.timestamp = Some(frame.timestamp);
-        options.track = frame.track.clone();
-        options.kind = frame.kind.clone();
-        options.uri = frame.uri.clone();
-        options.title = frame.title.clone();
-        options.metadata = frame.metadata.clone();
-        options.search_text = frame.search_text.clone();
-        options.tags = frame.tags.clone();
-        options.labels = frame.labels.clone();
-        options.extra_metadata = frame.extra_metadata.clone();
-        options.role = frame.role;
-        options.parent_id = frame.parent_id.and_then(|pid| id_map.get(&pid).copied());
-        options.auto_tag = false;
-        options.extract_dates = false;
-        options.extract_triplets = false;
-
-        let new_id = out.put_bytes_with_options(&payload, options)?;
-        id_map.insert(frame_id, new_id);
-        if dedup {
-            dedup_map.insert(key, new_id);
-        }
-        written += 1;
-    }
-
-    Ok((written, deduped))
 }
 
 pub(crate) fn parse_log_ts_from_uri(uri: &str) -> Option<i64> {
@@ -968,24 +724,17 @@ pub(crate) fn collect_mid_loop_reminders(
     out
 }
 
-/// Detect cycles in a rolling window of recent actions.
-/// Each action is a string like "tool_name:args_hash".
-/// Returns Some((cycle_length, repeat_count)) if a cycle is found.
 pub(crate) fn detect_cycle(actions: &std::collections::VecDeque<String>) -> Option<(usize, usize)> {
     let len = actions.len();
-    // Check cycle lengths from 1 (single repeat) to 5 (5-step pattern)
     for cycle_len in 1..=5 {
         if len < cycle_len * 2 {
             continue;
         }
-        // Minimum repeats to declare a cycle: 3 for single, 2 for multi-step
         let min_repeats = if cycle_len == 1 { 3 } else { 2 };
         if len < cycle_len * min_repeats {
             continue;
         }
-        // Extract the most recent `cycle_len` items as the candidate pattern
         let pattern: Vec<&String> = actions.iter().rev().take(cycle_len).collect();
-        // Check how many consecutive times this pattern repeats going backwards
         let mut repeats = 1usize;
         'outer: for rep in 1..min_repeats {
             let start = cycle_len * rep;
@@ -1034,8 +783,6 @@ pub(crate) fn compute_drift_score(
     score.max(0.0)
 }
 
-/// Heuristic scan for high-confidence markers in assistant text.
-/// Returns true if the text contains phrases suggesting unverified claims.
 pub(crate) fn scan_confidence_markers(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     const MARKERS: &[&str] = &[
@@ -1059,17 +806,6 @@ pub(crate) fn scan_confidence_markers(text: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
-/// Determine whether the covert critic should fire this step.
-/// Updates `last_critic_step` when it decides to fire.
-///
-/// Escalation behavior: when `violation_count` is high, the critic fires
-/// more frequently to increase oversight on persistently misbehaving sessions.
-///   - violation_count >= 5: fire every step
-///   - violation_count >= 3: fire every 2 steps
-///   - otherwise: use the base `interval`
-///
-/// NOTE: callers in agent.rs must pass `violation_count` (e.g. from
-/// `drift_state.critic_history.len()` or a dedicated counter).
 pub(crate) fn critic_should_fire(
     step: usize,
     base_interval: usize,
@@ -1083,11 +819,10 @@ pub(crate) fn critic_should_fire(
         return false;
     }
 
-    // Escalation: fire more frequently with more violations
     let interval = if violation_count >= 5 {
-        1  // Every step
+        1
     } else if violation_count >= 3 {
-        2  // Every 2 steps
+        2
     } else {
         base_interval
     };
@@ -1095,7 +830,6 @@ pub(crate) fn critic_should_fire(
     let within_interval = step > 0 && step.saturating_sub(*last_critic_step) < interval;
 
     if within_interval {
-        // Check for high-priority triggers that override the interval
         let last_assistant = messages
             .iter()
             .rev()
@@ -1103,14 +837,12 @@ pub(crate) fn critic_should_fire(
             .and_then(|m| m.content.as_deref())
             .unwrap_or("");
 
-        // Confidence signal: override interval
         if scan_confidence_markers(last_assistant) {
             eprintln!("[critic] triggered: confidence markers detected");
             *last_critic_step = step;
             return true;
         }
 
-        // Tool failure without acknowledgment: override interval
         if reminder_state.last_tool_failed {
             let lower = last_assistant.to_ascii_lowercase();
             let acknowledges = lower.contains("error")
@@ -1128,7 +860,6 @@ pub(crate) fn critic_should_fire(
         return false;
     }
 
-    // Periodic trigger
     *last_critic_step = step;
 
     if tool_calls.len() >= 3 {
@@ -1157,11 +888,8 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    // ── detect_cycle tests ──────────────────────────────────────────────
-
     #[test]
     fn detect_cycle_single_repeat() {
-        // 3 identical actions = cycle(1, 3)
         let mut actions = VecDeque::new();
         actions.push_back("read:abc".to_string());
         actions.push_back("read:abc".to_string());
@@ -1184,7 +912,6 @@ mod tests {
 
     #[test]
     fn detect_cycle_two_step_pattern() {
-        // A-B-A-B = cycle(2, 2)
         let mut actions = VecDeque::new();
         actions.push_back("read:abc".to_string());
         actions.push_back("write:def".to_string());
@@ -1204,14 +931,11 @@ mod tests {
 
     #[test]
     fn detect_cycle_too_few() {
-        // Only 2 identical — not enough (need 3 for cycle_len=1)
         let mut actions = VecDeque::new();
         actions.push_back("read:abc".to_string());
         actions.push_back("read:abc".to_string());
         assert!(detect_cycle(&actions).is_none());
     }
-
-    // ── rrf_fuse tests ──────────────────────────────────────────────────
 
     #[test]
     fn rrf_fuse_single_list() {
@@ -1246,7 +970,6 @@ mod tests {
         }];
         let fused = rrf_fuse(&lists, 60.0);
         assert_eq!(fused.len(), 2);
-        // First should be "a" (rank 1, base weight 2.0)
         assert_eq!(fused[0].key, "a");
         assert!(fused[0].rrf_score > fused[1].rrf_score);
     }
@@ -1288,7 +1011,6 @@ mod tests {
             },
         ];
         let fused = rrf_fuse(&lists, 60.0);
-        // Same key appears in both lists — should be fused into one entry
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].sources.len(), 2);
     }
