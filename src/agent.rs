@@ -24,7 +24,7 @@ use crate::{
     tools_from_active, AgentHookRequest, AgentLogEntry, AgentMessage,
     AgentProgress, AgentRunOutput, AgentSession, AgentToolCall, AgentToolResult,
     ContinuationCheckpoint,
-    DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
+    CommandSpec, DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
     ToolExecution,
     open_skill_db, list_skills, search_skills, record_skill_use,
 };
@@ -440,13 +440,37 @@ pub(crate) fn run_agent_with_prompt(
     let agent_cfg = config.agent.clone().unwrap_or_default();
     let agent_workspace = resolve_workspace(None, &agent_cfg);
     let hook_cfg = config.hooks.clone().unwrap_or_default();
-    let model_spec = resolve_hook_spec(
+    let base_model_spec = resolve_hook_spec(
         model_hook,
         300000,
         agent_cfg.model_hook.clone().or(hook_cfg.llm),
         None,
     )
     .ok_or("agent requires --model-hook or config.agent.model_hook or config.hooks.llm")?;
+    let mut model_spec = base_model_spec.clone();
+
+    // Opus escalation: build a fallback HookSpec for when critic fires
+    let opus_escalation_spec: Option<HookSpec> = {
+        // Only useful if the base model isn't already Opus
+        let base_cmd = match &base_model_spec.command {
+            CommandSpec::String(s) => s.trim().to_ascii_lowercase(),
+            CommandSpec::Array(a) => a.first().map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default(),
+        };
+        let is_already_opus = base_cmd == "builtin:claude" || base_cmd == "claude";
+        if is_already_opus {
+            None
+        } else {
+            Some(HookSpec {
+                command: CommandSpec::String("builtin:claude".to_string()),
+                timeout_ms: base_model_spec.timeout_ms,
+                full_text: base_model_spec.full_text,
+            })
+        }
+    };
+    let opus_escalation_steps: usize = env_optional("OPUS_ESCALATION_STEPS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let mut opus_escalation_remaining: usize = 0;
 
     let mut system_prompt = if let Some(system) = system_override {
         system
@@ -891,6 +915,15 @@ pub(crate) fn run_agent_with_prompt(
                 Err(e) => {
                     eprintln!("[harness] compaction failed: {e}");
                 }
+            }
+        }
+
+        // Model escalation: count down Opus steps and revert to base model
+        if opus_escalation_remaining > 0 {
+            opus_escalation_remaining -= 1;
+            if opus_escalation_remaining == 0 {
+                eprintln!("[harness] Opus escalation window ended, reverting to base model");
+                model_spec = base_model_spec.clone();
             }
         }
 
@@ -1548,6 +1581,15 @@ pub(crate) fn run_agent_with_prompt(
                 // Persist violations to disk
                 if let Ok(json) = serde_json::to_string(&drift_state) {
                     let _ = std::fs::write(&drift_path, json);
+                }
+
+                // Model escalation: swap to Opus for next N steps when critic fires
+                if let Some(ref opus_spec) = opus_escalation_spec {
+                    if opus_escalation_remaining == 0 {
+                        eprintln!("[harness] critic fired — escalating to Opus for {opus_escalation_steps} steps");
+                        model_spec = opus_spec.clone();
+                        opus_escalation_remaining = opus_escalation_steps;
+                    }
                 }
 
                 // Progressive escalation based on violation count

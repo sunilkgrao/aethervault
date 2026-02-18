@@ -365,8 +365,19 @@ pub(crate) fn parse_claude_response(
 pub(crate) fn call_claude(
     request: &AgentHookRequest,
 ) -> Result<AgentHookResponse, Box<dyn std::error::Error>> {
+    call_claude_with_model(request, None)
+}
+
+pub(crate) fn call_claude_with_model(
+    request: &AgentHookRequest,
+    model_override: Option<&str>,
+) -> Result<AgentHookResponse, Box<dyn std::error::Error>> {
     let api_key = env_required("ANTHROPIC_API_KEY")?;
-    let model = env_required("ANTHROPIC_MODEL")?;
+    let model = if let Some(m) = model_override {
+        m.to_string()
+    } else {
+        env_required("ANTHROPIC_MODEL")?
+    };
     let base_url = env_optional("ANTHROPIC_BASE_URL")
         .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".to_string());
     let max_tokens = env_u64("ANTHROPIC_MAX_TOKENS", 8192)?;
@@ -672,7 +683,8 @@ pub(crate) fn call_critic(
     let api_key = env_optional("CRITIC_API_KEY")
         .or_else(|| env_optional("ANTHROPIC_API_KEY"))?;
     let model = env_optional("CRITIC_MODEL")
-        .unwrap_or_else(|| "claude-opus-4-6".to_string());
+        .unwrap_or_else(|| env_optional("SONNET_MODEL")
+            .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string()));
     let base_url = env_optional("ANTHROPIC_BASE_URL")
         .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".to_string());
     let timeout_ms: u64 = env_optional("CRITIC_TIMEOUT")
@@ -836,21 +848,28 @@ pub(crate) fn call_critic(
 }
 
 pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Result<AgentMessage, String> {
-    let is_builtin = match &hook.command {
-        CommandSpec::String(cmd) => {
-            let cmd = cmd.trim().to_ascii_lowercase();
-            cmd == "builtin:claude" || cmd == "claude"
-        }
+    let hook_cmd = match &hook.command {
+        CommandSpec::String(cmd) => cmd.trim().to_ascii_lowercase(),
         CommandSpec::Array(items) => items
             .first()
             .map(|cmd| cmd.trim().to_ascii_lowercase())
-            .map(|cmd| cmd == "builtin:claude" || cmd == "claude")
-            .unwrap_or(false),
+            .unwrap_or_default(),
     };
-    if is_builtin {
+    let is_builtin_claude = hook_cmd == "builtin:claude" || hook_cmd == "claude";
+    let is_builtin_sonnet = hook_cmd == "builtin:sonnet" || hook_cmd == "sonnet";
+
+    if is_builtin_claude || is_builtin_sonnet {
+        // For builtin:sonnet, override model to Sonnet via env or hardcoded default
+        let model_override = if is_builtin_sonnet {
+            Some(std::env::var("SONNET_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string()))
+        } else {
+            None
+        };
+
         // Retry once at this level for transient failures (covers the case where
         // all fallback endpoints failed due to a temporary network blip)
-        let result = call_claude(request);
+        let result = call_claude_with_model(request, model_override.as_deref());
         match result {
             Ok(resp) => return Ok(resp.message),
             Err(e) => {
@@ -858,7 +877,7 @@ pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Re
                 if err_str.contains("transport") || err_str.contains("timed out") || err_str.contains("Network") {
                     eprintln!("[call_agent_hook] first attempt failed ({err_str}), retrying in 3s...");
                     thread::sleep(Duration::from_secs(3));
-                    return call_claude(request)
+                    return call_claude_with_model(request, model_override.as_deref())
                         .map(|resp| resp.message)
                         .map_err(|e| {
                             format!("I hit an API error and couldn't recover after retrying. The error was: {e}")

@@ -18,7 +18,9 @@ use crate::{
 
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 120_000;
 const SLACK_API_BASE: &str = "https://slack.com/api";
-const VOICEBOX_API: &str = "http://raoDesktop:8000/generate";
+fn voicebox_api_url() -> String {
+    std::env::var("VOICEBOX_API_URL").unwrap_or_else(|_| "http://localhost:8000/generate".to_string())
+}
 const MAX_QUEUED_PER_SESSION: usize = 5;
 const MAX_FILE_BYTES: u64 = 25_000_000;
 const MAX_TEXT_CHUNK_CHARS: usize = 3900;
@@ -619,7 +621,7 @@ fn generate_voice_audio(http_agent: &ureq::Agent, directive: &VoiceDirective) ->
     });
 
     let response = http_agent
-        .post(VOICEBOX_API)
+        .post(&voicebox_api_url())
         .set("Content-Type", "application/json")
         .send_json(payload)
         .map_err(|e| format!("voicebox request error: {e}"))?;

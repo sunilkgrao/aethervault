@@ -38,8 +38,12 @@ pub(crate) fn resolve_bridge_model_hook(cli: Option<String>) -> Option<String> {
     if cli.is_some() {
         return cli;
     }
-    if env_optional("ANTHROPIC_API_KEY").is_some() && env_optional("ANTHROPIC_MODEL").is_some() {
-        return Some("builtin:claude".to_string());
+    // Prefer Sonnet for the orchestrator — fast + cheap.
+    // Opus kicks in automatically via critic-triggered escalation.
+    if env_optional("ANTHROPIC_API_KEY").is_some() {
+        if env_optional("SONNET_MODEL").is_some() || env_optional("ANTHROPIC_MODEL").is_some() {
+            return Some("builtin:sonnet".to_string());
+        }
     }
     None
 }
