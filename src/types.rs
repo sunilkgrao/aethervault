@@ -236,11 +236,12 @@ pub(crate) struct AgentConfig {
     #[serde(default)]
     pub(crate) model_hook: Option<HookSpec>,
     #[serde(default)]
-    pub(crate) subagents: Vec<SubagentSpec>,
     /// Default model hook for dynamically spawned subagents that don't match
     /// a named config entry. Enables ad-hoc agent creation without pre-configuration.
     #[serde(default)]
     pub(crate) default_subagent_hook: Option<String>,
+    #[serde(default)]
+    pub(crate) subagents: Vec<SubagentSpec>,
     /// MCP servers to spawn as long-lived sidecars (generic plugin system)
     #[serde(default)]
     pub(crate) mcp_servers: Vec<McpServerConfig>,
@@ -525,7 +526,7 @@ pub(crate) struct BridgeAgentConfig {
     pub(crate) session_prefix: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct SubagentSpec {
     pub(crate) name: String,
     /// Human-readable description used for auto-routing.

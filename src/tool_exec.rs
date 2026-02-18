@@ -15,6 +15,7 @@ use chrono::Utc;
 use walkdir::WalkDir;
 
 use std::sync::mpsc;
+use std::process::Command;
 
 const NO_TIMEOUT_MS: u64 = u64::MAX;
 const PROCESS_POLL_MS: u64 = 250;
@@ -298,9 +299,153 @@ fn wait_for_child_monitored(
     }
 }
 
+fn escape_sql_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "''")
+}
+
+fn skill_db_exec_with_flags(
+    db_path: &Path,
+    flags: &[&str],
+    query: &str,
+) -> Result<String, String> {
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("skill db: failed to create parent directory: {e}"))?;
+    }
+    let output = Command::new("sqlite3")
+        .args(flags)
+        .arg(db_path)
+        .arg(query)
+        .output()
+        .map_err(|e| format!("skill db: unable to execute sqlite3: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        let stderr = if output.stderr.is_empty() {
+            stdout.clone()
+        } else {
+            String::from_utf8_lossy(&output.stderr).to_string()
+        };
+        let detail = stderr.trim();
+        let err = if detail.is_empty() {
+            "command failed with no message".to_string()
+        } else {
+            detail.to_string()
+        };
+        return Err(format!("skill db: {err}"));
+    }
+    Ok(stdout)
+}
+
+fn skill_db_exec(db_path: &Path, query: &str) -> Result<String, String> {
+    skill_db_exec_with_flags(db_path, &[], query)
+}
+
+fn ensure_skill_db(db_path: &Path) -> Result<(), String> {
+    let ddl = "CREATE TABLE IF NOT EXISTS skills (
+    name TEXT PRIMARY KEY,
+    trigger TEXT,
+    steps TEXT,
+    tools TEXT,
+    notes TEXT,
+    success_rate REAL NOT NULL DEFAULT 0.0,
+    use_count INTEGER NOT NULL DEFAULT 0
+);";
+    skill_db_exec(db_path, ddl)?;
+    Ok(())
+}
+
+fn upsert_skill_db(mv2: &Path, parsed: &ToolSkillStoreArgs) -> Result<(), String> {
+    let db_path = skill_db_path(mv2);
+    ensure_skill_db(&db_path)?;
+    let name = escape_sql_value(&parsed.name);
+    let trigger = escape_sql_value(&parsed.trigger.clone().unwrap_or_default());
+    let steps = serde_json::to_string(&parsed.steps.clone().unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    let tools = serde_json::to_string(&parsed.tools.clone().unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    let steps = escape_sql_value(&steps);
+    let tools = escape_sql_value(&tools);
+    let notes = escape_sql_value(&parsed.notes.clone().unwrap_or_default());
+    let sql = format!(
+        "INSERT INTO skills (name, trigger, steps, tools, notes, success_rate, use_count)
+         VALUES ('{name}', '{trigger}', '{steps}', '{tools}', '{notes}', 0.0, 0)
+         ON CONFLICT(name) DO UPDATE SET
+            trigger=excluded.trigger,
+            steps=excluded.steps,
+            tools=excluded.tools,
+            notes=excluded.notes;",
+    );
+    skill_db_exec(&db_path, &sql)?;
+    Ok(())
+}
+
+fn search_skill_db(mv2: &Path, query: &str, limit: usize) -> Result<Vec<serde_json::Value>, String> {
+    let db_path = skill_db_path(mv2);
+    ensure_skill_db(&db_path)?;
+    let escaped = escape_sql_value(&query.to_lowercase());
+    let like_query = format!("%{escaped}%");
+    let sql = format!(
+        "SELECT name, trigger, steps, tools, notes, success_rate, use_count
+         FROM skills
+         WHERE lower(name) LIKE '{like_query}'
+            OR lower(trigger) LIKE '{like_query}'
+            OR lower(steps) LIKE '{like_query}'
+            OR lower(tools) LIKE '{like_query}'
+            OR lower(notes) LIKE '{like_query}'
+         ORDER BY (
+             CASE WHEN lower(name) LIKE '{like_query}' THEN 100 ELSE 0 END +
+             CASE WHEN lower(trigger) LIKE '{like_query}' THEN 50 ELSE 0 END +
+             CASE WHEN lower(steps) LIKE '{like_query}' THEN 20 ELSE 0 END +
+             CASE WHEN lower(tools) LIKE '{like_query}' THEN 20 ELSE 0 END +
+             CASE WHEN lower(notes) LIKE '{like_query}' THEN 10 ELSE 0 END +
+             CAST(COALESCE(success_rate, 0.0) * 10 AS INTEGER) +
+             CAST(COALESCE(use_count, 0) AS INTEGER)
+         ) DESC, name ASC
+         LIMIT {limit};",
+    );
+    let raw = skill_db_exec_with_flags(&db_path, &["-json"], &sql)?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|e| format!("skill db: {e}"))?;
+    let query_low = query.to_lowercase();
+    let mut results = Vec::new();
+    for row in rows {
+        let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let trigger = row.get("trigger").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let steps = row.get("steps").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let tools = row.get("tools").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let notes = row.get("notes").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut score = 0.0;
+        if name.to_lowercase().contains(&query_low) {
+            score += 3.0;
+        }
+        if trigger.to_lowercase().contains(&query_low) {
+            score += 2.0;
+        }
+        if steps.to_lowercase().contains(&query_low) {
+            score += 1.0;
+        }
+        if tools.to_lowercase().contains(&query_low) {
+            score += 0.5;
+        }
+        if notes.to_lowercase().contains(&query_low) {
+            score += 0.5;
+        }
+        results.push(serde_json::json!({
+            "uri": name,
+            "title": name,
+            "text": format!("trigger: {trigger}\nsteps: {steps}\ntools: {tools}\nnotes: {notes}"),
+            "score": score,
+        }));
+    }
+    Ok(results)
+}
+
 use crate::{
     env_optional,
     kill_process_tree,
+    skill_db_path,
     with_read_mem,
     with_write_mem,
     load_approvals,
@@ -1886,12 +2031,18 @@ pub(crate) fn execute_tool_with_handles(
             let db_path = workspace.join("skills.sqlite");
             let conn = open_skill_db(&db_path).map_err(|e| format!("skill db: {e}"))?;
             let now = Utc::now().to_rfc3339();
+            let skill_name = parsed.name.clone();
+            let skill_trigger = parsed.trigger.clone();
+            let skill_steps = parsed.steps.clone().unwrap_or_default();
+            let skill_tools = parsed.tools.clone().unwrap_or_default();
+            let skill_notes = parsed.notes.clone();
+
             let skill = SkillRecord {
-                name: parsed.name.clone(),
-                trigger: parsed.trigger,
-                steps: parsed.steps.unwrap_or_default(),
-                tools: parsed.tools.unwrap_or_default(),
-                notes: parsed.notes,
+                name: skill_name.clone(),
+                trigger: skill_trigger.clone(),
+                steps: skill_steps.clone(),
+                tools: skill_tools.clone(),
+                notes: skill_notes.clone(),
                 success_rate: 0.0,
                 times_used: 0,
                 times_succeeded: 0,
@@ -1900,9 +2051,67 @@ pub(crate) fn execute_tool_with_handles(
                 contexts: Vec::new(),
             };
             upsert_skill(&conn, &skill).map_err(|e| format!("upsert: {e}"))?;
+
+            upsert_skill_db(mv2, &parsed)?;
+            let ts = Utc::now().timestamp();
+            let payload = serde_json::json!({
+                "name": skill_name,
+                "trigger": skill_trigger,
+                "steps": skill_steps,
+                "tools": skill_tools,
+                "notes": skill_notes,
+                "ts_utc": ts
+            });
+            let bytes = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
+            let hash = blake3_hash(&bytes);
+            let slug = payload
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("skill")
+                .to_ascii_lowercase()
+                .replace(' ', "-");
+            let uri = format!("aethervault://skills/{}/{}-{}", slug, ts, hash.to_hex());
+            let mut details = serde_json::json!({
+                "uri": uri,
+                "stored_in_sqlite": true,
+                "name": parsed.name,
+                "db": db_path.display().to_string(),
+            });
+            let capsule_write = with_write_mem(mem_read, mem_write, mv2, true, |mem| {
+                let mut options = PutOptions::default();
+                options.uri = Some(details["uri"].as_str().unwrap_or_default().to_string());
+                options.title = Some("skill".to_string());
+                options.kind = Some("application/json".to_string());
+                options.track = Some("aethervault.skill".to_string());
+                options.search_text = Some(payload.to_string());
+                mem.put_bytes_with_options(&bytes, options)
+                    .map_err(|e| e.to_string())?;
+                mem.commit().map_err(|e| e.to_string())?;
+                Ok(())
+            });
+            if let Some(obj) = details.as_object_mut() {
+                obj.insert(
+                    "stored_in_capsule".into(),
+                    serde_json::Value::Bool(capsule_write.is_ok()),
+                );
+            }
+            if let Err(err) = &capsule_write {
+                if let Some(obj) = details.as_object_mut() {
+                    obj.insert(
+                        "capsule_error".into(),
+                        serde_json::Value::String(format!(
+                            "Capsule write skipped after SQLite upsert: {err}"
+                        )),
+                    );
+                }
+            }
             Ok(ToolExecution {
-                output: format!("Skill '{}' stored.", parsed.name),
-                details: serde_json::json!({ "name": parsed.name, "db": db_path.display().to_string() }),
+                output: if capsule_write.is_ok() {
+                    "Skill stored.".to_string()
+                } else {
+                    "Skill stored in SQLite; capsule write skipped.".to_string()
+                },
+                details,
                 is_error: false,
             })
         }
@@ -1914,11 +2123,11 @@ pub(crate) fn execute_tool_with_handles(
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
             let db_path = workspace.join("skills.sqlite");
             let limit = parsed.limit.unwrap_or(10);
-            let conn = open_skill_db(&db_path).map_err(|e| format!("skill db: {e}"))?;
-            let results = search_skills(&conn, &parsed.query, limit);
-            let out: Vec<serde_json::Value> = results
-                .into_iter()
-                .map(|s| {
+            let mut out = Vec::new();
+
+            if let Ok(conn) = open_skill_db(&db_path) {
+                let results = search_skills(&conn, &parsed.query, limit);
+                out.extend(results.into_iter().map(|s| {
                     serde_json::json!({
                         "name": s.name,
                         "trigger": s.trigger,
@@ -1929,8 +2138,38 @@ pub(crate) fn execute_tool_with_handles(
                         "times_used": s.times_used,
                         "last_used": s.last_used,
                     })
-                })
-                .collect();
+                }));
+            }
+
+            if let Ok(mut out_skill_db) = search_skill_db(mv2, &parsed.query, limit) {
+                out.append(&mut out_skill_db);
+            } else if let Ok(mem_out) = with_read_mem(mem_read, mem_write, mv2, |mem| {
+                let request = SearchRequest {
+                    query: parsed.query.clone(),
+                    top_k: limit,
+                    snippet_chars: 200,
+                    uri: None,
+                    scope: Some("aethervault://skills/".to_string()),
+                    cursor: None,
+                    temporal: None,
+                    as_of_frame: None,
+                    as_of_ts: None,
+                    no_sketch: true,
+                };
+                let response = mem.search(request).map_err(|e| e.to_string())?;
+                let mut out = Vec::new();
+                for hit in response.hits {
+                    out.push(serde_json::json!({
+                        "uri": hit.uri,
+                        "title": hit.title,
+                        "text": hit.text,
+                        "score": hit.score
+                    }));
+                }
+                Ok(out)
+            }) {
+                out.extend(mem_out);
+            }
             Ok(ToolExecution {
                 output: format!("Found {} skills.", out.len()),
                 details: serde_json::json!({ "results": out }),
@@ -1986,8 +2225,11 @@ pub(crate) fn execute_tool_with_handles(
             let subagents = load_subagents_from_config(&config);
             let mut system = parsed.system.clone();
             let mut model_hook = parsed.model_hook.clone();
-            let spec = subagents.iter().find(|s| s.name == parsed.name);
-            if let Some(spec) = spec {
+            let default_subagent_hook = config
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.default_subagent_hook.clone());
+            if let Some(spec) = subagents.iter().find(|s| s.name == parsed.name) {
                 if system.is_none() {
                     system = spec.system.clone();
                 }
@@ -1995,12 +2237,12 @@ pub(crate) fn execute_tool_with_handles(
                     model_hook = spec.model_hook.clone();
                 }
             } else if system.is_none() && model_hook.is_none() {
-                // Dynamic subagent: use default_subagent_hook from config
-                let default_hook = config.agent.as_ref()
-                    .and_then(|a| a.default_subagent_hook.clone());
-                if let Some(hook) = default_hook {
+                if let Some(hook) = default_subagent_hook.clone() {
                     model_hook = Some(hook);
-                    eprintln!("[subagent] '{}' not in config, using default hook", parsed.name);
+                    eprintln!(
+                        "[subagent] '{}' not in config, using default hook",
+                        parsed.name
+                    );
                 } else {
                     return Err(format!(
                         "unknown subagent '{}' and no default_subagent_hook configured. \
@@ -2071,6 +2313,10 @@ pub(crate) fn execute_tool_with_handles(
                 })?
             };
             let subagents = load_subagents_from_config(&config_snapshot);
+            let default_subagent_hook = config_snapshot
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.default_subagent_hook.clone());
             let ts = Utc::now().timestamp();
 
             // Release all capsule handles before spawning subagent threads so they can
@@ -2101,16 +2347,24 @@ pub(crate) fn execute_tool_with_handles(
                         model_hook = spec.model_hook.clone();
                     }
                 } else if system.is_none() && model_hook.is_none() {
-                    let default_hook = config_snapshot.agent.as_ref()
-                        .and_then(|a| a.default_subagent_hook.clone());
-                    if let Some(hook) = default_hook {
+                    if let Some(hook) = config_snapshot
+                        .agent
+                        .as_ref()
+                        .and_then(|a| a.default_subagent_hook.clone())
+                    {
                         model_hook = Some(hook);
-                        eprintln!("[subagent_batch] '{}' not in config, using default hook", inv.name);
+                        eprintln!(
+                            "[subagent_batch] '{}' not in config, using default hook",
+                            inv.name
+                        );
                     } else {
                         prepared.push(PreparedInvocation {
                             name: inv.name.clone(),
                             prompt: inv.prompt.clone(),
-                            cfg: Err(format!("unknown subagent '{}' and no default_subagent_hook", inv.name)),
+                            cfg: Err(format!(
+                                "unknown subagent '{}' and no default_subagent_hook",
+                                inv.name
+                            )),
                             index: i,
                         });
                         continue;
