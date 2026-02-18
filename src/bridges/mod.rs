@@ -1,20 +1,20 @@
-pub(crate) mod slack;
 pub(crate) mod telegram;
+pub(crate) mod slack;
 pub(crate) mod whatsapp;
 pub(crate) mod webhook;
 
 pub(crate) use telegram::*;
 
+#[allow(unused_imports)]
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use chrono::Utc;
 
 use crate::{
-    call_claude, env_optional, open_skill_db, run_agent_with_prompt, upsert_skill,
-    AgentHookRequest, AgentMessage, AgentProgress, AgentRunOutput,
-    BridgeAgentConfig, BridgeCommand, DistilledSkill, SkillRecord, DEFAULT_WORKSPACE_DIR,
+    env_optional, run_agent_with_prompt,
+    AgentProgress, AgentRunOutput, BridgeAgentConfig, BridgeCommand,
 };
 use self::telegram::run_telegram_bridge;
 use self::whatsapp::run_whatsapp_bridge;
@@ -91,7 +91,6 @@ pub(crate) fn run_agent_for_bridge(
     progress: Option<Arc<Mutex<AgentProgress>>>,
 ) -> Result<AgentRunOutput, String> {
     let (tx, rx) = mpsc::channel();
-    let session_for_distill = session.clone();
     let prompt_text = prompt.to_string();
     let mv2 = config.mv2.clone();
     let model_hook = model_hook_override.or_else(|| config.model_hook.clone());
@@ -127,220 +126,7 @@ pub(crate) fn run_agent_for_bridge(
     // No timeout — let the agent run as long as it needs.
     // The agent is bounded by max_steps, not wall-clock time.
     // Long-running tasks (dev work, swarms, batch processing) can take hours.
-    let result = rx.recv().map_err(|err| format!("Agent channel error: {err}"))?;
-
-    // SkillRL R2+R3: Fire-and-forget skill distillation based on outcome
-    let workspace = std::env::var("AETHERVAULT_WORKSPACE")
-        .ok()
-        .map(PathBuf::from);
-    match &result {
-        Ok(output) => {
-            distill_skills_from_run(output, workspace.clone());
-        }
-        Err(err_msg) => {
-            distill_failure_skill(err_msg, &session_for_distill, workspace);
-        }
-    }
-
-    result
-}
-
-// --- SkillRL: Distillation prompts ---
-
-const SKILL_DISTILL_PROMPT: &str = r#"You are a skill distiller. Analyze the agent trajectory and extract 1-3 reusable behavioral patterns.
-
-For each skill, output JSON:
-[
-  {
-    "title": "3-5 word name",
-    "principle": "1-2 sentence actionable strategy",
-    "when_to_apply": "conditions when this skill applies"
-  }
-]
-
-Rules:
-- Only extract genuinely reusable patterns, not task-specific trivia
-- Focus on strategies that succeeded, not routine operations
-- Each skill should be applicable across different tasks
-- Output ONLY the JSON array, nothing else"#;
-
-const FAILURE_DISTILL_PROMPT: &str = r#"You are a failure analyst. Given an agent session that failed, extract 1-2 prevention skills.
-
-For each skill, output JSON:
-[
-  {
-    "title": "3-5 word name (what to avoid)",
-    "principle": "What went wrong and how to prevent it",
-    "when_to_apply": "Conditions that signal this failure pattern"
-  }
-]
-
-Rules:
-- Focus on the root cause, not symptoms
-- Make the prevention actionable and specific
-- Output ONLY the JSON array, nothing else"#;
-
-/// SkillRL R2: Distill reusable skills from successful agent runs.
-/// Runs in a background thread — fire-and-forget.
-fn distill_skills_from_run(
-    result: &AgentRunOutput,
-    workspace: Option<PathBuf>,
-) {
-    let messages = result.messages.clone();
-    let session = result
-        .session
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-    let ws = workspace.unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
-
-    thread::spawn(move || {
-        // Only distill from sessions with 5+ tool calls (non-trivial tasks)
-        let tool_count = messages.iter().filter(|m| m.role == "tool").count();
-        if tool_count < 5 {
-            return;
-        }
-
-        // Build a compact trajectory summary
-        let trajectory: String = messages
-            .iter()
-            .filter(|m| m.role == "assistant" || m.role == "tool")
-            .filter_map(|m| {
-                let role = &m.role;
-                m.content.as_ref().map(|c| {
-                    let preview: String = c.chars().take(200).collect();
-                    format!("[{role}] {preview}")
-                })
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let distill_request = AgentHookRequest {
-            messages: vec![
-                AgentMessage {
-                    role: "system".to_string(),
-                    content: Some(SKILL_DISTILL_PROMPT.to_string()),
-                    tool_calls: Vec::new(),
-                    name: None,
-                    tool_call_id: None,
-                    is_error: None,
-                },
-                AgentMessage {
-                    role: "user".to_string(),
-                    content: Some(format!(
-                        "Session: {session}\n\nTrajectory:\n{trajectory}"
-                    )),
-                    tool_calls: Vec::new(),
-                    name: None,
-                    tool_call_id: None,
-                    is_error: None,
-                },
-            ],
-            tools: Vec::new(),
-            session: Some(format!("distill:{session}")),
-        };
-
-        if let Ok(response) = call_claude(&distill_request) {
-            if let Some(text) = response.message.content {
-                // Strip markdown fences if present
-                let json_text = text
-                    .trim()
-                    .trim_start_matches("```json")
-                    .trim_start_matches("```")
-                    .trim_end_matches("```")
-                    .trim();
-                if let Ok(skills) = serde_json::from_str::<Vec<DistilledSkill>>(json_text) {
-                    let db_path = ws.join("skills.sqlite");
-                    if let Ok(conn) = open_skill_db(&db_path) {
-                        for skill in &skills {
-                            let record = SkillRecord {
-                                name: skill.title.clone(),
-                                trigger: Some(skill.when_to_apply.clone()),
-                                steps: Vec::new(),
-                                tools: Vec::new(),
-                                notes: Some(skill.principle.clone()),
-                                success_rate: 0.0,
-                                times_used: 0,
-                                times_succeeded: 0,
-                                last_used: None,
-                                created_at: Utc::now().to_rfc3339(),
-                                contexts: vec![session.clone()],
-                            };
-                            let _ = upsert_skill(&conn, &record);
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// SkillRL R3: Distill prevention skills from failed agent runs.
-/// Runs in a background thread — fire-and-forget.
-fn distill_failure_skill(
-    error_msg: &str,
-    session: &str,
-    workspace: Option<PathBuf>,
-) {
-    let error = error_msg.to_string();
-    let session = session.to_string();
-    let ws = workspace.unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
-
-    thread::spawn(move || {
-        let distill_request = AgentHookRequest {
-            messages: vec![
-                AgentMessage {
-                    role: "system".to_string(),
-                    content: Some(FAILURE_DISTILL_PROMPT.to_string()),
-                    tool_calls: Vec::new(),
-                    name: None,
-                    tool_call_id: None,
-                    is_error: None,
-                },
-                AgentMessage {
-                    role: "user".to_string(),
-                    content: Some(format!("Session: {session}\nFailure: {error}")),
-                    tool_calls: Vec::new(),
-                    name: None,
-                    tool_call_id: None,
-                    is_error: None,
-                },
-            ],
-            tools: Vec::new(),
-            session: Some(format!("distill-fail:{session}")),
-        };
-
-        if let Ok(response) = call_claude(&distill_request) {
-            if let Some(text) = response.message.content {
-                let json_text = text
-                    .trim()
-                    .trim_start_matches("```json")
-                    .trim_start_matches("```")
-                    .trim_end_matches("```")
-                    .trim();
-                if let Ok(skills) = serde_json::from_str::<Vec<DistilledSkill>>(json_text) {
-                    let db_path = ws.join("skills.sqlite");
-                    if let Ok(conn) = open_skill_db(&db_path) {
-                        for skill in &skills {
-                            let record = SkillRecord {
-                                name: format!("AVOID: {}", skill.title),
-                                trigger: Some(skill.when_to_apply.clone()),
-                                steps: Vec::new(),
-                                tools: Vec::new(),
-                                notes: Some(format!("FAILURE LESSON: {}", skill.principle)),
-                                success_rate: 0.0,
-                                times_used: 0,
-                                times_succeeded: 0,
-                                last_used: None,
-                                created_at: Utc::now().to_rfc3339(),
-                                contexts: vec![session.clone()],
-                            };
-                            let _ = upsert_skill(&conn, &record);
-                        }
-                    }
-                }
-            }
-        }
-    });
+    rx.recv().map_err(|err| format!("Agent channel error: {err}"))?.map_err(|e| e)
 }
 
 pub(crate) fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -435,7 +221,12 @@ pub(crate) fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::erro
                 log,
                 log_commit_interval,
             )?;
-            run_slack_bridge(config, bot_token, app_token, signing_secret)
+            run_slack_bridge(
+                config,
+                bot_token,
+                app_token,
+                signing_secret,
+            )
         }
         BridgeCommand::Discord {
             mv2,

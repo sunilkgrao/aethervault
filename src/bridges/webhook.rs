@@ -38,7 +38,16 @@ pub(crate) fn run_webhook_bridge(
             let _ = request.respond(response);
             continue;
         }
-        let payload = parse_json_body(&mut request).unwrap_or_else(|_| serde_json::json!({}));
+        let payload = match parse_json_body(&mut request) {
+            Ok(payload) => payload,
+            Err(err) => {
+                eprintln!("{name} bridge malformed JSON payload: {err}");
+                let response = Response::from_string("bad request: malformed JSON body")
+                    .with_status_code(400);
+                let _ = request.respond(response);
+                continue;
+            }
+        };
         if let Some(challenge) = payload.get("challenge").and_then(|v| v.as_str()) {
             let response = Response::from_string(challenge.to_string());
             let _ = request.respond(response);

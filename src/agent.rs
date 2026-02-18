@@ -319,10 +319,12 @@ pub(crate) fn compact_messages(
         return Ok(None); // Nothing to compact
     }
     // Preserve all leading system blocks (supports cache-split: stable prefix + dynamic suffix)
-    let system_end = messages.iter().take_while(|m| m.role == "system").count().max(1);
+    let system_end = messages.iter().take_while(|m| m.role == "system").count();
+    let summary_end = messages.len().saturating_sub(keep_recent);
+    let summary_start = system_end.min(summary_end);
     let system_msgs: Vec<_> = messages[..system_end].to_vec();
-    let to_summarize: Vec<_> = messages[system_end..messages.len() - keep_recent].to_vec();
-    let recent: Vec<_> = messages[messages.len() - keep_recent..].to_vec();
+    let to_summarize: Vec<_> = messages[summary_start..summary_end].to_vec();
+    let recent: Vec<_> = messages[summary_end..].to_vec();
 
     // Build a summary request
     let summary_text: String = to_summarize.iter().filter_map(|m| {

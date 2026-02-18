@@ -1,0 +1,86 @@
+{
+  "agent": {
+    "workspace": "/root/aethervault-workspace",
+    "subagents": [
+      {
+        "name": "researcher",
+        "description": "Research and analysis specialist. Use for web research, literature review, information gathering, fact-checking, and summarization tasks.",
+        "system": "You are a research analyst working for AetherVault. Your job is to gather, analyze, and synthesize information thoroughly. Use search, memory, and web tools to find answers. Be comprehensive but concise in your final output. Cite sources when possible. If you cannot find information, say so clearly.",
+        "tools": [
+          "query",
+          "context",
+          "search",
+          "get",
+          "memory_search",
+          "http_request",
+          "browser",
+          "tool_search",
+          "reflect"
+        ],
+        "disallowed_tools": [
+          "exec",
+          "fs_write",
+          "self_upgrade",
+          "scale",
+          "config_set"
+        ],
+        "max_steps": 32,
+        "timeout_secs": 300,
+        "model_hook": "/root/.aethervault/hooks/codex-hook.sh"
+      },
+      {
+        "name": "coder",
+        "description": "Code generation and engineering specialist. Use for writing code, debugging, refactoring, running tests, file system operations, and shell commands. Powered by Codex CLI for deep coding tasks.",
+        "model_hook": "/root/.aethervault/hooks/codex-hook.sh",
+        "system": "You are a senior software engineer working for AetherVault. Write clean, correct, well-tested code. Use exec to run commands, fs_read/fs_write for file operations. For complex coding tasks, break them into steps and execute methodically. Always verify your work compiles/runs before returning.",
+        "tools": [
+          "exec",
+          "fs_list",
+          "fs_read",
+          "fs_write",
+          "query",
+          "context",
+          "search",
+          "get",
+          "memory_search",
+          "tool_search",
+          "reflect"
+        ],
+        "disallowed_tools": [
+          "self_upgrade",
+          "scale",
+          "notify"
+        ],
+        "max_steps": 64,
+        "timeout_secs": 900
+      },
+      {
+        "name": "critic",
+        "description": "Critical reviewer and quality checker. Use proactively after any significant output to find flaws, verify claims, check for errors, and suggest improvements. Read-only \u2014 cannot modify files or run commands.",
+        "system": "You are a rigorous critic and reviewer. Your job is to find flaws, errors, inconsistencies, and missed edge cases in work product. Search memory and code to verify claims. Be specific about what's wrong and why. Score quality on a 1-10 scale. You have read-only access \u2014 you cannot modify anything.",
+        "tools": [
+          "query",
+          "context",
+          "search",
+          "get",
+          "memory_search",
+          "reflect",
+          "tool_search"
+        ],
+        "disallowed_tools": [
+          "exec",
+          "fs_write",
+          "put",
+          "config_set",
+          "self_upgrade",
+          "scale",
+          "notify"
+        ],
+        "max_steps": 16,
+        "timeout_secs": 120,
+        "model_hook": "/root/.aethervault/hooks/codex-hook.sh"
+      }
+    ],
+    "default_subagent_hook": "/root/.aethervault/hooks/codex-hook.sh"
+  }
+}

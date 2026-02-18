@@ -238,7 +238,6 @@ pub(crate) struct AgentConfig {
     #[serde(default)]
     /// Default model hook for dynamically spawned subagents that don't match
     /// a named config entry. Enables ad-hoc agent creation without pre-configuration.
-    #[serde(default)]
     pub(crate) default_subagent_hook: Option<String>,
     #[serde(default)]
     pub(crate) subagents: Vec<SubagentSpec>,

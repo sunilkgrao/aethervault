@@ -14,6 +14,8 @@ rayon = "1.10.0"
 tokio = { version = "1.44.0", features = ["rt-multi-thread", "macros"] }
 walkdir = "2.5.0"
 ureq = { version = "2.10.1", default-features = false, features = ["json", "tls"] }
+tungstenite = { version = "0.26.2", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "blocking", "rustls-tls", "multipart"] }
 tiny_http = "0.12.0"
 url = "2.5.4"
 urlencoding = "2.1.3"

@@ -1,12 +1,15 @@
+#[allow(unused_imports)]
 use std::collections::HashMap;
+#[allow(unused_imports)]
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fs;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json;
+use url::Url;
 
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,13 +17,32 @@ use base64::Engine;
 
 use crate::{
     AgentProgress, BridgeAgentConfig, CompletionEvent, ActiveRun,
-    ContinuationCheckpoint,
     SessionTurn, load_session_turns, save_session_turns,
-    run_agent_with_prompt, try_handle_approval_chat, env_optional,
+    run_agent_with_prompt, try_handle_approval_chat,
 };
 
-// 2 minutes — prevents hanging on unresponsive external services
-const NO_TIMEOUT_MS: u64 = 120_000;
+const NO_TIMEOUT_MS: u64 = u64::MAX;
+
+fn parse_telegram_token(base_url: &str) -> Option<String> {
+    let parsed = Url::parse(base_url).ok()?;
+    let mut segments = parsed.path_segments()?;
+    while let Some(segment) = segments.next() {
+        if segment == "bot" {
+            if let Some(next_segment) = segments.next() {
+                if !next_segment.is_empty() {
+                    return Some(next_segment.to_string());
+                }
+            }
+            continue;
+        }
+        if let Some(token) = segment.strip_prefix("bot") {
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TelegramUpdateResponse {
@@ -134,14 +156,6 @@ pub(crate) struct TelegramDocument {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub(crate) struct TelegramVideoNote {
-    pub(crate) file_id: String,
-    #[serde(default)]
-    pub(crate) duration: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct TelegramMessage {
     pub(crate) chat: TelegramChat,
     #[serde(default)]
@@ -161,8 +175,6 @@ pub(crate) struct TelegramMessage {
     #[serde(default)]
     pub(crate) document: Option<TelegramDocument>,
     #[serde(default)]
-    pub(crate) video_note: Option<TelegramVideoNote>,
-    #[serde(default)]
     pub(crate) sticker: Option<TelegramSticker>,
     #[serde(default)]
     pub(crate) contact: Option<TelegramContact>,
@@ -179,84 +191,127 @@ pub(crate) struct TelegramChat {
     pub(crate) id: i64,
 }
 
-pub(crate) fn telegram_download_file_bytes(agent: &ureq::Agent, base_url: &str, file_id: &str) -> Result<(Vec<u8>, String), String> {
+pub(crate) fn telegram_download_file_bytes(agent: &ureq::Agent, base_url: &str, file_id: &str) -> Option<(Vec<u8>, String)> {
     let url = format!("{base_url}/getFile");
     let payload = serde_json::json!({"file_id": file_id});
-    let resp = agent.post(&url)
+    eprintln!("[telegram/download] Resolving Telegram file_id={file_id}");
+    let resp = match agent.post(&url)
         .set("content-type", "application/json")
-        .send_json(payload)
-        .map_err(|e| format!("getFile API failed: {e}"))?;
-    let data: serde_json::Value = resp.into_json()
-        .map_err(|e| format!("getFile response parse failed: {e}"))?;
-    let file_path = data["result"]["file_path"].as_str()
-        .ok_or_else(|| format!("getFile missing file_path: {}",
-            serde_json::to_string(&data).unwrap_or_default().chars().take(300).collect::<String>()))?;
-    let token_part = base_url.split("/bot").last()
-        .ok_or_else(|| "cannot extract token from base_url".to_string())?;
-    let api_base = std::env::var("TELEGRAM_API_BASE")
-        .unwrap_or_else(|_| "https://api.telegram.org".to_string());
-    let download_url = format!("{api_base}/file/bot{token_part}/{file_path}");
-    let dl_resp = agent.get(&download_url).call()
-        .map_err(|e| format!("file download failed: {e}"))?;
+        .send_json(payload) {
+            Ok(resp) => resp,
+            Err(err) => {
+                eprintln!("[telegram/download] getFile request failed for file_id={file_id}: {err}");
+                return None;
+            }
+        };
+    if resp.status() != 200 {
+        eprintln!("[telegram/download] getFile returned HTTP {} for file_id={file_id}", resp.status());
+    }
+    let data: serde_json::Value = match resp.into_json() {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("[telegram/download] Failed to parse getFile response for file_id={file_id}: {err}");
+            return None;
+        }
+    };
+    if !data.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        eprintln!("[telegram/download] getFile returned ok=false for file_id={file_id}: {data}");
+        return None;
+    }
+    let Some(file_path) = data["result"]["file_path"].as_str() else {
+        eprintln!("[telegram/download] getFile missing file_path for file_id={file_id}: {data}");
+        return None;
+    };
+    let decoded_file_path = urlencoding::decode(file_path).ok()?.into_owned();
+    let token_part = parse_telegram_token(base_url)?;
+    let api_base = if let Ok(base) = std::env::var("TELEGRAM_API_BASE") {
+        base
+    } else {
+        "https://api.telegram.org".to_string()
+    };
+    let download_url = format!("{api_base}/file/bot{token_part}/{decoded_file_path}");
+    let dl_resp = match agent.get(&download_url).call() {
+        Ok(resp) => resp,
+        Err(err) => {
+            eprintln!("[telegram/download] File download request failed for file_id={file_id} path={file_path}: {err}");
+            return None;
+        }
+    };
+    if dl_resp.status() != 200 {
+        eprintln!("[telegram/download] File download returned HTTP {} for file_id={file_id}", dl_resp.status());
+    }
     let content_type = dl_resp.header("content-type")
         .unwrap_or("application/octet-stream").to_string();
     let mut bytes = Vec::new();
-    dl_resp.into_reader().take(20_000_000).read_to_end(&mut bytes)
-        .map_err(|e| format!("file read failed: {e}"))?;
-    if bytes.is_empty() {
-        return Err("downloaded file is 0 bytes".to_string());
+    if let Err(err) = dl_resp.into_reader().take(20_000_000).read_to_end(&mut bytes) {
+        eprintln!("[telegram/download] Failed to read file bytes for file_id={file_id}: {err}");
+        return None;
     }
-    Ok((bytes, content_type))
+    if bytes.is_empty() {
+        eprintln!("[telegram/download] Empty file bytes for file_id={file_id}");
+        return None;
+    }
+    eprintln!("[telegram/download] file_id={file_id} downloaded {} bytes (ct={})", bytes.len(), content_type);
+    Some((bytes, content_type))
 }
 
-pub(crate) fn transcribe_audio_deepgram(audio_bytes: &[u8], mime_type: &str) -> Result<String, String> {
-    let api_key = std::env::var("DEEPGRAM_API_KEY")
-        .map_err(|_| "DEEPGRAM_API_KEY not set".to_string())?;
+pub(crate) fn transcribe_audio_deepgram(audio_bytes: &[u8], mime_type: &str) -> Option<String> {
+    let api_key = match std::env::var("DEEPGRAM_API_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            eprintln!("[deepgram] DEEPGRAM_API_KEY env var not set");
+            return None;
+        }
+    };
     if api_key.trim().is_empty() {
-        return Err("DEEPGRAM_API_KEY is empty".to_string());
+        eprintln!("[deepgram] DEEPGRAM_API_KEY env var is empty");
+        return None;
     }
     let agent = ureq::AgentBuilder::new()
-        .timeout_read(Duration::from_secs(120))
-        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_millis(NO_TIMEOUT_MS))
+        .timeout_connect(Duration::from_millis(NO_TIMEOUT_MS))
         .build();
-
-    let mut last_err = String::new();
-    for attempt in 0..3u32 {
-        if attempt > 0 {
-            let backoff = Duration::from_millis(1000 * 2u64.pow(attempt));
-            eprintln!("[voice] Deepgram retry {attempt}/2 after: {last_err}");
-            thread::sleep(backoff);
-        }
-        match agent.post("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true")
-            .set("Authorization", &format!("Token {api_key}"))
-            .set("Content-Type", mime_type)
-            .send_bytes(audio_bytes)
-        {
-            Ok(resp) => {
-                let data: serde_json::Value = resp.into_json()
-                    .map_err(|e| format!("Deepgram response parse: {e}"))?;
-                let transcript = data["results"]["channels"][0]["alternatives"][0]["transcript"]
-                    .as_str()
-                    .ok_or_else(|| format!("Deepgram missing transcript: {}",
-                        serde_json::to_string(&data).unwrap_or_default().chars().take(300).collect::<String>()))?;
-                if transcript.trim().is_empty() {
-                    return Err("Deepgram returned empty transcript (silent/too short)".to_string());
-                }
-                return Ok(transcript.to_string());
+    eprintln!("[deepgram] Transcribing audio bytes={} mime={}", audio_bytes.len(), mime_type);
+    let resp = match agent.post("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true")
+        .set("Authorization", &format!("Token {api_key}"))
+        .set("Content-Type", mime_type)
+        .send_bytes(audio_bytes) {
+            Ok(resp) => resp,
+            Err(err) => {
+                eprintln!("[deepgram] Request failed (mime={mime_type}): {err}");
+                return None;
             }
-            Err(ureq::Error::Status(code, resp)) => {
-                let body = resp.into_string().unwrap_or_default();
-                last_err = format!("HTTP {code}: {}", body.chars().take(200).collect::<String>());
-                if code >= 500 || code == 429 { continue; }
-                return Err(format!("Deepgram error: {last_err}"));
-            }
-            Err(e) => {
-                last_err = format!("network: {e}");
-                continue;
-            }
-        }
+        };
+    if resp.status() >= 400 {
+        eprintln!("[deepgram] HTTP {} for mime={mime_type}", resp.status());
     }
-    Err(format!("Deepgram failed after 3 attempts: {last_err}"))
+    let body = match resp.into_string() {
+        Ok(body) => body,
+        Err(err) => {
+            eprintln!("[deepgram] Failed reading response body for mime={mime_type}: {err}");
+            return None;
+        }
+    };
+    let data: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("[deepgram] Failed parsing response JSON for mime={mime_type}: {err}. Body: {}", body.chars().take(1000).collect::<String>());
+            return None;
+        }
+    };
+    let transcript = data.get("results")
+        .and_then(|r| r.get("channels"))
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("alternatives"))
+        .and_then(|a| a.get(0))
+        .and_then(|a| a.get("transcript"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())?;
+    if transcript.trim().is_empty() {
+        eprintln!("[deepgram] Transcript empty for mime={mime_type}. Raw: {}", body.chars().take(1000).collect::<String>());
+        return None;
+    }
+    Some(transcript)
 }
 
 pub(crate) fn guess_image_media_type(ct: &str, file_path: &str) -> String {
@@ -268,20 +323,32 @@ pub(crate) fn guess_image_media_type(ct: &str, file_path: &str) -> String {
     "image/jpeg".to_string()
 }
 
+fn normalize_mime_for_deepgram(raw_mime: &str) -> String {
+    let base = raw_mime
+        .split(';')
+        .next()
+        .unwrap_or(raw_mime)
+        .trim()
+        .to_lowercase();
+    if base.is_empty() { "audio/ogg".to_string() } else { base }
+}
+
 /// Extract content from a Telegram update. Returns (chat_id, message_id, text).
 /// For photos, the text will contain an [AV_IMAGE:base64:media_type:DATA] marker.
 /// For voice/audio, the transcription is prepended to any caption/text.
 pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Agent, base_url: &str) -> Option<(i64, Option<i64>, String)> {
     // Handle callback queries (inline keyboard presses)
     if let Some(cb) = &update.callback_query {
-        if let Some(data) = &cb.data {
-            let chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(0);
-            let user_name = cb.from.as_ref()
-                .and_then(|u| u.first_name.clone())
-                .unwrap_or_else(|| "User".to_string());
-            let msg_id = cb.message.as_ref().and_then(|m| m.message_id);
-            return Some((chat_id, msg_id, format!("[Callback button pressed by {user_name}]: {data}")));
+        if let Some(msg) = cb.message.as_ref() {
+            if let Some(data) = &cb.data {
+                let user_name = cb.from.as_ref()
+                    .and_then(|u| u.first_name.clone())
+                    .unwrap_or_else(|| "User".to_string());
+                let msg_id = msg.message_id;
+                return Some((msg.chat.id, msg_id, format!("[Callback button pressed by {user_name}]: {data}")));
+            }
         }
+        return None;
     }
 
     let msg = update
@@ -344,166 +411,128 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
         if !photos.is_empty() {
             // Telegram sends multiple sizes; pick the largest (last in array)
             let best = photos.iter().max_by_key(|p| p.file_size.unwrap_or(0))?;
-            match telegram_download_file_bytes(agent, base_url, &best.file_id) {
-                Ok((bytes, ct)) => {
-                    let media_type = guess_image_media_type(&ct, &best.file_id);
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                    let marker = format!("[AV_IMAGE:{}:{}]", media_type, b64);
-                    let text = if base_text.trim().is_empty() {
-                        format!("{marker}\nDescribe what you see in this image.")
-                    } else {
-                        format!("{marker}\n{base_text}")
-                    };
-                    return Some((chat_id, msg_id, text));
-                }
-                Err(e) => {
-                    eprintln!("[photo] download failed: {e}");
-                    let text = if base_text.trim().is_empty() {
-                        format!("[User sent a photo but it could not be downloaded: {e}]")
-                    } else {
-                        format!("[User sent a photo but it could not be downloaded: {e}]\n{base_text}")
-                    };
-                    return Some((chat_id, msg_id, text));
-                }
+            if let Some((bytes, ct)) = telegram_download_file_bytes(agent, base_url, &best.file_id) {
+                let media_type = guess_image_media_type(&ct, &best.file_id);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let marker = format!("[AV_IMAGE:{}:{}]", media_type, b64);
+                let text = if base_text.trim().is_empty() {
+                    format!("{marker}\nDescribe what you see in this image.")
+                } else {
+                    format!("{marker}\n{base_text}")
+                };
+                return Some((chat_id, msg_id, text));
             }
+            // Download failed, fall through to caption/text
+            let text = if base_text.trim().is_empty() {
+                "[User sent a photo but it could not be downloaded]".to_string()
+            } else {
+                format!("[User sent a photo but it could not be downloaded]\n{base_text}")
+            };
+            return Some((chat_id, msg_id, text));
         }
     }
 
     // Handle voice messages
     if let Some(voice) = &msg.voice {
-        let duration_s = voice.duration.unwrap_or(0);
-        let mime = voice.mime_type.clone().unwrap_or_else(|| "audio/ogg".to_string());
-        eprintln!("[voice] received: file_id={} duration={duration_s}s mime={mime}", voice.file_id);
-
-        match telegram_download_file_bytes(agent, base_url, &voice.file_id) {
-            Ok((bytes, _ct)) => {
-                let size_kb = bytes.len() / 1024;
-                eprintln!("[voice] downloaded {size_kb}KB");
-
-                // Persist audio before transcription attempt
-                let ts = SystemTime::now().duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis()).unwrap_or(0);
-                let tmp_path = format!("/tmp/voice_{ts}.ogg");
-                if let Err(e) = std::fs::write(&tmp_path, &bytes) {
-                    eprintln!("[voice] WARNING: persist failed: {e}");
-                }
-
-                match transcribe_audio_deepgram(&bytes, &mime) {
-                    Ok(transcript) => {
-                        eprintln!("[voice] transcribed OK ({} chars)", transcript.len());
-                        let _ = std::fs::remove_file(&tmp_path);
-                        let text = if base_text.trim().is_empty() {
-                            format!("[Voice message transcription]: {transcript}")
-                        } else {
-                            format!("[Voice message transcription]: {transcript}\n\nUser also wrote: {base_text}")
-                        };
-                        return Some((chat_id, msg_id, text));
-                    }
-                    Err(e) => {
-                        eprintln!("[voice] transcription FAILED: {e} (saved: {tmp_path})");
-                        return Some((chat_id, msg_id, format!(
-                            "[User sent a {duration_s}s voice message but transcription failed: {e}]"
-                        )));
-                    }
-                }
+        let raw_mime = voice.mime_type.clone().unwrap_or_else(|| "audio/ogg".to_string());
+        let mime = normalize_mime_for_deepgram(&raw_mime);
+        eprintln!("[telegram/extract] Voice message chat_id={chat_id} msg_id={:?} file_id={} raw_mime={raw_mime} normalized_mime={mime}", msg.message_id, voice.file_id);
+        if let Some((bytes, ct)) = telegram_download_file_bytes(agent, base_url, &voice.file_id) {
+            eprintln!("[telegram/extract] Voice download complete chat_id={chat_id} bytes={} ct={ct}", bytes.len());
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+            let timestamp_millis = now.as_millis();
+            let timestamp_iso = chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + now).to_rfc3339();
+            let sample_dir = "/root/.aethervault/workspace/voice-samples";
+            if let Err(e) = fs::create_dir_all(sample_dir) {
+                eprintln!("Failed to create voice samples directory {sample_dir}: {e}");
             }
-            Err(e) => {
-                eprintln!("[voice] download FAILED: {e}");
-                return Some((chat_id, msg_id, format!(
-                    "[User sent a {duration_s}s voice message but download failed: {e}]"
-                )));
+            let audio_path = format!("{sample_dir}/voice_{timestamp_millis}.ogg");
+            if let Err(e) = fs::write(&audio_path, &bytes) {
+                eprintln!("Failed to save voice audio file {audio_path}: {e}");
+            } else {
+                eprintln!("Saved voice audio file {audio_path} ({} bytes)", bytes.len());
             }
+            let meta_path = format!("{sample_dir}/voice_{timestamp_millis}.json");
+            let meta = serde_json::json!({
+                "file_id": &voice.file_id,
+                "mime_type": &raw_mime,
+                "duration": voice.duration,
+                "timestamp": timestamp_iso,
+            });
+            if let Err(e) = fs::write(&meta_path, meta.to_string()) {
+                eprintln!("Failed to save voice metadata file {meta_path}: {e}");
+            } else {
+                eprintln!("Saved voice metadata file {meta_path}");
+            }
+            if let Some(transcript) = transcribe_audio_deepgram(&bytes, &mime) {
+                let text = if base_text.trim().is_empty() {
+                    format!("[Voice message transcription]: {transcript}")
+                } else {
+                    format!("[Voice message transcription]: {transcript}\n\nUser also wrote: {base_text}")
+                };
+                eprintln!("[telegram/extract] Voice transcription success chat_id={chat_id} chars={}", transcript.chars().count());
+                return Some((chat_id, msg_id, text));
+            }
+            eprintln!("[telegram/extract] Voice transcription None for chat_id={chat_id} msg_id={:?}", msg.message_id);
+            return Some((chat_id, msg_id, "[User sent a voice message but transcription failed]".to_string()));
         }
+        eprintln!("[telegram/extract] Voice download failed for chat_id={chat_id} msg_id={:?}", msg.message_id);
+        return Some((chat_id, msg_id, "[User sent a voice message but it could not be downloaded]".to_string()));
     }
 
     // Handle audio files
     if let Some(audio) = &msg.audio {
-        let duration_s = audio.duration.unwrap_or(0);
-        let mime = audio.mime_type.clone().unwrap_or_else(|| "audio/mpeg".to_string());
+        let raw_mime = audio.mime_type.clone().unwrap_or_else(|| "audio/mpeg".to_string());
+        let mime = normalize_mime_for_deepgram(&raw_mime);
         let title_note = audio.title.as_deref().map(|t| format!(" (title: {t})")).unwrap_or_default();
-        eprintln!("[audio] received: file_id={} duration={duration_s}s mime={mime}{title_note}", audio.file_id);
-
-        match telegram_download_file_bytes(agent, base_url, &audio.file_id) {
-            Ok((bytes, _ct)) => {
-                let size_kb = bytes.len() / 1024;
-                eprintln!("[audio] downloaded {size_kb}KB");
-
-                // Persist audio before transcription attempt
-                let ts = SystemTime::now().duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis()).unwrap_or(0);
-                let ext = if mime.contains("ogg") { "ogg" } else { "mp3" };
-                let tmp_path = format!("/tmp/audio_{ts}.{ext}");
-                if let Err(e) = std::fs::write(&tmp_path, &bytes) {
-                    eprintln!("[audio] WARNING: persist failed: {e}");
-                }
-
-                match transcribe_audio_deepgram(&bytes, &mime) {
-                    Ok(transcript) => {
-                        eprintln!("[audio] transcribed OK ({} chars)", transcript.len());
-                        let _ = std::fs::remove_file(&tmp_path);
-                        let text = format!("[Audio{title_note} transcription]: {transcript}");
-                        return Some((chat_id, msg_id, text));
-                    }
-                    Err(e) => {
-                        eprintln!("[audio] transcription FAILED: {e} (saved: {tmp_path})");
-                        return Some((chat_id, msg_id, format!(
-                            "[User sent a {duration_s}s audio file{title_note} but transcription failed: {e}]"
-                        )));
-                    }
-                }
+        if let Some((bytes, _ct)) = telegram_download_file_bytes(agent, base_url, &audio.file_id) {
+            eprintln!("[telegram/extract] Audio message chat_id={chat_id} msg_id={:?} file_id={} raw_mime={raw_mime} normalized_mime={mime}", msg.message_id, audio.file_id);
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+            let timestamp_millis = now.as_millis();
+            let timestamp_iso = chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + now).to_rfc3339();
+            let sample_dir = "/root/.aethervault/workspace/voice-samples";
+            if let Err(e) = fs::create_dir_all(sample_dir) {
+                eprintln!("Failed to create voice samples directory {sample_dir}: {e}");
             }
-            Err(e) => {
-                eprintln!("[audio] download FAILED: {e}");
-                return Some((chat_id, msg_id, format!(
-                    "[User sent an audio file{title_note} but download failed: {e}]"
-                )));
+            let ext = if mime == "audio/mpeg" {
+                "mp3"
+            } else if mime == "audio/ogg" {
+                "ogg"
+            } else if mime == "audio/mp4" {
+                "m4a"
+            } else if let Some(suffix) = mime.strip_prefix("audio/") {
+                suffix
+            } else {
+                "bin"
+            };
+            let audio_path = format!("{sample_dir}/audio_{timestamp_millis}.{ext}");
+            if let Err(e) = fs::write(&audio_path, &bytes) {
+                eprintln!("Failed to save audio file {audio_path}: {e}");
+            } else {
+                eprintln!("Saved audio file {audio_path} ({} bytes)", bytes.len());
             }
+            let meta_path = format!("{sample_dir}/audio_{timestamp_millis}.json");
+            let meta = serde_json::json!({
+                "file_id": &audio.file_id,
+                "mime_type": &raw_mime,
+                "duration": audio.duration,
+                "timestamp": timestamp_iso,
+            });
+            if let Err(e) = fs::write(&meta_path, meta.to_string()) {
+                eprintln!("Failed to save audio metadata file {meta_path}: {e}");
+            } else {
+                eprintln!("Saved audio metadata file {meta_path}");
+            }
+            if let Some(transcript) = transcribe_audio_deepgram(&bytes, &mime) {
+                let text = format!("[Audio{title_note} transcription]: {transcript}");
+                eprintln!("[telegram/extract] Audio transcription success chat_id={chat_id} chars={}", transcript.chars().count());
+                return Some((chat_id, msg_id, text));
+            }
+            eprintln!("[telegram/extract] Audio transcription failed for chat_id={chat_id} msg_id={:?}", msg.message_id);
+            return Some((chat_id, msg_id, format!("[User sent an audio file{title_note} but transcription failed]")));
         }
-    }
-
-    // Handle video notes (circular video messages — contain audio worth transcribing)
-    if let Some(vn) = &msg.video_note {
-        let duration_s = vn.duration.unwrap_or(0);
-        eprintln!("[video_note] received: file_id={} duration={duration_s}s", vn.file_id);
-
-        match telegram_download_file_bytes(agent, base_url, &vn.file_id) {
-            Ok((bytes, _ct)) => {
-                let size_kb = bytes.len() / 1024;
-                eprintln!("[video_note] downloaded {size_kb}KB");
-
-                let ts = SystemTime::now().duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis()).unwrap_or(0);
-                let tmp_path = format!("/tmp/videonote_{ts}.mp4");
-                if let Err(e) = std::fs::write(&tmp_path, &bytes) {
-                    eprintln!("[video_note] WARNING: persist failed: {e}");
-                }
-
-                match transcribe_audio_deepgram(&bytes, "video/mp4") {
-                    Ok(transcript) => {
-                        eprintln!("[video_note] transcribed OK ({} chars)", transcript.len());
-                        let _ = std::fs::remove_file(&tmp_path);
-                        let text = if base_text.trim().is_empty() {
-                            format!("[Video note transcription]: {transcript}")
-                        } else {
-                            format!("[Video note transcription]: {transcript}\n\nUser also wrote: {base_text}")
-                        };
-                        return Some((chat_id, msg_id, text));
-                    }
-                    Err(e) => {
-                        eprintln!("[video_note] transcription FAILED: {e} (saved: {tmp_path})");
-                        return Some((chat_id, msg_id, format!(
-                            "[User sent a {duration_s}s video note but transcription failed: {e}]"
-                        )));
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[video_note] download FAILED: {e}");
-                return Some((chat_id, msg_id, format!(
-                    "[User sent a {duration_s}s video note but download failed: {e}]"
-                )));
-            }
-        }
+        eprintln!("[telegram/extract] Audio download failed for chat_id={chat_id} msg_id={:?}", msg.message_id);
+        return Some((chat_id, msg_id, format!("[User sent an audio file{title_note} but it could not be downloaded]")));
     }
 
     // Handle documents (text-based ones)
@@ -520,21 +549,16 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
             || fname.ends_with(".sh") || fname.ends_with(".yaml")
             || fname.ends_with(".yml") || fname.ends_with(".toml");
         if is_text {
-            match telegram_download_file_bytes(agent, base_url, &doc.file_id) {
-                Ok((bytes, _ct)) => {
-                    if let Ok(text_content) = String::from_utf8(bytes) {
-                        let truncated = if text_content.len() > 50000 {
-                            let safe: String = text_content.chars().take(50000).collect();
-                            format!("{safe}\n... (truncated, {} total chars)", text_content.chars().count())
-                        } else {
-                            text_content
-                        };
-                        let text = format!("[Document: {fname}]\n```\n{truncated}\n```\n\n{base_text}");
-                        return Some((chat_id, msg_id, text));
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[doc] download failed for {fname}: {e}");
+            if let Some((bytes, _ct)) = telegram_download_file_bytes(agent, base_url, &doc.file_id) {
+                if let Ok(text_content) = String::from_utf8(bytes) {
+                    let truncated = if text_content.len() > 50000 {
+                        let safe: String = text_content.chars().take(50000).collect();
+                        format!("{safe}\n... (truncated, {} total chars)", text_content.chars().count())
+                    } else {
+                        text_content
+                    };
+                    let text = format!("[Document: {fname}]\n```\n{truncated}\n```\n\n{base_text}");
+                    return Some((chat_id, msg_id, text));
                 }
             }
         }
@@ -579,6 +603,59 @@ pub(crate) fn split_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+#[allow(dead_code)]
+pub(crate) fn telegram_send_message_returning_id(
+    agent: &ureq::Agent,
+    base_url: &str,
+    chat_id: i64,
+    text: &str,
+) -> Option<i64> {
+    let url = format!("{base_url}/sendMessage");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+    });
+    match agent.post(&url).set("content-type", "application/json").send_json(payload) {
+        Ok(resp) => {
+            if let Ok(body) = resp.into_json::<serde_json::Value>() {
+                body.get("result")
+                    .and_then(|r| r.get("message_id"))
+                    .and_then(|v| v.as_i64())
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn telegram_edit_message(
+    agent: &ureq::Agent,
+    base_url: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) {
+    let url = format!("{base_url}/editMessageText");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    });
+    let _ = agent.post(&url).set("content-type", "application/json").send_json(payload);
+}
+
+#[allow(dead_code)]
+pub(crate) fn telegram_delete_message(agent: &ureq::Agent, base_url: &str, chat_id: i64, message_id: i64) {
+    let url = format!("{base_url}/deleteMessage");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+    });
+    let _ = agent.post(&url).set("content-type", "application/json").send_json(payload);
+}
+
 pub(crate) fn telegram_send_typing(agent: &ureq::Agent, base_url: &str, chat_id: i64) {
     let url = format!("{base_url}/sendChatAction");
     let payload = serde_json::json!({
@@ -599,6 +676,30 @@ pub(crate) fn telegram_answer_callback(agent: &ureq::Agent, base_url: &str, call
     let _ = agent.post(&url)
         .set("content-type", "application/json")
         .send_json(payload);
+}
+
+#[allow(dead_code)]
+pub(crate) fn escape_markdown_v2(text: &str) -> String {
+    let special = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+    let mut out = String::with_capacity(text.len() * 2);
+    let in_code_block = false;
+    let mut in_inline_code = false;
+    for ch in text.chars() {
+        if ch == '`' {
+            in_inline_code = !in_inline_code;
+            out.push(ch);
+            continue;
+        }
+        if in_inline_code || in_code_block {
+            out.push(ch);
+            continue;
+        }
+        if special.contains(&ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 pub(crate) fn telegram_send_message(
@@ -685,10 +786,10 @@ pub(crate) fn spawn_agent_run(
         checkpoint_response: None,
         extended_max_steps: None,
         interim_messages: Vec::new(),
-        first_ack_sent: false,
         opus_steps: 0,
         delegated_steps: 0,
         steering_messages: Vec::new(),
+        first_ack_sent: false,
     }));
 
     // Worker thread -- calls run_agent_with_prompt directly (no middle thread)
@@ -878,89 +979,6 @@ pub(crate) fn handle_telegram_completion(
         }
     };
 
-    // Self-continuation: check for continuation marker and auto-chain
-    let max_chain_depth: usize = env_optional("AGENT_MAX_CHAIN_DEPTH")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
-
-    if let Some(checkpoint_path) = output.strip_prefix("[CONTINUATION_NEEDED:")
-        .and_then(|s| s.strip_suffix(']'))
-    {
-        // Load the checkpoint and spawn a continuation session
-        if let Ok(checkpoint_json) = std::fs::read_to_string(checkpoint_path) {
-            if let Ok(checkpoint) = serde_json::from_str::<ContinuationCheckpoint>(&checkpoint_json) {
-                if checkpoint.chain_depth <= max_chain_depth {
-                    // Send progress message
-                    let _ = telegram_send_message(
-                        http_agent, base_url, chat_id,
-                        &format!("Continuing task (phase {}/{max_chain_depth})...", checkpoint.chain_depth),
-                    );
-
-                    // Build continuation prompt
-                    let key_decisions_str = if checkpoint.key_decisions.is_empty() {
-                        "None recorded yet.".to_string()
-                    } else {
-                        checkpoint.key_decisions.join("\n- ")
-                    };
-                    let continuation_prompt = format!(
-                        "[Continuation from previous session — chain depth {}]\n\n\
-                         ORIGINAL GOAL: {}\n\n\
-                         WHAT WAS DONE:\n{}\n\n\
-                         KEY DECISIONS SO FAR:\n- {}\n\n\
-                         REMAINING WORK:\n{}\n\n\
-                         Total steps so far: {}. Continue working toward the goal.",
-                        checkpoint.chain_depth,
-                        checkpoint.goal,
-                        checkpoint.summary,
-                        key_decisions_str,
-                        checkpoint.remaining_work,
-                        checkpoint.total_steps,
-                    );
-
-                    let continuation_session = format!(
-                        "{}:chain:{}",
-                        checkpoint.session.split(":chain:").next().unwrap_or(&checkpoint.session),
-                        checkpoint.chain_depth,
-                    );
-
-                    let progress = spawn_agent_run(
-                        agent_config,
-                        chat_id,
-                        reply_to_id,
-                        &continuation_prompt,
-                        continuation_session,
-                        completion_tx,
-                        http_agent,
-                        base_url,
-                    );
-
-                    if let Some(run) = active_runs.get_mut(&chat_id) {
-                        run.progress = progress;
-                    } else {
-                        active_runs.insert(chat_id, ActiveRun {
-                            progress,
-                            queued_messages: Vec::new(),
-                        });
-                    }
-                    return;
-                }
-                // Max chain depth reached — fall through to send final output
-                let _ = telegram_send_message(
-                    http_agent, base_url, chat_id,
-                    &format!("Reached maximum chain depth ({max_chain_depth}). Summary of progress:\n{}", checkpoint.summary),
-                );
-                if let Some(run) = active_runs.get_mut(&chat_id) {
-                    if run.queued_messages.is_empty() {
-                        active_runs.remove(&chat_id);
-                    }
-                }
-                return;
-            }
-        }
-        // Checkpoint load failed — send error and fall through
-        eprintln!("[continuation] failed to load checkpoint: {checkpoint_path}");
-    }
-
     // Save conversation turns for session continuity
     let session_id = format!("{}telegram:{chat_id}", agent_config.session_prefix);
     {
@@ -1070,48 +1088,6 @@ pub(crate) fn run_telegram_bridge(
         }
     }
 
-    // Startup capsule health check: run `doctor` to detect and auto-repair
-    // corruption from previous crashes (e.g., mid-commit SIGKILL during deploy).
-    {
-        let vault_path = &agent_config.mv2;
-        if vault_path.exists() {
-            eprintln!("[bridge] running startup capsule health check...");
-            match std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "aethervault".into()))
-                .args(["doctor", &vault_path.to_string_lossy()])
-                .output()
-            {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    if stdout.contains("status: Clean") || stdout.contains("verification: Passed") {
-                        eprintln!("[bridge] capsule health: OK");
-                    } else {
-                        eprintln!("[bridge] capsule health issue detected:\n{}", &stdout[..stdout.len().min(500)]);
-                        // The doctor attempts Tier 2 repair automatically.
-                        // If it still fails, log but continue — the agent can still
-                        // function with read-only access to memory.
-                        if stdout.contains("status: Failed") {
-                            eprintln!("[bridge] WARNING: capsule repair failed — memory writes may be unavailable");
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[bridge] capsule health check failed to run: {e}");
-                }
-            }
-        }
-    }
-
-    // --- SIGTERM graceful shutdown ---
-    // When systemd sends SIGTERM (e.g., during deploy), we stop accepting new messages
-    // and wait for in-progress agent runs to finish their capsule commits before exiting.
-    // This prevents the mid-commit crash that causes capsule corruption.
-    static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
-    extern "C" fn sigterm_handler(_: libc::c_int) {
-        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-    }
-    unsafe { libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t); }
-    eprintln!("[bridge] SIGTERM handler installed for graceful shutdown");
-
     let mut active_runs: HashMap<i64, ActiveRun> = HashMap::new();
     let (completion_tx, completion_rx) = mpsc::channel::<CompletionEvent>();
 
@@ -1119,40 +1095,6 @@ pub(crate) fn run_telegram_bridge(
     let mut last_vault_check = std::time::Instant::now();
     let vault_check_interval = Duration::from_secs(300); // every 5 min
     loop {
-        // Check for SIGTERM — drain active runs, then exit cleanly
-        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-            if active_runs.is_empty() {
-                eprintln!("[bridge] SIGTERM received, no active runs — exiting cleanly");
-                return Ok(());
-            }
-            eprintln!(
-                "[bridge] SIGTERM received, waiting for {} active run(s) to finish...",
-                active_runs.len()
-            );
-            // Drain completions with a hard deadline of 60 seconds
-            let deadline = std::time::Instant::now() + Duration::from_secs(60);
-            while !active_runs.is_empty() && std::time::Instant::now() < deadline {
-                if let Ok(event) = completion_rx.recv_timeout(Duration::from_secs(2)) {
-                    handle_telegram_completion(
-                        event,
-                        &http_agent,
-                        &base_url,
-                        &agent_config,
-                        &mut active_runs,
-                        &completion_tx,
-                    );
-                }
-            }
-            if !active_runs.is_empty() {
-                eprintln!(
-                    "[bridge] SIGTERM deadline: {} run(s) still active, forcing exit",
-                    active_runs.len()
-                );
-            } else {
-                eprintln!("[bridge] SIGTERM: all runs completed, exiting cleanly");
-            }
-            return Ok(());
-        }
         // 0. Periodic vault health check
         if last_vault_check.elapsed() >= vault_check_interval {
             last_vault_check = std::time::Instant::now();
@@ -1255,6 +1197,7 @@ pub(crate) fn run_telegram_bridge(
             }
 
             // Check if there's already an active run for this chat
+            const MAX_QUEUED_PER_CHAT: usize = 5;
             if let Some(run) = active_runs.get_mut(&chat_id) {
                 // Check if user is responding to a checkpoint
                 let lower = user_text.trim().to_lowercase();
@@ -1283,15 +1226,12 @@ pub(crate) fn run_telegram_bridge(
                     }
                     // Not a clear checkpoint response -- treat as queued message
                 }
-                // Inject into the running agent as a steering message.
-                // The agent loop drains these at each step and injects them
-                // as user messages so the LLM can adjust course immediately.
-                // We do NOT also queue them — that would cause double-handling
-                // (once mid-run, once as a new prompt after completion).
-                {
-                    let mut guard = run.progress.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.steering_messages.push(user_text);
+                // Silently queue -- no robotic ack messages.
+                // All queued messages are merged into one prompt on completion.
+                if run.queued_messages.len() < MAX_QUEUED_PER_CHAT {
+                    run.queued_messages.push((user_text, reply_to_id));
                 }
+                // No response sent -- the agent will address everything when it finishes.
                 continue;
             }
 

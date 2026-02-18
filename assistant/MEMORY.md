@@ -73,10 +73,10 @@ macOS VM NOVEL OPTIMIZATIONS deployed (2026-02-14 session). New code-level enhan
 8. **deploy-pgo-qemu.sh** — auto-deploys PGO binary and updates boot script + systemd service
 9. **vm-status.sh** — comprehensive performance dashboard
 10. **qemu-perf-monitor.py** — KVM exit rate analyzer with recommendations
-CODEX CLI NON-INTERACTIVE: Use `codex exec -m gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox "prompt"` for non-interactive Codex invocations. No subagent config needed — just exec tool. The `exec` subcommand replaces interactive mode. Works perfectly.
+## Subagent Routing: For Codex coding tasks, use subagent_invoke(name="coder", prompt="..."). The coder subagent runs Codex CLI internally via its model_hook. Do NOT use exec to spawn codex processes directly.
 BROWSER BROKER DEPLOYED (2026-02-14). Playwright-based HTTP broker on port 4040. Node.js/Express, 3-page pool, Chromium headless. Code at /tmp/browser-broker/dist/index.js (125 lines, hand-written). Supports: goto, click, type, extract, screenshot, evaluate. Systemd service: browser-broker.service. AetherVault browser_request tool now fully functional. 282ms first response. TODO: move code from /tmp to /opt/browser-broker for persistence across reboots.
 BROWSER ARCHITECTURE DECISION (2026-02-14): Current Playwright/Express sidecar moved from /tmp to /opt/browser-broker/, systemd enabled, working at 154ms. Short-term: keep sidecar. Medium-term RIGHT ANSWER: Playwright MCP Server over stdio, spawned as child process from Rust binary. No HTTP, no ports, no separate systemd. Modify Rust binary to speak MCP protocol. Do NOT compile browser into Rust (chromiumoxide/fantoccini lag behind Playwright). Do NOT use managed APIs (latency/cost). Do NOT use browser-use/Stagehand (they want to BE the agent, we just need a browser primitive).
-CODEX INVOCATION FIX (2026-06-15): There is NO codex-yolo hook or model_hook needed. Just spawn a subagent with NO model_hook and have it run the CLI command directly: `codex exec -m gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox "prompt"`. The subagent itself runs the shell command. No special hook configuration required.
+## Subagent Hook: The coder subagent has model_hook=codex-hook.sh configured in config.json. No manual hook setup needed. subagent_invoke(name="coder") automatically routes through Codex CLI.
 DREAMINA/CAPCUT VIDEO MODELS (2026-02-14): dreamina.capcut.com is CapCut's AI video/image platform. Available models: Seedance 2.0 ("Video"), Seedance 1.5 Pro, Seedance 1.0 (Fast/Pro/Mini), Seaweed alpha, Veo 3/3.1 (Google), Sora 2 (OpenAI), Seedream 2.0-5.0 (images), Nano Banana (Google). No public API — requires browser login. Internal API is behind authenticated SPA. JS bundles at sf16-web-tos-buz.capcutcdn-us.com. Main bundle: main.9086ecc2.js (397KB). Also has "seedance_3_0" reference suggesting Seedance 3.0 coming soon.
 macOS VM CRASH FIX (2026-06-15): OOM killed QEMU during install (6GB guest + overhead > 8GB droplet). Fixes: (1) Reduced guest RAM 6G→5G, hugepages 3072→2560. (2) Removed invalid `iothread=iothread-net` from virtio-net-pci (not supported in QEMU 9.0.2). (3) Removed unsupported `+invtsc` CPU flag. VM restarted successfully in tmux session "macos". VNC: 159.223.165.148:5901.
 macOS VM RELAUNCHED (2026-06-15). Droplet ID 551766641, name macos-vm, NEW IP: 134.209.112.229. QEMU running in tmux session "macos" with Penryn CPU, 5GB RAM, 4 cores, OpenCore bootloader, vmxnet3 networking with user-mode NAT (dns=8.8.8.8), VNC :1 (port 5901), SSH guest port 2222. 64GB qcow2 disk created. NAT/ip_forward configured on host. BaseSystem.img = recovery installer. macOS NOT YET INSTALLED — user needs to VNC in, use Disk Utility to format drive as APFS, then install.
@@ -406,7 +406,7 @@ codex-cli-invocation, raodesktop-ssh-access, macos-vm-management, browser-automa
 01-architecture.md (394 lines), 02-memory.md (329 lines), 03-triggers.md (51 lines), 04-skills.md (137 lines), 05-research.md (326 lines), 06-reflection.md (256 lines), 07-compute.md (138 lines), 08-evaluation.md (265 lines), 09-knowledge-graph.md (301 lines), 10-master-plan.md (243 lines). Total: 2,440 lines / 107KB.
 
 ## Key Architecture Decisions:
-- Codex swarm via parallel exec calls (NOT subagent_batch — config doesn't hot-reload)
+- Codex tasks routed via subagent_invoke(name="coder") and subagent_batch for parallel fan-out (3 subagents: researcher, coder, critic)
 - 5 always-on services: Memory Consolidation, Research Engine, Skill Synthesis, KG Growth, Self-Evaluation
 - Event-driven control plane with topic classes: session.lifecycle, consolidation.jobs, research.requests, skill.proposals, kg.updates, eval.results
 - Three-phase rollout: Phase 1 (triggers+skills) DONE, Phase 2 (memory consolidation+reflection loops) THIS WEEK, Phase 3 (GPU compute+fine-tuning) THIS MONTH
@@ -544,8 +544,9 @@ Location: /opt/av-evolution/ (9 scripts, 689 lines total)
 ### raoDesktop Clone: ~/aethervault/ (cloned via HTTPS, read-only). Has full src/ directory.
 
 ### Evolution Pipeline: /opt/av-evolution/ — FIXED to use WORKTREE="/root/.aethervault" (was wrong pointing at rust-src/). review.sh updated to scan src/*.rs files instead of old monolith.
-## BUG: skill_search broken — "Lexical index is not enabled" error. skill_store may work but search doesn't. Needs investigation — likely capsule config issue.## CRITICAL: STOP TRYING subagent_batch/subagent_invoke FOR CODEX
-There are ZERO configured subagents. subagent_list returns empty. NEVER attempt subagent_batch or subagent_invoke — it will ALWAYS fail. The ONLY correct pattern for Codex swarms is parallel `exec` calls with `codex exec -m gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox "prompt"`. This is PERMANENT. Do NOT waste a turn checking subagent_list — just go straight to exec.
+## BUG: skill_search broken — "Lexical index is not enabled" error. skill_store may work but search does not. Needs investigation — likely capsule config issue.
+## Subagent System: OPERATIONAL
+3 subagents configured (researcher, coder, critic). Use subagent_invoke for single delegation, subagent_batch for parallel fan-out. subagent_list confirms availability. For Codex coding tasks, use subagent_invoke(name="coder", prompt="..."). The coder subagent runs Codex CLI internally via its model_hook. Do NOT use exec to spawn codex processes directly.
 BUILD PENDING (2026-02-15): cargo build --release running on AV droplet (PID 468793). Once complete: cp target/release/aethervault /usr/local/bin/aethervault && systemctl restart aethervault. Fixes included: agent.rs (3 bugs), mcp.rs (timeouts+reconnect), 32 cargo warnings, evolution pipeline. All changes compile clean (cargo check passes, 0 warnings).
 ## ARCHITECTURE PRINCIPLE: NO TIMEOUTS, BACKGROUND-FIRST (2026-06-15)
 - Codex sessions should NEVER have timeouts. Let them run hours if needed (8+ hours is acceptable).
@@ -558,3 +559,56 @@ BUILD PENDING (2026-02-15): cargo build --release running on AV droplet (PID 468
 - Investigate Bun as shell/runtime optimization (Claude Code reduced bash overhead with Bun).
 TASK QUEUE: Research Exa.ai (https://exa.ai/) for Personal CRM project — neural search API for finding people, companies, contacts. Evaluate how it can enrich our CRM with real-time web data, LinkedIn profiles, company info, contact discovery. High priority for CRM enrichment layer.TASK QUEUE: Research vercel-labs/just-bash transform pattern (https://github.com/vercel-labs/just-bash/blob/main/src/transform/README.md) for self-improvement. Evaluate how LLM-to-bash transformation patterns can improve our Codex CLI invocations, tool execution, and shell automation quality.
 
+macOS VM CONFIG FIX (2026-02-16): Root cause of boot loop was SAMPLE config.plist ("Do NOT try loading it"). Additionally, opencore-image-ng.sh failed to copy config.plist into the qcow2 image — had to inject manually via guestfish. Production config written at /root/OSX-KVM/OpenCore/config-production.plist. Key settings: iMacPro1,1 SMBIOS, DmgLoading=Any, DummyPowerManagement=true, DisableWatchDog=true, LapicKernelPanic=true, PanicNoKextDump=true, PowerTimeoutKernelPanic=true, SIP disabled (csr=7/8PAA==), boot-args="keepsyms=1 -v tlbto_us=0 vti=9", Debug Target=67. Fresh 64GB disk created. Boot script: boot-production.sh. guestfish (libguestfs-tools) installed for future OpenCore image edits. QEMU PID running stable post-fix. VNC: 134.209.112.229:5901.
+
+## MEMORY ARCHITECTURE OVERHAUL (2026-02-16)
+
+MV2 capsule now ONLY holds semantically searchable knowledge. All waste writes removed:
+
+**Removed from MV2:**
+- Agent turn logs → JSONL only (workspace/logs/agent-YYYY-MM-DD.jsonl)
+- Config persistence → flat JSON file (workspace/config.json), capsule is fallback only
+- Skills → SQLite (workspace/skills.sqlite) with success_rate tracking
+
+**Kept in MV2 (valuable for retrieval):**
+- Observations (quality-gated + blake3 dedup guard)
+- Reflections, SOUL/identity, daily notes, feedback, ingested docs
+
+**New safety nets:**
+- Capsule health check on startup (warn at 50MB, error at 100MB, configurable via CAPSULE_WARN_MB/CAPSULE_MAX_MB)
+- Observation dedup: blake3 hash prevents duplicate writes within same session
+- Config writes go to flat file first, never touch capsule
+
+**Binary:** Commit 9d3bff8, both blue/green slots updated, service running.
+**skill_search bug:** FIXED — skills now in SQLite, no longer depends on lex index.
+**BUILD PENDING note above:** OBSOLETE — build is complete and deployed.
+RESEARCH PROJECT: Qwen3-TTS-12Hz-1.7B-CustomVoice — Custom voice TTS model from Qwen. Setup on raoDesktop. URL: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice. Added 2026-06-16.
+PERSONAL CRM v1 DEPLOYED (2026-02-16). WhatsApp extraction complete: 203 contacts, 145 groups from 353 chats. Data at raoDesktop:/home/sunil/crm-extract/. Files: raw_chats.json (295KB), knowledge_graph.json (191KB), knowledge_graph_final.json (190KB). Enrichment with qwen3:32b running in background (PID 17204, 78/204 done) → will produce knowledge_graph_enriched.json. Key relationships mapped: 17 family, top friends (Amro Amad, Amit Gandhi, Mohamed Ghaleb, Dev Rajendran, Antonio Sciuto, Benjamin Fiechtner, Joseph Sindaha, Maher Charab, Mazin Almusharaf, Samer Salim), 2 vendors. Action items tracked for Dev Rajendran (pending call), Mohamed Ghaleb (catch up), Samer Salim (capital raising), Vivek Ganotra (reconnect). WhatsApp bridge running on raoDesktop port 3001 (server-profile.js, Chrome profile auth). Limitation: only ~15 recent messages per chat (WhatsApp Web cache). Future: deeper history via Google Takeout or phone backup.
+
+SKILLRL + CAPSULE PERF + DELEGATION UPDATE (2026-02-16):
+**Binary:** Commit 6c2e08a deployed to green slot, service running.
+**SkillRL features (arXiv:2602.08234):**
+- R1: Top skills auto-injected into system prompt from skills.sqlite (before KV-cache breakpoint)
+- R2: Background distillation of 1-3 reusable skills from successful runs (5+ tool calls)
+- R3: Background distillation of failure-prevention skills (prefixed AVOID:) from failed runs
+- R4: skill_search results tracked; success/fail recorded via record_skill_use at session end
+- R6: When drift score < 70, top skills injected as behavioral anchors in reminders
+- R5 (capsule dual-write) was implemented then REMOVED — audit found zero capsule readers for skills
+**Capsule performance fixes:**
+- load_feedback_scores: replaced O(n) full-capsule scan with scoped Tantivy search (track:aethervault.feedback + scope prefix)
+- list_config_entries: replaced O(n) scan with scoped search (track:aethervault.config)
+- daily memory export: replaced O(n) scan with scoped search (track:aethervault.memory)
+- trigger_list: changed from with_write_mem to with_read_mem (was taking exclusive lock for read-only)
+- vector temporal filtering: batched frame_by_id lookups instead of N+1 per-hit calls
+**Delegation-first agent prompt:**
+- System prompt now enforces delegate first, audit second — main loop orchestrates, subagents execute
+- Explicit cost model: Opus (expensive) for orchestration, Codex (free) for all heavy work
+- Anti-patterns: don't troubleshoot step-by-step, don't read 5+ files, don't write multi-file changes in main loop
+- Subagents can spawn nested Codex sub-workers for swarm execution at zero marginal cost
+WhatsApp CRM extraction status (2026-02-16): IndexedDB dump completed — 355 chats, 1,681 messages, 10,340 contacts. Files at raoDesktop:/home/sunil/crm-extract/ (deep_history_full.json 416KB, raw_idb_dump.json). Key finding: WhatsApp Web IndexedDB only stores ~15 recent messages per chat. Scrolling up loads older messages into React DOM only, NOT into IndexedDB. To get full history need either: (1) Google Takeout, (2) phone chat export, or (3) DOM scraping while scrolled. Working scripts: wa-idb-extract.js (IDB dump), wa-final.js (search+click+scroll+dump). Chrome headless on raoDesktop with CDP at port 9222, puppeteer-core at /home/sunil/crm-extract/node_modules/.
+VOICEBOX VOICE CLONE WORKING (2026-02-17). Sunil's voice profile created on Voicebox (raoDesktop port 8000). Profile ID: ec8f85d0-6b6a-4d0e-9a3a-c225fbeafade. 3 voice samples uploaded (23s + 22.5s + 21.3s = 66.8s total). Qwen3-TTS 1.7B model loaded on RTX 3090 (4GB VRAM). First generation successful: 4.48s audio in 67.7s. API: POST /generate with {text, profile_id}. Audio download: GET /audio/{generation_id}. Voice samples saved on AV droplet at /root/.aethervault/workspace/voice-samples/ — new voice notes auto-saved by telegram bridge for future sample accumulation.
+SLACK BRIDGE: Code written (1,171 lines slack.rs), wired into mod.rs/cli.rs/Cargo.toml. Build running in background (PID 712233). Needs 3 env vars from Sunil: SLACK_BOT_TOKEN (xoxb-), SLACK_APP_TOKEN (xapp-), SLACK_SIGNING_SECRET. Manifest at /root/.aethervault/workspace/slack-app-manifest.yaml. Voice note support via [VOICE:] prefix → Voicebox API → files.upload. Socket Mode (WebSocket) for real-time events.
+SLACK BRIDGE IS LIVE AND WORKING (confirmed 2026-06-17). Bot name: "Raobot". Workspace: Tribble (T05261TL2EP). Sunil's DM channel: D0AFASN9FFG, Sunil's user ID: U0528KFHAE8. File uploads work via files.getUploadURLExternal → PUT → files.completeUploadExternal (old files.upload is deprecated). Bot token starts with xoxb-5074061682. Env vars are in /root/.secrets/master.env. DO NOT tell Sunil the Slack bridge isn't working — it IS working.
+iMESSAGE CRM PIPELINE RUNNING (2026-02-17). chat.db (560MB, 330K messages) extracted to 1,028 contact files + 424 group chats. Ollama worker (qwen3:8b on raoDesktop RTX 3090) processing all contacts sequentially (~8-14s each, ~2-3hr total). Output: ~/crm-imessage/profiles/*.json on raoDesktop. Cron on AV droplet checks every 15min — when worker finishes, auto-runs ingest_profiles.py which rsyncs profiles back and stores in capsule as crm://imessage/ frames (track: crm.imessage, kind: crm-profile). Scripts: extract_conversations.py (done), ollama_analyze.py (running on raoDesktop), ingest_profiles.py (ready on AV), check_and_ingest.sh (cron). Conversation data at /root/.aethervault/workspace/crm-imessage/conversations/ (28MB). Group chats not yet analyzed — future task.
+IDENTITY: My name is Linus. This is permanent and non-negotiable. Always refer to myself as Linus, not AetherVault or AV.
+CODEX MODEL ENFORCEMENT (2026-02-17): gpt-5.3-codex-spark is now hardcoded in ALL active configs and scripts. Verified locations: (1) AV ~/.codex/config.toml + config.json, (2) raoDesktop ~/.codex/config.toml, (3) codex-model-hook.py line 335, (4) analyze_batch.py, (5) evolution review.sh + propose.sh, (6) research-engine/research.py, (7) self-eval/*.py, (8) av-content-agent/server.py. This is PERMANENT and NON-NEGOTIABLE. Never use any other Codex model.

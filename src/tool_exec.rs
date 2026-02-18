@@ -521,6 +521,7 @@ use crate::{
     ToolSkillSearchArgs,
     ToolSubagentInvokeArgs,
     ToolSubagentBatchArgs,
+    SubagentSpec,
     ToolGmailListArgs,
     ToolGmailReadArgs,
     ToolGmailSendArgs,
@@ -544,6 +545,9 @@ use crate::{
 
 const EXEC_BACKGROUND_THRESHOLD_MS: u64 = 300_000;
 const DEFAULT_EXEC_BG_URL: &str = "http://127.0.0.1:8082";
+const DEFAULT_SUBAGENT_HOOK: &str = "codex-hook.sh";
+const DEFAULT_SUBAGENT_MAX_STEPS: usize = 64;
+const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 600;
 
 fn background_exec_job_name(command: &str) -> String {
     let short: String = command.chars().take(80).collect();
@@ -2223,39 +2227,39 @@ pub(crate) fn execute_tool_with_handles(
                 })?
             };
             let subagents = load_subagents_from_config(&config);
+            let default_hook = DEFAULT_SUBAGENT_HOOK.to_string();
+            let synth_spec = SubagentSpec {
+                name: parsed.name.clone(),
+                description: None,
+                system: None,
+                model_hook: Some(default_hook),
+                tools: Vec::new(),
+                disallowed_tools: Vec::new(),
+                max_steps: Some(DEFAULT_SUBAGENT_MAX_STEPS),
+                timeout_secs: Some(DEFAULT_SUBAGENT_TIMEOUT_SECS),
+            };
+            let spec = subagents
+                .iter()
+                .find(|s| s.name == parsed.name)
+                .unwrap_or(&synth_spec);
+            if spec.name != parsed.name {
+                eprintln!(
+                    "[subagent_invoke] '{}' not in config, using synthesized default spec",
+                    parsed.name
+                );
+            }
+
             let mut system = parsed.system.clone();
             let mut model_hook = parsed.model_hook.clone();
-            let default_subagent_hook = config
-                .agent
-                .as_ref()
-                .and_then(|agent| agent.default_subagent_hook.clone());
-            if let Some(spec) = subagents.iter().find(|s| s.name == parsed.name) {
-                if system.is_none() {
-                    system = spec.system.clone();
-                }
-                if model_hook.is_none() {
-                    model_hook = spec.model_hook.clone();
-                }
-            } else if system.is_none() && model_hook.is_none() {
-                if let Some(hook) = default_subagent_hook.clone() {
-                    model_hook = Some(hook);
-                    eprintln!(
-                        "[subagent] '{}' not in config, using default hook",
-                        parsed.name
-                    );
-                } else {
-                    return Err(format!(
-                        "unknown subagent '{}' and no default_subagent_hook configured. \
-                         Either add it to config.json subagents[] or set default_subagent_hook.",
-                        parsed.name
-                    ));
-                }
+            if system.is_none() {
+                system = spec.system.clone();
+            }
+            if model_hook.is_none() {
+                model_hook = spec.model_hook.clone();
             }
 
             // Resolve max_steps: invocation arg > spec > default 64
-            let max_steps = parsed.max_steps
-                .or(spec.and_then(|s| s.max_steps))
-                .unwrap_or(64);
+            let max_steps = parsed.max_steps.or(spec.max_steps).unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
 
             let cfg = build_bridge_agent_config(
                 mv2.to_path_buf(),
@@ -2313,10 +2317,7 @@ pub(crate) fn execute_tool_with_handles(
                 })?
             };
             let subagents = load_subagents_from_config(&config_snapshot);
-            let default_subagent_hook = config_snapshot
-                .agent
-                .as_ref()
-                .and_then(|agent| agent.default_subagent_hook.clone());
+            let default_hook = DEFAULT_SUBAGENT_HOOK.to_string();
             let ts = Utc::now().timestamp();
 
             // Release all capsule handles before spawning subagent threads so they can
@@ -2338,43 +2339,37 @@ pub(crate) fn execute_tool_with_handles(
             for (i, inv) in parsed.invocations.into_iter().enumerate() {
                 let mut system = inv.system.clone();
                 let mut model_hook = inv.model_hook.clone();
-                let spec = subagents.iter().find(|s| s.name == inv.name);
-                if let Some(spec) = spec {
-                    if system.is_none() {
-                        system = spec.system.clone();
-                    }
-                    if model_hook.is_none() {
-                        model_hook = spec.model_hook.clone();
-                    }
-                } else if system.is_none() && model_hook.is_none() {
-                    if let Some(hook) = config_snapshot
-                        .agent
-                        .as_ref()
-                        .and_then(|a| a.default_subagent_hook.clone())
-                    {
-                        model_hook = Some(hook);
-                        eprintln!(
-                            "[subagent_batch] '{}' not in config, using default hook",
-                            inv.name
-                        );
-                    } else {
-                        prepared.push(PreparedInvocation {
-                            name: inv.name.clone(),
-                            prompt: inv.prompt.clone(),
-                            cfg: Err(format!(
-                                "unknown subagent '{}' and no default_subagent_hook",
-                                inv.name
-                            )),
-                            index: i,
-                        });
-                        continue;
-                    }
+                let synth_spec = SubagentSpec {
+                    name: inv.name.clone(),
+                    description: None,
+                    system: None,
+                    model_hook: Some(default_hook.clone()),
+                    tools: Vec::new(),
+                    disallowed_tools: Vec::new(),
+                    max_steps: Some(DEFAULT_SUBAGENT_MAX_STEPS),
+                    timeout_secs: Some(DEFAULT_SUBAGENT_TIMEOUT_SECS),
+                };
+                let spec = subagents
+                    .iter()
+                    .find(|s| s.name == inv.name)
+                    .unwrap_or(&synth_spec);
+                if spec.name != inv.name {
+                    eprintln!(
+                        "[subagent_batch] '{}' not in config, using synthesized default spec",
+                        inv.name
+                    );
+                }
+                if system.is_none() {
+                    system = spec.system.clone();
+                }
+                if model_hook.is_none() {
+                    model_hook = spec.model_hook.clone();
                 }
 
                 // Resolve max_steps: invocation arg > spec > default 64
                 let max_steps = inv.max_steps
-                    .or(spec.and_then(|s| s.max_steps))
-                    .unwrap_or(64);
+                    .or(spec.max_steps)
+                    .unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
 
                 let cfg = build_bridge_agent_config(
                     mv2.to_path_buf(),
