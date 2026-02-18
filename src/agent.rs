@@ -270,6 +270,14 @@ pub(crate) fn default_system_prompt() -> String {
         "NEVER report success when the tool output shows errors or empty results.",
         "If output is ambiguous or incomplete, say so. Quote the relevant output to support claims.",
         "",
+        "## Multi-Step Grounding Rules",
+        "When executing multi-step tasks:",
+        "- NEVER claim a step is complete until the tool output for that step confirms it.",
+        "- Report each step's ACTUAL outcome, including failures, before proceeding to the next step.",
+        "- If a tool call fails, acknowledge the failure explicitly before retrying or moving on.",
+        "- When reporting subagent results, quote the subagent's actual output — do NOT paraphrase or embellish.",
+        "- If a subagent returns empty or error results, say so — do NOT fabricate results on its behalf.",
+        "",
         "## Request Triage",
         "Before using tools, classify the request:",
         "- Conversational (greeting, thanks, status check): Respond directly. No tools needed.",
@@ -812,14 +820,18 @@ pub(crate) fn run_agent_with_prompt(
 
     let mut reminder_state = ReminderState::default();
     let mut drift_state = DriftState::default();
-    // Load persisted violations from previous sessions
+    // Load persisted violations from previous sessions.
+    // Cap loaded violations so a new session doesn't start in LEVEL 4 from prior runs.
     let drift_path = log_dir.join("drift_state.json");
     if let Ok(data) = std::fs::read_to_string(&drift_path) {
         if let Ok(persisted) = serde_json::from_str::<DriftState>(&data) {
-            drift_state.violations = persisted.violations;
+            // Only carry forward critic_history, NOT violation counts.
+            // Each session starts with a clean violation slate — accumulated
+            // violations from previous sessions were causing new sessions to
+            // immediately hit LEVEL 3/4 thresholds.
             drift_state.critic_history = persisted.critic_history;
-            eprintln!("[drift] loaded {} persisted violations",
-                drift_state.violations.get("critic_correction").copied().unwrap_or(0));
+            let prev_count = persisted.violations.get("critic_correction").copied().unwrap_or(0);
+            eprintln!("[drift] loaded {prev_count} persisted violations (reset to 0 for new session)");
         }
     }
     let mut recent_actions: VecDeque<String> = VecDeque::with_capacity(30);
@@ -1618,25 +1630,26 @@ pub(crate) fn run_agent_with_prompt(
                             tool_call_id: None,
                             is_error: None,
                         });
-                        // Enforce: halve remaining step budget
+                        // Enforce: reduce remaining step budget by 1/3 (was halved — too aggressive)
                         let remaining = current_max_steps.saturating_sub(step);
-                        current_max_steps = step + remaining / 2;
+                        current_max_steps = step + (remaining * 2 / 3).max(6);
                         eprintln!("[critic] LEVEL 3 enforcement: step budget reduced to {current_max_steps} (was {})", step + remaining);
                     }
                     _ => {
-                        // Level 4: Log for potential session termination
-                        eprintln!("[critic] LEVEL 4 escalation: {violation_count} violations — session should be terminated");
+                        // Level 4: Graceful wind-down instead of hard kill.
+                        // Give the agent enough steps to write partial results.
+                        eprintln!("[critic] LEVEL 4 escalation: {violation_count} violations — winding down gracefully");
                         messages.push(AgentMessage {
                             role: "user".to_string(),
-                            content: Some(format!("[CRITICAL] {violation_count} grounding violations. Your outputs are unreliable. Simplify your approach: one tool call at a time, quote the output, then respond. No multi-step plans until grounding improves.")),
+                            content: Some(format!("[CRITICAL — GRACEFUL WIND-DOWN] {violation_count} grounding violations. You have 6 steps remaining. IMMEDIATELY:\n1. Write any partial results to disk (files the user requested).\n2. Summarize what you actually accomplished vs. what failed.\n3. Do NOT make new claims — only report verified facts from tool outputs.\nAfter these 6 steps, the session will end.")),
                             tool_calls: Vec::new(),
                             name: None,
                             tool_call_id: None,
                             is_error: None,
                         });
-                        // Enforce: force completion within 3 steps
-                        current_max_steps = step + 3;
-                        eprintln!("[critic] LEVEL 4 enforcement: forced completion in 3 steps (step={step}, max={current_max_steps})");
+                        // Enforce: allow 6 steps for graceful output (was 3 — too aggressive)
+                        current_max_steps = step + 6;
+                        eprintln!("[critic] LEVEL 4 enforcement: graceful wind-down in 6 steps (step={step}, max={current_max_steps})");
                     }
                 }
             }

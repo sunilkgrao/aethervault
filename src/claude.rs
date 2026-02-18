@@ -20,9 +20,17 @@ identifiers, version numbers, boot sequences) that do NOT appear in any tool out
 2. OVERCLAIMING: Does the agent say tools succeeded when they actually failed or returned errors?\n\
 3. UNACKNOWLEDGED FAILURES: Did a tool call fail (non-zero exit, error text) and the agent \
 did not address it?\n\
-4. SCOPE CREEP: Is the agent doing work far beyond what the user requested?\n\
-5. PHANTOM CAPABILITIES: Does the agent claim to be doing something (\"launching a swarm\", \
-\"deploying agents\") when the tool outputs show no evidence of it?\n\n\
+4. SCOPE CREEP: Is the agent doing work far beyond what the user requested?\n\n\
+IMPORTANT — SUBAGENT AWARENESS:\n\
+This agent can invoke subagents via subagent_invoke and subagent_batch tools. When a subagent \
+is invoked, its tool output contains the subagent's results. The agent is EXPECTED to \
+report these results. This is NOT a phantom capability — it is a legitimate tool call. \
+Only flag subagent claims as ungrounded if the subagent tool output is empty, shows errors, \
+or the agent claims results that differ from what the subagent actually returned.\n\n\
+IMPORTANT — ACTIVE SELF-CORRECTION:\n\
+If the agent acknowledges a previous error and is actively correcting it (e.g., re-running \
+a failed query with corrected parameters), this should be treated as GROUNDED behavior, not \
+a new violation. Only flag if the agent claims the corrected action succeeded without evidence.\n\n\
 RESPONSE FORMAT — return ONLY this JSON:\n\
 {\"grounded\": true/false, \"issues\": [\"specific issue with evidence quote\"], \
 \"agent_claim\": \"what the agent claimed (quote)\", \
@@ -695,7 +703,7 @@ pub(crate) fn call_critic(
         .unwrap_or(1024);
     let context_turns: usize = env_optional("CRITIC_CONTEXT_TURNS")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(6);
+        .unwrap_or(12);
     let version = env_optional("ANTHROPIC_VERSION")
         .unwrap_or_else(|| "2023-06-01".to_string());
 
