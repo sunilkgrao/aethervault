@@ -53,6 +53,8 @@ pub(crate) fn load_session_logs(
             Err(_) => continue,
         };
         let reader = BufReader::new(file);
+
+        let mut file_entries = Vec::new();
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
@@ -62,15 +64,17 @@ pub(crate) fn load_session_logs(
                 Ok(e) => e,
                 Err(_) => continue,
             };
+            file_entries.push(entry);
+        }
+
+        for entry in file_entries.into_iter().rev() {
             if entry.session.as_deref() == Some(session) {
                 collected.push(entry);
                 if collected.len() >= limit {
-                    collected.reverse();
                     return collected;
                 }
             }
         }
     }
-    collected.reverse();
     collected
 }

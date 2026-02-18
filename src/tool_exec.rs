@@ -98,6 +98,19 @@ struct ChildResult {
     status: std::process::ExitStatus,
 }
 
+fn tail_last_chars(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+
+    text
+        .char_indices()
+        .rev()
+        .nth(max_chars.saturating_sub(1))
+        .map(|(idx, _)| &text[idx..])
+        .unwrap_or(text)
+}
+
 /// Waits for a child process while monitoring stdout/stderr activity.
 /// Uses the provided `ExecPolicy` to enforce both hard wall-clock deadlines
 /// and stale-output detection independently per command class.
@@ -212,16 +225,8 @@ fn wait_for_child_monitored(
                         &stderr_buf.lock().unwrap_or_else(|e| e.into_inner()),
                     )
                     .to_string();
-                    let stdout_tail = if stdout.len() > 500 {
-                        &stdout[stdout.len() - 500..]
-                    } else {
-                        &stdout
-                    };
-                    let stderr_tail = if stderr.len() > 500 {
-                        &stderr[stderr.len() - 500..]
-                    } else {
-                        &stderr
-                    };
+                    let stdout_tail = tail_last_chars(&stdout, 500);
+                    let stderr_tail = tail_last_chars(&stderr, 500);
                     return Err(format!(
                         "Process timed out (pid {pid}): exceeded {hard}ms deadline \
                          (ran {total_s}s). Consider increasing timeout_ms or using \
@@ -249,16 +254,8 @@ fn wait_for_child_monitored(
                         &stderr_buf.lock().unwrap_or_else(|e| e.into_inner()),
                     )
                     .to_string();
-                    let stdout_tail = if stdout.len() > 500 {
-                        &stdout[stdout.len() - 500..]
-                    } else {
-                        &stdout
-                    };
-                    let stderr_tail = if stderr.len() > 500 {
-                        &stderr[stderr.len() - 500..]
-                    } else {
-                        &stderr
-                    };
+                    let stdout_tail = tail_last_chars(&stdout, 500);
+                    let stderr_tail = tail_last_chars(&stderr, 500);
                     return Err(format!(
                         "Process stale-killed (pid {pid}): no stdout/stderr output for \
                          {idle_min} minutes (ran {total_min} minutes total). \

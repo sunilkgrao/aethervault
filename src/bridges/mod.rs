@@ -104,22 +104,36 @@ pub(crate) fn run_agent_for_bridge(
     let log = config.log;
 
     thread::spawn(move || {
-        let result = run_agent_with_prompt(
-            mv2,
-            prompt_text,
-            Some(session),
-            model_hook,
-            system_text,
-            no_memory,
-            context_query,
-            context_results,
-            context_max_bytes,
-            max_steps,
-            log_commit_interval,
-            log,
-            progress,
-        )
-        .map_err(|e| e.to_string());
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_agent_with_prompt(
+                mv2,
+                prompt_text,
+                Some(session),
+                model_hook,
+                system_text,
+                no_memory,
+                context_query,
+                context_results,
+                context_max_bytes,
+                max_steps,
+                log_commit_interval,
+                log,
+                progress,
+            )
+            .map_err(|e| e.to_string())
+        })) {
+            Ok(result) => result,
+            Err(panic_info) => {
+                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "agent panicked".to_string()
+                };
+                Err(format!("Agent crashed: {msg}"))
+            }
+        };
         let _ = tx.send(result);
     });
 
