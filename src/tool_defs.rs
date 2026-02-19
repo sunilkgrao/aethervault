@@ -484,16 +484,16 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "subagent_list",
-            "description": "List all configured subagents with their capabilities, tools, and limits. ALWAYS call this before using subagent_invoke or subagent_batch to discover available specialists. Returns name, description, allowed tools, max_steps, and timeout for each subagent.",
+            "description": "Check subagent configuration. Shows whether dynamic spawning is enabled and any pre-existing agent configs. You can use subagent_invoke with ANY name — you don't need to call this first.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         serde_json::json!({
             "name": "subagent_invoke",
-            "description": "Invoke a subagent to perform a task. Can use pre-configured agents (from subagent_list) or spawn ad-hoc agents with any name — unknown names use the default Codex hook. The subagent runs with its own session, tools, and memory. Use any descriptive name (e.g., 'frontend-builder', 'api-researcher', 'test-writer').",
+            "description": "Spawn a subagent to perform a task. Use ANY descriptive name — the name should describe what the agent does (e.g., 'log-analyzer', 'api-tester', 'deploy-checker'). The subagent runs with its own session, tools, and memory.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "Name for this subagent. Use a pre-configured name (from subagent_list) to inherit its config, or any descriptive name for an ad-hoc agent using the default hook." },
+                    "name": { "type": "string", "description": "Descriptive name for this subagent (e.g., 'log-analyzer', 'code-reviewer'). Choose a name that describes the task." },
                     "prompt": { "type": "string", "description": "Detailed task description for the subagent. Be specific — the subagent has its own context." },
                     "system": { "type": "string", "description": "Override the subagent's system prompt" },
                     "model_hook": { "type": "string", "description": "Override the subagent's model hook" },
@@ -504,17 +504,17 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "subagent_batch",
-            "description": "Invoke multiple subagents concurrently for parallel work. You can spawn ANY number of agents — use the same name multiple times for parallel instances (e.g., 5 coders working on different files), or mix different names. Each invocation runs independently with its own session. Use max_concurrent to limit parallelism.",
+            "description": "Spawn multiple subagents concurrently for parallel work. Each invocation runs independently with its own session. Use descriptive names for each agent. Use max_concurrent to limit parallelism.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "invocations": {
                         "type": "array",
-                        "description": "Array of subagent invocations to run concurrently. Each has name, prompt, and optional overrides. Use any name — pre-configured or ad-hoc.",
+                        "description": "Array of subagent invocations to run concurrently. Each has name, prompt, and optional overrides.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "name": { "type": "string", "description": "Name for this subagent. Pre-configured names inherit config; any other name uses the default hook." },
+                                "name": { "type": "string", "description": "Descriptive name for this subagent (e.g., 'log-analyzer', 'security-scanner')." },
                                 "prompt": { "type": "string", "description": "Task/prompt for this subagent" },
                                 "system": { "type": "string" },
                                 "model_hook": { "type": "string" },

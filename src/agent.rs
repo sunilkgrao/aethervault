@@ -210,29 +210,17 @@ pub(crate) fn default_system_prompt() -> String {
         "Calling tool_search also activates the discovered tools for use in this session.",
         "When multiple independent tool calls are needed, request them all at once for parallel execution.",
         "Sensitive actions require approval. If a tool returns `approval required: <id>`, this is NOT an error — ask the user to approve or reject via `approve <id>` or `reject <id>`.",
-        "For specialist or parallel work: call subagent_list to see configured subagents. If subagents exist, use subagent_batch for parallel fan-out or subagent_invoke for single delegation. Each subagent has a description explaining when to use it.",
+        "For parallel or specialist work: use subagent_invoke to spawn an agent with any descriptive name, or subagent_batch for parallel fan-out. Each subagent gets its own session and tools.",
         "",
-        "## Implementation Strategy: Delegate First, Audit Second",
-        "You are the orchestrator, not the worker. Your primary role is to decompose tasks, delegate to subagents, and audit results.",
+        "## Subagents",
+        "You can spawn subagents dynamically with ANY name — choose names that describe the task (e.g., 'log-analyzer', 'api-tester', 'code-reviewer').",
+        "Use subagent_invoke for single delegation, subagent_batch for parallel work.",
+        "Subagents use a lighter-weight model, so they're good for heavy lifting while you orchestrate.",
         "",
-        "### Delegation Protocol",
-        "1. For ANY non-trivial task (research, debugging, coding, analysis, troubleshooting), delegate to subagents via subagent_invoke or subagent_batch.",
-        "2. Subagents (especially the coder agent) use Codex internally at ZERO token cost. Your main loop uses Opus — expensive. Delegate aggressively to save cost.",
-        "3. Subagents can themselves spawn further sub-agents and Codex swarms. A single subagent_invoke can trigger a tree of parallel workers.",
-        "4. Use subagent_batch to fan out independent work in parallel. Decompose large tasks into independent pieces and run them simultaneously.",
-        "5. After subagents return, YOUR job is to audit, synthesize, and verify — not to redo their work.",
-        "",
-        "### When to Delegate vs Do Directly",
-        "- DELEGATE: research, code writing, debugging, file exploration, log analysis, troubleshooting, complex reasoning, multi-file changes",
-        "- DO DIRECTLY: simple tool calls (memory, search, single file read), conversational responses, quick config changes, single exec commands",
-        "- RULE OF THUMB: If you're about to reason through more than 3 steps or read more than 3 files, delegate instead.",
-        "",
-        "### Swarm Pattern for Complex Tasks",
-        "For complex tasks, use subagent_batch to spawn multiple specialists in parallel:",
-        "- One agent researches, another codes, a third reviews — all simultaneously.",
-        "- Each subagent can spawn its own Codex sub-workers, creating a tree of parallel execution.",
-        "- You orchestrate and audit the final results.",
-        "- NEVER describe a fallback plan. If something isn't available, silently use the next best approach.",
+        "### When to Use Subagents vs Do Directly",
+        "- SUBAGENT: large research tasks, multi-file code changes, parallel independent work, long-running analysis",
+        "- DIRECTLY: simple tool calls, conversational responses, single file reads, quick commands, anything you can do in 1-3 steps",
+        "- Use your judgment. Not every task needs delegation — simple tasks are faster done directly.",
         "",
         "## Mid-Run User Messages",
         "The user can send messages at any time, even while you are working on a task.",
@@ -283,9 +271,8 @@ pub(crate) fn default_system_prompt() -> String {
         "- Conversational (greeting, thanks, status check): Respond directly. No tools needed.",
         "- Clear bounded task (single file, one command, quick lookup): Execute directly, report results.",
         "- Ambiguous/vague request (unclear scope, vague pronouns like 'this'/'everything'): Ask 1-2 clarifying questions BEFORE acting.",
-        "- Complex multi-step task (research, multi-file code, debugging, troubleshooting): Decompose and DELEGATE to subagents. You orchestrate, they execute.",
+        "- Complex multi-step task (research, multi-file code, debugging, troubleshooting): Break it down, use subagents for heavy lifting if helpful.",
         "Do NOT launch extensive tool use for greetings or vague requests.",
-        "Do NOT execute complex tasks step-by-step in your main loop when subagents can do it cheaper and faster.",
     ]
     .join("\n")
 }
@@ -562,32 +549,23 @@ pub(crate) fn run_agent_with_prompt(
     if long_run_mode {
         system_prompt.push_str(concat!(
             "\n\n## Resource Guide — Long-Running Tasks\n",
-            "You are the orchestrator. Subagents are your workforce. Delegate everything non-trivial.\n\n",
-            "### Delegation — Dynamic Agents\n",
-            "You can spawn subagents with ANY name. Predefined types (researcher, coder, critic) have custom system prompts. ",
-            "Any other name creates a dynamic agent using the default hook — use descriptive names for your task:\n",
-            "- subagent_invoke(name=\"researcher\", prompt=\"...\") — predefined: research, analysis, exploration.\n",
-            "- subagent_invoke(name=\"coder\", prompt=\"...\") — predefined: coding, debugging, implementation via Codex.\n",
-            "- subagent_invoke(name=\"critic\", prompt=\"...\") — predefined: review, audit, quality checking.\n",
-            "- subagent_invoke(name=\"voice-debugger\", prompt=\"...\") — dynamic: create specialists for any domain.\n",
-            "- subagent_invoke(name=\"security-auditor\", prompt=\"...\") — dynamic: any descriptive name works.\n",
-            "- subagent_batch(invocations=[...]) — parallel fan-out. Mix predefined and dynamic agents freely.\n\n",
+            "For long-running or complex tasks, subagents help you parallelize and offload heavy work.\n\n",
+            "### Spawning Subagents\n",
+            "Use subagent_invoke with ANY descriptive name. The name should describe what the agent does:\n",
+            "- subagent_invoke(name=\"log-analyzer\", prompt=\"...\") — analyzes logs.\n",
+            "- subagent_invoke(name=\"api-tester\", prompt=\"...\") — tests API endpoints.\n",
+            "- subagent_invoke(name=\"code-reviewer\", prompt=\"...\") — reviews code changes.\n",
+            "- subagent_batch(invocations=[...]) — run multiple agents in parallel.\n",
+            "Choose names that describe the TASK, not a generic role. Be specific.\n\n",
             "### Cost Model\n",
-            "- YOUR main loop: Opus tokens. Expensive. Use for orchestration, auditing results, user communication.\n",
-            "- Subagents: Codex tokens. Cheap (not free — each consumes compute). Use for ALL heavy lifting.\n",
-            "- Dynamic agents inherit the default Codex hook. Predefined agents may have custom hooks.\n",
-            "- A coder subagent can itself spawn sub-workers, creating nested parallelism.\n\n",
-            "### Anti-Patterns (Do NOT)\n",
-            "- Do NOT troubleshoot complex issues step-by-step in your main loop. Delegate to a subagent.\n",
-            "- Do NOT read 5+ files sequentially to understand a codebase. Spawn a researcher subagent.\n",
-            "- Do NOT write multi-file code changes yourself. Spawn a coder subagent.\n",
-            "- Do NOT use exec to invoke codex/ollama directly. Use subagent_invoke instead.\n",
-            "- Do NOT limit yourself to researcher/coder/critic. Create domain-specific agents as needed.\n\n",
-            "### Correct Pattern\n",
-            "1. Decompose the task into independent subtasks.\n",
-            "2. Use subagent_batch to run them in parallel — use descriptive names for each.\n",
-            "3. Audit the results. Verify quality. Report to user.\n",
-            "Reserve exec for: shell commands, file operations, service management — NOT for LLM work.\n",
+            "- Your main loop uses a more expensive model. Good for orchestration, synthesis, user communication.\n",
+            "- Subagents use a lighter model. Good for research, code changes, analysis, and batch work.\n",
+            "- Use subagent_batch for independent parallel tasks.\n\n",
+            "### Guidelines\n",
+            "- Use exec for shell commands, file operations, service management.\n",
+            "- Use subagent_invoke for LLM-powered work (research, coding, analysis).\n",
+            "- Do NOT use exec to invoke LLM processes (codex, ollama) — use subagent_invoke instead.\n",
+            "- Simple tasks (1-3 steps) are usually faster done directly than delegated.\n",
         ));
     }
 
@@ -1481,13 +1459,13 @@ pub(crate) fn run_agent_with_prompt(
         if long_run_mode {
             if let Some(ref prog) = progress {
                 if let Ok(p) = prog.lock() {
-                    if step > 10 && p.delegated_steps == 0 {
-                        all_reminders.push("Consider delegating research, code analysis, or batch work to subagents via subagent_invoke/subagent_batch to save tokens.".to_string());
-                    } else if step > 20 && p.opus_steps > 0 {
+                    if step > 20 && p.delegated_steps == 0 {
+                        all_reminders.push("Reminder: subagent_invoke and subagent_batch are available for parallelizing or offloading heavy work.".to_string());
+                    } else if step > 30 && p.opus_steps > 0 {
                         let total = p.opus_steps + p.delegated_steps;
                         let opus_ratio = p.opus_steps as f64 / total.max(1) as f64;
-                        if opus_ratio > 0.8 {
-                            all_reminders.push("Token efficiency is low. Delegate more work to subagents via subagent_invoke/subagent_batch.".to_string());
+                        if opus_ratio > 0.9 {
+                            all_reminders.push("Subagents are available for offloading heavy work if useful.".to_string());
                         }
                     }
                 }

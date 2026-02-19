@@ -1192,7 +1192,7 @@ pub(crate) fn execute_tool(
 
             // Codex-in-exec detection guardrail
             let codex_warning = if parsed.command.contains("codex exec") || parsed.command.contains("codex --full-auto") {
-                Some("[ROUTING HINT: This command delegates to an LLM. Consider using subagent_invoke(name=\"coder\", prompt=\"...\") instead, which provides better timeout handling and memory access. Continuing with exec as requested.]\n\n")
+                Some("[ROUTING HINT: This command delegates to an LLM. Consider using subagent_invoke(name=\"<descriptive-name>\", prompt=\"...\") instead, which provides better timeout handling and memory access. Continuing with exec as requested.]\n\n")
             } else {
                 None
             };
@@ -2142,18 +2142,12 @@ pub(crate) fn execute_tool(
             let has_default_hook = config.agent.as_ref()
                 .and_then(|a| a.default_subagent_hook.as_ref())
                 .is_some();
-            let dynamic_note = if has_default_hook {
-                " Dynamic spawning is enabled — you can use ANY name with subagent_invoke, not just these. Use descriptive names like 'voice-debugger' or 'security-auditor'."
-            } else {
-                ""
-            };
             Ok(ToolExecution {
-                output: if details.is_empty() && !has_default_hook {
-                    "No subagents configured. Define them in workspace config.json under agent.subagents.".to_string()
-                } else if details.is_empty() {
-                    "No predefined subagents, but dynamic spawning is enabled. Use subagent_invoke with any descriptive name.".to_string()
+                output: if !has_default_hook && details.is_empty() {
+                    "No subagent hook configured. Define default_subagent_hook in config.json.".to_string()
                 } else {
-                    format!("{} predefined subagents available.{dynamic_note}", details.len())
+                    format!("Dynamic spawning enabled. Use subagent_invoke with any descriptive name.{}",
+                        if details.is_empty() { String::new() } else { format!(" {} pre-configured agents also available.", details.len()) })
                 },
                 details: serde_json::json!({
                     "subagents": details,
