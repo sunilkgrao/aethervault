@@ -435,9 +435,12 @@ pub(crate) fn run_agent_with_prompt(
     let agent_cfg = config.agent.clone().unwrap_or_default();
     let agent_workspace = resolve_workspace(None, &agent_cfg);
     let hook_cfg = config.hooks.clone().unwrap_or_default();
+    // No wall-clock deadline for model hooks — zombie detection handles stuck processes.
+    // The old 300s timeout killed complex Codex tasks (CRM ingestion, VM repair, KG growth)
+    // before they could finish.  Subagent steps are bounded by max_steps, not wall-clock.
     let base_model_spec = resolve_hook_spec(
         model_hook,
-        300000,
+        u64::MAX,
         agent_cfg.model_hook.clone().or(hook_cfg.llm),
         None,
     )
