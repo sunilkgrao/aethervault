@@ -39,11 +39,11 @@ fn check_capsule_health(mv2: &Path) {
     let warn_mb: u64 = std::env::var("CAPSULE_WARN_MB")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(50);
+        .unwrap_or(1500);
     let max_mb: u64 = std::env::var("CAPSULE_MAX_MB")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
+        .unwrap_or(1900);
 
     let size_bytes = match fs::metadata(mv2) {
         Ok(meta) => meta.len(),

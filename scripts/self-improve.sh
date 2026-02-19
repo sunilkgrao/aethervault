@@ -6,7 +6,7 @@ set -euo pipefail
 source /root/.cargo/env
 WORKSPACE="/root/.aethervault"
 REPO="/root/aethervault"
-MV2="${WORKSPACE}/capsule.mv2"
+MV2="${AETHERVAULT_MV2:-${WORKSPACE}/memory.mv2}"
 LOG="${WORKSPACE}/data/self-improve-log.jsonl"
 LOCK="/tmp/aethervault-self-improve.lock"
 DATE=$(date -u +%Y%m%d-%H%M%S)

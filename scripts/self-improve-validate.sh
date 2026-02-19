@@ -5,7 +5,7 @@ set -euo pipefail
 
 source /root/.cargo/env
 WORKSPACE="/root/.aethervault"
-MV2="${WORKSPACE}/capsule.mv2"
+MV2="${AETHERVAULT_MV2:-${WORKSPACE}/memory.mv2}"
 PASS=0
 FAIL=0
 

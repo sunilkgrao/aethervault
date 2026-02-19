@@ -59,19 +59,42 @@ log_to_file() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_DIR/capsule-manager.log"
 }
 
-# Determine the effective capacity limit based on WAL size (mirrors Rust tier logic)
+# Determine the effective capacity limit.
+# Previously tried to parse WAL size from `doctor --dry-run`, but that output
+# is unreliable (field may be absent). Now uses a simple heuristic:
+# if the capsule file is already > Free tier limit, it's clearly Dev+ tier.
+# Can also be overridden via CAPSULE_TIER env var.
 get_effective_limit() {
     local capsule="${1:-$MV2}"
-    local doctor_out
-    doctor_out=$("$AV" doctor --dry-run "$capsule" 2>&1)
-    local wal_size
-    wal_size=$(echo "$doctor_out" | grep -oP 'wal_size=\K[0-9]+' || echo "0")
+
+    # Allow explicit override: CAPSULE_TIER=dev|enterprise|free
+    case "${CAPSULE_TIER:-}" in
+        enterprise) echo "$((10 * 1024 * 1024 * 1024))"; return ;;
+        dev)        echo "$TIER_DEV_LIMIT"; return ;;
+        free)       echo "$TIER_FREE_LIMIT"; return ;;
+    esac
+
+    # Heuristic: if file is already larger than Free tier limit, assume Dev tier.
+    # A Free tier capsule can never grow past 200 MiB, so if it's bigger, it's Dev+.
+    local file_size
+    file_size=$(stat -c%s "$capsule" 2>/dev/null || stat -f%z "$capsule" 2>/dev/null || echo "0")
+    if [ "$file_size" -gt "$TIER_FREE_LIMIT" ]; then
+        echo "$TIER_DEV_LIMIT"  # Dev: 2 GiB
+        return
+    fi
+
+    # Try doctor output as fallback
+    local doctor_out wal_size
+    doctor_out=$("$AV" doctor --dry-run "$capsule" 2>&1 || true)
+    wal_size=$(echo "$doctor_out" | grep -oP 'wal_size=\K[0-9]+' 2>/dev/null || echo "0")
     if [ "$wal_size" -ge "$((16 * 1024 * 1024))" ]; then
         echo "$((10 * 1024 * 1024 * 1024))"  # Enterprise: 10 GiB
     elif [ "$wal_size" -ge "$WAL_SIZE_MEDIUM" ]; then
         echo "$TIER_DEV_LIMIT"  # Dev: 2 GiB
     else
-        echo "$TIER_FREE_LIMIT"  # Free: 200 MiB
+        # Default to Dev tier for production safety — Free tier limit (200 MiB)
+        # is too aggressive and causes doom loops when tier detection fails.
+        echo "$TIER_DEV_LIMIT"
     fi
 }
 
@@ -604,6 +627,32 @@ cmd_watchdog() {
     # Cron-safe watchdog: check health, log, alert, auto-compact if needed
     mkdir -p "$LOG_DIR"
 
+    # Circuit breaker: if we already attempted a rebuild recently and it failed,
+    # don't try again. Write a cooldown marker with a 6-hour expiry.
+    local cooldown_file="/tmp/aethervault-watchdog-cooldown"
+    if [ -f "$cooldown_file" ]; then
+        local cooldown_age
+        cooldown_age=$(( $(date +%s) - $(stat -c%Y "$cooldown_file" 2>/dev/null || stat -f%m "$cooldown_file" 2>/dev/null || echo "0") ))
+        if [ "$cooldown_age" -lt 21600 ]; then  # 6 hours
+            log_to_file "WATCHDOG: In cooldown ($(( (21600 - cooldown_age) / 60 ))m remaining). Skipping destructive actions."
+            # Still check bridge health below, just skip rebuild/compact
+            local bridge_status="inactive"
+            if systemctl is-active --quiet aethervault 2>/dev/null; then
+                bridge_status="active"
+            fi
+            if [ "$bridge_status" = "inactive" ]; then
+                if systemctl is-enabled --quiet aethervault 2>/dev/null; then
+                    log_to_file "WATCHDOG: Auto-restarting bridge (cooldown mode)..."
+                    systemctl start aethervault
+                fi
+            fi
+            echo "COOLDOWN: bridge=$bridge_status"
+            return 0
+        else
+            rm -f "$cooldown_file"
+        fi
+    fi
+
     if [ ! -f "$MV2" ]; then
         log_to_file "WATCHDOG: CRITICAL — capsule missing at $MV2"
         send_telegram_alert "CAPSULE MISSING: $MV2 not found on aethervault server"
@@ -623,58 +672,21 @@ cmd_watchdog() {
     # Log every check
     log_to_file "WATCHDOG: ${pct}% ($(format_bytes "$data_size") / $(format_bytes "$capacity_limit")) bridge=$bridge_status"
 
-    # Check for capacity issues
-    if [ "$data_size" -gt "$capacity_limit" ]; then
-        log_to_file "WATCHDOG: ALERT — OVER CAPACITY — triggering emergency rebuild"
-        send_telegram_alert "CAPSULE OVER CAPACITY: ${pct}%. Triggering emergency archive+rebuild..."
-        # Fall through to critical handler which does archive+rebuild
-    fi
-
     local crit_threshold=$((capacity_limit * CRITICAL_PCT / 100))
     if [ "$data_size" -gt "$crit_threshold" ]; then
-        log_to_file "WATCHDOG: ALERT — CRITICAL capacity (${pct}%)"
-        send_telegram_alert "CAPSULE CRITICAL: ${pct}% capacity used. Auto-archiving and rebuilding..."
-        # Auto-archive + merge rebuild at critical threshold
-        # Step 1: Stop bridge for exclusive access
-        local bridge_was_active=false
-        if systemctl is-active --quiet aethervault 2>/dev/null; then
-            bridge_was_active=true
-            systemctl stop aethervault
-            sleep 2
-        fi
-        # Step 2: Archive current capsule
-        mkdir -p "$ARCHIVE_DIR"
-        local ts=$(date +%Y%m%d-%H%M%S)
-        cp "$MV2" "${ARCHIVE_DIR}/memory-${ts}.mv2"
-        log_to_file "WATCHDOG: Archived to memory-${ts}.mv2"
-        # Step 3: Save config before merge
-        local config_tmp="/tmp/watchdog-config-$$.json"
-        "$AV" config "$MV2" get --key index --raw > "$config_tmp" 2>/dev/null || echo "{}" > "$config_tmp"
-        # Step 4: Merge into fresh capsule (drops dead/corrupt frames, resets WAL)
-        local tmp_empty="/tmp/watchdog-empty-$$.mv2"
-        local tmp_rebuilt="/tmp/watchdog-rebuilt-$$.mv2"
-        "$AV" init "$tmp_empty" 2>/dev/null
-        if "$AV" merge "$MV2" "$tmp_empty" "$tmp_rebuilt" 2>/dev/null; then
-            # Step 5: Restore config
-            if [ -s "$config_tmp" ] && [ "$(cat "$config_tmp")" != "{}" ]; then
-                "$AV" config "$tmp_rebuilt" set --key index --file "$config_tmp" 2>/dev/null
-            fi
-            # Step 6: Swap in rebuilt capsule
-            mv "$MV2" "${MV2}.pre-rebuild"
-            mv "$tmp_rebuilt" "$MV2"
-            rm -f "${MV2}.pre-rebuild" "$config_tmp"
-            local new_size=$(stat -c%s "$MV2" 2>/dev/null || stat -f%z "$MV2" 2>/dev/null)
-            log_to_file "WATCHDOG: Rebuilt capsule: $(format_bytes "$data_size") -> $(format_bytes "$new_size")"
-            send_telegram_alert "CAPSULE REBUILT: $(format_bytes "$data_size") -> $(format_bytes "$new_size"). Archive saved."
+        log_to_file "WATCHDOG: ALERT — capacity at ${pct}%"
+        send_telegram_alert "CAPSULE ALERT: ${pct}% capacity used ($(format_bytes "$data_size") / $(format_bytes "$capacity_limit")). Manual review recommended."
+
+        # Try a compact (non-destructive, doesn't stop bridge for long).
+        # Do NOT attempt a full rebuild automatically — that's what caused the doom loop.
+        # Rebuilds should be triggered manually via `capsule-manager.sh rebuild`.
+        log_to_file "WATCHDOG: Attempting compact..."
+        if cmd_compact 2>&1 | tail -5; then
+            log_to_file "WATCHDOG: Compact succeeded"
         else
-            log_to_file "WATCHDOG: Merge failed, falling back to compact"
-            rm -f "$config_tmp"
-            cmd_compact
-        fi
-        rm -f "$tmp_empty" "$tmp_rebuilt"
-        # Step 6: Restart bridge
-        if [ "$bridge_was_active" = true ]; then
-            systemctl start aethervault
+            log_to_file "WATCHDOG: Compact failed — setting 6h cooldown"
+            touch "$cooldown_file"
+            send_telegram_alert "CAPSULE COMPACT FAILED: Manual intervention needed. Run capsule-manager.sh rebuild"
         fi
     fi
 
