@@ -639,8 +639,6 @@ pub(crate) fn run_agent_with_prompt(
             }
         }
     }
-
-
     // Knowledge Graph entity auto-injection
     let kg_path = agent_workspace.as_ref()
         .map(|ws| ws.join("data/knowledge-graph.json"))
@@ -1049,7 +1047,7 @@ pub(crate) fn run_agent_with_prompt(
                                     // Dedup guard: skip if we already wrote identical observation this session
                                     let hash = blake3::hash(facts.as_bytes()).to_hex().to_string();
                                     {
-                                        let mut seen = OBSERVATION_DEDUP.lock().unwrap();
+                                        let mut seen = OBSERVATION_DEDUP.lock().unwrap_or_else(|e| e.into_inner());
                                         if !seen.insert(hash) {
                                             eprintln!("[observation-dedup] skipped duplicate: {}...", &facts.chars().take(60).collect::<String>());
                                             return;
@@ -1094,18 +1092,16 @@ pub(crate) fn run_agent_with_prompt(
         }
 
         // Send interim text to user when agent narrates before tool calls
-        if has_interim_text {
+        if let Some(ref text) = final_text {
             if let Some(ref prog) = progress {
                 if let Ok(mut p) = prog.lock() {
-                    let text = final_text.as_ref().unwrap().clone();
                     // Only send if substantive (not just "OK" or single words)
                     if text.len() > 15 {
-                        p.interim_messages.push(text);
+                        p.interim_messages.push(text.clone());
                     }
                 }
             }
         }
-
         // Validate all tool calls before execution
         for call in &tool_calls {
             if call.id.trim().is_empty() {
