@@ -1,0 +1,17 @@
+[Unit]
+Description=AetherVault Autonomous Self-Improvement Cycle
+After=aethervault.service
+Requires=aethervault.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/aethervault
+EnvironmentFile=/root/.aethervault/.env
+ExecStart=/root/aethervault/scripts/self-improve.sh
+TimeoutStartSec=1800
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

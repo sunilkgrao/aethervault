@@ -46,6 +46,7 @@ All hooks live in `/root/.aethervault/hooks/`:
 | `*/5 * * * *` | `memory-extractor.py` | Real-time fact extraction from conversations |
 | `*/15 * * * *` | `memory-health.py` | 9-check health + auto-fix + dead-man's switch |
 | Monday (weekly) | `weekly-reflection.py` | Weekly meta-insight generation |
+| `0 */6 * * *` (+jitter) | `self-improve.sh` | Autonomous self-improvement cycle (SICA-style) |
 
 ---
 
@@ -149,3 +150,44 @@ NEVER post real IPs, hostnames, ports, paths, or credentials externally. Always 
 | Email | GMAIL_USER, GMAIL_APP_PASSWORD |
 | Clawdbot | CLAWDBOT_GATEWAY_TOKEN, CLAWDBOT_SESSION_KEY, TELEGRAM_ID |
 | Phone | SUNIL_NUMBER |
+
+---
+
+## Autonomous Self-Improvement
+
+The agent runs a SICA-style self-improvement loop every 6 hours via systemd timer.
+
+### How It Works
+1. **Scan**: Agent analyzes its own source code + recent failures (Sonnet, 128 steps)
+2. **Implement**: Agent makes the change + cargo check (Claude, 196 steps)
+3. **Validate**: Automated regression battery (cargo check, cargo test, agent smoke tests)
+4. **Deploy**: git commit → push → self_upgrade (blue-green with 30s auto-rollback)
+5. **Archive**: Improvement recorded in capsule memory + JSONL log
+
+### Safety Gates
+- Flock: only one cycle at a time
+- Only src/ files can be modified
+- Risk must be "low" or "medium"
+- Independent cargo check (don't trust agent output)
+- Full regression battery before deploy
+- Blue-green deploy with 30s auto-rollback on crash
+- Every change is a git commit (full audit trail)
+
+### Management
+```bash
+# Check timer status
+systemctl status aethervault-self-improve.timer
+
+# View improvement log
+cat /root/.aethervault/data/self-improve-log.jsonl | python3 -m json.tool
+
+# Trigger manual improvement cycle
+systemctl start aethervault-self-improve.service
+
+# Disable autonomous improvement
+systemctl stop aethervault-self-improve.timer
+systemctl disable aethervault-self-improve.timer
+
+# View last cycle output
+journalctl -u aethervault-self-improve.service --since "6 hours ago"
+```
