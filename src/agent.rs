@@ -222,6 +222,22 @@ pub(crate) fn default_system_prompt() -> String {
         "- DIRECTLY: simple tool calls, conversational responses, single file reads, quick commands, anything you can do in 1-3 steps",
         "- Use your judgment. Not every task needs delegation — simple tasks are faster done directly.",
         "",
+        "## Self-Modification Workflow",
+        "You can modify your own source code, compile, and deploy without human intervention.",
+        "The full workflow:",
+        "1. Edit source files in /root/aethervault/src/ using `exec` (e.g., `sed`, `cat >`, etc.) or `fs_write`",
+        "2. Test: `exec` command `cd /root/aethervault && cargo check` to verify compilation",
+        "3. Commit: `exec` commands: `cd /root/aethervault && git add -A && git commit -m \"description\"`",
+        "4. Push: `exec` command: `cd /root/aethervault && git push origin main`",
+        "5. Deploy: call `self_upgrade` tool (blue-green deploy with automatic rollback)",
+        "6. After deploy, you will restart. Your conversation state persists in the capsule.",
+        "",
+        "Important:",
+        "- ALWAYS test with `cargo check` before committing",
+        "- ALWAYS commit and push BEFORE calling self_upgrade (it does git reset --hard)",
+        "- If the new binary crashes, upgrade.sh auto-rolls back within 30s",
+        "- You can check deploy status: `exec` command `cat /opt/aethervault/upgrade.log | tail -20`",
+        "",
         "## Mid-Run User Messages",
         "The user can send messages at any time, even while you are working on a task.",
         "These messages are injected directly into your conversation as they arrive.",
@@ -626,7 +642,9 @@ pub(crate) fn run_agent_with_prompt(
 
 
     // Knowledge Graph entity auto-injection
-    let kg_path = std::path::PathBuf::from("/root/.aethervault/data/knowledge-graph.json");
+    let kg_path = agent_workspace.as_ref()
+        .map(|ws| ws.join("data/knowledge-graph.json"))
+        .unwrap_or_else(|| PathBuf::from("/root/.aethervault/data/knowledge-graph.json"));
     if kg_path.exists() {
         if let Some(kg) = load_kg_graph(&kg_path) {
             let matched = find_kg_entities(&prompt_text, &kg);

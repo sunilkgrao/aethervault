@@ -227,6 +227,8 @@ pub(crate) struct AgentConfig {
     #[serde(default)]
     pub(crate) max_steps: Option<usize>,
     #[serde(default)]
+    pub(crate) subagent_max_steps: Option<usize>,
+    #[serde(default)]
     pub(crate) log: Option<bool>,
     #[serde(default)]
     pub(crate) log_commit_interval: Option<usize>,

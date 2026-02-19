@@ -56,17 +56,18 @@ fn classify_exec_policy(command: &str) -> ExecPolicy {
         };
     }
 
-    // Network commands: strict timeouts
+    // SSH: no hard timeout — bounded by stale detection only.
+    // Complex VM diagnostics routinely exceed 2 min.
     if cmd.starts_with("ssh ") || cmd.contains("| ssh ") {
         return ExecPolicy {
-            hard_timeout_ms: 120_000,     // 2 minutes
-            stale_threshold_ms: 60_000,   // 1 minute
+            hard_timeout_ms: EXEC_NO_TIMEOUT,
+            stale_threshold_ms: 300_000,       // 5 min idle before kill
         };
     }
     if cmd.starts_with("curl ") || cmd.starts_with("wget ") {
         return ExecPolicy {
-            hard_timeout_ms: 60_000,      // 1 minute
-            stale_threshold_ms: 30_000,   // 30 seconds
+            hard_timeout_ms: 300_000,     // 5 minutes
+            stale_threshold_ms: 120_000,  // 2 min idle
         };
     }
 
@@ -2172,6 +2173,9 @@ pub(crate) fn execute_tool(
             let resolved_hook = config.agent.as_ref()
                 .and_then(|a| a.default_subagent_hook.clone())
                 .unwrap_or_else(|| DEFAULT_SUBAGENT_HOOK.to_string());
+            let config_max_steps = config.agent.as_ref()
+                .and_then(|a| a.subagent_max_steps)
+                .unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
             let synth_spec = SubagentSpec {
                 name: parsed.name.clone(),
                 description: None,
@@ -2179,7 +2183,7 @@ pub(crate) fn execute_tool(
                 model_hook: Some(resolved_hook),
                 tools: Vec::new(),
                 disallowed_tools: Vec::new(),
-                max_steps: Some(DEFAULT_SUBAGENT_MAX_STEPS),
+                max_steps: Some(config_max_steps),
                 timeout_secs: Some(DEFAULT_SUBAGENT_TIMEOUT_SECS),
             };
             let spec = subagents
@@ -2301,6 +2305,9 @@ pub(crate) fn execute_tool(
             for (i, inv) in parsed.invocations.into_iter().enumerate() {
                 let mut system = inv.system.clone();
                 let mut model_hook = inv.model_hook.clone();
+                let config_max_steps = config_snapshot.agent.as_ref()
+                    .and_then(|a| a.subagent_max_steps)
+                    .unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
                 let synth_spec = SubagentSpec {
                     name: inv.name.clone(),
                     description: None,
@@ -2308,7 +2315,7 @@ pub(crate) fn execute_tool(
                     model_hook: Some(resolved_hook.clone()),
                     tools: Vec::new(),
                     disallowed_tools: Vec::new(),
-                    max_steps: Some(DEFAULT_SUBAGENT_MAX_STEPS),
+                    max_steps: Some(config_max_steps),
                     timeout_secs: Some(DEFAULT_SUBAGENT_TIMEOUT_SECS),
                 };
                 let spec = subagents
