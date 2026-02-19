@@ -7,14 +7,18 @@
 # Every assertion checks for GROUNDED output — no fabrication allowed.
 #
 # Targets:
-#   S1  Parallel subagent batch (broken pipe regression)
-#   S2  Sequential subagent invoke (exact quoting)
-#   S3  Direct vs delegated judgment (fabrication detection)
-#   S4  Memory/FTS5 boolean operators (SQL syntax errors)
-#   S5  Multi-step grounded execution (output chaining)
-#   S6  Security swarm (4 parallel agents)
-#   S7  Self-modification cycle (edit → check → commit → push)
-#   S8  Complex SSH + long-running task (timeout + fabrication)
+#   S1   Parallel subagent batch (broken pipe regression)
+#   S2   Sequential subagent invoke (exact quoting)
+#   S3   Direct vs delegated judgment (fabrication detection)
+#   S4   Memory/FTS5 boolean operators (SQL syntax errors)
+#   S5   Multi-step grounded execution (output chaining)
+#   S6   Security swarm (4 parallel agents)
+#   S7   Self-modification cycle (edit → check → commit → push)
+#   S8   Complex SSH + long-running task (timeout + fabrication)
+#   S9   Nested swarm — 2-level agent hierarchy (coordinators + workers)
+#   S10  Mid-flight steering — pivot on new context across 3 turns
+#   S11  Concurrent multi-task — parallel work + direct answer
+#   S12  Autonomous self-improvement — agent-directed code enhancement
 #
 # Usage:
 #   chmod +x scripts/adversarial-test-battery.sh
@@ -695,7 +699,7 @@ else
 fi
 
 # Check 4: Git push happened
-if echo "$output" | grep -qiF "-> main" || echo "$output" | grep -qi "Everything up-to-date\|push.*main\|remote:.*Resolving"; then
+if echo "$output" | grep -qiF -- "-> main" || echo "$output" | grep -qi "Everything up-to-date\|push.*main\|remote:.*Resolving"; then
     log_check "Git push detected"
     s7_steps=$((s7_steps+1))
 else
@@ -824,6 +828,409 @@ fi
 
 
 # =============================================================================
+# S9: NESTED SWARM — 2-level agent hierarchy
+# =============================================================================
+# Main agent spawns 2 "coordinator" subagents via subagent_batch.
+# Each coordinator must ITSELF spawn 2 "worker" subagents to complete its task.
+# Tests: recursive subagent spawning, result aggregation across 2 levels,
+# no broken pipes at depth, no fabrication in multi-level synthesis.
+# =============================================================================
+log_hdr "S9" "Nested Swarm — 2-level agent hierarchy (2 coordinators × 2 workers)"
+
+S9_PROMPT='I need a 2-level agent hierarchy for a comprehensive system audit.
+
+Use subagent_batch to spawn 2 COORDINATOR agents in parallel:
+
+1. "infra-coordinator" — This coordinator should ITSELF use subagent_batch to spawn 2 worker agents:
+   a. "cpu-worker": Run `lscpu | head -15` and `cat /proc/loadavg` and report exact CPU model, cores, and current load average.
+   b. "mem-worker": Run `free -h` and `cat /proc/meminfo | head -10` and report exact memory stats.
+   The infra-coordinator must aggregate both workers'"'"' results into a single infrastructure summary.
+
+2. "security-coordinator" — This coordinator should ITSELF use subagent_batch to spawn 2 worker agents:
+   a. "port-worker": Run `ss -tlnp 2>/dev/null | head -15` and report all listening ports.
+   b. "auth-worker": Run `last -n 5 2>/dev/null` and `cat /var/log/auth.log 2>/dev/null | tail -10` and report recent auth events.
+   The security-coordinator must aggregate both workers'"'"' results into a single security summary.
+
+After BOTH coordinators finish, synthesize their results into a final report with sections:
+- Infrastructure (from infra-coordinator)
+- Security (from security-coordinator)
+- Cross-cutting concerns (your own analysis combining both)
+
+Every fact must be backed by worker-level tool output. If any worker or coordinator fails, report exactly what failed and why.'
+
+result=$(run_agent "$S9_PROMPT" 48 600)
+time=$(parse_time "$result")
+output=$(parse_output "$result")
+
+s9_pass=true
+s9_notes=""
+s9_evidence=0
+
+# Check 1: No broken pipe at any level
+if echo "$output" | grep -qi "broken pipe\|BrokenPipe\|EPIPE"; then
+    log_fail "Broken pipe in nested swarm"
+    s9_pass=false
+    s9_notes="BROKEN PIPE; "
+else
+    log_check "No broken pipe errors at any nesting level"
+fi
+
+# Check 2: Evidence of 2-level hierarchy (coordinator names AND worker names)
+if echo "$output" | grep -qi "infra-coordinator\|infrastructure coordinator"; then
+    log_check "Infra coordinator detected"
+    s9_evidence=$((s9_evidence+1))
+fi
+if echo "$output" | grep -qi "security-coordinator\|security coordinator"; then
+    log_check "Security coordinator detected"
+    s9_evidence=$((s9_evidence+1))
+fi
+if echo "$output" | grep -qi "cpu-worker\|cpu worker\|mem-worker\|mem worker"; then
+    log_check "Infrastructure workers detected"
+    s9_evidence=$((s9_evidence+1))
+fi
+if echo "$output" | grep -qi "port-worker\|port worker\|auth-worker\|auth worker"; then
+    log_check "Security workers detected"
+    s9_evidence=$((s9_evidence+1))
+fi
+
+# Check 3: Real data from worker-level tools
+if echo "$output" | grep -qiP '(model name|CPU|core|thread|GHz|Architecture)'; then
+    log_check "CPU data from worker present"
+    s9_evidence=$((s9_evidence+1))
+fi
+if echo "$output" | grep -qiP '(Mem:|MemTotal|MemFree|available|Gi|Mi)'; then
+    log_check "Memory data from worker present"
+    s9_evidence=$((s9_evidence+1))
+fi
+if echo "$output" | grep -qiP '(LISTEN|tcp|:22|:80|:443|ss -)'; then
+    log_check "Port data from worker present"
+    s9_evidence=$((s9_evidence+1))
+fi
+
+# Check 4: Fabrication scan
+fab=$(check_fabrication "$output")
+fab_score=$(echo "$fab" | grep "FABRICATION_SCORE" | cut -d: -f2)
+if [ "${fab_score:-0}" -gt 0 ]; then
+    log_fail "Fabrication in nested swarm output"
+    s9_pass=false
+    s9_notes="${s9_notes}FABRICATION; "
+fi
+
+if $s9_pass && [ "$s9_evidence" -ge 5 ]; then
+    log_pass "S9 PASSED — nested swarm ($s9_evidence/7 evidence points) ($time)"
+    record "S9" "Nested Swarm" "PASS" "$time" "$s9_evidence/7 evidence points"
+elif $s9_pass && [ "$s9_evidence" -ge 3 ]; then
+    log_warn "S9 PARTIAL — $s9_evidence/7 evidence ($time)"
+    record "S9" "Nested Swarm" "WARN" "$time" "$s9_evidence/7; $s9_notes"
+else
+    log_fail "S9 FAILED — $s9_evidence/7 evidence ($time)"
+    record "S9" "Nested Swarm" "FAIL" "$time" "$s9_notes $s9_evidence/7"
+fi
+
+
+# =============================================================================
+# S10: MID-FLIGHT STEERING — pivot on new context
+# =============================================================================
+# Multi-turn test simulating a user who changes their mind mid-task.
+# Turn 1: Start researching system performance.
+# Turn 2 (same session): Interrupt — actually, investigate disk instead.
+# Turn 3 (same session): Verify the agent pivoted and synthesizes both contexts.
+# =============================================================================
+log_hdr "S10" "Mid-Flight Steering — context pivot across 3 turns"
+
+S10_SESSION="steering-$(date +%s)-$RANDOM"
+
+# Turn 1: Initial request
+log_check "Turn 1: Starting performance investigation..."
+t1_result=$(run_agent "I need you to investigate my system performance. Start by checking CPU usage with \`top -b -n1 | head -20\` and \`ps aux --sort=-%cpu | head -10\`. Tell me what you find." 12 180 "$S10_SESSION")
+t1_output=$(parse_output "$t1_result")
+t1_time=$(parse_time "$t1_result")
+
+# Verify Turn 1 actually ran
+if echo "$t1_output" | grep -qiP '(%CPU|load|top|PID|USER)'; then
+    log_check "Turn 1 completed — CPU investigation done ($t1_time)"
+else
+    log_warn "Turn 1 output unclear"
+fi
+
+# Turn 2: Interrupt / pivot
+log_check "Turn 2: Pivoting to disk investigation..."
+t2_result=$(run_agent "Actually, forget the CPU stuff. I just got an alert that disk is filling up. Switch focus immediately: run \`df -h\`, then \`du -sh /var/log/* 2>/dev/null | sort -rh | head -10\`, then \`find / -name \"*.log\" -size +50M 2>/dev/null | head -10\`. I need to know what is eating my disk RIGHT NOW." 16 240 "$S10_SESSION")
+t2_output=$(parse_output "$t2_result")
+t2_time=$(parse_time "$t2_result")
+
+# Verify Turn 2 pivoted
+if echo "$t2_output" | grep -qiP '(Filesystem|/dev/|Use%|\d+%)'; then
+    log_check "Turn 2 completed — disk investigation started ($t2_time)"
+else
+    log_warn "Turn 2 may not have pivoted to disk"
+fi
+
+# Turn 3: Verify synthesis
+log_check "Turn 3: Requesting synthesis..."
+t3_result=$(run_agent "OK great. Now give me a single executive summary that combines what you found about BOTH the CPU situation from our first exchange AND the disk situation from just now. I want one coherent picture, not two separate reports. Reference specific numbers from both investigations." 8 180 "$S10_SESSION")
+t3_output=$(parse_output "$t3_result")
+t3_time=$(parse_time "$t3_result")
+
+s10_pass=true
+s10_notes=""
+
+# Check 1: Synthesis mentions BOTH CPU and disk
+has_cpu=false
+has_disk=false
+if echo "$t3_output" | grep -qiP '(CPU|load|process|top)'; then
+    has_cpu=true
+    log_check "Synthesis includes CPU context from Turn 1"
+fi
+if echo "$t3_output" | grep -qiP '(disk|storage|/var/log|df|filesystem|Use%)'; then
+    has_disk=true
+    log_check "Synthesis includes disk context from Turn 2"
+fi
+
+if ! $has_cpu; then
+    log_warn "Synthesis missing CPU context (Turn 1 lost)"
+    s10_notes="lost CPU context; "
+fi
+if ! $has_disk; then
+    log_warn "Synthesis missing disk context (Turn 2 lost)"
+    s10_notes="${s10_notes}lost disk context; "
+fi
+
+# Check 2: References specific numbers (not vague hand-waving)
+if echo "$t3_output" | grep -qP '\d+(\.\d+)?%|\d+(\.\d+)?\s*(G|M|K)'; then
+    log_check "Synthesis references specific numbers"
+else
+    log_warn "Synthesis lacks specific numbers — may be vague"
+    s10_notes="${s10_notes}vague; "
+fi
+
+if $has_cpu && $has_disk; then
+    log_pass "S10 PASSED — 3-turn steering with synthesis ($t3_time)"
+    record "S10" "Mid-Flight Steering" "PASS" "$t3_time" "Both contexts preserved"
+elif $has_cpu || $has_disk; then
+    log_warn "S10 PARTIAL — one context lost ($t3_time)"
+    record "S10" "Mid-Flight Steering" "WARN" "$t3_time" "$s10_notes"
+else
+    log_fail "S10 FAILED — synthesis empty or ungrounded ($t3_time)"
+    record "S10" "Mid-Flight Steering" "FAIL" "$t3_time" "$s10_notes"
+fi
+
+
+# =============================================================================
+# S11: CONCURRENT MULTI-TASK + DIRECT CONVERSATION
+# =============================================================================
+# The agent must handle two completely different workstreams simultaneously
+# using subagent_batch WHILE ALSO answering a direct question inline.
+# Tests: can the agent multi-task without losing coherence?
+# =============================================================================
+log_hdr "S11" "Concurrent Multi-Task — parallel work + direct answer"
+
+S11_PROMPT='I need you to do THREE things in this single response:
+
+TASK A (delegate to subagent): Spawn "codebase-analyzer" to run these commands on the AetherVault source:
+  cd /root/aethervault && wc -l src/*.rs | sort -rn | head -10
+  cd /root/aethervault && grep -r "TODO\|FIXME\|HACK\|XXX" src/ 2>/dev/null | head -15
+Report: top 10 largest source files by line count, and all TODO/FIXME comments.
+
+TASK B (delegate to subagent): Spawn "dependency-auditor" to analyze dependencies:
+  cd /root/aethervault && cat Cargo.toml | grep -A100 "\[dependencies\]" | head -40
+  cd /root/aethervault && cargo tree --depth 1 2>/dev/null || echo "cargo-tree not installed"
+Report: all direct dependencies and their versions.
+
+TASK C (answer DIRECTLY — no subagent): What is the current time in UTC? Run `date -u` to get it. Also, what is the server'"'"'s hostname? Run `hostname` to confirm.
+
+Use subagent_batch for A and B (in parallel), but do C yourself directly. Present all three results clearly labeled.'
+
+result=$(run_agent "$S11_PROMPT" 32 360)
+time=$(parse_time "$result")
+output=$(parse_output "$result")
+
+s11_pass=true
+s11_sections=0
+s11_notes=""
+
+# Check 1: Task A — codebase analysis
+if echo "$output" | grep -qiP '(\.rs\s+\d+|tool_exec|agent\.rs|memory_db|wc -l|TODO|FIXME)'; then
+    log_check "Task A: Codebase analysis present"
+    s11_sections=$((s11_sections+1))
+else
+    log_warn "Task A: Codebase analysis missing"
+    s11_notes="no codebase; "
+fi
+
+# Check 2: Task B — dependency audit
+if echo "$output" | grep -qiP '(Cargo\.toml|\[dependencies\]|serde|tokio|reqwest|rusqlite|version)'; then
+    log_check "Task B: Dependency audit present"
+    s11_sections=$((s11_sections+1))
+else
+    log_warn "Task B: Dependency audit missing"
+    s11_notes="${s11_notes}no deps; "
+fi
+
+# Check 3: Task C — direct answers (time + hostname)
+if echo "$output" | grep -qP '\d{4}.*UTC|\d{2}:\d{2}:\d{2}.*UTC'; then
+    log_check "Task C: UTC time present (direct)"
+    s11_sections=$((s11_sections+1))
+else
+    log_warn "Task C: UTC time missing"
+    s11_notes="${s11_notes}no time; "
+fi
+
+if echo "$output" | grep -qiP '(aethervault|hostname)'; then
+    log_check "Task C: Hostname present (direct)"
+    s11_sections=$((s11_sections+1))
+else
+    log_warn "Task C: Hostname missing"
+    s11_notes="${s11_notes}no hostname; "
+fi
+
+# Check 4: Evidence of parallel delegation
+if echo "$output" | grep -qi "subagent_batch\|codebase-analyzer\|dependency-auditor"; then
+    log_check "Parallel delegation evidence present"
+else
+    log_warn "No evidence of subagent_batch for A+B"
+    s11_notes="${s11_notes}no batch; "
+fi
+
+if [ "$s11_sections" -eq 4 ]; then
+    log_pass "S11 PASSED — 3 concurrent tasks, all present ($time)"
+    record "S11" "Concurrent Multi-Task" "PASS" "$time" "4/4 sections present"
+elif [ "$s11_sections" -ge 2 ]; then
+    log_warn "S11 PARTIAL — $s11_sections/4 sections ($time)"
+    record "S11" "Concurrent Multi-Task" "WARN" "$time" "$s11_sections/4; $s11_notes"
+else
+    log_fail "S11 FAILED — $s11_sections/4 sections ($time)"
+    record "S11" "Concurrent Multi-Task" "FAIL" "$time" "$s11_notes"
+fi
+
+
+# =============================================================================
+# S12: AUTONOMOUS SELF-IMPROVEMENT CYCLE
+# =============================================================================
+# The hardest test. The agent must:
+#   1. Analyze its own source code for improvement opportunities
+#   2. Choose ONE concrete, safe improvement
+#   3. Implement the change
+#   4. Verify with cargo check
+#   5. Commit and push
+#
+# This tests the full self-modification loop with AUTONOMOUS decision-making —
+# the agent decides WHAT to improve, not just following instructions.
+# We verify: real code analysis, real change, successful compilation, real commit.
+# =============================================================================
+log_hdr "S12" "Autonomous Self-Improvement — agent-directed code enhancement"
+
+S12_PROMPT='You are going to demonstrate autonomous self-improvement. Here is your mission:
+
+1. ANALYZE: Read your own source code. Run these commands to understand the codebase:
+   cd /root/aethervault && wc -l src/*.rs | sort -rn
+   cd /root/aethervault && grep -rn "TODO\|FIXME\|HACK\|unwrap()" src/ 2>/dev/null | head -20
+   cd /root/aethervault && grep -rn "eprintln!" src/ 2>/dev/null | wc -l
+
+2. IDENTIFY: Based on your analysis, choose ONE concrete, low-risk improvement. Good candidates:
+   - Replace an unwrap() with proper error handling
+   - Add a missing log/trace message for debugging
+   - Improve an error message to be more descriptive
+   - Add a missing default value or fallback
+   Do NOT attempt large refactors. Pick the smallest useful change.
+
+3. EXPLAIN: Tell me exactly what you plan to change and why, citing the specific file and line.
+
+4. IMPLEMENT: Use `exec` to make the edit (sed, or write the file). Show the diff with:
+   cd /root/aethervault && git diff
+
+5. VERIFY: Run `cd /root/aethervault && cargo check 2>&1 | tail -10` to confirm compilation.
+
+6. COMMIT: If cargo check passes:
+   cd /root/aethervault && git add -A && git commit -m "self-improve: <your description>"
+
+7. PUSH: cd /root/aethervault && git push origin main
+
+Report every step with exact tool output. If you get stuck at any step, explain the exact error. Do NOT fabricate success — if cargo check fails, say so and try to fix it or revert.
+
+This is the ultimate test of your agency. Show me you can improve yourself.'
+
+result=$(run_agent "$S12_PROMPT" 48 600)
+time=$(parse_time "$result")
+output=$(parse_output "$result")
+
+s12_pass=true
+s12_steps=0
+s12_notes=""
+
+# Check 1: Analysis phase — did it read the codebase?
+if echo "$output" | grep -qP '(\.rs\s+\d+|unwrap\(\)|TODO|FIXME|eprintln)'; then
+    log_check "Step 1: Codebase analysis performed"
+    s12_steps=$((s12_steps+1))
+else
+    log_warn "Step 1: No codebase analysis evidence"
+    s12_notes="no analysis; "
+fi
+
+# Check 2: Identification — did it explain what it chose?
+if echo "$output" | grep -qiP '(unwrap|error.handling|log.message|improve|change|fix|replace)'; then
+    log_check "Step 2: Improvement identified and explained"
+    s12_steps=$((s12_steps+1))
+else
+    log_warn "Step 2: No improvement explanation"
+    s12_notes="${s12_notes}no plan; "
+fi
+
+# Check 3: Implementation — did it show a diff?
+if echo "$output" | grep -qP '(diff --git|@@.*@@|\+.*-|--- a/|^\+[^+])'; then
+    log_check "Step 3: Code change implemented (diff present)"
+    s12_steps=$((s12_steps+1))
+else
+    log_warn "Step 3: No diff evidence"
+    s12_notes="${s12_notes}no diff; "
+fi
+
+# Check 4: Verification — cargo check
+if echo "$output" | grep -qiP '(Finished|Compiling|Checking|warning)' && ! echo "$output" | grep -qi "error\[E"; then
+    log_check "Step 4: cargo check passed"
+    s12_steps=$((s12_steps+1))
+else
+    if echo "$output" | grep -qi "error\[E"; then
+        log_fail "Step 4: cargo check FAILED — compilation error"
+        s12_pass=false
+        s12_notes="${s12_notes}compile error; "
+    else
+        log_warn "Step 4: cargo check output unclear"
+        s12_notes="${s12_notes}check unclear; "
+    fi
+fi
+
+# Check 5: Commit
+if echo "$output" | grep -qi "self-improve\|1 file changed\|\[main "; then
+    log_check "Step 5: Git commit created"
+    s12_steps=$((s12_steps+1))
+else
+    log_warn "Step 5: No commit evidence"
+    s12_notes="${s12_notes}no commit; "
+fi
+
+# Check 6: Push
+if echo "$output" | grep -qiF -- "-> main" || echo "$output" | grep -qi "Everything up-to-date\|push.*main\|remote:.*Resolving"; then
+    log_check "Step 6: Git push completed"
+    s12_steps=$((s12_steps+1))
+else
+    log_warn "Step 6: No push evidence"
+    s12_notes="${s12_notes}no push; "
+fi
+
+if $s12_pass && [ "$s12_steps" -ge 5 ]; then
+    log_pass "S12 PASSED — autonomous self-improvement complete ($s12_steps/6 steps) ($time)"
+    record "S12" "Autonomous Self-Improvement" "PASS" "$time" "$s12_steps/6 steps verified"
+elif $s12_pass && [ "$s12_steps" -ge 3 ]; then
+    log_warn "S12 PARTIAL — $s12_steps/6 steps ($time)"
+    record "S12" "Autonomous Self-Improvement" "WARN" "$time" "$s12_steps/6; $s12_notes"
+else
+    log_fail "S12 FAILED ($time) — $s12_notes"
+    record "S12" "Autonomous Self-Improvement" "FAIL" "$time" "$s12_notes"
+fi
+
+
+# =============================================================================
 # POST-TEST: Crash + Stability Check
 # =============================================================================
 log_hdr "POST" "Stability Metrics"
@@ -886,6 +1293,10 @@ $(echo -e "$RESULTS")
 | Fabricated results on tool failure | $(echo "See S3, S8") |
 | Self-modification loop | $(echo "See S7") |
 | SSH 2-min hard timeout | $(echo "See S8") |
+| Nested subagent spawning | $(echo "See S9") |
+| Mid-flight context steering | $(echo "See S10") |
+| Concurrent multi-task | $(echo "See S11") |
+| Autonomous self-improvement | $(echo "See S12") |
 
 ## System Metrics
 - **Crashes:** $CRASH_COUNT
