@@ -923,8 +923,9 @@ impl MemoryDb {
         let tokens: Vec<&str> = cleaned
             .split_whitespace()
             .filter(|t| t.len() >= 2 || t.chars().all(|c| c.is_ascii_digit()))
-            // Strip FTS5 boolean operators — they cause syntax errors when used as search terms
-            .filter(|t| !matches!(t.to_uppercase().as_str(), "NOT" | "AND" | "NEAR"))
+            // Strip FTS5 boolean operators — they cause syntax errors when used as search terms.
+            // OR must be stripped too: tokens.join(" OR ") would produce "OR OR foo".
+            .filter(|t| !matches!(t.to_uppercase().as_str(), "NOT" | "AND" | "OR" | "NEAR"))
             .collect();
         if tokens.is_empty() {
             return String::new();
@@ -1321,6 +1322,15 @@ mod tests {
         assert_eq!(
             MemoryDb::sanitize_fts_query("NEAR something"),
             "something"
+        );
+        // OR is also stripped (it's the join separator)
+        assert_eq!(
+            MemoryDb::sanitize_fts_query("OR fallback"),
+            "fallback"
+        );
+        assert_eq!(
+            MemoryDb::sanitize_fts_query("this OR that"),
+            "this OR that" // "OR" stripped, "this" + "that" re-joined with OR
         );
     }
 

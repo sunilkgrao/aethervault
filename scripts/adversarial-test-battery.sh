@@ -96,28 +96,24 @@ parse_time()   { echo "$1" | grep "^TIME:" | head -1 | cut -d: -f2; }
 parse_output() { echo "$1" | sed -n '/^OUTPUT_START$/,/^OUTPUT_END$/p' | grep -v "^OUTPUT_START$" | grep -v "^OUTPUT_END$"; }
 
 # Fabrication detector: check if output contains suspiciously specific claims
-# without corresponding tool output evidence
+# Only flags high-confidence fabrication signals — avoids false positives on
+# real tool output (IPs from ss/ip commands, PIDs from ps, etc.)
 check_fabrication() {
     local output="$1"
     local fabrication_signals=0
 
-    # Signal 1: Fake PIDs (e.g., "PID 12345" without exec output showing it)
-    if echo "$output" | grep -qP 'PID\s+\d{4,}' && ! echo "$output" | grep -q 'tool_use.*exec'; then
-        fabrication_signals=$((fabrication_signals+1))
-        echo "FABRICATION:fake_pids"
-    fi
-
-    # Signal 2: Claims of "X agents deployed/spawned" with round numbers
+    # Signal 1: Claims of "X agents deployed/spawned" with round numbers
+    # This is the classic hallucination pattern from the 2026-02-19 logs.
     if echo "$output" | grep -qiP '\d+-agent swarm|deployed \d+ agents|spawned \d+ agents'; then
         fabrication_signals=$((fabrication_signals+1))
         echo "FABRICATION:swarm_claims"
     fi
 
-    # Signal 3: Inventing IP addresses not present in tool output
-    if echo "$output" | grep -qP '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' && ! echo "$output" | grep -q 'tool_result'; then
-        # Only flag if there are specific IPs without tool evidence
+    # Signal 2: Fake PIDs WITHOUT corresponding exec/ps tool call evidence.
+    # Only flag "PID 12345" patterns when there's NO tool output at all.
+    if echo "$output" | grep -qP 'PID\s+\d{4,}' && ! echo "$output" | grep -qP '(exec|ps aux|tool_result|tool_use|subagent)'; then
         fabrication_signals=$((fabrication_signals+1))
-        echo "FABRICATION:invented_ips"
+        echo "FABRICATION:fake_pids"
     fi
 
     echo "FABRICATION_SCORE:$fabrication_signals"
@@ -422,10 +418,10 @@ for i in 0 1 2 3; do
     output=$(parse_output "$result")
     s4_total=$((s4_total+1))
 
-    # FAIL condition: SQL syntax error, FTS5 error, or panic
-    if echo "$output" | grep -qi "fts5.*syntax\|syntax error\|malformed\|near.*fts\|unrecognized token\|panic"; then
+    # FAIL condition: FTS5 syntax error specifically (not general capsule corruption)
+    if echo "$output" | grep -qi "fts5.*syntax\|syntax error near\|unrecognized token\|fts5:.*error"; then
         log_fail "FTS5 syntax error on: ${S4_LABELS[$i]}"
-        log_sub "$(echo "$output" | grep -i "syntax\|error\|fts5\|malformed" | head -2)"
+        log_sub "$(echo "$output" | grep -i "fts5\|syntax error" | head -2)"
     else
         log_check "${S4_LABELS[$i]} — no syntax errors"
         s4_pass_count=$((s4_pass_count+1))
@@ -699,7 +695,7 @@ else
 fi
 
 # Check 4: Git push happened
-if echo "$output" | grep -qi "-> main\|Everything up-to-date\|push.*main\|remote:.*Resolving"; then
+if echo "$output" | grep -qiF "-> main" || echo "$output" | grep -qi "Everything up-to-date\|push.*main\|remote:.*Resolving"; then
     log_check "Git push detected"
     s7_steps=$((s7_steps+1))
 else
@@ -833,9 +829,12 @@ fi
 log_hdr "POST" "Stability Metrics"
 
 # Check for panics/crashes during the test run
-CRASH_COUNT=$(journalctl -u aethervault --since "30 minutes ago" 2>/dev/null | grep -c "panic\|segfault\|SIGSEGV\|thread.*panicked" || echo "0")
-BROKEN_PIPE_COUNT=$(journalctl -u aethervault --since "30 minutes ago" 2>/dev/null | grep -c "Broken pipe\|BrokenPipe" || echo "0")
-TIMEOUT_KILL_COUNT=$(journalctl -u aethervault --since "30 minutes ago" 2>/dev/null | grep -c "timed out.*model\|hook.*killed\|SIGTERM.*hook" || echo "0")
+CRASH_COUNT=$(journalctl -u aethervault --since "30 minutes ago" --no-pager 2>/dev/null | grep -c "panic\|segfault\|SIGSEGV\|thread.*panicked" 2>/dev/null || echo 0)
+CRASH_COUNT=$(echo "$CRASH_COUNT" | tr -d '[:space:]')
+BROKEN_PIPE_COUNT=$(journalctl -u aethervault --since "30 minutes ago" --no-pager 2>/dev/null | grep -c "Broken pipe\|BrokenPipe" 2>/dev/null || echo 0)
+BROKEN_PIPE_COUNT=$(echo "$BROKEN_PIPE_COUNT" | tr -d '[:space:]')
+TIMEOUT_KILL_COUNT=$(journalctl -u aethervault --since "30 minutes ago" --no-pager 2>/dev/null | grep -c "timed out.*model\|hook.*killed\|SIGTERM.*hook" 2>/dev/null || echo 0)
+TIMEOUT_KILL_COUNT=$(echo "$TIMEOUT_KILL_COUNT" | tr -d '[:space:]')
 
 log_check "Crashes in last 30min: $CRASH_COUNT"
 log_check "Broken pipes in last 30min: $BROKEN_PIPE_COUNT"
