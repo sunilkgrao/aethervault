@@ -2169,12 +2169,14 @@ pub(crate) fn execute_tool(
                 load_capsule_config(db).unwrap_or_default()
             };
             let subagents = load_subagents_from_config(&config);
-            let default_hook = DEFAULT_SUBAGENT_HOOK.to_string();
+            let resolved_hook = config.agent.as_ref()
+                .and_then(|a| a.default_subagent_hook.clone())
+                .unwrap_or_else(|| DEFAULT_SUBAGENT_HOOK.to_string());
             let synth_spec = SubagentSpec {
                 name: parsed.name.clone(),
                 description: None,
                 system: None,
-                model_hook: Some(default_hook),
+                model_hook: Some(resolved_hook),
                 tools: Vec::new(),
                 disallowed_tools: Vec::new(),
                 max_steps: Some(DEFAULT_SUBAGENT_MAX_STEPS),
@@ -2186,8 +2188,9 @@ pub(crate) fn execute_tool(
                 .unwrap_or(&synth_spec);
             if spec.name != parsed.name {
                 eprintln!(
-                    "[subagent_invoke] '{}' not in config, using synthesized default spec",
-                    parsed.name
+                    "[subagent_invoke] '{}' not in config, using dynamic spec (hook: {})",
+                    parsed.name,
+                    spec.model_hook.as_deref().unwrap_or("none"),
                 );
             }
 
@@ -2279,7 +2282,9 @@ pub(crate) fn execute_tool(
                 load_capsule_config(db).unwrap_or_default()
             };
             let subagents = load_subagents_from_config(&config_snapshot);
-            let default_hook = DEFAULT_SUBAGENT_HOOK.to_string();
+            let resolved_hook = config_snapshot.agent.as_ref()
+                .and_then(|a| a.default_subagent_hook.clone())
+                .unwrap_or_else(|| DEFAULT_SUBAGENT_HOOK.to_string());
             let ts = Utc::now().timestamp();
 
             let max_conc = parsed.max_concurrent.unwrap_or(parsed.invocations.len());
@@ -2300,7 +2305,7 @@ pub(crate) fn execute_tool(
                     name: inv.name.clone(),
                     description: None,
                     system: None,
-                    model_hook: Some(default_hook.clone()),
+                    model_hook: Some(resolved_hook.clone()),
                     tools: Vec::new(),
                     disallowed_tools: Vec::new(),
                     max_steps: Some(DEFAULT_SUBAGENT_MAX_STEPS),
@@ -2312,8 +2317,9 @@ pub(crate) fn execute_tool(
                     .unwrap_or(&synth_spec);
                 if spec.name != inv.name {
                     eprintln!(
-                        "[subagent_batch] '{}' not in config, using synthesized default spec",
-                        inv.name
+                        "[subagent_batch] '{}' not in config, using dynamic spec (hook: {})",
+                        inv.name,
+                        spec.model_hook.as_deref().unwrap_or("none"),
                     );
                 }
                 if system.is_none() {
