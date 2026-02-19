@@ -597,6 +597,18 @@ pub(crate) enum Command {
     Stats {
         mv2: PathBuf,
     },
+
+    /// Migrate hot-memories.jsonl into the capsule (Mem0-style consolidation).
+    MigrateHotMemories {
+        /// Capsule path
+        mv2: PathBuf,
+        /// Path to hot-memories.jsonl
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
+        /// Plan only (no writes)
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]

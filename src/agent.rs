@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::memory_db::{MemoryDb, PutOptions};
+use crate::consolidation::put_with_consolidation;
 use chrono::Utc;
 use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -33,35 +34,15 @@ use crate::{
 static OBSERVATION_DEDUP: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Check capsule file size and log warnings if it is getting large.
-/// Thresholds are configurable via CAPSULE_WARN_MB (default 50) and CAPSULE_MAX_MB (default 100).
+/// Check capsule file size and log a warning if it exceeds 2GB.
 fn check_capsule_health(mv2: &Path) {
-    let warn_mb: u64 = std::env::var("CAPSULE_WARN_MB")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1500);
-    let max_mb: u64 = std::env::var("CAPSULE_MAX_MB")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1900);
-
     let size_bytes = match fs::metadata(mv2) {
         Ok(meta) => meta.len(),
-        Err(_) => return, // file doesn't exist yet or unreadable; nothing to check
+        Err(_) => return,
     };
-
     let size_mb = size_bytes / (1024 * 1024);
-
-    if size_bytes > max_mb * 1024 * 1024 {
-        eprintln!(
-            "[capsule-health] ERROR: capsule is {size_mb}MB (>{max_mb}MB). \
-             Consider running `aethervault doctor --compact` to reclaim space."
-        );
-    } else if size_bytes > warn_mb * 1024 * 1024 {
-        eprintln!(
-            "[capsule-health] WARNING: capsule is {size_mb}MB (>{warn_mb}MB threshold). \
-             Monitor growth; compact if it keeps increasing."
-        );
+    if size_mb > 2000 {
+        eprintln!("[capsule-health] capsule is {size_mb}MB — consider running VACUUM");
     }
 }
 
@@ -1076,20 +1057,26 @@ pub(crate) fn run_agent_with_prompt(
                                         Utc::now().timestamp()
                                     );
                                     if let Ok(obs_db) = open_or_create_db(&mv2_clone) {
-                                        if obs_db.frame_by_uri(&uri).is_ok() {
-                                            eprintln!("[observation-dedup] cross-session duplicate skipped");
-                                        } else {
-                                            let mut opts = PutOptions::default();
-                                            opts.uri = Some(uri.clone());
-                                            opts.kind = Some("text/markdown".to_string());
-                                            opts.track = Some("aethervault.observation".to_string());
-                                            opts.search_text = Some(facts.clone());
-                                            if let Err(e) = obs_db.put_bytes_with_options(facts.as_bytes(), opts) {
-                                                eprintln!("[observation] put failed: {e}");
+                                        let mut opts = PutOptions::default();
+                                        opts.uri = Some(uri.clone());
+                                        opts.kind = Some("text/markdown".to_string());
+                                        opts.track = Some("aethervault.observation".to_string());
+                                        opts.search_text = Some(facts.clone());
+                                        match put_with_consolidation(&obs_db, facts.as_bytes(), opts) {
+                                            Ok(result) => {
+                                                let decision_str = format!("{:?}", result.decision);
+                                                if result.frame_id.is_none() {
+                                                    eprintln!("[observation-consolidation] NOOP: {decision_str}");
+                                                } else {
+                                                    eprintln!("[observation-consolidation] {decision_str}");
+                                                }
                                             }
-                                            if let Err(e) = obs_db.commit() {
-                                                eprintln!("[observation] commit failed: {e}");
+                                            Err(e) => {
+                                                eprintln!("[observation] consolidation failed: {e}");
                                             }
+                                        }
+                                        if let Err(e) = obs_db.commit() {
+                                            eprintln!("[observation] commit failed: {e}");
                                         }
                                     }
                                 } else if !facts.trim().is_empty() {

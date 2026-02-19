@@ -15,6 +15,7 @@ mod services;
 mod agent_log;
 mod config_file;
 mod memory_db;
+mod consolidation;
 mod skill_registry;
 
 // Re-export all module items at crate root so cross-module references work.
@@ -1322,6 +1323,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  {name}: {value}");
             }
 
+            Ok(())
+        }
+
+        Command::MigrateHotMemories {
+            mv2,
+            jsonl,
+            dry_run,
+        } => {
+            let jsonl_path = jsonl.unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                PathBuf::from(format!("{home}/.aethervault/data/hot-memories.jsonl"))
+            });
+            if !jsonl_path.exists() {
+                eprintln!(
+                    "JSONL file not found: {}",
+                    jsonl_path.display()
+                );
+                std::process::exit(2);
+            }
+            let db = open_or_create_db(&mv2)?;
+            let report = db
+                .migrate_hot_memories(&jsonl_path, dry_run)
+                .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
+            if dry_run {
+                println!("Dry run — no writes performed.");
+            }
+            println!(
+                "Hot-memory migration: total={} added={} updated={} noop={} invalid={} errors={}",
+                report.total_lines,
+                report.added,
+                report.updated,
+                report.skipped_noop,
+                report.skipped_invalid,
+                report.errors.len()
+            );
+            for err in &report.errors {
+                eprintln!("  error: {err}");
+            }
+            if !dry_run {
+                db.commit().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            }
             Ok(())
         }
     }

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::memory_db::{MemoryDb, SearchRequest, PutOptions};
+use crate::consolidation::{put_with_consolidation, ConsolidationDecision};
 use base64::Engine;
 use chrono::Utc;
 use walkdir::WalkDir;
@@ -840,13 +841,42 @@ pub(crate) fn execute_tool(
             options.track = parsed.track;
             options.kind = parsed.kind;
             options.search_text = Some(text.clone());
-            let frame_id = db
-                .put_bytes_with_options(text.as_bytes(), options)
-                .map_err(|e| e.to_string())?;
+
+            // Use consolidation only when URI is new (existing URI supersede handles dupes)
+            let uri_exists = db.frame_by_uri(&parsed.uri).is_ok();
+            let (frame_id, decision_str) = if uri_exists {
+                let fid = db
+                    .put_bytes_with_options(text.as_bytes(), options)
+                    .map_err(|e| e.to_string())?;
+                (fid, "supersede".to_string())
+            } else {
+                let result = put_with_consolidation(db, text.as_bytes(), options)
+                    .map_err(|e| e.to_string())?;
+                match result.decision {
+                    ConsolidationDecision::Noop { existing_id } => {
+                        db.commit().map_err(|e| e.to_string())?;
+                        let details = serde_json::json!({
+                            "frame_id": existing_id,
+                            "uri": parsed.uri,
+                            "decision": "noop"
+                        });
+                        return Ok(ToolExecution {
+                            output: format!("Deduplicated (similar to frame #{existing_id})"),
+                            details,
+                            is_error: false,
+                        });
+                    }
+                    _ => (
+                        result.frame_id.unwrap_or(0),
+                        format!("{:?}", result.decision),
+                    ),
+                }
+            };
             db.commit().map_err(|e| e.to_string())?;
             let details = serde_json::json!({
                 "frame_id": frame_id,
-                "uri": parsed.uri
+                "uri": parsed.uri,
+                "decision": decision_str
             });
             let output = format!("Stored frame #{frame_id}");
             Ok(ToolExecution {
@@ -1961,12 +1991,21 @@ pub(crate) fn execute_tool(
                 options.kind = Some("application/json".to_string());
                 options.track = Some("aethervault.reflection".to_string());
                 options.search_text = Some(payload.to_string());
-                db.put_bytes_with_options(&bytes, options)
+                let result = put_with_consolidation(db, &bytes, options)
                     .map_err(|e| e.to_string())?;
                 db.commit().map_err(|e| e.to_string())?;
+                let output = match result.decision {
+                    ConsolidationDecision::Noop { existing_id } => {
+                        format!("Reflection deduplicated (similar to frame #{existing_id}).")
+                    }
+                    ConsolidationDecision::Update { supersede_id } => {
+                        format!("Reflection updated (superseded frame #{supersede_id}).")
+                    }
+                    ConsolidationDecision::Add => "Reflection stored.".to_string(),
+                };
                 Ok(ToolExecution {
-                    output: "Reflection stored.".to_string(),
-                    details: serde_json::json!({ "uri": uri }),
+                    output,
+                    details: serde_json::json!({ "uri": uri, "decision": format!("{:?}", result.decision) }),
                     is_error: false,
                 })
             }

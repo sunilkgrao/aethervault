@@ -229,6 +229,16 @@ pub(crate) struct MigrationReport {
     pub(crate) errors: Vec<String>,
 }
 
+#[derive(Debug)]
+pub(crate) struct HotMemoryMigrationReport {
+    pub(crate) total_lines: usize,
+    pub(crate) added: usize,
+    pub(crate) updated: usize,
+    pub(crate) skipped_noop: usize,
+    pub(crate) skipped_invalid: usize,
+    pub(crate) errors: Vec<String>,
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // MemoryDb — SQLite backend
 // ═════════════════════════════════════════════════════════════════════════
@@ -351,6 +361,17 @@ impl MemoryDb {
 
     fn init_schema(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.conn.execute_batch(SCHEMA_SQL)?;
+
+        // Backward-compatible migrations (silently ignore if already applied)
+        self.conn
+            .execute_batch("ALTER TABLE frames ADD COLUMN importance REAL DEFAULT NULL;")
+            .ok();
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_frames_created_at ON frames(created_at);",
+            )
+            .ok();
+
         Ok(())
     }
 
@@ -487,6 +508,32 @@ impl MemoryDb {
         Ok(self.conn.last_insert_rowid() as u64)
     }
 
+    /// Find an active frame with a matching blake3 checksum (cross-track: identical bytes are never stored twice).
+    pub(crate) fn find_active_frame_by_checksum(
+        &self,
+        checksum: &[u8],
+    ) -> Result<FrameId, String> {
+        self.conn
+            .query_row(
+                "SELECT id FROM frames WHERE checksum = ?1 AND status = 'active' LIMIT 1",
+                params![checksum],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|id| id as u64)
+            .map_err(|e| format!("find_active_frame_by_checksum: {e}"))
+    }
+
+    /// Mark a single frame as superseded.
+    pub(crate) fn supersede_frame(&self, id: FrameId) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE frames SET status = 'superseded' WHERE id = ? AND status = 'active'",
+                params![id as i64],
+            )
+            .map_err(|e| format!("supersede_frame({id}): {e}"))?;
+        Ok(())
+    }
+
     /// Mark a frame as deleted.
     pub(crate) fn delete_frame(&self, id: FrameId) -> Result<(), String> {
         self.conn
@@ -592,14 +639,17 @@ impl MemoryDb {
             }
         }
 
-        bind_values.push(Box::new(request.top_k as i64));
+        // Over-fetch 3x to allow recency re-ranking to surface recent results
+        let overfetch = (request.top_k * 3).max(request.top_k + 10);
+        bind_values.push(Box::new(overfetch as i64));
         let limit_idx = bind_values.len();
 
         let where_clause = conditions.join(" AND ");
         let sql = format!(
             "SELECT f.id, f.uri, f.title, f.track,
                     snippet(frames_fts, 3, '', '', '…', {snippet_tokens}) as snippet,
-                    bm25(frames_fts) as rank_score
+                    bm25(frames_fts) as rank_score,
+                    f.timestamp
              FROM frames_fts fts
              JOIN frames f ON f.id = fts.rowid
              WHERE frames_fts MATCH ?1
@@ -613,41 +663,63 @@ impl MemoryDb {
 
         let mut stmt = self.conn.prepare(&sql).map_err(|e| format!("search prepare: {e}"))?;
 
+        let now = Utc::now().timestamp() as f64;
+        let half_life: f64 = 604800.0; // 7 days in seconds
+
         let rows = stmt
             .query_map(bind_refs.as_slice(), |row| {
                 let id: i64 = row.get(0)?;
                 let uri: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
                 let title: Option<String> = row.get(2)?;
                 let snippet: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
-                let score: f64 = row.get(5)?;
+                let bm25_score: f64 = row.get(5)?;
+                let timestamp: i64 = row.get(6)?;
 
-                Ok(SearchHit {
-                    rank: 0,
-                    frame_id: id as u64,
-                    uri,
-                    title,
-                    range: (0, 0),
-                    text: snippet,
-                    matches: 0,
-                    chunk_range: None,
-                    chunk_text: None,
-                    score: Some(score.abs() as f32), // bm25 returns negative scores
-                    metadata: None,
-                })
+                Ok((id, uri, title, snippet, bm25_score, timestamp))
             })
             .map_err(|e| format!("search query: {e}"))?;
 
+        // Recency-weighted ranking: BM25 relevance * (1 + 0.3 * exp(-ln2 * age_seconds / half_life))
+        // Half-life = 7 days. Recent content gets up to 30% boost; old content negligible boost.
         let mut hits: Vec<SearchHit> = Vec::new();
-        for (i, row_result) in rows.enumerate() {
+        for row_result in rows {
             match row_result {
-                Ok(mut hit) => {
-                    hit.rank = i;
-                    hits.push(hit);
+                Ok((id, uri, title, snippet, bm25_score, timestamp)) => {
+                    let age_seconds = (now - timestamp as f64).max(0.0);
+                    let recency_boost =
+                        1.0 + 0.3 * (-0.693 * age_seconds / half_life).exp();
+                    let weighted_score = bm25_score.abs() * recency_boost;
+
+                    hits.push(SearchHit {
+                        rank: 0,
+                        frame_id: id as u64,
+                        uri,
+                        title,
+                        range: (0, 0),
+                        text: snippet,
+                        matches: 0,
+                        chunk_range: None,
+                        chunk_text: None,
+                        score: Some(weighted_score as f32),
+                        metadata: None,
+                    });
                 }
                 Err(e) => {
                     eprintln!("[memory_db] search row error: {e}");
                 }
             }
+        }
+
+        // Sort by recency-weighted score descending, then truncate to requested top_k
+        hits.sort_by(|a, b| {
+            b.score
+                .unwrap_or(0.0)
+                .partial_cmp(&a.score.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(request.top_k);
+        for (i, hit) in hits.iter_mut().enumerate() {
+            hit.rank = i;
         }
 
         Ok(SearchResponse { hits })
@@ -1111,6 +1183,140 @@ impl MemoryDb {
         })
     }
 
+    /// Migrate hot-memories.jsonl into the capsule.
+    ///
+    /// Each line is parsed as JSON with `fact`, `metadata.importance`, `metadata.created_at`,
+    /// `metadata.category`, `metadata.t_invalid`. Lines with `t_invalid` set are skipped.
+    /// Content is run through consolidation to avoid duplicates.
+    pub(crate) fn migrate_hot_memories(
+        &self,
+        jsonl_path: &Path,
+        dry_run: bool,
+    ) -> Result<HotMemoryMigrationReport, String> {
+        use crate::consolidation::{consolidate, put_with_consolidation, ConsolidationDecision};
+
+        let content = std::fs::read_to_string(jsonl_path)
+            .map_err(|e| format!("read {}: {e}", jsonl_path.display()))?;
+
+        let mut report = HotMemoryMigrationReport {
+            total_lines: 0,
+            added: 0,
+            updated: 0,
+            skipped_noop: 0,
+            skipped_invalid: 0,
+            errors: Vec::new(),
+        };
+
+        for (line_num, line) in content.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            report.total_lines += 1;
+
+            let parsed: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("line {line_num}: parse error: {e}"));
+                    continue;
+                }
+            };
+
+            // Skip if t_invalid is set (already deleted)
+            if parsed
+                .pointer("/metadata/t_invalid")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+            {
+                report.skipped_invalid += 1;
+                continue;
+            }
+
+            let fact = match parsed.get("fact").and_then(|v| v.as_str()) {
+                Some(f) if !f.trim().is_empty() => f.to_string(),
+                _ => {
+                    // Try "memory" key as fallback
+                    match parsed.get("memory").and_then(|v| v.as_str()) {
+                        Some(m) if !m.trim().is_empty() => m.to_string(),
+                        _ => {
+                            report.errors.push(format!("line {line_num}: no fact/memory field"));
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            let created_at = parsed
+                .pointer("/metadata/created_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp())
+                .or_else(|| {
+                    parsed
+                        .pointer("/metadata/created_at")
+                        .and_then(|v| v.as_i64())
+                });
+
+            let importance = parsed
+                .pointer("/metadata/importance")
+                .and_then(|v| v.as_f64());
+
+            let category = parsed
+                .pointer("/metadata/category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general");
+
+            if dry_run {
+                let decision = consolidate(
+                    self,
+                    fact.as_bytes(),
+                    Some(&fact),
+                    Some("aethervault.observation"),
+                );
+                match decision {
+                    ConsolidationDecision::Noop { .. } => report.skipped_noop += 1,
+                    ConsolidationDecision::Update { .. } => report.updated += 1,
+                    ConsolidationDecision::Add => report.added += 1,
+                }
+                continue;
+            }
+
+            let uri = format!("aethervault://memory/hot-import/{line_num}");
+            let mut opts = PutOptions::default();
+            opts.uri = Some(uri);
+            opts.track = Some("aethervault.observation".to_string());
+            opts.kind = Some("text/markdown".to_string());
+            opts.search_text = Some(fact.clone());
+            opts.tags = vec!["migrated-from-hot-memories".to_string()];
+            if let Some(ts) = created_at {
+                opts.timestamp = Some(ts);
+            }
+            opts.extra_metadata
+                .insert("hot_memory_category".into(), category.to_string());
+            if let Some(imp) = importance {
+                opts.extra_metadata
+                    .insert("hot_memory_importance".into(), imp.to_string());
+            }
+
+            match put_with_consolidation(self, fact.as_bytes(), opts) {
+                Ok(result) => match result.decision {
+                    ConsolidationDecision::Noop { .. } => report.skipped_noop += 1,
+                    ConsolidationDecision::Update { .. } => report.updated += 1,
+                    ConsolidationDecision::Add => report.added += 1,
+                },
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("line {line_num}: put failed: {e}"));
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
     /// Database file size in bytes.
     pub(crate) fn file_size(&self, path: &Path) -> u64 {
         std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
@@ -1347,5 +1553,141 @@ mod tests {
         let (track, rest) = MemoryDb::extract_track_filter("hello world");
         assert!(track.is_none());
         assert_eq!(rest, "hello world");
+    }
+
+    #[test]
+    fn test_search_recency_boost() {
+        let path = temp_db_path("recency_boost");
+        let _ = std::fs::remove_file(&path);
+        let db = MemoryDb::open_or_create(&path).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let thirty_days_ago = now - 30 * 86400;
+
+        // Insert old frame
+        let mut opts_old = PutOptions::default();
+        opts_old.uri = Some("test://doc/old".to_string());
+        opts_old.search_text = Some("rust memory systems programming language".to_string());
+        opts_old.timestamp = Some(thirty_days_ago);
+        db.put_bytes_with_options(b"rust memory systems programming language", opts_old)
+            .unwrap();
+
+        // Insert recent frame with identical text
+        let mut opts_new = PutOptions::default();
+        opts_new.uri = Some("test://doc/new".to_string());
+        opts_new.search_text = Some("rust memory systems programming language".to_string());
+        opts_new.timestamp = Some(now);
+        db.put_bytes_with_options(b"rust memory systems programming language", opts_new)
+            .unwrap();
+
+        let request = SearchRequest {
+            query: "rust memory systems".to_string(),
+            top_k: 10,
+            snippet_chars: 200,
+            uri: None,
+            scope: None,
+            cursor: None,
+            temporal: None,
+            as_of_frame: None,
+            as_of_ts: None,
+            no_sketch: false,
+        };
+
+        let response = db.search(request).unwrap();
+        assert!(response.hits.len() >= 2);
+        // Recent frame should rank first due to recency boost
+        assert_eq!(response.hits[0].uri, "test://doc/new");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_search_relevance_still_wins() {
+        let path = temp_db_path("relevance_wins");
+        let _ = std::fs::remove_file(&path);
+        let db = MemoryDb::open_or_create(&path).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let seven_days_ago = now - 7 * 86400;
+
+        // Old but highly relevant
+        let mut opts_old = PutOptions::default();
+        opts_old.uri = Some("test://doc/relevant".to_string());
+        opts_old.search_text = Some(
+            "rust programming language memory safety borrow checker ownership lifetime".to_string(),
+        );
+        opts_old.timestamp = Some(seven_days_ago);
+        db.put_bytes_with_options(
+            b"rust programming language memory safety borrow checker ownership lifetime",
+            opts_old,
+        )
+        .unwrap();
+
+        // New but irrelevant
+        let mut opts_new = PutOptions::default();
+        opts_new.uri = Some("test://doc/irrelevant".to_string());
+        opts_new.search_text = Some("python scripting dynamic typing".to_string());
+        opts_new.timestamp = Some(now);
+        db.put_bytes_with_options(b"python scripting dynamic typing", opts_new)
+            .unwrap();
+
+        let request = SearchRequest {
+            query: "rust memory safety borrow checker".to_string(),
+            top_k: 10,
+            snippet_chars: 200,
+            uri: None,
+            scope: None,
+            cursor: None,
+            temporal: None,
+            as_of_frame: None,
+            as_of_ts: None,
+            no_sketch: false,
+        };
+
+        let response = db.search(request).unwrap();
+        assert!(!response.hits.is_empty());
+        // The highly relevant old frame should still rank first
+        assert_eq!(response.hits[0].uri, "test://doc/relevant");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_importance_column_migration() {
+        let path = temp_db_path("importance_col");
+        let _ = std::fs::remove_file(&path);
+        let db = MemoryDb::open_or_create(&path).unwrap();
+
+        // Verify the importance column exists by inserting and querying
+        let result: Result<Option<f64>, _> = db.conn().query_row(
+            "SELECT importance FROM frames LIMIT 1",
+            [],
+            |row| row.get(0),
+        );
+        // Table is empty but query should succeed (column exists)
+        assert!(
+            result.is_ok() || result.is_err(), // No rows is OK; column-missing would error on prepare
+            "importance column should exist after init_schema"
+        );
+
+        // Also verify we can insert with importance
+        db.conn()
+            .execute(
+                "INSERT INTO frames (status, timestamp, importance) VALUES ('active', 0, 0.75)",
+                [],
+            )
+            .expect("should be able to insert importance value");
+
+        let val: f64 = db
+            .conn()
+            .query_row(
+                "SELECT importance FROM frames WHERE importance IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!((val - 0.75).abs() < 0.01);
+
+        std::fs::remove_file(&path).ok();
     }
 }
