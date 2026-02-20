@@ -101,7 +101,7 @@ fn is_duplicate_event(seen: &mut VecDeque<String>, event_id: &str) -> bool {
 
 fn append_session_turn(session_key: &str, role: &str, text: &str, config: &BridgeAgentConfig) {
     let session = format!("{}slack:{session_key}", config.session_prefix);
-    let mut turns = load_session_turns(&session, 8);
+    let mut turns = load_session_turns(&session, 20);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -111,7 +111,7 @@ fn append_session_turn(session_key: &str, role: &str, text: &str, config: &Bridg
         content: text.to_string(),
         timestamp: now,
     });
-    save_session_turns(&session, &turns, 8);
+    save_session_turns(&session, &turns, 20);
 }
 
 fn slack_api_post_json(

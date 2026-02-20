@@ -394,10 +394,10 @@ pub(crate) enum Command {
         #[arg(long)]
         context_query: Option<String>,
         /// Max results for memory context
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 20)]
         context_results: usize,
         /// Max bytes for memory context
-        #[arg(long, default_value_t = 12_000)]
+        #[arg(long, default_value_t = 40_000)]
         context_max_bytes: usize,
         /// Max tool/LLM steps before aborting
         #[arg(long, default_value_t = 64)]
@@ -646,10 +646,10 @@ pub(crate) enum BridgeCommand {
         #[arg(long)]
         context_query: Option<String>,
         /// Max results for memory context
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 20)]
         context_results: usize,
         /// Max bytes for memory context
-        #[arg(long, default_value_t = 12_000)]
+        #[arg(long, default_value_t = 40_000)]
         context_max_bytes: usize,
         /// Max tool/LLM steps
         #[arg(long, default_value_t = 64)]
@@ -685,10 +685,10 @@ pub(crate) enum BridgeCommand {
         #[arg(long)]
         context_query: Option<String>,
         /// Max results for memory context
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 20)]
         context_results: usize,
         /// Max bytes for memory context
-        #[arg(long, default_value_t = 12_000)]
+        #[arg(long, default_value_t = 40_000)]
         context_max_bytes: usize,
         /// Max tool/LLM steps
         #[arg(long, default_value_t = 64)]
@@ -721,9 +721,9 @@ pub(crate) enum BridgeCommand {
         no_memory: bool,
         #[arg(long)]
         context_query: Option<String>,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 20)]
         context_results: usize,
-        #[arg(long, default_value_t = 12_000)]
+        #[arg(long, default_value_t = 40_000)]
         context_max_bytes: usize,
         #[arg(long, default_value_t = 64)]
         max_steps: usize,
@@ -748,9 +748,9 @@ pub(crate) enum BridgeCommand {
         no_memory: bool,
         #[arg(long)]
         context_query: Option<String>,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 20)]
         context_results: usize,
-        #[arg(long, default_value_t = 12_000)]
+        #[arg(long, default_value_t = 40_000)]
         context_max_bytes: usize,
         #[arg(long, default_value_t = 64)]
         max_steps: usize,
@@ -775,9 +775,9 @@ pub(crate) enum BridgeCommand {
         no_memory: bool,
         #[arg(long)]
         context_query: Option<String>,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 20)]
         context_results: usize,
-        #[arg(long, default_value_t = 12_000)]
+        #[arg(long, default_value_t = 40_000)]
         context_max_bytes: usize,
         #[arg(long, default_value_t = 64)]
         max_steps: usize,
@@ -804,9 +804,9 @@ pub(crate) enum BridgeCommand {
         no_memory: bool,
         #[arg(long)]
         context_query: Option<String>,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 20)]
         context_results: usize,
-        #[arg(long, default_value_t = 12_000)]
+        #[arg(long, default_value_t = 40_000)]
         context_max_bytes: usize,
         #[arg(long, default_value_t = 64)]
         max_steps: usize,
@@ -833,9 +833,9 @@ pub(crate) enum BridgeCommand {
         no_memory: bool,
         #[arg(long)]
         context_query: Option<String>,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 20)]
         context_results: usize,
-        #[arg(long, default_value_t = 12_000)]
+        #[arg(long, default_value_t = 40_000)]
         context_max_bytes: usize,
         #[arg(long, default_value_t = 64)]
         max_steps: usize,
@@ -860,9 +860,9 @@ pub(crate) enum BridgeCommand {
         no_memory: bool,
         #[arg(long)]
         context_query: Option<String>,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 20)]
         context_results: usize,
-        #[arg(long, default_value_t = 12_000)]
+        #[arg(long, default_value_t = 40_000)]
         context_max_bytes: usize,
         #[arg(long, default_value_t = 64)]
         max_steps: usize,

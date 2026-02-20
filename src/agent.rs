@@ -138,7 +138,7 @@ pub(crate) fn run_agent(
 
     // Save session turns for CLI agent continuity (mirrors Telegram bridge behaviour)
     if let Some(ref sess_id) = session_for_save {
-        let mut turns = load_session_turns(sess_id, 8);
+        let mut turns = load_session_turns(sess_id, 20);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -155,7 +155,7 @@ pub(crate) fn run_agent(
                 timestamp: now,
             });
         }
-        save_session_turns(sess_id, &turns, 8);
+        save_session_turns(sess_id, &turns, 20);
     }
 
     if json {
@@ -710,12 +710,12 @@ pub(crate) fn run_agent_with_prompt(
 
     // Insert session history as proper user/assistant messages (not in system prompt)
     if let Some(ref sess_id) = session {
-        let session_turns = load_session_turns(sess_id, 8);
+        let session_turns = load_session_turns(sess_id, 20);
         for turn in &session_turns {
             messages.push(AgentMessage {
                 role: turn.role.clone(),
-                content: Some(if turn.content.len() > 500 {
-                    let safe: String = turn.content.chars().take(500).collect();
+                content: Some(if turn.content.len() > 2000 {
+                    let safe: String = turn.content.chars().take(2000).collect();
                     format!("{safe}...")
                 } else {
                     turn.content.clone()

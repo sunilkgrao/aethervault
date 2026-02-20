@@ -1016,7 +1016,7 @@ pub(crate) fn handle_telegram_completion(
     // Save conversation turns for session continuity
     let session_id = format!("{}telegram:{chat_id}", agent_config.session_prefix);
     {
-        let mut turns = load_session_turns(&session_id, 8);
+        let mut turns = load_session_turns(&session_id, 20);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -1028,7 +1028,7 @@ pub(crate) fn handle_telegram_completion(
             content: output.clone(),
             timestamp: now,
         });
-        save_session_turns(&session_id, &turns, 8);
+        save_session_turns(&session_id, &turns, 20);
     }
 
     if let Err(err) = telegram_send_message_ext(http_agent, base_url, chat_id, &output, reply_to_id) {
@@ -1057,7 +1057,7 @@ pub(crate) fn handle_telegram_completion(
 
             // Save merged user message to session turns
             {
-                let mut turns = load_session_turns(&session, 8);
+                let mut turns = load_session_turns(&session, 20);
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
@@ -1067,7 +1067,7 @@ pub(crate) fn handle_telegram_completion(
                     content: merged_text.clone(),
                     timestamp: now,
                 });
-                save_session_turns(&session, &turns, 8);
+                save_session_turns(&session, &turns, 20);
             }
 
             let progress = spawn_agent_run(
@@ -1276,7 +1276,7 @@ pub(crate) fn run_telegram_bridge(
 
             // Save user message to session turns
             {
-                let mut turns = load_session_turns(&session, 8);
+                let mut turns = load_session_turns(&session, 20);
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
@@ -1286,7 +1286,7 @@ pub(crate) fn run_telegram_bridge(
                     content: user_text.clone(),
                     timestamp: now,
                 });
-                save_session_turns(&session, &turns, 8);
+                save_session_turns(&session, &turns, 20);
             }
 
             let progress = spawn_agent_run(
