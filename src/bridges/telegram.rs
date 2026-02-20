@@ -1,4 +1,3 @@
-#[allow(unused_imports)]
 use std::collections::HashMap;
 #[allow(unused_imports)]
 use std::io::Read;
@@ -612,84 +611,6 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
     Some((chat_id, msg_id, base_text))
 }
 
-pub(crate) fn split_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
-    if max_chars == 0 {
-        return vec![text.to_string()];
-    }
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut count = 0usize;
-    for ch in text.chars() {
-        if count >= max_chars {
-            chunks.push(current);
-            current = String::new();
-            count = 0;
-        }
-        current.push(ch);
-        count += 1;
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    if chunks.is_empty() {
-        chunks.push(String::new());
-    }
-    chunks
-}
-
-#[allow(dead_code)]
-pub(crate) fn telegram_send_message_returning_id(
-    agent: &ureq::Agent,
-    base_url: &str,
-    chat_id: i64,
-    text: &str,
-) -> Option<i64> {
-    let url = format!("{base_url}/sendMessage");
-    let payload = serde_json::json!({
-        "chat_id": chat_id,
-        "text": text,
-    });
-    match agent.post(&url).set("content-type", "application/json").send_json(payload) {
-        Ok(resp) => {
-            if let Ok(body) = resp.into_json::<serde_json::Value>() {
-                body.get("result")
-                    .and_then(|r| r.get("message_id"))
-                    .and_then(|v| v.as_i64())
-            } else {
-                None
-            }
-        }
-        Err(_) => None,
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn telegram_edit_message(
-    agent: &ureq::Agent,
-    base_url: &str,
-    chat_id: i64,
-    message_id: i64,
-    text: &str,
-) {
-    let url = format!("{base_url}/editMessageText");
-    let payload = serde_json::json!({
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-    });
-    let _ = agent.post(&url).set("content-type", "application/json").send_json(payload);
-}
-
-#[allow(dead_code)]
-pub(crate) fn telegram_delete_message(agent: &ureq::Agent, base_url: &str, chat_id: i64, message_id: i64) {
-    let url = format!("{base_url}/deleteMessage");
-    let payload = serde_json::json!({
-        "chat_id": chat_id,
-        "message_id": message_id,
-    });
-    let _ = agent.post(&url).set("content-type", "application/json").send_json(payload);
-}
-
 pub(crate) fn telegram_send_typing(agent: &ureq::Agent, base_url: &str, chat_id: i64) {
     let url = format!("{base_url}/sendChatAction");
     let payload = serde_json::json!({
@@ -712,30 +633,6 @@ pub(crate) fn telegram_answer_callback(agent: &ureq::Agent, base_url: &str, call
         .send_json(payload);
 }
 
-#[allow(dead_code)]
-pub(crate) fn escape_markdown_v2(text: &str) -> String {
-    let special = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
-    let mut out = String::with_capacity(text.len() * 2);
-    let in_code_block = false;
-    let mut in_inline_code = false;
-    for ch in text.chars() {
-        if ch == '`' {
-            in_inline_code = !in_inline_code;
-            out.push(ch);
-            continue;
-        }
-        if in_inline_code || in_code_block {
-            out.push(ch);
-            continue;
-        }
-        if special.contains(&ch) {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out
-}
-
 pub(crate) fn telegram_send_message(
     agent: &ureq::Agent,
     base_url: &str,
@@ -753,7 +650,7 @@ pub(crate) fn telegram_send_message_ext(
     reply_to: Option<i64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("{base_url}/sendMessage");
-    let chunks = split_text_chunks(text, 3900);
+    let chunks = super::split_text_chunks(text, 3900);
     for (i, chunk) in chunks.iter().enumerate() {
         // Try Markdown first, fall back to plain text
         let mut payload = serde_json::json!({
@@ -871,17 +768,10 @@ pub(crate) fn spawn_agent_run(
                 result: agent_result,
             },
             Err(panic_info) => {
-                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "agent panicked".to_string()
-                };
                 CompletionEvent {
                     chat_id,
                     reply_to_id,
-                    result: Err(format!("Agent crashed: {msg}")),
+                    result: Err(format!("Agent crashed: {}", super::panic_to_string(panic_info))),
                 }
             }
         };
@@ -1102,25 +992,7 @@ pub(crate) fn run_telegram_bridge(
         .build();
 
     // Clean up orphaned vault temp files from previous crashes.
-    // These are created during atomic writes and left behind if the process is killed.
-    {
-        let vault_path = &agent_config.db_path;
-        if let Some(parent) = vault_path.parent() {
-            if let Some(stem) = vault_path.file_name().and_then(|f| f.to_str()) {
-                let prefix = format!(".{}.", stem);
-                if let Ok(entries) = std::fs::read_dir(parent) {
-                    for entry in entries.flatten() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            if name.starts_with(&prefix) {
-                                let _ = std::fs::remove_file(entry.path());
-                                eprintln!("[bridge] cleaned up orphaned temp file: {}", name);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    super::cleanup_orphaned_temp_files(&agent_config.db_path);
 
     let mut active_runs: HashMap<i64, ActiveRun> = HashMap::new();
     let (completion_tx, completion_rx) = mpsc::channel::<CompletionEvent>();
@@ -1132,28 +1004,8 @@ pub(crate) fn run_telegram_bridge(
         // 0. Periodic vault health check
         if last_vault_check.elapsed() >= vault_check_interval {
             last_vault_check = std::time::Instant::now();
-            if let Ok(meta) = std::fs::metadata(&agent_config.db_path) {
-                let size_mb = meta.len() / 1_000_000;
-                if size_mb > 200 {
-                    eprintln!("[bridge] WARNING: vault size {size_mb}MB \u{2014} approaching hard cap");
-                }
-            }
-            // Also clean temp files that may have accumulated during runtime
-            if let Some(parent) = agent_config.db_path.parent() {
-                if let Some(stem) = agent_config.db_path.file_name().and_then(|f| f.to_str()) {
-                    let prefix = format!(".{stem}.");
-                    if let Ok(entries) = std::fs::read_dir(parent) {
-                        for entry in entries.flatten() {
-                            if let Some(name) = entry.file_name().to_str() {
-                                if name.starts_with(&prefix) {
-                                    let _ = std::fs::remove_file(entry.path());
-                                    eprintln!("[bridge] cleaned runtime temp file: {name}");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            super::check_vault_health(&agent_config.db_path);
+            super::cleanup_orphaned_temp_files(&agent_config.db_path);
         }
 
         // 1. Drain completions (non-blocking)

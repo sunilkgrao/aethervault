@@ -90,37 +90,6 @@ pub(crate) fn payload_session_fallback(prefix: &str, payload: &serde_json::Value
     format!("{prefix}:{}", blake3_hash(&bytes).to_hex())
 }
 
-#[allow(dead_code)] // Kept as fallback; primary Slack bridge uses Socket Mode
-pub(crate) fn extract_slack_event(payload: &serde_json::Value) -> Option<(String, String)> {
-    let text = payload
-        .get("event")
-        .and_then(|v| v.get("text"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            payload
-                .get("text")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })?;
-    let channel = payload
-        .get("event")
-        .and_then(|v| v.get("channel"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let user = payload
-        .get("event")
-        .and_then(|v| v.get("user"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let session = if channel != "unknown" || user != "unknown" {
-        format!("slack:{channel}:{user}")
-    } else {
-        payload_session_fallback("slack", payload)
-    };
-    Some((session, text))
-}
-
 pub(crate) fn extract_discord_event(payload: &serde_json::Value) -> Option<(String, String)> {
     let text = payload.get("content").and_then(|v| v.as_str())?.to_string();
     let channel = payload
@@ -222,7 +191,3 @@ pub(crate) fn reply_none(_: &BridgeAgentConfig, _: &str) -> Option<String> {
     None
 }
 
-#[allow(dead_code)]
-pub(crate) fn reply_slack(_: &BridgeAgentConfig, text: &str) -> Option<String> {
-    Some(serde_json::json!({ "text": text }).to_string())
-}

@@ -1,8 +1,6 @@
 use std::collections::HashMap;
-use std::path::Path;
-
 use crate::memory_db::{
-    Frame, FrameStatus, MemoryDb, SearchHit, SearchRequest, SearchResponse, TemporalFilter,
+    Frame, MemoryDb, SearchHit, SearchRequest, TemporalFilter,
 };
 use chrono::Utc;
 use serde_json;
@@ -196,22 +194,12 @@ pub(crate) fn print_plan(plan: &QueryPlan) {
     eprintln!("├─ {}", plan.cleaned_query);
     if !plan.lex_queries.is_empty() {
         for (i, q) in plan.lex_queries.iter().enumerate() {
-            let prefix = if i == plan.lex_queries.len() - 1 && plan.vec_queries.is_empty() {
+            let prefix = if i == plan.lex_queries.len() - 1 {
                 "└─"
             } else {
                 "├─"
             };
             eprintln!("{prefix} lex: {q}");
-        }
-    }
-    if !plan.vec_queries.is_empty() {
-        for (i, q) in plan.vec_queries.iter().enumerate() {
-            let prefix = if i == plan.vec_queries.len() - 1 {
-                "└─"
-            } else {
-                "├─"
-            };
-            eprintln!("{prefix} vec: {q}");
         }
     }
 }
@@ -277,8 +265,6 @@ pub(crate) fn execute_query(
         Some(TemporalFilter {
             start_utc: after_ts,
             end_utc: before_ts,
-            phrase: None,
-            tz: None,
         })
     } else {
         None
@@ -293,13 +279,10 @@ pub(crate) fn execute_query(
             query: cleaned_query.clone(),
             top_k: 2,
             snippet_chars: 80,
-            uri: None,
             scope: scope.clone(),
-            cursor: None,
             temporal: temporal.clone(),
             as_of_frame: None,
             as_of_ts: asof_ts,
-            no_sketch: false,
         };
         match db.search(probe_request) {
             Ok(resp) => {
@@ -312,8 +295,8 @@ pub(crate) fn execute_query(
     }
 
     let skipped_expansion = !args.no_expand && strong_signal;
-    let (lex_queries, mut vec_queries) = if args.no_expand || strong_signal {
-        (vec![cleaned_query.clone()], vec![cleaned_query.clone()])
+    let lex_queries = if args.no_expand || strong_signal {
+        vec![cleaned_query.clone()]
     } else if let Some(hook) = expansion_hook.as_ref() {
         let input = ExpansionHookInput {
             query: cleaned_query.clone(),
@@ -327,38 +310,19 @@ pub(crate) fn execute_query(
                     warnings.extend(output.warnings);
                 }
                 let mut lex = output.lex;
-                let mut vec = output.vec;
                 if lex.is_empty() {
                     lex = vec![cleaned_query.clone()];
                 }
-                if vec.is_empty() {
-                    vec = lex.clone();
-                }
-                (
-                    lex.into_iter().take(args.max_expansions.max(1)).collect(),
-                    vec.into_iter().take(args.max_expansions.max(1)).collect(),
-                )
+                lex.into_iter().take(args.max_expansions.max(1)).collect()
             }
             Err(err) => {
                 warnings.push(format!("expansion hook failed: {err}"));
-                (
-                    build_expansions(&cleaned_query, args.max_expansions),
-                    build_expansions(&cleaned_query, args.max_expansions),
-                )
+                build_expansions(&cleaned_query, args.max_expansions)
             }
         }
     } else {
-        (
-            build_expansions(&cleaned_query, args.max_expansions),
-            build_expansions(&cleaned_query, args.max_expansions),
-        )
+        build_expansions(&cleaned_query, args.max_expansions)
     };
-    if args.no_vector {
-        vec_queries.clear();
-    }
-    // Vector search via local HNSW is no longer supported after MV2 removal.
-    // Clear local vec queries unconditionally.
-    vec_queries.clear();
 
     let plan_obj = QueryPlan {
         cleaned_query: cleaned_query.clone(),
@@ -367,7 +331,6 @@ pub(crate) fn execute_query(
         temporal: temporal.clone(),
         skipped_expansion,
         lex_queries: lex_queries.clone(),
-        vec_queries: vec_queries.clone(),
     };
 
     if args.plan {
@@ -381,13 +344,10 @@ pub(crate) fn execute_query(
             query: q.clone(),
             top_k: lane_limit,
             snippet_chars: args.snippet_chars,
-            uri: None,
             scope: scope.clone(),
-            cursor: None,
             temporal: temporal.clone(),
             as_of_frame: None,
             as_of_ts: asof_ts,
-            no_sketch: false,
         };
         let hits = match db.search(request) {
             Ok(resp) => resp.hits,
@@ -717,9 +677,6 @@ pub(crate) fn collect_mid_loop_reminders(
     }
     if reminder_state.no_progress_streak >= 3 {
         out.push("No observable progress for several turns. Re-state your hypothesis, then pick one high-confidence next step.".to_string());
-    }
-    if reminder_state.reminder_ignored_count >= 1 {
-        out.push("A prior system reminder was not followed. Treat the next instruction as hard constraint.".to_string());
     }
     out
 }

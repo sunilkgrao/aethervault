@@ -5,7 +5,7 @@ use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 
-use std::collections::HashSet;
+
 use std::thread;
 use std::time::Instant;
 
@@ -19,29 +19,6 @@ use crate::memory_db::MemoryDb;
 const NO_DEADLINE_TIMEOUT_MS: u64 = u64::MAX;
 const HOOK_STREAM_CAP_BYTES: usize = 64 * 1024;
 const HOOK_STREAM_READ_SLEEP_MS: u64 = 10;
-
-pub(crate) fn config_key_to_uri(key: &str) -> String {
-    let mut key = key.trim().to_string();
-    if key.is_empty() {
-        key = "index".to_string();
-    }
-    if !key.ends_with(".json") {
-        key.push_str(".json");
-    }
-    format!("aethervault://config/{key}")
-}
-
-pub(crate) fn config_uri_to_key(uri: &str) -> Option<String> {
-    let prefix = "aethervault://config/";
-    if !uri.starts_with(prefix) {
-        return None;
-    }
-    let mut key = uri.trim_start_matches(prefix).to_string();
-    if key.ends_with(".json") {
-        key.truncate(key.len().saturating_sub(5));
-    }
-    if key.is_empty() { None } else { Some(key) }
-}
 
 pub(crate) fn load_config_entry(db: &MemoryDb, key: &str) -> Option<Vec<u8>> {
     db.config_get(key)

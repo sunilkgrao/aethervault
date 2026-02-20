@@ -8,9 +8,6 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[allow(unused_imports)]
-use crate::memory_db::MemoryDb;
-
 fn is_recoverable_mcp_error(msg: &str) -> bool {
     let msg = msg.to_ascii_lowercase();
     msg.contains("server closed connection")
@@ -64,13 +61,11 @@ pub(crate) struct McpServerHandle {
     msg_rx: mpsc::Receiver<ReaderEvent>,
     child: std::process::Child,
     next_id: i64,
-    timeout_secs: u64,
     dead: bool,
     /// Tools discovered from this server (original names)
     tools: Vec<serde_json::Value>,
 }
 
-const NO_TIMEOUT_SECS: u64 = u64::MAX;
 const MCP_POLL_INTERVAL_MS: u64 = 250;
 
 pub(crate) struct McpRegistry {
@@ -339,7 +334,6 @@ impl McpServerHandle {
             child,
             msg_rx,
             next_id: 1,
-            timeout_secs: cfg.timeout_secs.unwrap_or(NO_TIMEOUT_SECS),
             dead: false,
             tools: Vec::new(),
         };

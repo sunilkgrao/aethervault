@@ -116,17 +116,6 @@ pub(crate) fn record_skill_use(
     Ok(())
 }
 
-pub(crate) fn get_skill(conn: &Connection, name: &str) -> Option<SkillRecord> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT name, trigger, steps, tools, notes, success_rate, times_used, times_succeeded, last_used, created_at, contexts
-             FROM skills WHERE name = ?1",
-        )
-        .ok()?;
-    stmt.query_row(params![name], |row| Ok(row_to_skill(row)))
-        .ok()
-}
-
 pub(crate) fn list_skills(conn: &Connection, limit: usize) -> Vec<SkillRecord> {
     let mut stmt = match conn.prepare(
         "SELECT name, trigger, steps, tools, notes, success_rate, times_used, times_succeeded, last_used, created_at, contexts

@@ -14,9 +14,6 @@ use serde::Deserialize;
 use serde_json;
 use url::form_urlencoded;
 
-#[cfg(feature = "vec")]
-use aether_core::text_embed::{LocalTextEmbedder, TextEmbedConfig};
-
 // Re-imports from main (crate-internal helpers and types)
 use crate::{
     open_or_create_db, save_config_entry, load_config_entry, blake3_hash, execute_tool,
@@ -27,8 +24,6 @@ use crate::{
 use tiny_http::{Response, Server};
 use walkdir::WalkDir;
 
-#[allow(dead_code)]
-const NO_TIMEOUT_MS: u64 = 86_400_000;
 const DEFAULT_OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS: u64 = 10_000;
 const OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS_ENV: &str = "OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS";
 
@@ -44,19 +39,6 @@ pub(crate) fn read_optional_file(path: &Path) -> Option<String> {
     })
 }
 
-pub(crate) fn skill_db_path(db_path: &Path) -> PathBuf {
-    if let Some(workspace) = env_optional("AETHERVAULT_WORKSPACE") {
-        let mut path = PathBuf::from(workspace);
-        if path.is_dir() || (path.extension().and_then(|ext| ext.to_str()) != Some("sqlite")) {
-            path.push("skills.sqlite");
-        }
-        return path;
-    }
-    db_path.parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("workspace")
-        .join("skills.sqlite")
-}
 
 pub(crate) fn daily_memory_path(workspace: &Path) -> PathBuf {
     let date = Utc::now().format("%Y-%m-%d").to_string();
@@ -567,29 +549,38 @@ pub(crate) fn resolve_fs_path(path: &str, roots: &[PathBuf]) -> Result<PathBuf, 
 
 // ── OAuth Token Refresh ─────────────────────────────────────────────────
 
-pub(crate) fn refresh_google_token(
+fn refresh_oauth_token(
     mv2: &Path,
     token: &serde_json::Value,
+    client_id_env: &str,
+    client_secret_env: &str,
+    token_url: &str,
+    config_key: &str,
+    extra_params: &[(&str, &str)],
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let refresh_token = token
         .get("refresh_token")
         .and_then(|v| v.as_str())
         .ok_or("missing refresh_token")?;
-    let client_id = oauth_env("GOOGLE_CLIENT_ID")?;
-    let client_secret = oauth_env("GOOGLE_CLIENT_SECRET")?;
-    let payload = form_urlencoded::Serializer::new(String::new())
+    let client_id = oauth_env(client_id_env)?;
+    let client_secret = oauth_env(client_secret_env)?;
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer
         .append_pair("client_id", &client_id)
         .append_pair("client_secret", &client_secret)
         .append_pair("grant_type", "refresh_token")
-        .append_pair("refresh_token", refresh_token)
-        .finish();
+        .append_pair("refresh_token", refresh_token);
+    for &(k, v) in extra_params {
+        serializer.append_pair(k, v);
+    }
+    let payload = serializer.finish();
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(86400))
         .timeout_read(Duration::from_secs(86400))
         .timeout_write(Duration::from_secs(86400))
         .build();
     let resp = agent
-        .post("https://oauth2.googleapis.com/token")
+        .post(token_url)
         .set("content-type", "application/x-www-form-urlencoded")
         .send_string(&payload);
     let refreshed = match resp {
@@ -608,54 +599,38 @@ pub(crate) fn refresh_google_token(
     }
     let db = open_or_create_db(mv2)?;
     let bytes = serde_json::to_vec_pretty(&new_token)?;
-    save_config_entry(&db, "oauth.google", &bytes).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    save_config_entry(&db, config_key, &bytes).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     Ok(new_token)
+}
+
+pub(crate) fn refresh_google_token(
+    mv2: &Path,
+    token: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    refresh_oauth_token(
+        mv2,
+        token,
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "https://oauth2.googleapis.com/token",
+        "oauth.google",
+        &[],
+    )
 }
 
 pub(crate) fn refresh_microsoft_token(
     mv2: &Path,
     token: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let refresh_token = token
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .ok_or("missing refresh_token")?;
-    let client_id = oauth_env("MICROSOFT_CLIENT_ID")?;
-    let client_secret = oauth_env("MICROSOFT_CLIENT_SECRET")?;
-    let payload = form_urlencoded::Serializer::new(String::new())
-        .append_pair("client_id", &client_id)
-        .append_pair("client_secret", &client_secret)
-        .append_pair("grant_type", "refresh_token")
-        .append_pair("refresh_token", refresh_token)
-        .append_pair("scope", "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Calendars.ReadWrite")
-        .finish();
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(86400))
-        .timeout_read(Duration::from_secs(86400))
-        .timeout_write(Duration::from_secs(86400))
-        .build();
-    let resp = agent
-        .post("https://login.microsoftonline.com/common/oauth2/v2.0/token")
-        .set("content-type", "application/x-www-form-urlencoded")
-        .send_string(&payload);
-    let refreshed = match resp {
-        Ok(resp) => resp.into_json::<serde_json::Value>()?,
-        Err(ureq::Error::Status(code, resp)) => {
-            let text = resp.into_string().unwrap_or_default();
-            return Err(format!("refresh error {code}: {text}").into());
-        }
-        Err(err) => return Err(format!("refresh failed: {err}").into()),
-    };
-    let mut new_token = refreshed.clone();
-    if refreshed.get("refresh_token").is_none() {
-        if let Some(rt) = token.get("refresh_token") {
-            new_token["refresh_token"] = rt.clone();
-        }
-    }
-    let db = open_or_create_db(mv2)?;
-    let bytes = serde_json::to_vec_pretty(&new_token)?;
-    save_config_entry(&db, "oauth.microsoft", &bytes).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-    Ok(new_token)
+    refresh_oauth_token(
+        mv2,
+        token,
+        "MICROSOFT_CLIENT_ID",
+        "MICROSOFT_CLIENT_SECRET",
+        "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        "oauth.microsoft",
+        &[("scope", "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Calendars.ReadWrite")],
+    )
 }
 
 pub(crate) fn get_oauth_token(mv2: &Path, provider: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -1390,35 +1365,6 @@ pub(crate) fn run_watch_loop(
 
 // ── Qdrant / Vector DB ──────────────────────────────────────────────────
 
-#[cfg(feature = "vec")]
-pub(crate) fn build_embed_config(
-    model: Option<&str>,
-    cache_capacity: usize,
-    enable_cache: bool,
-) -> TextEmbedConfig {
-    let mut config = match model.map(|m| m.to_ascii_lowercase()) {
-        Some(ref name) if name == "bge-small" || name == "bge-small-en-v1.5" => {
-            TextEmbedConfig::bge_small()
-        }
-        Some(ref name) if name == "bge-base" || name == "bge-base-en-v1.5" => {
-            TextEmbedConfig::bge_base()
-        }
-        Some(ref name) if name == "nomic" || name == "nomic-embed-text-v1.5" => {
-            TextEmbedConfig::nomic()
-        }
-        Some(ref name) if name == "gte-large" => TextEmbedConfig::gte_large(),
-        Some(name) => {
-            let mut cfg = TextEmbedConfig::default();
-            cfg.model_name = name;
-            cfg
-        }
-        None => TextEmbedConfig::default(),
-    };
-    config.cache_capacity = cache_capacity;
-    config.enable_cache = enable_cache;
-    config
-}
-
 // === Qdrant External Vector DB Integration ===
 // Provides REST-based integration with Qdrant for scalable vector search.
 // Enabled when QDRANT_URL is set. Uses text-based search via Qdrant's built-in
@@ -1500,73 +1446,3 @@ pub(crate) fn qdrant_search_text(
     Ok(hits)
 }
 
-/// Upsert documents into Qdrant (used by the embed/index pipeline).
-/// Expects pre-computed embeddings.
-#[allow(dead_code)]
-pub(crate) fn qdrant_upsert(
-    base_url: &str,
-    collection: &str,
-    points: &[(u64, Vec<f32>, serde_json::Value)], // (id, vector, payload)
-) -> Result<usize, String> {
-    if points.is_empty() {
-        return Ok(0);
-    }
-
-    let url = format!("{}/collections/{}/points", base_url.trim_end_matches('/'), collection);
-    let qdrant_points: Vec<serde_json::Value> = points.iter().map(|(id, vec, payload)| {
-        serde_json::json!({
-            "id": id,
-            "vector": vec,
-            "payload": payload
-        })
-    }).collect();
-
-    let body = serde_json::json!({ "points": qdrant_points });
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(86400))
-        .timeout_read(Duration::from_secs(86400))
-        .timeout_write(Duration::from_secs(86400))
-        .build();
-
-    agent.put(&url)
-        .set("content-type", "application/json")
-        .send_string(&serde_json::to_string(&body).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("qdrant upsert: {e}"))?;
-
-    Ok(points.len())
-}
-
-/// Ensure a Qdrant collection exists, creating it if necessary.
-#[allow(dead_code)]
-pub(crate) fn qdrant_ensure_collection(
-    base_url: &str,
-    collection: &str,
-    vector_size: usize,
-) -> Result<(), String> {
-    let url = format!("{}/collections/{}", base_url.trim_end_matches('/'), collection);
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(86400))
-        .timeout_read(Duration::from_secs(86400))
-        .build();
-
-    // Check if collection exists
-    match agent.get(&url).call() {
-        Ok(_) => return Ok(()), // exists
-        Err(ureq::Error::Status(404, _)) => {} // needs creation
-        Err(e) => return Err(format!("qdrant check: {e}")),
-    }
-
-    // Create collection
-    let body = serde_json::json!({
-        "vectors": {
-            "size": vector_size,
-            "distance": "Cosine"
-        }
-    });
-    agent.put(&url)
-        .set("content-type", "application/json")
-        .send_string(&serde_json::to_string(&body).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("qdrant create collection: {e}"))?;
-
-    Ok(())
-}

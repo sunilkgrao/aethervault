@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::memory_db::{MemoryDb, PutOptions};
+use crate::memory_db::PutOptions;
 use crate::consolidation::put_with_consolidation;
 use chrono::Utc;
 use rayon::ThreadPoolBuilder;
@@ -411,6 +411,100 @@ pub(crate) fn compact_messages(
     Ok(extracted_goal)
 }
 
+/// Truncate large tool outputs to prevent context blowout.
+/// Non-error outputs exceeding `max_chars` are trimmed with a notice appended.
+fn truncate_tool_output(result: ToolExecution, max_chars: usize) -> ToolExecution {
+    if result.output.len() > max_chars && !result.is_error {
+        let truncated: String = result.output.chars().take(max_chars).collect();
+        ToolExecution {
+            output: format!(
+                "{truncated}\n\n[Output truncated: {} chars total, showing first {}. Use a more specific query for full results.]",
+                result.output.chars().count(),
+                max_chars
+            ),
+            details: result.details,
+            is_error: result.is_error,
+        }
+    } else {
+        result
+    }
+}
+
+/// Post-process a single completed tool execution: push results and messages,
+/// activate discovered tools, track skill retrieval, and write log entries.
+/// Returns `(is_error, tools_changed)` so the caller can update reminder state
+/// and refresh the active tool set as needed.
+fn process_tool_result(
+    call: &AgentToolCall,
+    result: ToolExecution,
+    tool_results: &mut Vec<AgentToolResult>,
+    messages: &mut Vec<AgentMessage>,
+    active_tools: &mut HashSet<String>,
+    retrieved_skills: &mut Vec<String>,
+    should_log: bool,
+    session: &Option<String>,
+    log_dir: &Path,
+) -> (bool, bool) {
+    let is_error = result.is_error;
+
+    let tool_content = format_tool_message_content(&call.name, &result.output, &result.details);
+    tool_results.push(AgentToolResult {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        output: result.output.clone(),
+        details: result.details.clone(),
+        is_error: result.is_error,
+    });
+    messages.push(AgentMessage {
+        role: "tool".to_string(),
+        content: if tool_content.is_empty() { None } else { Some(tool_content) },
+        tool_calls: Vec::new(),
+        name: Some(call.name.clone()),
+        tool_call_id: Some(call.id.clone()),
+        is_error: Some(result.is_error),
+    });
+
+    // Activate newly discovered tools from tool_search results
+    let mut tools_changed = false;
+    if call.name == "tool_search" && !is_error {
+        if let Some(results_arr) = result.details.get("results").and_then(|v| v.as_array()) {
+            for item in results_arr {
+                if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                    if active_tools.insert(name.to_string()) {
+                        tools_changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // SkillRL R4: Track skill names retrieved via skill_search
+    if call.name == "skill_search" && !is_error {
+        if let Some(results_arr) = result.details.get("results").and_then(|v| v.as_array()) {
+            for item in results_arr {
+                if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                    retrieved_skills.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    if should_log {
+        let entry = AgentLogEntry {
+            session: session.clone(),
+            role: "tool".to_string(),
+            text: result.output,
+            meta: Some(result.details),
+            ts_utc: Some(Utc::now().timestamp()),
+        };
+        if let Err(e) = append_log_jsonl(log_dir, &entry) {
+            eprintln!("[harness] failed to write agent log: {e}");
+        }
+    }
+
+    (is_error, tools_changed)
+}
+
 pub(crate) fn run_agent_with_prompt(
     mv2: PathBuf,
     prompt_text: String,
@@ -751,7 +845,6 @@ pub(crate) fn run_agent_with_prompt(
                 cfgs.push(McpServerConfig {
                     name: "excalidraw".to_string(),
                     command: cmd,
-                    timeout_secs: Some(u64::MAX),
                     env: HashMap::new(),
                 });
             }
@@ -1089,7 +1182,6 @@ pub(crate) fn run_agent_with_prompt(
             }
         }
         let tool_calls = message.tool_calls.clone();
-        let has_interim_text = !tool_calls.is_empty() && final_text.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false);
         messages.push(message);
         if tool_calls.is_empty() {
             completed = true;
@@ -1178,86 +1270,21 @@ pub(crate) fn run_agent_with_prompt(
                 }
             };
 
-            // Truncate large tool outputs to prevent context blowout
-            let result = if result.output.len() > max_tool_output && !result.is_error {
-                let truncated: String = result.output.chars().take(max_tool_output).collect();
-                ToolExecution {
-                    output: format!(
-                        "{truncated}\n\n[Output truncated: {} chars total, showing first {}. Use a more specific query for full results.]",
-                        result.output.chars().count(),
-                        max_tool_output
-                    ),
-                    details: result.details,
-                    is_error: result.is_error,
-                }
-            } else {
-                result
-            };
-
-            let tool_content =
-                format_tool_message_content(&call.name, &result.output, &result.details);
-            tool_results.push(AgentToolResult {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                output: result.output.clone(),
-                details: result.details.clone(),
-                is_error: result.is_error,
-            });
-            messages.push(AgentMessage {
-                role: "tool".to_string(),
-                content: if tool_content.is_empty() { None } else { Some(tool_content) },
-                tool_calls: Vec::new(),
-                name: Some(call.name.clone()),
-                tool_call_id: Some(call.id.clone()),
-                is_error: Some(result.is_error),
-            });
-
-            if call.name == "tool_search" && !result.is_error {
-                if let Some(results_arr) = result.details.get("results").and_then(|v| v.as_array()) {
-                    let mut changed = false;
-                    for item in results_arr {
-                        if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-                            if active_tools.insert(name.to_string()) {
-                                changed = true;
-                            }
-                        }
-                    }
-                    if changed {
-                        tools = tools_from_active(&tool_map, &active_tools);
-                    }
-                }
-            }
-
-            // SkillRL R4: Track skill names retrieved via skill_search
-            if call.name == "skill_search" && !result.is_error {
-                if let Some(results_arr) = result.details.get("results").and_then(|v| v.as_array()) {
-                    for item in results_arr {
-                        if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-                            retrieved_skills.push(name.to_string());
-                        }
-                    }
-                }
-            }
-
-            if should_log {
-                let entry = AgentLogEntry {
-                    session: session.clone(),
-                    role: "tool".to_string(),
-                    text: result.output,
-                    meta: Some(result.details),
-                    ts_utc: Some(Utc::now().timestamp()),
-                };
-                if let Err(e) = append_log_jsonl(&log_dir, &entry) {
-                    eprintln!("[harness] failed to write agent log: {e}");
-                }
+            let result = truncate_tool_output(result, max_tool_output);
+            let (is_error, tools_changed) = process_tool_result(
+                call, result,
+                &mut tool_results, &mut messages, &mut active_tools,
+                &mut retrieved_skills, should_log, &session, &log_dir,
+            );
+            if tools_changed {
+                tools = tools_from_active(&tool_map, &active_tools);
             }
 
             // Update reminder state from tool result
-            if result.is_error {
+            if is_error {
                 reminder_state.last_tool_failed = true;
                 reminder_state.same_tool_fail_streak += 1;
                 reminder_state.no_progress_streak += 1;
-                // If reminders were given and model still failed, that's a violation
                 if drift_state.turns > 0 && drift_state.last_score < 80.0 {
                     drift_state.reminder_violations += 1;
                 }
@@ -1355,81 +1382,18 @@ pub(crate) fn run_agent_with_prompt(
             }
 
             for (call, result) in results {
-                // Truncate large tool outputs to prevent context blowout
-                let result = if result.output.len() > max_tool_output && !result.is_error {
-                    let truncated: String = result.output.chars().take(max_tool_output).collect();
-                    ToolExecution {
-                        output: format!(
-                            "{truncated}\n\n[Output truncated: {} chars total, showing first {}.]",
-                            result.output.chars().count(),
-                            max_tool_output
-                        ),
-                        details: result.details,
-                        is_error: result.is_error,
-                    }
-                } else {
-                    result
-                };
-
-                let tool_content = format_tool_message_content(&call.name, &result.output, &result.details);
-                tool_results.push(AgentToolResult {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    output: result.output.clone(),
-                    details: result.details.clone(),
-                    is_error: result.is_error,
-                });
-                messages.push(AgentMessage {
-                    role: "tool".to_string(),
-                    content: if tool_content.is_empty() { None } else { Some(tool_content) },
-                    tool_calls: Vec::new(),
-                    name: Some(call.name.clone()),
-                    tool_call_id: Some(call.id.clone()),
-                    is_error: Some(result.is_error),
-                });
-
-                if call.name == "tool_search" && !result.is_error {
-                    if let Some(results_arr) = result.details.get("results").and_then(|v| v.as_array()) {
-                        let mut changed = false;
-                        for item in results_arr {
-                            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-                                if active_tools.insert(name.to_string()) {
-                                    changed = true;
-                                }
-                            }
-                        }
-                        if changed {
-                            tools = tools_from_active(&tool_map, &active_tools);
-                        }
-                    }
-                }
-
-                // SkillRL R4: Track skill names retrieved via skill_search
-                if call.name == "skill_search" && !result.is_error {
-                    if let Some(results_arr) = result.details.get("results").and_then(|v| v.as_array()) {
-                        for item in results_arr {
-                            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-                                retrieved_skills.push(name.to_string());
-                            }
-                        }
-                    }
-                }
-
-                if should_log {
-                    let entry = AgentLogEntry {
-                        session: session.clone(),
-                        role: "tool".to_string(),
-                        text: result.output,
-                        meta: Some(result.details),
-                        ts_utc: Some(Utc::now().timestamp()),
-                    };
-                    if let Err(e) = append_log_jsonl(&log_dir, &entry) {
-                        eprintln!("[harness] failed to write agent log: {e}");
-                    }
+                let result = truncate_tool_output(result, max_tool_output);
+                let (is_error, tools_changed) = process_tool_result(
+                    &call, result,
+                    &mut tool_results, &mut messages, &mut active_tools,
+                    &mut retrieved_skills, should_log, &session, &log_dir,
+                );
+                if tools_changed {
+                    tools = tools_from_active(&tool_map, &active_tools);
                 }
 
                 // Update reminder state from parallel tool result
-                if result.is_error {
+                if is_error {
                     reminder_state.last_tool_failed = true;
                     reminder_state.same_tool_fail_streak += 1;
                     reminder_state.no_progress_streak += 1;

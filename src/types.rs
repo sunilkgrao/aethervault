@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::memory_db::{MemoryDb, TemporalFilter};
+use crate::memory_db::TemporalFilter;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
@@ -49,15 +49,6 @@ pub(crate) struct DiffReport {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct MergeReport {
-    pub(crate) left: String,
-    pub(crate) right: String,
-    pub(crate) out: String,
-    pub(crate) written: usize,
-    pub(crate) deduped: usize,
-}
-
-#[derive(Debug, Serialize)]
 pub(crate) struct ConfigEntry {
     pub(crate) key: String,
     pub(crate) frame_id: u64,
@@ -72,7 +63,6 @@ pub(crate) struct QueryPlan {
     pub(crate) temporal: Option<TemporalFilter>,
     pub(crate) skipped_expansion: bool,
     pub(crate) lex_queries: Vec<String>,
-    pub(crate) vec_queries: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -252,9 +242,6 @@ pub(crate) struct McpServerConfig {
     pub(crate) name: String,
     /// Command to spawn the server (e.g. "npx excalidraw-mcp --stdio")
     pub(crate) command: String,
-    /// Timeout in seconds for each tools/call (default: 30)
-    #[serde(default)]
-    pub(crate) timeout_secs: Option<u64>,
     /// Environment variables to pass to the server
     #[serde(default)]
     pub(crate) env: HashMap<String, String>,
@@ -403,14 +390,6 @@ pub(crate) struct ContinuationCheckpoint {
     pub(crate) chain_depth: usize,
 }
 
-/// A skill pattern distilled from an agent trajectory by the SkillRL system.
-#[derive(Debug, Deserialize)]
-pub(crate) struct DistilledSkill {
-    pub(crate) title: String,
-    pub(crate) principle: String,
-    pub(crate) when_to_apply: String,
-}
-
 pub(crate) struct AgentProgress {
     pub(crate) step: usize,
     pub(crate) max_steps: usize,
@@ -449,27 +428,13 @@ pub(crate) struct ActiveRun {
     pub(crate) queued_messages: Vec<(String, Option<i64>)>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct ProgressEvent {
-    #[serde(default)]
-    pub(crate) session: Option<String>,
-    pub(crate) milestone: String,
-    pub(crate) percent: u8,
-    pub(crate) message: String,
-    #[serde(default)]
-    pub(crate) ts_utc: i64,
-}
-
 #[derive(Default)]
 pub(crate) struct ReminderState {
     pub(crate) last_tool_failed: bool,
     pub(crate) same_tool_fail_streak: usize,
     pub(crate) approval_required_count: usize,
     pub(crate) sequential_read_ops: usize,
-    pub(crate) last_tool_was_irreversible: bool,
-    pub(crate) user_confirmed: bool,
     pub(crate) no_progress_streak: usize,
-    pub(crate) reminder_ignored_count: usize,
 }
 
 /// Tracks a single critic correction event within an agent session.
@@ -479,7 +444,6 @@ pub(crate) struct CriticCorrection {
     pub(crate) step: usize,
     pub(crate) issues: Vec<String>,
     pub(crate) correction_text: String,
-    pub(crate) acknowledged: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -759,14 +723,3 @@ pub(crate) fn format_tool_message_content(name: &str, output: &str, details: &se
     format!("{output}\n\n[details]\n{details_str}")
 }
 
-/// Execute a closure with access to the MemoryDb.
-/// SQLite WAL mode handles concurrent reads/writes natively — no lock juggling needed.
-pub(crate) fn with_db<F, R>(
-    db: &MemoryDb,
-    f: F,
-) -> Result<R, String>
-where
-    F: FnOnce(&MemoryDb) -> Result<R, String>,
-{
-    f(db)
-}

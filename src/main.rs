@@ -187,9 +187,6 @@ fn copy_frame_to_archive(
     options.extra_metadata = frame.extra_metadata.clone();
     options.role = frame.role;
     options.parent_id = frame.parent_id;
-    options.auto_tag = false;
-    options.extract_dates = false;
-    options.extract_triplets = false;
     let id = archive.put_bytes_with_options(&payload, options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     Ok(id)
 }
@@ -397,13 +394,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 query: query.clone(),
                 top_k: limit,
                 snippet_chars,
-                uri: None,
                 scope,
-                cursor: None,
                 temporal: None,
                 as_of_frame: None,
                 as_of_ts: None,
-                no_sketch: false,
             };
 
             let response = db.search(request).map_err(|e| Box::<dyn std::error::Error>::from(e))?;

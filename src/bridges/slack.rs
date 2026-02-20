@@ -1,4 +1,3 @@
-#[allow(unused_imports)]
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::sync::{mpsc, Arc};
@@ -60,32 +59,6 @@ struct VoiceDirective {
     text: String,
     profile_id: String,
     instruct: String,
-}
-
-fn split_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
-    if max_chars == 0 {
-        return vec![text.to_string()];
-    }
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut count = 0usize;
-
-    for ch in text.chars() {
-        if count >= max_chars {
-            chunks.push(current);
-            current = String::new();
-            count = 0;
-        }
-        current.push(ch);
-        count += 1;
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    if chunks.is_empty() {
-        chunks.push(String::new());
-    }
-    chunks
 }
 
 fn is_duplicate_event(seen: &mut VecDeque<String>, event_id: &str) -> bool {
@@ -534,7 +507,7 @@ fn send_slack_message(
         return Ok(());
     }
 
-    for chunk in split_text_chunks(message, MAX_TEXT_CHUNK_CHARS) {
+    for chunk in super::split_text_chunks(message, MAX_TEXT_CHUNK_CHARS) {
         let mut payload = serde_json::json!({
             "channel": channel_id,
             "text": chunk,
@@ -758,14 +731,7 @@ fn spawn_slack_run(
         let result = match result {
             Ok(agent_result) => agent_result,
             Err(panic_info) => {
-                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "agent panicked".to_string()
-                };
-                Err(format!("Agent crashed: {msg}"))
+                Err(format!("Agent crashed: {}", super::panic_to_string(panic_info)))
             }
         };
 
@@ -1091,22 +1057,7 @@ pub(crate) fn run_slack_bridge(
     }
 
     // Best-effort cleanup of orphaned temp files from previous sessions.
-    {
-        if let Some(parent) = agent_config.db_path.parent() {
-            if let Some(stem) = agent_config.db_path.file_name().and_then(|f| f.to_str()) {
-                let prefix = format!(".{}.", stem);
-                if let Ok(entries) = std::fs::read_dir(parent) {
-                    for entry in entries.flatten() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            if name.starts_with(&prefix) {
-                                let _ = std::fs::remove_file(entry.path());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    super::cleanup_orphaned_temp_files(&agent_config.db_path);
 
     let mut active_runs: HashMap<String, SlackRunState> = HashMap::new();
     let (completion_tx, completion_rx) = mpsc::channel::<SlackCompletionEvent>();
@@ -1140,14 +1091,7 @@ pub(crate) fn run_slack_bridge(
         loop {
             if last_vault_check.elapsed() >= vault_check_interval {
                 last_vault_check = Instant::now();
-                if let Ok(meta) = std::fs::metadata(&config.db_path) {
-                    let size_mb = meta.len() / 1_000_000;
-                    if size_mb > 200 {
-                        eprintln!(
-                            "[bridge] WARNING: vault size {size_mb}MB — approaching hard cap"
-                        );
-                    }
-                }
+                super::check_vault_health(&config.db_path);
             }
 
             match socket_rx.recv_timeout(Duration::from_millis(250)) {

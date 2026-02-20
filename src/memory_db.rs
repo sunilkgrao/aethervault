@@ -96,10 +96,6 @@ pub(crate) struct TemporalFilter {
     pub(crate) start_utc: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) end_utc: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) phrase: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) tz: Option<String>,
 }
 
 // ── Frame ────────────────────────────────────────────────────────────────
@@ -152,16 +148,10 @@ pub(crate) struct SearchRequest {
     pub(crate) query: String,
     pub(crate) top_k: usize,
     pub(crate) snippet_chars: usize,
-    #[allow(dead_code)]
-    pub(crate) uri: Option<String>,
     pub(crate) scope: Option<String>,
-    #[allow(dead_code)]
-    pub(crate) cursor: Option<String>,
     pub(crate) temporal: Option<TemporalFilter>,
     pub(crate) as_of_frame: Option<FrameId>,
     pub(crate) as_of_ts: Option<i64>,
-    #[allow(dead_code)]
-    pub(crate) no_sketch: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -185,15 +175,6 @@ pub(crate) struct PutOptions {
     pub(crate) metadata: Option<serde_json::Value>,
     pub(crate) role: FrameRole,
     pub(crate) parent_id: Option<FrameId>,
-    // Feature flags — preserved for API compat but not meaningful in SQLite backend.
-    #[allow(dead_code)]
-    pub(crate) auto_tag: bool,
-    #[allow(dead_code)]
-    pub(crate) extract_dates: bool,
-    #[allow(dead_code)]
-    pub(crate) extract_triplets: bool,
-    #[allow(dead_code)]
-    pub(crate) instant_index: bool,
 }
 
 impl Default for PutOptions {
@@ -211,10 +192,6 @@ impl Default for PutOptions {
             metadata: None,
             role: FrameRole::default(),
             parent_id: None,
-            auto_tag: true,
-            extract_dates: true,
-            extract_triplets: true,
-            instant_index: true,
         }
     }
 }
@@ -325,17 +302,6 @@ CREATE INDEX IF NOT EXISTS idx_feedback_uri ON feedback(uri);
 // ── Core implementation ──────────────────────────────────────────────────
 
 impl MemoryDb {
-    /// Open an existing database. Errors if the file doesn't exist.
-    pub(crate) fn open(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        if !path.exists() {
-            return Err(format!("database not found: {}", path.display()).into());
-        }
-        let conn = Connection::open(path)?;
-        let db = Self { conn };
-        db.apply_pragmas()?;
-        Ok(db)
-    }
-
     /// Open or create a database file with full schema.
     pub(crate) fn open_or_create(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         if let Some(parent) = path.parent() {
@@ -373,11 +339,6 @@ impl MemoryDb {
             .ok();
 
         Ok(())
-    }
-
-    /// Borrow the underlying connection (for callers that need raw SQL).
-    pub(crate) fn conn(&self) -> &Connection {
-        &self.conn
     }
 
     // ── Frame read operations ────────────────────────────────────────
@@ -832,14 +793,6 @@ impl MemoryDb {
             Err(_) => return Vec::new(),
         };
         rows.filter_map(|r| r.ok()).collect()
-    }
-
-    pub(crate) fn config_delete(&self, key: &str) -> Result<bool, String> {
-        let rows = self
-            .conn
-            .execute("DELETE FROM config WHERE key = ?", params![key])
-            .map_err(|e| format!("config_delete({key}): {e}"))?;
-        Ok(rows > 0)
     }
 
     // ── Feedback operations ──────────────────────────────────────────
@@ -1337,6 +1290,22 @@ impl MemoryDb {
     }
 }
 
+#[cfg(test)]
+impl MemoryDb {
+    /// Borrow the underlying connection (test-only; used for raw SQL assertions).
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    pub(crate) fn config_delete(&self, key: &str) -> Result<bool, String> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM config WHERE key = ?", params![key])
+            .map_err(|e| format!("config_delete({key}): {e}"))?;
+        Ok(rows > 0)
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1441,13 +1410,10 @@ mod tests {
             query: "rust programming".to_string(),
             top_k: 10,
             snippet_chars: 200,
-            uri: None,
             scope: None,
-            cursor: None,
             temporal: None,
             as_of_frame: None,
             as_of_ts: None,
-            no_sketch: false,
         };
 
         let response = db.search(request).unwrap();
@@ -1584,13 +1550,10 @@ mod tests {
             query: "rust memory systems".to_string(),
             top_k: 10,
             snippet_chars: 200,
-            uri: None,
             scope: None,
-            cursor: None,
             temporal: None,
             as_of_frame: None,
             as_of_ts: None,
-            no_sketch: false,
         };
 
         let response = db.search(request).unwrap();
@@ -1635,13 +1598,10 @@ mod tests {
             query: "rust memory safety borrow checker".to_string(),
             top_k: 10,
             snippet_chars: 200,
-            uri: None,
             scope: None,
-            cursor: None,
             temporal: None,
             as_of_frame: None,
             as_of_ts: None,
-            no_sketch: false,
         };
 
         let response = db.search(request).unwrap();

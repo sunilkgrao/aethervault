@@ -5,9 +5,7 @@ pub(crate) mod webhook;
 
 pub(crate) use telegram::*;
 
-#[allow(unused_imports)]
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -60,20 +58,9 @@ pub(crate) fn build_bridge_agent_config(
     log: bool,
     log_commit_interval: usize,
 ) -> Result<BridgeAgentConfig, Box<dyn std::error::Error>> {
-    let model_hook = resolve_bridge_model_hook(model_hook);
-    let system = system;
-    let no_memory = no_memory;
-    let context_query = context_query;
-    let context_results = context_results;
-    let context_max_bytes = context_max_bytes;
-    let max_steps = max_steps;
-    let log_commit_interval = log_commit_interval.max(1);
-    let log = log;
-    let session_prefix = String::new();
-
     Ok(BridgeAgentConfig {
         db_path,
-        model_hook,
+        model_hook: resolve_bridge_model_hook(model_hook),
         system,
         no_memory,
         context_query,
@@ -81,9 +68,71 @@ pub(crate) fn build_bridge_agent_config(
         context_max_bytes,
         max_steps,
         log,
-        log_commit_interval,
-        session_prefix,
+        log_commit_interval: log_commit_interval.max(1),
+        session_prefix: String::new(),
     })
+}
+
+pub(crate) fn split_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if count >= max_chars {
+            chunks.push(current);
+            current = String::new();
+            count = 0;
+        }
+        current.push(ch);
+        count += 1;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+pub(crate) fn cleanup_orphaned_temp_files(db_path: &Path) {
+    if let Some(parent) = db_path.parent() {
+        if let Some(stem) = db_path.file_name().and_then(|f| f.to_str()) {
+            let prefix = format!(".{}.", stem);
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if name.starts_with(&prefix) {
+                            let _ = std::fs::remove_file(entry.path());
+                            eprintln!("[bridge] cleaned up orphaned temp file: {}", name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn check_vault_health(db_path: &Path) {
+    if let Ok(meta) = std::fs::metadata(db_path) {
+        let size_mb = meta.len() / 1_000_000;
+        if size_mb > 200 {
+            eprintln!("[bridge] WARNING: vault size {size_mb}MB \u{2014} approaching hard cap");
+        }
+    }
+}
+
+pub(crate) fn panic_to_string(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "agent panicked".to_string()
+    }
 }
 
 pub(crate) fn run_agent_for_bridge(
@@ -128,14 +177,7 @@ pub(crate) fn run_agent_for_bridge(
         })) {
             Ok(result) => result,
             Err(panic_info) => {
-                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "agent panicked".to_string()
-                };
-                Err(format!("Agent crashed: {msg}"))
+                Err(format!("Agent crashed: {}", panic_to_string(panic_info)))
             }
         };
         let _ = tx.send(result);

@@ -25,13 +25,6 @@ pub(crate) fn config_file_path(workspace: &Path) -> PathBuf {
     workspace.join("config.json")
 }
 
-pub(crate) fn load_file_config(path: &Path) -> FileConfig {
-    match std::fs::read_to_string(path) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-        Err(_) => FileConfig::default(),
-    }
-}
-
 pub(crate) fn load_config_from_file(workspace: &Path) -> CapsuleConfig {
     let path = config_file_path(workspace);
     if !path.exists() {
@@ -124,16 +117,3 @@ impl FileConfig {
     }
 }
 
-pub(crate) fn save_file_config(
-    path: &Path,
-    config: &FileConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(config)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}

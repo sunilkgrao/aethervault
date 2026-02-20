@@ -85,13 +85,10 @@ pub(crate) fn consolidate(
         query: query_prefix,
         top_k: 5,
         snippet_chars: 300,
-        uri: None,
         scope,
-        cursor: None,
         temporal: None,
         as_of_frame: None,
         as_of_ts: None,
-        no_sketch: false,
     };
 
     let candidates = match db.search(request) {

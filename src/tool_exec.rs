@@ -15,11 +15,87 @@ use chrono::Utc;
 use walkdir::WalkDir;
 
 use std::sync::mpsc;
-use std::process::Command;
 
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 120_000;
 /// Sentinel: disable timeout for exec policies (Codex CLI, builds).
 const EXEC_NO_TIMEOUT: u64 = u64::MAX;
+
+/// Build a ureq agent with uniform connect/read/write timeouts.
+fn make_http_agent(timeout_ms: u64) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(timeout_ms))
+        .timeout_read(Duration::from_millis(timeout_ms))
+        .timeout_write(Duration::from_millis(timeout_ms))
+        .build()
+}
+
+/// Run himalaya CLI with the given args, optionally piping stdin.
+/// Returns stdout as a String on success, or a formatted error on failure.
+fn run_himalaya(cmd: &mut std::process::Command, stdin_data: Option<&[u8]>) -> Result<String, String> {
+    if let Some(data) = stdin_data {
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| format!("himalaya: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(data).map_err(|e| format!("send stdin: {e}"))?;
+        }
+        let output = child.wait_with_output().map_err(|e| format!("send output: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!("himalaya error: {stderr}"));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let output = cmd.output().map_err(|e| format!("himalaya: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!("himalaya error: {stderr}"));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+}
+
+/// Perform an OAuth-authenticated GET request, returning the JSON response body.
+fn oauth_api_get(mv2: &Path, provider: &str, url: &str, label: &str) -> Result<serde_json::Value, String> {
+    let token = get_oauth_token(mv2, provider).map_err(|e| e.to_string())?;
+    let agent = make_http_agent(DEFAULT_HTTP_TIMEOUT_MS);
+    let resp = agent
+        .get(url)
+        .set("authorization", &format!("Bearer {}", token))
+        .call();
+    match resp {
+        Ok(resp) => resp
+            .into_json::<serde_json::Value>()
+            .map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(format!("{label} error {code}: {text}"))
+        }
+        Err(err) => Err(format!("{label} failed: {err}")),
+    }
+}
+
+/// Perform an OAuth-authenticated POST request with a JSON payload, returning the JSON response body.
+fn oauth_api_post(mv2: &Path, provider: &str, url: &str, payload: serde_json::Value, label: &str) -> Result<serde_json::Value, String> {
+    let token = get_oauth_token(mv2, provider).map_err(|e| e.to_string())?;
+    let agent = make_http_agent(DEFAULT_HTTP_TIMEOUT_MS);
+    let resp = agent
+        .post(url)
+        .set("authorization", &format!("Bearer {}", token))
+        .set("content-type", "application/json")
+        .send_json(payload);
+    match resp {
+        Ok(resp) => resp
+            .into_json::<serde_json::Value>()
+            .map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(format!("{label} error {code}: {text}"))
+        }
+        Err(err) => Err(format!("{label} failed: {err}")),
+    }
+}
 const PROCESS_POLL_MS: u64 = 250;
 const STATUS_REPORT_MS: u64 = 3_000;
 
@@ -299,153 +375,10 @@ fn wait_for_child_monitored(
     }
 }
 
-fn escape_sql_value(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\'', "''")
-}
-
-fn skill_db_exec_with_flags(
-    db_path: &Path,
-    flags: &[&str],
-    query: &str,
-) -> Result<String, String> {
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("skill db: failed to create parent directory: {e}"))?;
-    }
-    let output = Command::new("sqlite3")
-        .args(flags)
-        .arg(db_path)
-        .arg(query)
-        .output()
-        .map_err(|e| format!("skill db: unable to execute sqlite3: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if !output.status.success() {
-        let stderr = if output.stderr.is_empty() {
-            stdout.clone()
-        } else {
-            String::from_utf8_lossy(&output.stderr).to_string()
-        };
-        let detail = stderr.trim();
-        let err = if detail.is_empty() {
-            "command failed with no message".to_string()
-        } else {
-            detail.to_string()
-        };
-        return Err(format!("skill db: {err}"));
-    }
-    Ok(stdout)
-}
-
-fn skill_db_exec(db_path: &Path, query: &str) -> Result<String, String> {
-    skill_db_exec_with_flags(db_path, &[], query)
-}
-
-fn ensure_skill_db(db_path: &Path) -> Result<(), String> {
-    let ddl = "CREATE TABLE IF NOT EXISTS skills (
-    name TEXT PRIMARY KEY,
-    trigger TEXT,
-    steps TEXT,
-    tools TEXT,
-    notes TEXT,
-    success_rate REAL NOT NULL DEFAULT 0.0,
-    use_count INTEGER NOT NULL DEFAULT 0
-);";
-    skill_db_exec(db_path, ddl)?;
-    Ok(())
-}
-
-fn upsert_skill_db(mv2: &Path, parsed: &ToolSkillStoreArgs) -> Result<(), String> {
-    let db_path = skill_db_path(mv2);
-    ensure_skill_db(&db_path)?;
-    let name = escape_sql_value(&parsed.name);
-    let trigger = escape_sql_value(&parsed.trigger.clone().unwrap_or_default());
-    let steps = serde_json::to_string(&parsed.steps.clone().unwrap_or_default())
-        .map_err(|e| e.to_string())?;
-    let tools = serde_json::to_string(&parsed.tools.clone().unwrap_or_default())
-        .map_err(|e| e.to_string())?;
-    let steps = escape_sql_value(&steps);
-    let tools = escape_sql_value(&tools);
-    let notes = escape_sql_value(&parsed.notes.clone().unwrap_or_default());
-    let sql = format!(
-        "INSERT INTO skills (name, trigger, steps, tools, notes, success_rate, use_count)
-         VALUES ('{name}', '{trigger}', '{steps}', '{tools}', '{notes}', 0.0, 0)
-         ON CONFLICT(name) DO UPDATE SET
-            trigger=excluded.trigger,
-            steps=excluded.steps,
-            tools=excluded.tools,
-            notes=excluded.notes;",
-    );
-    skill_db_exec(&db_path, &sql)?;
-    Ok(())
-}
-
-fn search_skill_db(mv2: &Path, query: &str, limit: usize) -> Result<Vec<serde_json::Value>, String> {
-    let db_path = skill_db_path(mv2);
-    ensure_skill_db(&db_path)?;
-    let escaped = escape_sql_value(&query.to_lowercase());
-    let like_query = format!("%{escaped}%");
-    let sql = format!(
-        "SELECT name, trigger, steps, tools, notes, success_rate, use_count
-         FROM skills
-         WHERE lower(name) LIKE '{like_query}'
-            OR lower(trigger) LIKE '{like_query}'
-            OR lower(steps) LIKE '{like_query}'
-            OR lower(tools) LIKE '{like_query}'
-            OR lower(notes) LIKE '{like_query}'
-         ORDER BY (
-             CASE WHEN lower(name) LIKE '{like_query}' THEN 100 ELSE 0 END +
-             CASE WHEN lower(trigger) LIKE '{like_query}' THEN 50 ELSE 0 END +
-             CASE WHEN lower(steps) LIKE '{like_query}' THEN 20 ELSE 0 END +
-             CASE WHEN lower(tools) LIKE '{like_query}' THEN 20 ELSE 0 END +
-             CASE WHEN lower(notes) LIKE '{like_query}' THEN 10 ELSE 0 END +
-             CAST(COALESCE(success_rate, 0.0) * 10 AS INTEGER) +
-             CAST(COALESCE(use_count, 0) AS INTEGER)
-         ) DESC, name ASC
-         LIMIT {limit};",
-    );
-    let raw = skill_db_exec_with_flags(&db_path, &["-json"], &sql)?;
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let rows: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|e| format!("skill db: {e}"))?;
-    let query_low = query.to_lowercase();
-    let mut results = Vec::new();
-    for row in rows {
-        let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let trigger = row.get("trigger").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let steps = row.get("steps").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let tools = row.get("tools").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let notes = row.get("notes").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let mut score = 0.0;
-        if name.to_lowercase().contains(&query_low) {
-            score += 3.0;
-        }
-        if trigger.to_lowercase().contains(&query_low) {
-            score += 2.0;
-        }
-        if steps.to_lowercase().contains(&query_low) {
-            score += 1.0;
-        }
-        if tools.to_lowercase().contains(&query_low) {
-            score += 0.5;
-        }
-        if notes.to_lowercase().contains(&query_low) {
-            score += 0.5;
-        }
-        results.push(serde_json::json!({
-            "uri": name,
-            "title": name,
-            "text": format!("trigger: {trigger}\nsteps: {steps}\ntools: {tools}\nnotes: {notes}"),
-            "score": score,
-        }));
-    }
-    Ok(results)
-}
 
 use crate::{
     env_optional,
     kill_process_tree,
-    skill_db_path,
     load_approvals,
     save_approvals,
     approval_hash,
@@ -576,11 +509,7 @@ fn submit_exec_background_job(
         "name": background_exec_job_name(command),
     });
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-        .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-        .timeout_write(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-        .build();
+    let agent = make_http_agent(DEFAULT_HTTP_TIMEOUT_MS);
     let response = agent
         .post(&endpoint)
         .set("content-type", "application/json")
@@ -774,13 +703,10 @@ pub(crate) fn execute_tool(
                 query: parsed.query.clone(),
                 top_k: parsed.limit.unwrap_or(10),
                 snippet_chars: parsed.snippet_chars.unwrap_or(300),
-                uri: None,
                 scope,
-                cursor: None,
                 temporal: None,
                 as_of_frame: None,
                 as_of_ts: None,
-                no_sketch: false,
             };
             let response = db.search(request).map_err(|e| e.to_string())?;
             let mut lines = Vec::new();
@@ -976,13 +902,10 @@ pub(crate) fn execute_tool(
                 query: parsed.query.clone(),
                 top_k: parsed.limit.unwrap_or(10),
                 snippet_chars: 300,
-                uri: None,
                 scope: Some("aethervault://memory/".to_string()),
-                cursor: None,
                 temporal: None,
                 as_of_frame: None,
                 as_of_ts: None,
-                no_sketch: false,
             };
             let response = db.search(request).map_err(|e| e.to_string())?;
             let mut lines = Vec::new();
@@ -1090,12 +1013,7 @@ pub(crate) fn execute_tool(
             if let Some(account) = parsed.account {
                 cmd.arg("--account").arg(account);
             }
-            let output = cmd.output().map_err(|e| format!("himalaya: {e}"))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(format!("himalaya error: {stderr}"));
-            }
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stdout = run_himalaya(&mut cmd, None)?;
             let details = serde_json::from_str(&stdout)
                 .unwrap_or_else(|_| serde_json::json!({ "raw": stdout }));
             Ok(ToolExecution {
@@ -1119,12 +1037,7 @@ pub(crate) fn execute_tool(
             if let Some(account) = parsed.account {
                 cmd.arg("--account").arg(account);
             }
-            let output = cmd.output().map_err(|e| format!("himalaya: {e}"))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(format!("himalaya error: {stderr}"));
-            }
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stdout = run_himalaya(&mut cmd, None)?;
             let details = serde_json::from_str(&stdout)
                 .unwrap_or_else(|_| serde_json::json!({ "raw": stdout }));
             Ok(ToolExecution {
@@ -1160,24 +1073,7 @@ pub(crate) fn execute_tool(
 
             let mut cmd = build_external_command("himalaya", &[]);
             cmd.arg("template").arg("send");
-            let mut child = cmd
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("himalaya: {e}"))?;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(template.as_bytes())
-                    .map_err(|e| format!("send stdin: {e}"))?;
-            }
-            let output = child
-                .wait_with_output()
-                .map_err(|e| format!("send output: {e}"))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(format!("himalaya error: {stderr}"));
-            }
+            run_himalaya(&mut cmd, Some(template.as_bytes()))?;
             Ok(ToolExecution {
                 output: "Sent email.".to_string(),
                 details: serde_json::json!({ "status": "sent" }),
@@ -1195,11 +1091,7 @@ pub(crate) fn execute_tool(
             if let Some(account) = parsed.account {
                 cmd.arg("--account").arg(account);
             }
-            let output = cmd.output().map_err(|e| format!("himalaya: {e}"))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(format!("himalaya error: {stderr}"));
-            }
+            run_himalaya(&mut cmd, None)?;
             Ok(ToolExecution {
                 output: "Archived email.".to_string(),
                 details: serde_json::json!({ "status": "archived" }),
@@ -1319,11 +1211,7 @@ pub(crate) fn execute_tool(
                 "teams" => serde_json::json!({ "text": parsed.text }),
                 _ => serde_json::json!({ "text": parsed.text }),
             };
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .timeout_write(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .build();
+            let agent = make_http_agent(DEFAULT_HTTP_TIMEOUT_MS);
             let response = agent
                 .post(&webhook)
                 .set("content-type", "application/json")
@@ -1394,11 +1282,7 @@ pub(crate) fn execute_tool(
                 .unwrap_or_else(|| "GET".to_string())
                 .to_ascii_uppercase();
             let timeout = parsed.timeout_ms.unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_millis(timeout))
-                .timeout_write(Duration::from_millis(timeout))
-                .timeout_read(Duration::from_millis(timeout))
-                .build();
+            let agent = make_http_agent(timeout);
             let mut req = match method.as_str() {
                 "GET" => agent.get(&parsed.url),
                 "POST" => agent.post(&parsed.url),
@@ -1924,13 +1808,10 @@ pub(crate) fn execute_tool(
                     query: parsed.session.clone(),
                     top_k: 200,
                     snippet_chars: 200,
-                    uri: None,
                     scope: Some(scope),
-                    cursor: None,
                     temporal: None,
                     as_of_frame: None,
                     as_of_ts: None,
-                    no_sketch: true,
                 };
                 let response = db.search(request).map_err(|e| e.to_string())?;
                 let mut entries = Vec::new();
@@ -2040,7 +1921,6 @@ pub(crate) fn execute_tool(
             };
             upsert_skill(&conn, &skill).map_err(|e| format!("upsert: {e}"))?;
 
-            upsert_skill_db(mv2, &parsed)?;
             let ts = Utc::now().timestamp();
             let payload = serde_json::json!({
                 "name": skill_name,
@@ -2129,19 +2009,14 @@ pub(crate) fn execute_tool(
                 }));
             }
 
-            if let Ok(mut out_skill_db) = search_skill_db(mv2, &parsed.query, limit) {
-                out.append(&mut out_skill_db);
-            } else if let Ok(response) = db.search(SearchRequest {
+            if let Ok(response) = db.search(SearchRequest {
                 query: parsed.query.clone(),
                 top_k: limit,
                 snippet_chars: 200,
-                uri: None,
                 scope: Some("aethervault://skills/".to_string()),
-                cursor: None,
                 temporal: None,
                 as_of_frame: None,
                 as_of_ts: None,
-                no_sketch: true,
             }) {
                 for hit in response.hits {
                     out.push(serde_json::json!({
@@ -2473,10 +2348,6 @@ pub(crate) fn execute_tool(
         "gmail_list" => {
             let parsed: ToolGmailListArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
-            let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .build();
             let mut url = format!(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={}",
                 parsed.max_results.unwrap_or(10)
@@ -2485,20 +2356,7 @@ pub(crate) fn execute_tool(
                 url.push_str("&q=");
                 url.push_str(&urlencoding::encode(&q));
             }
-            let resp = agent
-                .get(&url)
-                .set("authorization", &format!("Bearer {}", token))
-                .call();
-            let payload = match resp {
-                Ok(resp) => resp
-                    .into_json::<serde_json::Value>()
-                    .map_err(|e| e.to_string())?,
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    return Err(format!("gmail_list error {code}: {text}").into());
-                }
-                Err(err) => return Err(format!("gmail_list failed: {err}").into()),
-            };
+            let payload = oauth_api_get(mv2, "google", &url, "gmail_list")?;
             Ok(ToolExecution {
                 output: "Gmail messages listed.".to_string(),
                 details: payload,
@@ -2508,28 +2366,11 @@ pub(crate) fn execute_tool(
         "gmail_read" => {
             let parsed: ToolGmailReadArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
-            let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .build();
             let url = format!(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=full",
                 parsed.id
             );
-            let resp = agent
-                .get(&url)
-                .set("authorization", &format!("Bearer {}", token))
-                .call();
-            let payload = match resp {
-                Ok(resp) => resp
-                    .into_json::<serde_json::Value>()
-                    .map_err(|e| e.to_string())?,
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    return Err(format!("gmail_read error {code}: {text}").into());
-                }
-                Err(err) => return Err(format!("gmail_read failed: {err}").into()),
-            };
+            let payload = oauth_api_get(mv2, "google", &url, "gmail_read")?;
             Ok(ToolExecution {
                 output: "Gmail message read.".to_string(),
                 details: payload,
@@ -2539,7 +2380,6 @@ pub(crate) fn execute_tool(
         "gmail_send" => {
             let parsed: ToolGmailSendArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
             let raw = format!(
                 "To: {}\r\nSubject: {}\r\n\r\n{}\r\n",
                 parsed.to, parsed.subject, parsed.body
@@ -2551,54 +2391,25 @@ pub(crate) fn execute_tool(
                 .trim_end_matches('=')
                 .to_string();
             let payload = serde_json::json!({ "raw": encoded });
-            let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .build();
-            let resp = agent
-                .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
-                .set("authorization", &format!("Bearer {}", token))
-                .set("content-type", "application/json")
-                .send_json(payload);
-            match resp {
-                Ok(resp) => Ok(ToolExecution {
-                    output: "Gmail message sent.".to_string(),
-                    details: resp
-                        .into_json::<serde_json::Value>()
-                        .map_err(|e| e.to_string())?,
-                    is_error: false,
-                }),
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    Err(format!("gmail_send error {code}: {text}").into())
-                }
-                Err(err) => Err(format!("gmail_send failed: {err}").into()),
-            }
+            let details = oauth_api_post(
+                mv2, "google",
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                payload, "gmail_send",
+            )?;
+            Ok(ToolExecution {
+                output: "Gmail message sent.".to_string(),
+                details,
+                is_error: false,
+            })
         }
         "gcal_list" => {
             let parsed: ToolGCalListArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
-            let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .build();
             let url = format!(
                 "https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults={}",
                 parsed.max_results.unwrap_or(10)
             );
-            let resp = agent
-                .get(&url)
-                .set("authorization", &format!("Bearer {}", token))
-                .call();
-            let payload = match resp {
-                Ok(resp) => resp
-                    .into_json::<serde_json::Value>()
-                    .map_err(|e| e.to_string())?,
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    return Err(format!("gcal_list error {code}: {text}").into());
-                }
-                Err(err) => return Err(format!("gcal_list failed: {err}").into()),
-            };
+            let payload = oauth_api_get(mv2, "google", &url, "gcal_list")?;
             Ok(ToolExecution {
                 output: "Calendar events listed.".to_string(),
                 details: payload,
@@ -2608,61 +2419,31 @@ pub(crate) fn execute_tool(
         "gcal_create" => {
             let parsed: ToolGCalCreateArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let token = get_oauth_token(mv2, "google").map_err(|e| e.to_string())?;
             let payload = serde_json::json!({
                 "summary": parsed.summary,
                 "description": parsed.description,
                 "start": { "dateTime": parsed.start },
                 "end": { "dateTime": parsed.end }
             });
-            let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .build();
-            let resp = agent
-                .post("https://www.googleapis.com/calendar/v3/calendars/primary/events")
-                .set("authorization", &format!("Bearer {}", token))
-                .set("content-type", "application/json")
-                .send_json(payload);
-            match resp {
-                Ok(resp) => Ok(ToolExecution {
-                    output: "Calendar event created.".to_string(),
-                    details: resp
-                        .into_json::<serde_json::Value>()
-                        .map_err(|e| e.to_string())?,
-                    is_error: false,
-                }),
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    Err(format!("gcal_create error {code}: {text}").into())
-                }
-                Err(err) => Err(format!("gcal_create failed: {err}").into()),
-            }
+            let details = oauth_api_post(
+                mv2, "google",
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+                payload, "gcal_create",
+            )?;
+            Ok(ToolExecution {
+                output: "Calendar event created.".to_string(),
+                details,
+                is_error: false,
+            })
         }
         "ms_mail_list" => {
             let parsed: ToolMsMailListArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let token = get_oauth_token(mv2, "microsoft").map_err(|e| e.to_string())?;
             let url = format!(
                 "https://graph.microsoft.com/v1.0/me/messages?$top={}",
                 parsed.top.unwrap_or(10)
             );
-            let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .build();
-            let resp = agent
-                .get(&url)
-                .set("authorization", &format!("Bearer {}", token))
-                .call();
-            let payload = match resp {
-                Ok(resp) => resp
-                    .into_json::<serde_json::Value>()
-                    .map_err(|e| e.to_string())?,
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    return Err(format!("ms_mail_list error {code}: {text}").into());
-                }
-                Err(err) => return Err(format!("ms_mail_list failed: {err}").into()),
-            };
+            let payload = oauth_api_get(mv2, "microsoft", &url, "ms_mail_list")?;
             Ok(ToolExecution {
                 output: "Microsoft mail listed.".to_string(),
                 details: payload,
@@ -2672,25 +2453,8 @@ pub(crate) fn execute_tool(
         "ms_mail_read" => {
             let parsed: ToolMsMailReadArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let token = get_oauth_token(mv2, "microsoft").map_err(|e| e.to_string())?;
             let url = format!("https://graph.microsoft.com/v1.0/me/messages/{}", parsed.id);
-            let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .build();
-            let resp = agent
-                .get(&url)
-                .set("authorization", &format!("Bearer {}", token))
-                .call();
-            let payload = match resp {
-                Ok(resp) => resp
-                    .into_json::<serde_json::Value>()
-                    .map_err(|e| e.to_string())?,
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    return Err(format!("ms_mail_read error {code}: {text}").into());
-                }
-                Err(err) => return Err(format!("ms_mail_read failed: {err}").into()),
-            };
+            let payload = oauth_api_get(mv2, "microsoft", &url, "ms_mail_read")?;
             Ok(ToolExecution {
                 output: "Microsoft mail read.".to_string(),
                 details: payload,
@@ -2700,28 +2464,11 @@ pub(crate) fn execute_tool(
         "ms_calendar_list" => {
             let parsed: ToolMsCalendarListArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let token = get_oauth_token(mv2, "microsoft").map_err(|e| e.to_string())?;
             let url = format!(
                 "https://graph.microsoft.com/v1.0/me/events?$top={}",
                 parsed.top.unwrap_or(10)
             );
-            let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .build();
-            let resp = agent
-                .get(&url)
-                .set("authorization", &format!("Bearer {}", token))
-                .call();
-            let payload = match resp {
-                Ok(resp) => resp
-                    .into_json::<serde_json::Value>()
-                    .map_err(|e| e.to_string())?,
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    return Err(format!("ms_calendar_list error {code}: {text}").into());
-                }
-                Err(err) => return Err(format!("ms_calendar_list failed: {err}").into()),
-            };
+            let payload = oauth_api_get(mv2, "microsoft", &url, "ms_calendar_list")?;
             Ok(ToolExecution {
                 output: "Microsoft calendar listed.".to_string(),
                 details: payload,
@@ -2731,7 +2478,6 @@ pub(crate) fn execute_tool(
         "ms_calendar_create" => {
             let parsed: ToolMsCalendarCreateArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let token = get_oauth_token(mv2, "microsoft").map_err(|e| e.to_string())?;
             let payload = serde_json::json!({
                 "subject": parsed.subject,
                 "body": {
@@ -2741,28 +2487,16 @@ pub(crate) fn execute_tool(
                 "start": { "dateTime": parsed.start, "timeZone": "UTC" },
                 "end": { "dateTime": parsed.end, "timeZone": "UTC" }
             });
-            let agent = ureq::AgentBuilder::new()
-                .timeout_read(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
-                .build();
-            let resp = agent
-                .post("https://graph.microsoft.com/v1.0/me/events")
-                .set("authorization", &format!("Bearer {}", token))
-                .set("content-type", "application/json")
-                .send_json(payload);
-            match resp {
-                Ok(resp) => Ok(ToolExecution {
-                    output: "Microsoft calendar event created.".to_string(),
-                    details: resp
-                        .into_json::<serde_json::Value>()
-                        .map_err(|e| e.to_string())?,
-                    is_error: false,
-                }),
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    Err(format!("ms_calendar_create error {code}: {text}").into())
-                }
-                Err(err) => Err(format!("ms_calendar_create failed: {err}").into()),
-            }
+            let details = oauth_api_post(
+                mv2, "microsoft",
+                "https://graph.microsoft.com/v1.0/me/events",
+                payload, "ms_calendar_create",
+            )?;
+            Ok(ToolExecution {
+                output: "Microsoft calendar event created.".to_string(),
+                details,
+                is_error: false,
+            })
         }
         "scale" => {
             let parsed: ToolScaleArgs =
