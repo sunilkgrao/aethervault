@@ -430,8 +430,23 @@ impl MemoryDb {
             .as_ref()
             .and_then(|m| serde_json::to_string(m).ok());
 
-        // Supersede existing active frames with the same URI (append-only semantics)
+        // Supersede existing active frames with the same URI (append-only semantics).
+        // Skip entirely if the existing frame has identical content (same blake3 hash).
         if let Some(ref uri) = options.uri {
+            let existing: Option<(i64, Vec<u8>)> = self
+                .conn
+                .query_row(
+                    "SELECT id, checksum FROM frames WHERE uri = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+                    params![uri],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+            if let Some((_id, existing_checksum)) = &existing {
+                if existing_checksum.as_slice() == checksum_bytes {
+                    // Content unchanged — return existing frame ID, no write needed
+                    return Ok(*_id as u64);
+                }
+            }
             self.conn
                 .execute(
                     "UPDATE frames SET status = 'superseded' WHERE uri = ? AND status = 'active'",
@@ -1283,6 +1298,24 @@ impl MemoryDb {
     }
 
     /// Run VACUUM to reclaim space.
+    /// Delete all superseded frames (they are dead weight after URI supersede).
+    pub(crate) fn purge_superseded(&self) -> Result<usize, String> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM frames WHERE status = 'superseded'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("count superseded: {e}"))?;
+        if count > 0 {
+            self.conn
+                .execute("DELETE FROM frames WHERE status = 'superseded'", [])
+                .map_err(|e| format!("purge superseded: {e}"))?;
+        }
+        Ok(count as usize)
+    }
+
     pub(crate) fn vacuum(&self) -> Result<(), String> {
         self.conn
             .execute_batch("VACUUM")

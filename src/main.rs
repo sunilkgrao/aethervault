@@ -1024,6 +1024,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let _ = (rebuild_time, rebuild_vec, dry_run, quiet);
             let db = open_or_create_db(&mv2)?;
+            // Always purge superseded frames — they are dead weight
+            let purged = db.purge_superseded().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            if purged > 0 {
+                eprintln!("[doctor] purged {purged} superseded frames");
+            }
             if rebuild_lex {
                 db.rebuild_fts().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
