@@ -240,6 +240,10 @@ pub(crate) fn to_anthropic_messages(messages: &[AgentMessage]) -> Vec<serde_json
             }
             "assistant" => {
                 let mut blocks = Vec::new();
+                // Thinking blocks must come first in assistant content
+                for tb in &msg.thinking_blocks {
+                    blocks.push(tb.clone());
+                }
                 if let Some(content) = &msg.content {
                     if !content.is_empty() {
                         blocks.push(serde_json::json!({"type": "text", "text": content}));
@@ -320,6 +324,7 @@ pub(crate) fn parse_claude_response(
         .ok_or("Claude response missing content")?;
     let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut thinking_blocks = Vec::new();
 
     for block in content {
         let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -348,6 +353,10 @@ pub(crate) fn parse_claude_response(
                     .unwrap_or_else(|| serde_json::json!({}));
                 tool_calls.push(AgentToolCall { id, name, args });
             }
+            "thinking" | "redacted_thinking" => {
+                // Preserve thinking blocks for multi-turn tool-use conversations
+                thinking_blocks.push(block.clone());
+            }
             _ => {}
         }
     }
@@ -366,6 +375,7 @@ pub(crate) fn parse_claude_response(
             name: None,
             tool_call_id: None,
             is_error: None,
+            thinking_blocks,
         },
     })
 }
@@ -434,11 +444,39 @@ pub(crate) fn call_claude_with_model(
     } else {
         None
     };
+    // Extended thinking: ANTHROPIC_THINKING controls thinking mode.
+    //   "adaptive" (recommended for Opus 4.6) — Claude decides when/how much to think.
+    //   "off" or unset — no thinking.
+    // ANTHROPIC_THINKING_EFFORT controls depth: "max", "high" (default), "medium", "low".
+    //   "max" is Opus 4.6 only — highest quality, no constraints on thinking depth.
+    let thinking_mode = env_optional("ANTHROPIC_THINKING")
+        .unwrap_or_default();
+    let thinking_enabled = thinking_mode == "adaptive";
+    let thinking_effort = env_optional("ANTHROPIC_THINKING_EFFORT")
+        .unwrap_or_else(|| "high".to_string());
+
+    let effective_max_tokens = if thinking_enabled {
+        // With thinking, max_tokens must cover thinking + response
+        max_tokens.max(16384)
+    } else {
+        max_tokens
+    };
+
     let mut payload = serde_json::json!({
         "model": model,
-        "max_tokens": max_tokens,
+        "max_tokens": effective_max_tokens,
         "messages": to_anthropic_messages(&request.messages),
     });
+
+    if thinking_enabled {
+        payload["thinking"] = serde_json::json!({
+            "type": "adaptive",
+        });
+        payload["output_config"] = serde_json::json!({
+            "effort": thinking_effort,
+        });
+    }
+
     if !system_blocks.is_empty() {
         if let Some(cache) = cache_control.clone() {
             let blocks: Vec<serde_json::Value> = system_blocks.iter().enumerate().map(|(i, text)| {
@@ -457,11 +495,14 @@ pub(crate) fn call_claude_with_model(
     if !tools.is_empty() {
         payload["tools"] = serde_json::json!(tools);
     }
-    if let Some(temp) = temperature {
-        payload["temperature"] = serde_json::json!(temp);
-    }
-    if let Some(p) = top_p {
-        payload["top_p"] = serde_json::json!(p);
+    // Temperature is incompatible with extended thinking
+    if !thinking_enabled {
+        if let Some(temp) = temperature {
+            payload["temperature"] = serde_json::json!(temp);
+        }
+        if let Some(p) = top_p {
+            payload["top_p"] = serde_json::json!(p);
+        }
     }
 
     let agent = ureq::AgentBuilder::new()

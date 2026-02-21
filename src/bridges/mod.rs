@@ -36,12 +36,9 @@ pub(crate) fn resolve_bridge_model_hook(cli: Option<String>) -> Option<String> {
     if cli.is_some() {
         return cli;
     }
-    // Prefer Sonnet for the orchestrator — fast + cheap.
-    // Opus kicks in automatically via critic-triggered escalation.
+    // Use ANTHROPIC_MODEL (e.g. claude-opus-4-6) via the builtin:claude hook.
     if env_optional("ANTHROPIC_API_KEY").is_some() {
-        if env_optional("SONNET_MODEL").is_some() || env_optional("ANTHROPIC_MODEL").is_some() {
-            return Some("builtin:sonnet".to_string());
-        }
+        return Some("builtin:claude".to_string());
     }
     None
 }

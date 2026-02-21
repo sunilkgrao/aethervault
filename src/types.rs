@@ -331,6 +331,10 @@ pub(crate) struct AgentMessage {
     pub(crate) tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) is_error: Option<bool>,
+    /// Raw thinking/redacted_thinking blocks from Claude's extended thinking.
+    /// Must be preserved and passed back for tool-use conversations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) thinking_blocks: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

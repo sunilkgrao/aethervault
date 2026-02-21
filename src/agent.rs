@@ -367,6 +367,7 @@ pub(crate) fn compact_messages(
                 name: None,
                 tool_call_id: None,
                 is_error: None,
+                thinking_blocks: vec![],
             },
             AgentMessage {
                 role: "user".to_string(),
@@ -375,6 +376,7 @@ pub(crate) fn compact_messages(
                 name: None,
                 tool_call_id: None,
                 is_error: None,
+                thinking_blocks: vec![],
             },
         ],
         tools: Vec::new(),
@@ -398,6 +400,7 @@ pub(crate) fn compact_messages(
         name: None,
         tool_call_id: None,
         is_error: None,
+        thinking_blocks: vec![],
     });
     messages.push(AgentMessage {
         role: "assistant".to_string(),
@@ -406,6 +409,7 @@ pub(crate) fn compact_messages(
         name: None,
         tool_call_id: None,
         is_error: None,
+        thinking_blocks: vec![],
     });
     messages.extend(recent);
     Ok(extracted_goal)
@@ -462,6 +466,7 @@ fn process_tool_result(
         name: Some(call.name.clone()),
         tool_call_id: Some(call.id.clone()),
         is_error: Some(result.is_error),
+        thinking_blocks: vec![],
     });
 
     // Activate newly discovered tools from tool_search results
@@ -790,6 +795,7 @@ pub(crate) fn run_agent_with_prompt(
         name: None,
         tool_call_id: None,
         is_error: None,
+        thinking_blocks: vec![],
     });
     if !system_dynamic.trim().is_empty() {
         messages.push(AgentMessage {
@@ -799,6 +805,7 @@ pub(crate) fn run_agent_with_prompt(
             name: None,
             tool_call_id: None,
             is_error: None,
+            thinking_blocks: vec![],
         });
     }
 
@@ -818,6 +825,7 @@ pub(crate) fn run_agent_with_prompt(
                 name: None,
                 tool_call_id: None,
                 is_error: None,
+                thinking_blocks: vec![],
             });
         }
     }
@@ -829,6 +837,7 @@ pub(crate) fn run_agent_with_prompt(
         name: None,
         tool_call_id: None,
         is_error: None,
+        thinking_blocks: vec![],
     });
 
     let tool_catalog = tool_definitions_json();
@@ -967,6 +976,7 @@ pub(crate) fn run_agent_with_prompt(
                         name: None,
                         tool_call_id: None,
                         is_error: None,
+                        thinking_blocks: vec![],
                     });
                 }
             }
@@ -989,6 +999,7 @@ pub(crate) fn run_agent_with_prompt(
                         name: None,
                         tool_call_id: None,
                         is_error: None,
+                        thinking_blocks: vec![],
                     });
                 }
             }
@@ -1064,6 +1075,7 @@ pub(crate) fn run_agent_with_prompt(
                     name: None,
                     tool_call_id: None,
                     is_error: None,
+                    thinking_blocks: vec![],
                 }
             }
         };
@@ -1120,6 +1132,7 @@ pub(crate) fn run_agent_with_prompt(
                                     name: None,
                                     tool_call_id: None,
                                     is_error: None,
+                                    thinking_blocks: vec![],
                                 },
                                 AgentMessage {
                                     role: "user".to_string(),
@@ -1128,6 +1141,7 @@ pub(crate) fn run_agent_with_prompt(
                                     name: None,
                                     tool_call_id: None,
                                     is_error: None,
+                                    thinking_blocks: vec![],
                                 },
                             ],
                             tools: Vec::new(),
@@ -1524,6 +1538,7 @@ pub(crate) fn run_agent_with_prompt(
                 name: None,
                 tool_call_id: None,
                 is_error: None,
+                thinking_blocks: vec![],
             });
         }
 
@@ -1549,6 +1564,7 @@ pub(crate) fn run_agent_with_prompt(
                     name: None,
                     tool_call_id: None,
                     is_error: None,
+                    thinking_blocks: vec![],
                 });
                 // Track in drift state
                 drift_state.violations.entry("critic_correction".to_string())
@@ -1581,6 +1597,7 @@ pub(crate) fn run_agent_with_prompt(
                             name: None,
                             tool_call_id: None,
                             is_error: None,
+                            thinking_blocks: vec![],
                         });
                     }
                     5..=6 => {
@@ -1593,6 +1610,7 @@ pub(crate) fn run_agent_with_prompt(
                             name: None,
                             tool_call_id: None,
                             is_error: None,
+                            thinking_blocks: vec![],
                         });
                         // Enforce: reduce remaining step budget by 1/3 (was halved — too aggressive)
                         let remaining = current_max_steps.saturating_sub(step);
@@ -1610,6 +1628,7 @@ pub(crate) fn run_agent_with_prompt(
                             name: None,
                             tool_call_id: None,
                             is_error: None,
+                            thinking_blocks: vec![],
                         });
                         // Enforce: allow 6 steps for graceful output (was 3 — too aggressive)
                         current_max_steps = step + 6;
@@ -1628,6 +1647,7 @@ pub(crate) fn run_agent_with_prompt(
                 name: None,
                 tool_call_id: None,
                 is_error: None,
+                thinking_blocks: vec![],
             });
         }
 
