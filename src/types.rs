@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::memory_db::TemporalFilter;
 use serde::{Deserialize, Serialize};
@@ -419,6 +420,164 @@ pub(crate) struct AgentProgress {
     /// Messages from the user injected mid-run (steering).
     /// The Telegram bridge pushes here; the agent loop drains and injects.
     pub(crate) steering_messages: Vec<String>,
+    /// Registry of background tasks (shared with tool_exec for non-blocking subagent spawns).
+    pub(crate) bg_registry: Option<Arc<Mutex<BackgroundTaskRegistry>>>,
+    /// Chat ID for this run (used by background task registry).
+    pub(crate) chat_id: Option<i64>,
+}
+
+// === Background Task Registry ===
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) enum BackgroundTaskStatus {
+    Running,
+    Completed,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BackgroundTask {
+    pub(crate) task_id: String,
+    pub(crate) name: String,
+    pub(crate) prompt_preview: String,
+    pub(crate) status: BackgroundTaskStatus,
+    pub(crate) started_at_epoch: u64,
+    pub(crate) completed_at_epoch: Option<u64>,
+    pub(crate) step_count: usize,
+    pub(crate) max_steps: usize,
+    pub(crate) result_text: Option<String>,
+    pub(crate) session: String,
+}
+
+pub(crate) struct BackgroundTaskRegistry {
+    counter: AtomicU64,
+    pub(crate) tasks: HashMap<i64, Vec<BackgroundTask>>,
+}
+
+impl BackgroundTaskRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            counter: AtomicU64::new(1),
+            tasks: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn next_id(&self) -> String {
+        let id = self.counter.fetch_add(1, Ordering::Relaxed);
+        format!("bg-{id}")
+    }
+
+    pub(crate) fn register(&mut self, chat_id: i64, task: BackgroundTask) {
+        self.tasks.entry(chat_id).or_default().push(task);
+    }
+
+    pub(crate) fn update_status(&mut self, task_id: &str, status: BackgroundTaskStatus, result_text: Option<String>) {
+        for tasks in self.tasks.values_mut() {
+            if let Some(task) = tasks.iter_mut().find(|t| t.task_id == task_id) {
+                task.status = status;
+                task.result_text = result_text;
+                task.completed_at_epoch = Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                );
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn active_for_chat(&self, chat_id: i64) -> Vec<&BackgroundTask> {
+        self.tasks
+            .get(&chat_id)
+            .map(|tasks| {
+                tasks.iter().filter(|t| t.status == BackgroundTaskStatus::Running).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn drain_completed(&mut self, chat_id: i64) -> Vec<BackgroundTask> {
+        let tasks = match self.tasks.get_mut(&chat_id) {
+            Some(tasks) => tasks,
+            None => return Vec::new(),
+        };
+        let mut completed = Vec::new();
+        tasks.retain(|t| {
+            if matches!(t.status, BackgroundTaskStatus::Completed | BackgroundTaskStatus::Failed(_)) {
+                completed.push(t.clone());
+                false
+            } else {
+                true
+            }
+        });
+        completed
+    }
+
+    pub(crate) fn scorecard(&self, chat_id: i64) -> String {
+        let tasks = match self.tasks.get(&chat_id) {
+            Some(tasks) if !tasks.is_empty() => tasks,
+            _ => return "No background tasks.".to_string(),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut lines = Vec::new();
+        for t in tasks {
+            let (icon, status_str, elapsed) = match &t.status {
+                BackgroundTaskStatus::Running => {
+                    let elapsed = now.saturating_sub(t.started_at_epoch);
+                    let icon = if elapsed < 600 { "\u{1F7E2}" } else { "\u{1F7E1}" }; // green/yellow circle
+                    let mins = elapsed / 60;
+                    let secs = elapsed % 60;
+                    (icon, "running".to_string(), format!("{mins}m {secs}s"))
+                }
+                BackgroundTaskStatus::Completed => {
+                    let elapsed = t.completed_at_epoch.unwrap_or(now).saturating_sub(t.started_at_epoch);
+                    let mins = elapsed / 60;
+                    let secs = elapsed % 60;
+                    ("\u{2705}", "done".to_string(), format!("{mins}m {secs}s"))
+                }
+                BackgroundTaskStatus::Failed(err) => {
+                    let short_err: String = err.chars().take(50).collect();
+                    ("\u{1F534}", format!("failed: {short_err}"), "".to_string())
+                }
+            };
+            lines.push(format!(
+                "{icon} {name} — {status_str} ({elapsed}, step {step}/{max})",
+                name = t.name,
+                step = t.step_count,
+                max = t.max_steps,
+            ));
+        }
+        lines.join("\n")
+    }
+
+    pub(crate) fn chats_with_completed(&self) -> Vec<i64> {
+        self.tasks
+            .iter()
+            .filter_map(|(&chat_id, tasks)| {
+                if tasks.iter().any(|t| matches!(t.status, BackgroundTaskStatus::Completed | BackgroundTaskStatus::Failed(_))) {
+                    Some(chat_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn chats_with_running(&self) -> Vec<i64> {
+        self.tasks
+            .iter()
+            .filter_map(|(&chat_id, tasks)| {
+                if tasks.iter().any(|t| t.status == BackgroundTaskStatus::Running) {
+                    Some(chat_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 pub(crate) struct CompletionEvent {

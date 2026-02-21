@@ -641,6 +641,16 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "bg_status",
+            "description": "Check status of background tasks. Returns a traffic-light scorecard of all running, completed, and failed background sub-agents.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Optional: check a specific task by ID" }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "self_upgrade",
             "description": "Trigger a self-upgrade: pull latest code from git, compile, validate, and hot-swap the binary. Uses blue-green deployment with automatic rollback. Requires approval. IMPORTANT: If you edited source files, you MUST git add, commit, and push your changes BEFORE calling this tool — it does `git reset --hard origin/<branch>` which wipes uncommitted changes.",
             "inputSchema": {
@@ -728,6 +738,7 @@ pub(crate) fn base_tool_names() -> HashSet<String> {
         "subagent_list",
         "subagent_invoke",
         "subagent_batch",
+        "bg_status",
         "approval_list",
         "exec",
         "notify",

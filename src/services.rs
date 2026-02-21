@@ -418,7 +418,7 @@ pub(crate) fn approve_and_maybe_execute(mv2: &Path, id: &str, execute: bool) -> 
         return Ok("Approved.".to_string());
     }
     let entry = entry.unwrap();
-    let result = execute_tool(&entry.tool, entry.args, mv2, &db, false);
+    let result = execute_tool(&entry.tool, entry.args, mv2, &db, false, None);
     match result {
         Ok(exec) => Ok(exec.output),
         Err(err) => Ok(format!("Execution error: {err}")),

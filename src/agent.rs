@@ -26,7 +26,7 @@ use crate::{
     AgentProgress, AgentRunOutput, AgentSession, AgentToolCall, AgentToolResult,
     ContinuationCheckpoint,
     CommandSpec, DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
-    ToolExecution,
+    ToolExecution, BackgroundTaskRegistry,
     open_skill_db, list_skills, search_skills, record_skill_use,
 };
 
@@ -193,10 +193,14 @@ pub(crate) fn default_system_prompt() -> String {
         "Sensitive actions require approval. If a tool returns `approval required: <id>`, this is NOT an error — ask the user to approve or reject via `approve <id>` or `reject <id>`.",
         "For parallel or specialist work: use subagent_invoke to spawn an agent with any descriptive name, or subagent_batch for parallel fan-out. Each subagent gets its own session and tools.",
         "",
-        "## Subagents",
+        "## Subagents (Background Tasks)",
         "You can spawn subagents dynamically with ANY name — choose names that describe the task (e.g., 'log-analyzer', 'api-tester', 'code-reviewer').",
         "Use subagent_invoke for single delegation, subagent_batch for parallel work.",
         "Subagents use a lighter-weight model, so they're good for heavy lifting while you orchestrate.",
+        "When you need to delegate complex work, use subagent_invoke — tasks run in the background automatically.",
+        "After spawning background tasks, tell the user what you started and finish your response.",
+        "Do not wait for background results. The user can check /status anytime.",
+        "When you see '[Background task completed]' steering messages, synthesize results concisely.",
         "",
         "### When to Use Subagents vs Do Directly",
         "- SUBAGENT: large research tasks, multi-file code changes, parallel independent work, long-running analysis",
@@ -950,6 +954,12 @@ pub(crate) fn run_agent_with_prompt(
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
 
+    // Extract background task registry from progress (if running via bridge)
+    let bg_registry_ref: Option<(i64, Arc<Mutex<BackgroundTaskRegistry>>)> = progress.as_ref().and_then(|p| {
+        let guard = p.lock().ok()?;
+        Some((guard.chat_id?, guard.bg_registry.clone()?))
+    });
+
     let mut completed = false;
     let mut current_max_steps = effective_max_steps;
     let mut step = 0;
@@ -1274,6 +1284,7 @@ pub(crate) fn run_agent_with_prompt(
                     &mv2,
                     &db,
                     false,
+                    bg_registry_ref.clone(),
                 ) {
                     Ok(result) => result,
                     Err(err) => ToolExecution {
@@ -1326,11 +1337,12 @@ pub(crate) fn run_agent_with_prompt(
             // Regular tools run in a bounded worker pool.
             if !regular_calls.is_empty() {
                 let mv2_ref = &mv2;
+                let bg_reg_ref = &bg_registry_ref;
                 let execute_regular_call = |call: &&AgentToolCall| -> (AgentToolCall, ToolExecution) {
                     let call = *call;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let local_db = open_or_create_db(mv2_ref).map_err(|e| e.to_string())?;
-                        execute_tool(&call.name, call.args.clone(), mv2_ref, &local_db, false)
+                        execute_tool(&call.name, call.args.clone(), mv2_ref, &local_db, false, bg_reg_ref.clone())
                     }));
 
                     let execution = match result {

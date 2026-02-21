@@ -16,6 +16,7 @@ use base64::Engine;
 
 use crate::{
     AgentProgress, BridgeAgentConfig, CompletionEvent, ActiveRun,
+    BackgroundTaskRegistry,
     SessionTurn, load_session_turns, save_session_turns,
     run_agent_with_prompt, try_handle_approval_chat,
 };
@@ -705,6 +706,7 @@ pub(crate) fn spawn_agent_run(
     completion_tx: &mpsc::Sender<CompletionEvent>,
     http_agent: &ureq::Agent,
     base_url: &str,
+    bg_registry: Option<Arc<Mutex<BackgroundTaskRegistry>>>,
 ) -> Arc<Mutex<AgentProgress>> {
     let progress = Arc::new(Mutex::new(AgentProgress {
         step: 0,
@@ -721,6 +723,8 @@ pub(crate) fn spawn_agent_run(
         delegated_steps: 0,
         steering_messages: Vec::new(),
         first_ack_sent: false,
+        bg_registry,
+        chat_id: Some(chat_id),
     }));
 
     // Worker thread -- calls run_agent_with_prompt directly (no middle thread)
@@ -886,6 +890,7 @@ pub(crate) fn handle_telegram_completion(
     agent_config: &BridgeAgentConfig,
     active_runs: &mut HashMap<i64, ActiveRun>,
     completion_tx: &mpsc::Sender<CompletionEvent>,
+    bg_registry: Option<Arc<Mutex<BackgroundTaskRegistry>>>,
 ) {
     let chat_id = event.chat_id;
     let reply_to_id = event.reply_to_id;
@@ -969,6 +974,7 @@ pub(crate) fn handle_telegram_completion(
                 completion_tx,
                 http_agent,
                 base_url,
+                bg_registry,
             );
             run.progress = progress;
         }
@@ -996,6 +1002,9 @@ pub(crate) fn run_telegram_bridge(
 
     let mut active_runs: HashMap<i64, ActiveRun> = HashMap::new();
     let (completion_tx, completion_rx) = mpsc::channel::<CompletionEvent>();
+    let bg_registry = Arc::new(Mutex::new(BackgroundTaskRegistry::new()));
+    let mut last_scorecard_send = std::time::Instant::now();
+    let scorecard_interval = Duration::from_secs(30 * 60); // every 30 min
 
     let mut offset: Option<i64> = None;
     let mut last_vault_check = std::time::Instant::now();
@@ -1017,14 +1026,103 @@ pub(crate) fn run_telegram_bridge(
                 &agent_config,
                 &mut active_runs,
                 &completion_tx,
+                Some(bg_registry.clone()),
             );
+        }
+
+        // 1b. Drain completed background tasks -> trigger synthesis runs
+        {
+            let chats_with_done = {
+                let reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
+                reg.chats_with_completed()
+            };
+            for chat_id in chats_with_done {
+                let completed = {
+                    let mut reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
+                    reg.drain_completed(chat_id)
+                };
+                if completed.is_empty() {
+                    continue;
+                }
+                // Build synthesis prompt from completed task results
+                let mut parts = Vec::new();
+                for task in &completed {
+                    let status_label = match &task.status {
+                        crate::BackgroundTaskStatus::Completed => "completed",
+                        crate::BackgroundTaskStatus::Failed(err) => {
+                            parts.push(format!(
+                                "[Background task completed] {} FAILED: {}",
+                                task.name, err
+                            ));
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    let result = task.result_text.as_deref().unwrap_or("(no output)");
+                    parts.push(format!(
+                        "[Background task {}] {} — {}\nResult:\n{}",
+                        status_label, task.name, task.prompt_preview, result
+                    ));
+                }
+                let synthesis_prompt = format!(
+                    "{}\n\nSynthesize these background task results concisely for the user. \
+                     Highlight key findings, actions taken, and any failures.",
+                    parts.join("\n\n---\n\n")
+                );
+
+                // If a foreground run is active, inject as steering messages
+                if let Some(run) = active_runs.get_mut(&chat_id) {
+                    let mut guard = run.progress.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.steering_messages.push(synthesis_prompt);
+                } else {
+                    // No active run — spawn a synthesis run
+                    let session = format!("{}telegram:{chat_id}", agent_config.session_prefix);
+                    let progress = spawn_agent_run(
+                        &agent_config,
+                        chat_id,
+                        None,
+                        &synthesis_prompt,
+                        session,
+                        &completion_tx,
+                        &http_agent,
+                        &base_url,
+                        Some(bg_registry.clone()),
+                    );
+                    active_runs.insert(chat_id, ActiveRun {
+                        progress,
+                        queued_messages: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        // 1c. Periodic scorecard (every 30 min for chats with running background tasks)
+        if last_scorecard_send.elapsed() >= scorecard_interval {
+            last_scorecard_send = std::time::Instant::now();
+            let chats_running = {
+                let reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
+                reg.chats_with_running()
+            };
+            for chat_id in chats_running {
+                let scorecard = {
+                    let reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
+                    reg.scorecard(chat_id)
+                };
+                if !scorecard.is_empty() {
+                    let _ = telegram_send_message(&http_agent, &base_url, chat_id, &format!("Background tasks:\n{scorecard}"));
+                }
+            }
         }
 
         // 2. Long-poll getUpdates (short-poll when runs are active to drain completions faster)
         let mut request = http_agent
             .get(&format!("{base_url}/getUpdates"))
             .query("limit", &poll_limit.to_string());
-        if let Some(effective_timeout) = if active_runs.is_empty() {
+        let has_bg_tasks = {
+            let reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
+            !reg.tasks.is_empty()
+        };
+        if let Some(effective_timeout) = if active_runs.is_empty() && !has_bg_tasks {
             if poll_timeout == u64::MAX {
                 None
             } else {
@@ -1112,16 +1210,32 @@ pub(crate) fn run_telegram_bridge(
                     }
                     // Not a clear checkpoint response -- treat as queued message
                 }
-                // Silently queue -- no robotic ack messages.
-                // All queued messages are merged into one prompt on completion.
+                // Push to steering_messages so the running agent sees it mid-loop,
+                // and also queue for merged replay on completion.
+                {
+                    let mut guard = run.progress.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.steering_messages.push(user_text.clone());
+                }
                 if run.queued_messages.len() < MAX_QUEUED_PER_CHAT {
                     run.queued_messages.push((user_text, reply_to_id));
                 }
-                // No response sent -- the agent will address everything when it finishes.
+                let _ = telegram_send_message(&http_agent, &base_url, chat_id, "Got it \u{2014} I'll work that in.");
                 continue;
             }
 
-            // No active run -- spawn a new one
+            // No active run -- check for /status command first
+            {
+                let lower = user_text.trim().to_lowercase();
+                if lower == "status" || lower == "/status" || lower == "scorecard" {
+                    let scorecard = {
+                        let reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
+                        reg.scorecard(chat_id)
+                    };
+                    let _ = telegram_send_message(&http_agent, &base_url, chat_id, &format!("Background tasks:\n{scorecard}"));
+                    continue;
+                }
+            }
+
             telegram_send_typing(&http_agent, &base_url, chat_id);
 
             let session = format!("{}telegram:{chat_id}", agent_config.session_prefix);
@@ -1150,6 +1264,7 @@ pub(crate) fn run_telegram_bridge(
                 &completion_tx,
                 &http_agent,
                 &base_url,
+                Some(bg_registry.clone()),
             );
 
             active_runs.insert(chat_id, ActiveRun {

@@ -416,6 +416,9 @@ use crate::{
     FeedbackEvent,
     QueryArgs,
     AgentRunOutput,
+    BackgroundTask,
+    BackgroundTaskStatus,
+    BackgroundTaskRegistry,
     ToolQueryArgs,
     ToolContextArgs,
     ToolSearchArgs,
@@ -535,6 +538,7 @@ pub(crate) fn execute_tool(
     mv2: &Path,
     db: &MemoryDb,
     read_only: bool,
+    bg_registry: Option<(i64, Arc<Mutex<BackgroundTaskRegistry>>)>,
 ) -> Result<ToolExecution, String> {
     let is_write = matches!(
         name,
@@ -2166,14 +2170,69 @@ pub(crate) fn execute_tool(
             let session = format!("subagent:{}:{}", parsed.name, Utc::now().timestamp());
             let prompt = parsed.prompt.clone();
 
-            // Spawn the bridge agent in a background thread.
+            // Non-blocking path: when bg_registry is present, register and return immediately
+            if let Some((chat_id, registry)) = bg_registry.as_ref() {
+                let task_id = {
+                    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    reg.next_id()
+                };
+                let now_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let preview: String = parsed.prompt.chars().take(100).collect();
+                let bg_task = BackgroundTask {
+                    task_id: task_id.clone(),
+                    name: parsed.name.clone(),
+                    prompt_preview: preview,
+                    status: BackgroundTaskStatus::Running,
+                    started_at_epoch: now_epoch,
+                    completed_at_epoch: None,
+                    step_count: 0,
+                    max_steps,
+                    result_text: None,
+                    session: session.clone(),
+                };
+                {
+                    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    reg.register(*chat_id, bg_task);
+                }
+                let reg_clone = registry.clone();
+                let tid = task_id.clone();
+                thread::spawn(move || {
+                    let r = run_agent_for_bridge(&cfg, &prompt, session, None, None, None);
+                    let mut reg = reg_clone.lock().unwrap_or_else(|e| e.into_inner());
+                    match r {
+                        Ok(output) => {
+                            reg.update_status(
+                                &tid,
+                                BackgroundTaskStatus::Completed,
+                                output.final_text,
+                            );
+                        }
+                        Err(err) => {
+                            reg.update_status(
+                                &tid,
+                                BackgroundTaskStatus::Failed(err.to_string()),
+                                None,
+                            );
+                        }
+                    }
+                });
+                return Ok(ToolExecution {
+                    output: format!("Background task started: {} (id: {})", parsed.name, task_id),
+                    details: serde_json::json!({ "task_id": task_id, "name": parsed.name }),
+                    is_error: false,
+                });
+            }
+
+            // Blocking path (CLI / non-bridge contexts): spawn and wait
             let (tx, rx) = std::sync::mpsc::channel();
             thread::spawn(move || {
                 let r = run_agent_for_bridge(&cfg, &prompt, session, None, None, None);
                 let _ = tx.send(r);
             });
 
-            // No timeout — zombie detection handles stuck processes
             let result = rx.recv()
                 .map_err(|e| format!("channel error: {e}"))?
                 .map_err(|e| e.to_string())?;
@@ -2276,7 +2335,74 @@ pub(crate) fn execute_tool(
                 });
             }
 
-            // Process invocations in chunks of max_conc for concurrency limiting.
+            // Non-blocking path: when bg_registry is present, register all and return immediately
+            if let Some((chat_id, registry)) = bg_registry.as_ref() {
+                let now_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let mut task_ids = Vec::new();
+                for item in &prepared {
+                    let task_id = {
+                        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                        reg.next_id()
+                    };
+                    let preview: String = item.prompt.chars().take(100).collect();
+                    let max_steps_val = match &item.cfg {
+                        Ok(cfg) => cfg.max_steps,
+                        Err(_) => DEFAULT_SUBAGENT_MAX_STEPS,
+                    };
+                    let bg_task = BackgroundTask {
+                        task_id: task_id.clone(),
+                        name: item.name.clone(),
+                        prompt_preview: preview,
+                        status: BackgroundTaskStatus::Running,
+                        started_at_epoch: now_epoch,
+                        completed_at_epoch: None,
+                        step_count: 0,
+                        max_steps: max_steps_val,
+                        result_text: None,
+                        session: format!("subagent:{}:{}:{}", item.name, ts, item.index),
+                    };
+                    {
+                        let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                        reg.register(*chat_id, bg_task);
+                    }
+                    match &item.cfg {
+                        Ok(cfg) => {
+                            let cfg = cfg.clone();
+                            let session = format!("subagent:{}:{}:{}", item.name, ts, item.index);
+                            let prompt = item.prompt.clone();
+                            let reg_clone = registry.clone();
+                            let tid = task_id.clone();
+                            thread::spawn(move || {
+                                let r = run_agent_for_bridge(&cfg, &prompt, session, None, None, None);
+                                let mut reg = reg_clone.lock().unwrap_or_else(|e| e.into_inner());
+                                match r {
+                                    Ok(output) => {
+                                        reg.update_status(&tid, BackgroundTaskStatus::Completed, output.final_text);
+                                    }
+                                    Err(err) => {
+                                        reg.update_status(&tid, BackgroundTaskStatus::Failed(err.to_string()), None);
+                                    }
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                            reg.update_status(&task_id, BackgroundTaskStatus::Failed(err.clone()), None);
+                        }
+                    }
+                    task_ids.push(serde_json::json!({ "task_id": task_id, "name": item.name }));
+                }
+                return Ok(ToolExecution {
+                    output: format!("{} background tasks started.", task_ids.len()),
+                    details: serde_json::json!({ "tasks": task_ids }),
+                    is_error: false,
+                });
+            }
+
+            // Blocking path (CLI): process invocations in chunks of max_conc for concurrency limiting.
             let mut all_results: Vec<serde_json::Value> = Vec::new();
             let mut all_ok = true;
 
@@ -2344,6 +2470,26 @@ pub(crate) fn execute_tool(
                 details: serde_json::json!({ "results": all_results }),
                 is_error: !all_ok,
             })
+        }
+        "bg_status" => {
+            match bg_registry.as_ref() {
+                Some((chat_id, registry)) => {
+                    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    let scorecard = reg.scorecard(*chat_id);
+                    Ok(ToolExecution {
+                        output: scorecard,
+                        details: serde_json::json!(null),
+                        is_error: false,
+                    })
+                }
+                None => {
+                    Ok(ToolExecution {
+                        output: "No background task registry available (not running in bridge mode).".to_string(),
+                        details: serde_json::json!(null),
+                        is_error: false,
+                    })
+                }
+            }
         }
         "gmail_list" => {
             let parsed: ToolGmailListArgs =
