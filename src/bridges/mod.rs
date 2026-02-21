@@ -118,9 +118,9 @@ pub(crate) fn cleanup_orphaned_temp_files(db_path: &Path) {
 
 pub(crate) fn check_vault_health(db_path: &Path) {
     if let Ok(meta) = std::fs::metadata(db_path) {
-        let size_mb = meta.len() / 1_000_000;
-        if size_mb > 200 {
-            eprintln!("[bridge] WARNING: vault size {size_mb}MB \u{2014} approaching hard cap");
+        let size_mb = meta.len() / (1024 * 1024);
+        if size_mb > 2000 {
+            eprintln!("[bridge] vault is {size_mb}MB — consider running VACUUM");
         }
     }
 }
