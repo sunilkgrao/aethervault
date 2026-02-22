@@ -26,7 +26,7 @@ use crate::{
     AgentProgress, AgentRunOutput, AgentSession, AgentToolCall, AgentToolResult,
     ContinuationCheckpoint,
     CommandSpec, DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
-    ToolExecution, BackgroundTaskRegistry,
+    ToolExecution, BackgroundTaskRegistry, SessionRegistry,
     open_skill_db, list_skills, search_skills, record_skill_use,
 };
 
@@ -984,6 +984,11 @@ pub(crate) fn run_agent_with_prompt(
         Some((guard.chat_id?, guard.bg_registry.clone()?))
     });
 
+    // Extract session registry from progress (if running via bridge)
+    let session_registry_ref: Option<Arc<Mutex<SessionRegistry>>> = progress.as_ref().and_then(|p| {
+        p.lock().ok().and_then(|g| g.session_registry.clone())
+    });
+
     let mut completed = false;
     let mut current_max_steps = effective_max_steps;
     let mut step = 0;
@@ -1115,10 +1120,15 @@ pub(crate) fn run_agent_with_prompt(
         };
         if let Some(content) = message.content.clone() {
             final_text = Some(content.clone());
-            // Update progress: text preview
+            // Update progress: text preview + last_output for session status
             if let Some(ref prog) = progress {
                 if let Ok(mut p) = prog.lock() {
                     p.text_preview = Some(content.chars().take(100).collect());
+                    if let Some(ref lo) = p.last_output {
+                        if let Ok(mut out) = lo.lock() {
+                            *out = Some(content.clone());
+                        }
+                    }
                 }
             }
             // Track turns for observational memory extraction
@@ -1309,6 +1319,7 @@ pub(crate) fn run_agent_with_prompt(
                     &db,
                     false,
                     bg_registry_ref.clone(),
+                    session_registry_ref.clone(),
                 ) {
                     Ok(result) => result,
                     Err(err) => ToolExecution {
@@ -1362,11 +1373,12 @@ pub(crate) fn run_agent_with_prompt(
             if !regular_calls.is_empty() {
                 let mv2_ref = &mv2;
                 let bg_reg_ref = &bg_registry_ref;
+                let sess_reg_ref = &session_registry_ref;
                 let execute_regular_call = |call: &&AgentToolCall| -> (AgentToolCall, ToolExecution) {
                     let call = *call;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let local_db = open_or_create_db(mv2_ref).map_err(|e| e.to_string())?;
-                        execute_tool(&call.name, call.args.clone(), mv2_ref, &local_db, false, bg_reg_ref.clone())
+                        execute_tool(&call.name, call.args.clone(), mv2_ref, &local_db, false, bg_reg_ref.clone(), sess_reg_ref.clone())
                     }));
 
                     let execution = match result {

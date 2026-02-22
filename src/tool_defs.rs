@@ -579,6 +579,47 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "session_start",
+            "description": "Start a persistent subagent session that you can interact with. The subagent runs in the background with full tool access (file I/O, exec, search, etc). Write large inputs to files instead of passing as arguments. Use session_send to send follow-up instructions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Descriptive name for the session (e.g., 'crm-analyzer', 'data-pipeline')" },
+                    "prompt": { "type": "string", "description": "Initial task description for the subagent" },
+                    "system": { "type": "string", "description": "Override the subagent's system prompt" },
+                    "model_hook": { "type": "string", "description": "Override the subagent's model hook" },
+                    "max_steps": { "type": "integer", "description": "Max reasoning steps (default: 64)" },
+                    "input_file": { "type": "string", "description": "Path to a file to copy into the session workspace as input.md" }
+                },
+                "required": ["name", "prompt"]
+            }
+        }),
+        serde_json::json!({
+            "name": "session_send",
+            "description": "Send a follow-up message to a running subagent session. Injected as a user message on the subagent's next reasoning step.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session ID returned by session_start" },
+                    "message": { "type": "string", "description": "Message to inject into the subagent's conversation" },
+                    "file": { "type": "string", "description": "Path to a file to copy into the session workspace" }
+                },
+                "required": ["session_id", "message"]
+            }
+        }),
+        serde_json::json!({
+            "name": "session_status",
+            "description": "Check status of subagent sessions. Without session_id, lists all. With session_id, shows progress, last output, and workspace files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Check a specific session (omit to list all)" },
+                    "list_files": { "type": "boolean", "description": "List files in the session workspace" },
+                    "read_file": { "type": "string", "description": "Read a file from the session workspace (relative path)" }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "gmail_list",
             "description": "List Gmail messages (OAuth).",
             "inputSchema": {
@@ -788,6 +829,9 @@ pub(crate) fn base_tool_names() -> HashSet<String> {
         "subagent_list",
         "subagent_invoke",
         "subagent_batch",
+        "session_start",
+        "session_send",
+        "session_status",
         "bg_status",
         "approval_list",
         "exec",

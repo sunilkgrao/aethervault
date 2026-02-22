@@ -640,6 +640,7 @@ pub(crate) fn run_mcp_server(mv2: PathBuf, read_only: bool) -> Result<(), Box<dy
                     &db,
                     read_only,
                     None,
+                    None,
                 ) {
                     Ok(result) => serde_json::json!({
                         "jsonrpc": "2.0",

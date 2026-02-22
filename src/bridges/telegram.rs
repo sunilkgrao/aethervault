@@ -16,7 +16,7 @@ use base64::Engine;
 
 use crate::{
     AgentProgress, BridgeAgentConfig, CompletionEvent, ActiveRun,
-    BackgroundTaskRegistry,
+    BackgroundTaskRegistry, SessionRegistry,
     SessionTurn, load_session_turns, save_session_turns,
     run_agent_with_prompt, try_handle_approval_chat,
 };
@@ -708,6 +708,7 @@ pub(crate) fn spawn_agent_run(
     base_url: &str,
     bg_registry: Option<Arc<Mutex<BackgroundTaskRegistry>>>,
 ) -> Arc<Mutex<AgentProgress>> {
+    let session_registry = Arc::new(Mutex::new(SessionRegistry::new()));
     let progress = Arc::new(Mutex::new(AgentProgress {
         step: 0,
         max_steps: agent_config.max_steps,
@@ -725,6 +726,8 @@ pub(crate) fn spawn_agent_run(
         first_ack_sent: false,
         bg_registry,
         chat_id: Some(chat_id),
+        last_output: None,
+        session_registry: Some(session_registry),
     }));
 
     // Worker thread -- calls run_agent_with_prompt directly (no middle thread)

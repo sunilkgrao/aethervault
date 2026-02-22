@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -456,7 +457,13 @@ use crate::{
     ToolSkillSearchArgs,
     ToolSubagentInvokeArgs,
     ToolSubagentBatchArgs,
+    ToolSessionStartArgs,
+    ToolSessionSendArgs,
+    ToolSessionStatusArgs,
     SubagentSpec,
+    SubagentSession,
+    SessionRegistry,
+    AgentProgress,
     ToolGmailListArgs,
     ToolGmailReadArgs,
     ToolGmailSendArgs,
@@ -540,6 +547,7 @@ pub(crate) fn execute_tool(
     db: &MemoryDb,
     read_only: bool,
     bg_registry: Option<(i64, Arc<Mutex<BackgroundTaskRegistry>>)>,
+    session_registry: Option<Arc<Mutex<SessionRegistry>>>,
 ) -> Result<ToolExecution, String> {
     let is_write = matches!(
         name,
@@ -3022,6 +3030,338 @@ pub(crate) fn execute_tool(
             } else {
                 let code = output.status.code().unwrap_or(-1);
                 Err(format!("upgrade.sh failed (exit {code}):\n{combined}"))
+            }
+        }
+        // === Interactive Session Tools ===
+        "session_start" => {
+            let parsed: ToolSessionStartArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+
+            let sess_reg = session_registry.as_ref()
+                .ok_or_else(|| "session tools not available (not running in bridge mode)".to_string())?;
+
+            // Resolve subagent spec (reuse logic from subagent_invoke)
+            let ws = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let cfg_path = crate::config_file_path(&ws);
+            let config = if cfg_path.exists() {
+                crate::load_config_from_file(&ws)
+            } else {
+                load_capsule_config(db).unwrap_or_default()
+            };
+            let subagents = load_subagents_from_config(&config);
+            let resolved_hook = config.agent.as_ref()
+                .and_then(|a| a.default_subagent_hook.clone())
+                .unwrap_or_else(|| DEFAULT_SUBAGENT_HOOK.to_string());
+            let config_max_steps = config.agent.as_ref()
+                .and_then(|a| a.subagent_max_steps)
+                .unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
+            let synth_spec = SubagentSpec {
+                name: parsed.name.clone(),
+                description: None,
+                system: None,
+                model_hook: Some(resolved_hook),
+                tools: Vec::new(),
+                disallowed_tools: Vec::new(),
+                max_steps: Some(config_max_steps),
+                timeout_secs: Some(DEFAULT_SUBAGENT_TIMEOUT_SECS),
+            };
+            let spec = subagents
+                .iter()
+                .find(|s| s.name == parsed.name)
+                .unwrap_or(&synth_spec);
+
+            let mut system = parsed.system.clone();
+            let mut model_hook = parsed.model_hook.clone();
+            if system.is_none() { system = spec.system.clone(); }
+            if model_hook.is_none() { model_hook = spec.model_hook.clone(); }
+
+            let max_steps = parsed.max_steps.or(spec.max_steps).unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
+
+            // Generate session ID and create workspace
+            let session_id = {
+                let reg = sess_reg.lock().unwrap_or_else(|e| e.into_inner());
+                reg.next_id(&parsed.name)
+            };
+            let workspace_dir = PathBuf::from("/root/.aethervault/workspace/sessions").join(&session_id);
+            let _ = std::fs::create_dir_all(&workspace_dir);
+
+            // Copy input file if provided
+            if let Some(ref input_file) = parsed.input_file {
+                let src = PathBuf::from(input_file);
+                if src.exists() {
+                    let dest = workspace_dir.join("input.md");
+                    let _ = std::fs::copy(&src, &dest);
+                }
+            }
+
+            // Write task prompt to workspace
+            let _ = std::fs::write(workspace_dir.join("task.md"), &parsed.prompt);
+
+            // Inject workspace info into system prompt
+            let workspace_str = workspace_dir.to_string_lossy().to_string();
+            let workspace_instruction = format!(
+                "\n\nYour session workspace is {workspace_str}. \
+                 Read inputs from there (e.g. input.md). \
+                 Write all outputs as files there (e.g. output.json, results.md). \
+                 The orchestrator can read these files via session_status."
+            );
+            if let Some(ref mut sys) = system {
+                sys.push_str(&workspace_instruction);
+            } else {
+                system = Some(workspace_instruction);
+            }
+
+            // Build agent config
+            let cfg = build_bridge_agent_config(
+                mv2.to_path_buf(),
+                model_hook,
+                system,
+                false,
+                None,
+                8,
+                12_000,
+                max_steps,
+                true,
+                8,
+            ).map_err(|e| e.to_string())?;
+            let agent_session = format!("session:{}:{}", parsed.name, Utc::now().timestamp());
+
+            // Create AgentProgress with last_output and session_registry
+            let last_output_handle = Arc::new(Mutex::new(None::<String>));
+            let progress = Arc::new(Mutex::new(AgentProgress {
+                step: 0,
+                max_steps,
+                phase: "starting".to_string(),
+                text_preview: None,
+                started_at: std::time::Instant::now(),
+                tools_used: HashMap::new(),
+                checkpoint_sent: false,
+                checkpoint_response: None,
+                extended_max_steps: None,
+                interim_messages: Vec::new(),
+                first_ack_sent: false,
+                opus_steps: 0,
+                delegated_steps: 0,
+                steering_messages: Vec::new(),
+                bg_registry: None,
+                chat_id: None,
+                last_output: Some(last_output_handle.clone()),
+                session_registry: Some(sess_reg.clone()),
+            }));
+
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let sub_session = SubagentSession {
+                session_id: session_id.clone(),
+                name: parsed.name.clone(),
+                progress: progress.clone(),
+                started_at_epoch: now_epoch,
+                status: BackgroundTaskStatus::Running,
+                result_text: None,
+                last_output: last_output_handle.clone(),
+                workspace_dir: workspace_dir.clone(),
+            };
+
+            {
+                let mut reg = sess_reg.lock().unwrap_or_else(|e| e.into_inner());
+                reg.register(sub_session);
+            }
+
+            // Spawn the agent in a background thread
+            let sess_reg_clone = sess_reg.clone();
+            let sid = session_id.clone();
+            let prompt = parsed.prompt.clone();
+            thread::spawn(move || {
+                let r = run_agent_for_bridge(&cfg, &prompt, agent_session, None, None, Some(progress));
+                let mut reg = sess_reg_clone.lock().unwrap_or_else(|e| e.into_inner());
+                match r {
+                    Ok(output) => {
+                        reg.update_completed(&sid, BackgroundTaskStatus::Completed, output.final_text);
+                    }
+                    Err(err) => {
+                        reg.update_completed(&sid, BackgroundTaskStatus::Failed(err.to_string()), None);
+                    }
+                }
+            });
+
+            Ok(ToolExecution {
+                output: format!("Session started: {} (id: {})\nWorkspace: {}", parsed.name, session_id, workspace_str),
+                details: serde_json::json!({
+                    "session_id": session_id,
+                    "name": parsed.name,
+                    "workspace": workspace_str,
+                }),
+                is_error: false,
+            })
+        }
+        "session_send" => {
+            let parsed: ToolSessionSendArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+
+            let sess_reg = session_registry.as_ref()
+                .ok_or_else(|| "session tools not available (not running in bridge mode)".to_string())?;
+
+            let reg = sess_reg.lock().unwrap_or_else(|e| e.into_inner());
+            let session = reg.get(&parsed.session_id)
+                .ok_or_else(|| format!("session not found: {}", parsed.session_id))?;
+
+            // Copy file to workspace if provided
+            if let Some(ref file_path) = parsed.file {
+                let src = PathBuf::from(file_path);
+                if src.exists() {
+                    if let Some(fname) = src.file_name() {
+                        let dest = session.workspace_dir.join(fname);
+                        let _ = std::fs::copy(&src, &dest);
+                    }
+                }
+            }
+
+            match &session.status {
+                BackgroundTaskStatus::Running => {
+                    // Push message into steering_messages
+                    if let Ok(mut p) = session.progress.lock() {
+                        p.steering_messages.push(parsed.message.clone());
+                    }
+                    Ok(ToolExecution {
+                        output: format!("Message delivered to session {}", parsed.session_id),
+                        details: serde_json::json!({ "session_id": parsed.session_id, "delivered": true }),
+                        is_error: false,
+                    })
+                }
+                BackgroundTaskStatus::Completed => {
+                    let result = session.result_text.as_deref().unwrap_or("(no output)");
+                    Ok(ToolExecution {
+                        output: format!("Session {} already completed. Final result:\n{}", parsed.session_id, result),
+                        details: serde_json::json!({ "session_id": parsed.session_id, "status": "completed" }),
+                        is_error: false,
+                    })
+                }
+                BackgroundTaskStatus::Failed(err) => {
+                    Ok(ToolExecution {
+                        output: format!("Session {} failed: {}", parsed.session_id, err),
+                        details: serde_json::json!({ "session_id": parsed.session_id, "status": "failed" }),
+                        is_error: true,
+                    })
+                }
+            }
+        }
+        "session_status" => {
+            let parsed: ToolSessionStatusArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+
+            let sess_reg = session_registry.as_ref()
+                .ok_or_else(|| "session tools not available (not running in bridge mode)".to_string())?;
+
+            let reg = sess_reg.lock().unwrap_or_else(|e| e.into_inner());
+
+            match parsed.session_id {
+                None => {
+                    // List all sessions
+                    Ok(ToolExecution {
+                        output: reg.list_summary(),
+                        details: serde_json::json!(null),
+                        is_error: false,
+                    })
+                }
+                Some(ref sid) => {
+                    let session = reg.get(sid)
+                        .ok_or_else(|| format!("session not found: {sid}"))?;
+
+                    let (step, max, phase, tools_used) = session.progress.lock()
+                        .map(|p| (p.step, p.max_steps, p.phase.clone(), p.tools_used.clone()))
+                        .unwrap_or((0, 0, "unknown".to_string(), HashMap::new()));
+
+                    let last_out = session.last_output.lock()
+                        .ok()
+                        .and_then(|g| g.clone())
+                        .unwrap_or_else(|| "(no output yet)".to_string());
+
+                    let status_str = match &session.status {
+                        BackgroundTaskStatus::Running => "running".to_string(),
+                        BackgroundTaskStatus::Completed => "completed".to_string(),
+                        BackgroundTaskStatus::Failed(e) => format!("failed: {e}"),
+                    };
+
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let elapsed = now.saturating_sub(session.started_at_epoch);
+                    let mins = elapsed / 60;
+                    let secs = elapsed % 60;
+
+                    let mut output = format!(
+                        "Session: {sid}\nName: {}\nStatus: {status_str}\nStep: {step}/{max}\nPhase: {phase}\nElapsed: {mins}m {secs}s\n",
+                        session.name,
+                    );
+
+                    // Show tools used
+                    if !tools_used.is_empty() {
+                        let tools_str: Vec<String> = tools_used.iter()
+                            .map(|(k, v)| format!("{k}({v})"))
+                            .collect();
+                        output.push_str(&format!("Tools: {}\n", tools_str.join(", ")));
+                    }
+
+                    // Show last output (truncated)
+                    let preview: String = last_out.chars().take(500).collect();
+                    output.push_str(&format!("\nLast output:\n{preview}"));
+
+                    // Show final result if completed
+                    if let Some(ref result) = session.result_text {
+                        let result_preview: String = result.chars().take(1000).collect();
+                        output.push_str(&format!("\n\nFinal result:\n{result_preview}"));
+                    }
+
+                    // List workspace files if requested
+                    if parsed.list_files.unwrap_or(false) {
+                        let mut files = Vec::new();
+                        if let Ok(entries) = std::fs::read_dir(&session.workspace_dir) {
+                            for entry in entries.flatten() {
+                                if let Ok(meta) = entry.metadata() {
+                                    let size = meta.len();
+                                    let name = entry.file_name().to_string_lossy().to_string();
+                                    files.push(format!("  {name} ({size} bytes)"));
+                                }
+                            }
+                        }
+                        if files.is_empty() {
+                            output.push_str("\n\nWorkspace: (empty)");
+                        } else {
+                            output.push_str(&format!("\n\nWorkspace files:\n{}", files.join("\n")));
+                        }
+                    }
+
+                    // Read a specific file if requested
+                    if let Some(ref read_file) = parsed.read_file {
+                        let file_path = session.workspace_dir.join(read_file);
+                        match std::fs::read_to_string(&file_path) {
+                            Ok(contents) => {
+                                let preview: String = contents.chars().take(4000).collect();
+                                output.push_str(&format!("\n\n--- {read_file} ---\n{preview}"));
+                            }
+                            Err(e) => {
+                                output.push_str(&format!("\n\nFailed to read {read_file}: {e}"));
+                            }
+                        }
+                    }
+
+                    Ok(ToolExecution {
+                        output,
+                        details: serde_json::json!({
+                            "session_id": sid,
+                            "status": status_str,
+                            "step": step,
+                            "max_steps": max,
+                        }),
+                        is_error: false,
+                    })
+                }
             }
         }
         _ => Err("unknown tool".into()),

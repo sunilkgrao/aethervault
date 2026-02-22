@@ -373,6 +373,38 @@ pub(crate) struct ToolSubagentInvokeArgs {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct ToolSessionStartArgs {
+    pub(crate) name: String,
+    pub(crate) prompt: String,
+    #[serde(default)]
+    pub(crate) system: Option<String>,
+    #[serde(default)]
+    pub(crate) model_hook: Option<String>,
+    #[serde(default)]
+    pub(crate) max_steps: Option<usize>,
+    #[serde(default)]
+    pub(crate) input_file: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolSessionSendArgs {
+    pub(crate) session_id: String,
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) file: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolSessionStatusArgs {
+    #[serde(default)]
+    pub(crate) session_id: Option<String>,
+    #[serde(default)]
+    pub(crate) list_files: Option<bool>,
+    #[serde(default)]
+    pub(crate) read_file: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct ToolSubagentBatchArgs {
     /// Array of subagent invocations to run concurrently.
     pub(crate) invocations: Vec<ToolSubagentInvokeArgs>,

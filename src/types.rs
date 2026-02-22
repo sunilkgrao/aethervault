@@ -424,6 +424,10 @@ pub(crate) struct AgentProgress {
     pub(crate) bg_registry: Option<Arc<Mutex<BackgroundTaskRegistry>>>,
     /// Chat ID for this run (used by background task registry).
     pub(crate) chat_id: Option<i64>,
+    /// Latest assistant output text (shared with session registry for status queries).
+    pub(crate) last_output: Option<Arc<Mutex<Option<String>>>>,
+    /// Registry of interactive subagent sessions (shared with tool_exec).
+    pub(crate) session_registry: Option<Arc<Mutex<SessionRegistry>>>,
 }
 
 // === Background Task Registry ===
@@ -577,6 +581,86 @@ impl BackgroundTaskRegistry {
                 }
             })
             .collect()
+    }
+}
+
+// === Interactive Session Registry ===
+
+pub(crate) struct SubagentSession {
+    pub(crate) session_id: String,
+    pub(crate) name: String,
+    pub(crate) progress: Arc<Mutex<AgentProgress>>,
+    pub(crate) started_at_epoch: u64,
+    pub(crate) status: BackgroundTaskStatus,
+    pub(crate) result_text: Option<String>,
+    pub(crate) last_output: Arc<Mutex<Option<String>>>,
+    pub(crate) workspace_dir: PathBuf,
+}
+
+pub(crate) struct SessionRegistry {
+    counter: AtomicU64,
+    pub(crate) sessions: HashMap<String, SubagentSession>,
+}
+
+impl SessionRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            counter: AtomicU64::new(1),
+            sessions: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn next_id(&self, name: &str) -> String {
+        let id = self.counter.fetch_add(1, Ordering::Relaxed);
+        format!("session-{id}-{name}")
+    }
+
+    pub(crate) fn register(&mut self, session: SubagentSession) {
+        self.sessions.insert(session.session_id.clone(), session);
+    }
+
+    pub(crate) fn get(&self, session_id: &str) -> Option<&SubagentSession> {
+        self.sessions.get(session_id)
+    }
+
+    pub(crate) fn get_mut(&mut self, session_id: &str) -> Option<&mut SubagentSession> {
+        self.sessions.get_mut(session_id)
+    }
+
+    pub(crate) fn update_completed(&mut self, session_id: &str, status: BackgroundTaskStatus, result_text: Option<String>) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.status = status;
+            session.result_text = result_text;
+        }
+    }
+
+    pub(crate) fn list_summary(&self) -> String {
+        if self.sessions.is_empty() {
+            return "No active sessions.".to_string();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut lines = Vec::new();
+        for s in self.sessions.values() {
+            let elapsed = now.saturating_sub(s.started_at_epoch);
+            let mins = elapsed / 60;
+            let secs = elapsed % 60;
+            let (step, max) = s.progress.lock()
+                .map(|p| (p.step, p.max_steps))
+                .unwrap_or((0, 0));
+            let status_str = match &s.status {
+                BackgroundTaskStatus::Running => "running",
+                BackgroundTaskStatus::Completed => "completed",
+                BackgroundTaskStatus::Failed(_) => "failed",
+            };
+            lines.push(format!(
+                "{} — {} (step {}/{}, {mins}m {secs}s)",
+                s.session_id, status_str, step, max,
+            ));
+        }
+        lines.join("\n")
     }
 }
 
