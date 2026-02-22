@@ -258,11 +258,10 @@ pub(crate) fn run_codex_native(prompt: &str) -> Result<AgentMessage, String> {
 
         match run_codex_once(prompt, &account) {
             Ok(msg) => return Ok(msg),
-            Err(e) if e.contains("rate limit") => {
-                eprintln!("[codex] Account {account} rate limited, trying next...");
+            Err(e) => {
+                eprintln!("[codex] Account {account} failed: {e}, trying next...");
                 continue;
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -326,10 +325,11 @@ fn run_codex_once(prompt: &str, account: &str) -> Result<AgentMessage, String> {
     }
 
     if !output.status.success() && output.stdout.is_empty() {
-        // Don't mark as rate-limited for non-rate-limit errors, but do
-        // signal the retry loop to try the next account.
+        // Mark account as temporarily unavailable so pick_best_account
+        // skips it on the next iteration of the retry loop.
+        pool_mark_rate_limited(account);
         return Err(format!(
-            "codex account {account} failed (rate limit): exit code {:?}: {}",
+            "codex account {account} failed: exit code {:?}: {}",
             output.status.code(),
             stderr.trim()
         ));
