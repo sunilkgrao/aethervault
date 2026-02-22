@@ -451,7 +451,9 @@ pub(crate) fn call_claude_with_model(
     //   "max" is Opus 4.6 only — highest quality, no constraints on thinking depth.
     let thinking_mode = env_optional("ANTHROPIC_THINKING")
         .unwrap_or_default();
-    let thinking_enabled = thinking_mode == "adaptive";
+    // Disable thinking when using a model override (e.g. Sonnet for compaction) —
+    // adaptive thinking is Opus-only and will cause 400 errors on other models.
+    let thinking_enabled = thinking_mode == "adaptive" && model_override.is_none();
     let thinking_effort = env_optional("ANTHROPIC_THINKING_EFFORT")
         .unwrap_or_else(|| "high".to_string());
 
@@ -636,9 +638,11 @@ pub(crate) fn call_claude_with_model(
                     }
                     Err(ureq::Error::Status(code, resp)) => {
                         let text = resp.into_string().unwrap_or_default();
-                        if attempt == max_retries {
-                            eprintln!("[call_claude] Vertex fallback failed: {code} {text}");
-                        } else {
+                        eprintln!("[call_claude] Vertex fallback failed: {code} {text}");
+                        if code == 400 {
+                            break; // 400 = bad request (prompt too long, etc.) — don't retry
+                        }
+                        if attempt < max_retries {
                             let delay = (retry_base * 2.0_f64.powi(attempt as i32)).min(retry_max);
                             thread::sleep(Duration::from_secs_f64(delay));
                         }
