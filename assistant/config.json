@@ -26,12 +26,64 @@
         ],
         "max_steps": 32,
         "timeout_secs": 300,
-        "model_hook": "/root/.aethervault/hooks/codex-hook.sh"
+        "model_hook": "builtin:pool"
       },
       {
         "name": "coder",
-        "description": "Code generation and engineering specialist. Use for writing code, debugging, refactoring, running tests, file system operations, and shell commands. Powered by Codex CLI for deep coding tasks.",
-        "model_hook": "/root/.aethervault/hooks/codex-hook.sh",
+        "description": "Code generation and engineering specialist. Use for writing code, debugging, refactoring, running tests, file system operations, and shell commands. Uses native Rust pool routing (Codex + Claude Code) with auto-failover.",
+        "model_hook": "builtin:pool",
+        "system": "You are a senior software engineer working for AetherVault. Write clean, correct, well-tested code. Use exec to run commands, fs_read/fs_write for file operations. For complex coding tasks, break them into steps and execute methodically. Always verify your work compiles/runs before returning.",
+        "tools": [
+          "exec",
+          "fs_list",
+          "fs_read",
+          "fs_write",
+          "query",
+          "context",
+          "search",
+          "get",
+          "memory_search",
+          "tool_search",
+          "reflect"
+        ],
+        "disallowed_tools": [
+          "self_upgrade",
+          "scale",
+          "notify"
+        ],
+        "max_steps": 64,
+        "timeout_secs": 900
+      },
+      {
+        "name": "coder-codex",
+        "description": "Code generation specialist powered explicitly by Codex CLI. Bypasses pool router — always uses Codex directly.",
+        "model_hook": "builtin:codex",
+        "system": "You are a senior software engineer working for AetherVault. Write clean, correct, well-tested code. Use exec to run commands, fs_read/fs_write for file operations. For complex coding tasks, break them into steps and execute methodically. Always verify your work compiles/runs before returning.",
+        "tools": [
+          "exec",
+          "fs_list",
+          "fs_read",
+          "fs_write",
+          "query",
+          "context",
+          "search",
+          "get",
+          "memory_search",
+          "tool_search",
+          "reflect"
+        ],
+        "disallowed_tools": [
+          "self_upgrade",
+          "scale",
+          "notify"
+        ],
+        "max_steps": 64,
+        "timeout_secs": 900
+      },
+      {
+        "name": "coder-claude",
+        "description": "Code generation specialist powered explicitly by Claude Code CLI. Bypasses pool router — always uses Claude Code directly.",
+        "model_hook": "builtin:claude-code",
         "system": "You are a senior software engineer working for AetherVault. Write clean, correct, well-tested code. Use exec to run commands, fs_read/fs_write for file operations. For complex coding tasks, break them into steps and execute methodically. Always verify your work compiles/runs before returning.",
         "tools": [
           "exec",
@@ -56,8 +108,8 @@
       },
       {
         "name": "critic",
-        "description": "Critical reviewer and quality checker. Use proactively after any significant output to find flaws, verify claims, check for errors, and suggest improvements. Read-only \u2014 cannot modify files or run commands.",
-        "system": "You are a rigorous critic and reviewer. Your job is to find flaws, errors, inconsistencies, and missed edge cases in work product. Search memory and code to verify claims. Be specific about what's wrong and why. Score quality on a 1-10 scale. You have read-only access \u2014 you cannot modify anything.",
+        "description": "Critical reviewer and quality checker. Use proactively after any significant output to find flaws, verify claims, check for errors, and suggest improvements. Read-only — cannot modify files or run commands.",
+        "system": "You are a rigorous critic and reviewer. Your job is to find flaws, errors, inconsistencies, and missed edge cases in work product. Search memory and code to verify claims. Be specific about what's wrong and why. Score quality on a 1-10 scale. You have read-only access — you cannot modify anything.",
         "tools": [
           "query",
           "context",
@@ -78,9 +130,9 @@
         ],
         "max_steps": 16,
         "timeout_secs": 120,
-        "model_hook": "/root/.aethervault/hooks/codex-hook.sh"
+        "model_hook": "builtin:pool"
       }
     ],
-    "default_subagent_hook": "/root/.aethervault/hooks/codex-hook.sh"
+    "default_subagent_hook": "builtin:pool"
   }
 }

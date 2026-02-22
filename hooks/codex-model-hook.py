@@ -17,94 +17,19 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.request
-import urllib.error
+
+# Add hooks directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pool_state
+from common import (
+    AETHERVAULT_HOME, send_telegram, send_typing, extract_last_user_message,
+    format_elapsed, make_hook_response, make_hook_error_response,
+)
 
 CODEX_TIMEOUT = None  # No timeout — Codex tasks can run for hours/days
 PROGRESS_INTERVAL = 60  # Check every 60 seconds
 TEXT_UPDATE_INTERVAL = 120  # Send text update every 2 minutes
 PROGRESS_BAR_WIDTH = 14
-AETHERVAULT_HOME = os.environ.get("AETHERVAULT_HOME", os.path.expanduser("~/.aethervault"))
-ENV_FILE = os.path.join(AETHERVAULT_HOME, ".env")
-
-
-def load_env_var(key):
-    """Load a var from environment or .env file."""
-    val = os.environ.get(key, "")
-    if val:
-        return val
-    if os.path.exists(ENV_FILE):
-        try:
-            with open(ENV_FILE) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        k, _, v = line.partition('=')
-                        if k.strip() == key:
-                            return v.strip()
-        except OSError:
-            pass
-    return ""
-
-
-def send_telegram(text):
-    """Send a Telegram message (best-effort, never blocks the hook)."""
-    token = load_env_var("TELEGRAM_BOT_TOKEN")
-    chat_id = load_env_var("TELEGRAM_CHAT_ID")
-    if not chat_id:
-        try:
-            cfg_path = os.path.join(AETHERVAULT_HOME, "config", "briefing.json")
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-                chat_id = str(cfg.get("chat_id", ""))
-        except Exception:
-            pass
-    if not token or not chat_id:
-        return
-    try:
-        data = json.dumps({"chat_id": chat_id, "text": text}).encode()
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-        urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
-
-
-def send_typing(chat_id, token):
-    """Send typing indicator to Telegram."""
-    if not token or not chat_id:
-        return
-    try:
-        data = json.dumps({"chat_id": chat_id, "action": "typing"}).encode()
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendChatAction",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-        urllib.request.urlopen(req, timeout=5)
-    except Exception:
-        pass
-
-
-def extract_last_user_message(messages):
-    """Extract the last user message text from the messages array."""
-    if not isinstance(messages, list):
-        return ""
-    for msg in reversed(messages):
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") == "user" and msg.get("content"):
-            content = msg["content"]
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts = [b.get("text", "") for b in content
-                         if isinstance(b, dict) and b.get("type") == "text"]
-                return "\n".join(parts)
-    return ""
 
 
 def tail_file(filepath, n_lines=5, max_chars=400):
@@ -147,12 +72,6 @@ def count_output_stats(filepath):
         return lines, size
     except (OSError, IOError):
         return 0, 0
-
-
-def format_elapsed(seconds):
-    """Format seconds as Xm Ys."""
-    m, s = divmod(int(seconds), 60)
-    return f"{m}m {s}s"
 
 
 def parse_progress_line(raw_line):
@@ -200,17 +119,6 @@ def render_progress_bar(percent):
 
 def progress_reporter(full_prompt, output_path, start_time, stop_event):
     """Background thread: sends real-time Telegram updates with actual progress."""
-    token = load_env_var("TELEGRAM_BOT_TOKEN")
-    chat_id = load_env_var("TELEGRAM_CHAT_ID")
-    if not chat_id:
-        try:
-            cfg_path = os.path.join(AETHERVAULT_HOME, "config", "briefing.json")
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-                chat_id = str(cfg.get("chat_id", ""))
-        except Exception:
-            pass
-
     update_num = 0
     last_line_count = 0
     last_offset = 0
@@ -248,7 +156,7 @@ def progress_reporter(full_prompt, output_path, start_time, stop_event):
                 latest_milestone = milestone
                 latest_message = message
 
-        send_typing(chat_id, token)
+        send_typing()
 
         if (update_num * PROGRESS_INTERVAL) % TEXT_UPDATE_INTERVAL != 0:
             continue
@@ -300,24 +208,44 @@ def parse_codex_jsonl(filepath):
                 if not isinstance(event, dict):
                     continue
                 event_type = event.get("type", "")
-                # Extract text from completed agent messages
                 if event_type == "item.completed":
                     item = event.get("item", {})
                     if isinstance(item, dict) and item.get("text"):
                         text_parts.append(item["text"])
             except (json.JSONDecodeError, TypeError, ValueError):
-                # Non-JSON line — might be raw text output, include it
                 text_parts.append(line)
     return "\n".join(text_parts).strip()
 
 
-def run_codex(prompt):
-    """Run Codex CLI with streaming output and real-time progress reporting."""
+RATE_LIMIT_PATTERNS = [
+    "rate limit", "429", "too many requests", "quota exceeded", "ratelimiterror",
+]
+
+
+def _is_rate_limit(stderr_text, exit_code):
+    """Detect rate limit from exit code and stderr patterns."""
+    if exit_code == 429:
+        return True
+    lower = stderr_text.lower()
+    return any(pat in lower for pat in RATE_LIMIT_PATTERNS)
+
+
+def _run_codex_once(prompt, account):
+    """Run Codex CLI once with a specific account. Returns (output, rate_limited)."""
+    profile = pool_state.get_account_profile(account)
+    config_dir = profile.get("codex_config_dir", "/root/.codex")
+    model = profile.get("model", "gpt-5.3-codex-spark")
+    reasoning = profile.get("reasoning_effort", "xhigh")
+
     logs_dir = os.path.join(AETHERVAULT_HOME, "logs")
     os.makedirs(logs_dir, exist_ok=True)
     fd, output_path = tempfile.mkstemp(prefix="codex-output-", suffix=".log",
                                         dir=logs_dir)
     os.close(fd)
+
+    fd_err, stderr_path = tempfile.mkstemp(prefix="codex-stderr-", suffix=".log",
+                                            dir=logs_dir)
+    os.close(fd_err)
 
     stop_event = threading.Event()
     start_time = time.time()
@@ -329,53 +257,91 @@ def run_codex(prompt):
     reporter.start()
 
     try:
-        with open(output_path, "w") as out_f:
+        env = os.environ.copy()
+        env["CODEX_CONFIG_DIR"] = config_dir
+
+        with open(output_path, "w") as out_f, open(stderr_path, "w") as err_f:
             proc = subprocess.Popen(
                 ["codex", "exec",
-                 "-m", "gpt-5.3-codex-spark",
+                 "-m", model,
                  "--dangerously-bypass-approvals-and-sandbox",
                  "--json",
                  "--skip-git-repo-check",
-                 "-c", "model_reasoning_effort=\"xhigh\"",
+                 "-c", f'model_reasoning_effort="{reasoning}"',
                  prompt],
                 stdout=out_f,
-                stderr=subprocess.DEVNULL,
+                stderr=err_f,
                 text=True,
                 cwd="/root/quake",
+                env=env,
             )
 
-        # No timeout — Codex tasks can run for hours or days.
-        # The Rust caller handles zombie detection; we just wait.
         proc.wait()
+
+        try:
+            with open(stderr_path, "r", errors="replace") as f:
+                stderr_text = f.read()
+        except OSError:
+            stderr_text = ""
+
+        if _is_rate_limit(stderr_text, proc.returncode):
+            pool_state.mark_rate_limited(account)
+            elapsed = time.time() - start_time
+            send_telegram(
+                f"[Codex] Rate limited (account: {account}) after {format_elapsed(elapsed)}\n"
+                f"Prompt:\n{prompt[:300]}"
+            )
+            return None, True
 
         output = parse_codex_jsonl(output_path)
 
         elapsed = time.time() - start_time
         line_count, byte_size = count_output_stats(output_path)
+        pool_state.mark_success(account)
 
         if elapsed > TEXT_UPDATE_INTERVAL:
             size_str = f"{byte_size / 1024:.1f}KB" if byte_size < 1024 * 1024 else f"{byte_size / (1024*1024):.1f}MB"
             status = "completed" if proc.returncode == 0 else f"exited with code {proc.returncode}"
             send_telegram(
-                f"[Codex] {status} in {format_elapsed(elapsed)}\n"
+                f"[Codex] {status} in {format_elapsed(elapsed)} (account: {account})\n"
                 f"Output: {line_count} lines ({size_str})\n\n"
                 f"Prompt:\n{prompt[:500]}\n\n"
                 f"Final output:\n{tail_file(output_path, n_lines=5, max_chars=400)}"
             )
 
-        return output if output else "(Codex returned no output)"
+        return (output if output else "(Codex returned no output)"), False
 
     except Exception as e:
         send_telegram(f"[Codex] Error: {e}\nPrompt:\n{prompt[:300]}")
-        return f"(Codex error: {e})"
+        return f"(Codex error: {e})", False
 
     finally:
         stop_event.set()
         reporter.join(timeout=2)
-        try:
-            os.unlink(output_path)
-        except OSError:
-            pass
+        for path in (output_path, stderr_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def run_codex(prompt):
+    """Run Codex CLI with account rotation and auto-failover on rate limit."""
+    tried_accounts = set()
+
+    while True:
+        account = pool_state.pick_best_account("codex")
+        if account is None or account in tried_accounts:
+            if tried_accounts:
+                return "(All Codex accounts are rate-limited)"
+            else:
+                return "(No Codex accounts configured)"
+
+        tried_accounts.add(account)
+        result, rate_limited = _run_codex_once(prompt, account)
+
+        if not rate_limited:
+            return result
 
 
 def main():
@@ -383,13 +349,7 @@ def main():
         raw_input = sys.stdin.read()
         request = json.loads(raw_input)
     except (json.JSONDecodeError, ValueError) as e:
-        print(json.dumps({
-            "message": {
-                "role": "assistant",
-                "content": f"(Error: Invalid JSON input to Codex hook: {e})",
-                "tool_calls": []
-            }
-        }))
+        print(make_hook_error_response(f"(Error: Invalid JSON input to Codex hook: {e})"))
         return
 
     messages = request.get("messages", [])
@@ -400,14 +360,7 @@ def main():
     else:
         response_text = run_codex(prompt)
 
-    response = {
-        "message": {
-            "role": "assistant",
-            "content": response_text,
-            "tool_calls": []
-        }
-    }
-    print(json.dumps(response))
+    print(make_hook_response(response_text))
 
 
 if __name__ == "__main__":

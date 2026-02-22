@@ -22,14 +22,21 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
+
+# Import shared utilities from common.py (re-exported for downstream scripts)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import (  # noqa: E402
+    AETHERVAULT_HOME, ENV_FILE,
+    CLAUDE_API_URL, CLAUDE_API_VERSION,
+    log, log_error, log_warn,
+    load_env, get_api_key,
+    call_claude, parse_claude_json,
+    send_telegram as _send_telegram_quiet,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
-AETHERVAULT_HOME = os.environ.get("AETHERVAULT_HOME", os.path.expanduser("~/.aethervault"))
 CAPSULE_PATH = os.environ.get("CAPSULE_PATH", os.path.join(AETHERVAULT_HOME, "memory.mv2"))
 AETHERVAULT_BIN = os.environ.get("AETHERVAULT_BIN", "/usr/local/bin/aethervault")
 HOT_MEMORY_PATH = os.path.join(AETHERVAULT_HOME, "data", "hot-memories.jsonl")
@@ -37,7 +44,6 @@ LOCK_PATH = os.path.join(AETHERVAULT_HOME, "data", "hot-memories.lock")
 ARCHIVE_PATH = os.path.join(AETHERVAULT_HOME, "data", "hot-memories-archive.jsonl")
 HEALTH_PATH = os.path.join(AETHERVAULT_HOME, "data", "memory-health.json")
 FAILURE_PATH = os.path.join(AETHERVAULT_HOME, "data", "extractor-failures.json")
-ENV_FILE = os.path.join(AETHERVAULT_HOME, ".env")
 OWNER_NAME = os.environ.get("OWNER_NAME", "the user")
 
 # Buffer limits
@@ -60,60 +66,6 @@ RECENCY_DECAY_RATE = 0.995
 # Alert thresholds
 CONSECUTIVE_FAILURE_ALERT_THRESHOLD = 3
 MARKER_STALE_MINUTES = 30
-
-# Claude API config
-CLAUDE_API_URL = os.environ.get("CLAUDE_API_URL", "http://127.0.0.1:11436/v1/messages")
-CLAUDE_API_VERSION = os.environ.get("CLAUDE_API_VERSION", "2023-06-01")
-MAX_RETRIES = 2
-RETRY_DELAY_SECONDS = 3
-
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-def log(msg: str, level: str = "INFO"):
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] [{level}] {msg}", flush=True)
-
-
-def log_error(msg: str):
-    log(msg, level="ERROR")
-
-
-def log_warn(msg: str):
-    log(msg, level="WARN")
-
-
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
-
-def load_env():
-    """Load environment variables from .env file if present."""
-    if os.path.isfile(ENV_FILE):
-        try:
-            with open(ENV_FILE, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "=" in line:
-                        key, _, value = line.partition("=")
-                        key = key.strip()
-                        value = value.strip().strip('"').strip("'")
-                        if key and value:
-                            os.environ.setdefault(key, value)
-        except OSError as e:
-            log_warn(f"Could not read {ENV_FILE}: {e}")
-
-
-def get_api_key() -> str:
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not key:
-        log_error("ANTHROPIC_API_KEY not set")
-        sys.exit(1)
-    return key
 
 
 # ---------------------------------------------------------------------------
@@ -568,110 +520,12 @@ def search_capsule(query: str, collections: list = None, limit: int = 10) -> lis
 
 
 # ---------------------------------------------------------------------------
-# Claude API
-# ---------------------------------------------------------------------------
-
-def call_claude(api_key: str, system_prompt: str, user_message: str,
-                max_tokens: int = 2048, model: str = None,
-                timeout: int = 60) -> str:
-    """Call Claude API with retry logic. Returns text response or empty string on failure."""
-    if model is None:
-        model = os.environ.get("EXTRACTOR_MODEL",
-                               os.environ.get("REFLECTION_MODEL", "claude-sonnet-4-5"))
-    payload = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_message}],
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": api_key,
-        "anthropic-version": CLAUDE_API_VERSION,
-    }
-    data = json.dumps(payload).encode("utf-8")
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            req = urllib.request.Request(
-                CLAUDE_API_URL, data=data, headers=headers, method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-
-            content_blocks = body.get("content", [])
-            text_parts = [b["text"] for b in content_blocks if b.get("type") == "text"]
-            result = "\n".join(text_parts)
-
-            usage = body.get("usage", {})
-            log(f"Claude API: in={usage.get('input_tokens', '?')} "
-                f"out={usage.get('output_tokens', '?')}")
-            return result
-
-        except urllib.error.HTTPError as e:
-            err_body = ""
-            try:
-                err_body = e.read().decode("utf-8", errors="replace")[:300]
-            except Exception:
-                pass
-            log_error(f"Claude API HTTP {e.code} (attempt {attempt}): {err_body}")
-            if e.code in (429, 500, 502, 503, 529) and attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_SECONDS * attempt)
-                continue
-            return ""
-        except Exception as e:
-            log_error(f"Claude API error (attempt {attempt}): {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_SECONDS * attempt)
-                continue
-            return ""
-    return ""
-
-
-def parse_claude_json(raw: str) -> dict:
-    """Parse JSON from Claude response, stripping markdown fences."""
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        cleaned = "\n".join(lines)
-    return json.loads(cleaned)
-
-
-# ---------------------------------------------------------------------------
-# Telegram notification
+# Telegram notification (wraps common.send_telegram with logging)
 # ---------------------------------------------------------------------------
 
 def send_telegram(text: str):
-    """Send a Telegram notification. Logs failure instead of silently swallowing."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-    if not chat_id:
-        try:
-            cfg_path = os.path.join(AETHERVAULT_HOME, "config", "briefing.json")
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-                chat_id = str(cfg.get("chat_id", ""))
-        except Exception:
-            pass
-
-    if not token or not chat_id:
-        return
-
-    try:
-        data = json.dumps({"chat_id": chat_id, "text": text}).encode()
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        log_warn(f"Telegram notification failed: {e}")
+    """Send a Telegram notification. Delegates to common.send_telegram."""
+    _send_telegram_quiet(text)
 
 
 # ---------------------------------------------------------------------------

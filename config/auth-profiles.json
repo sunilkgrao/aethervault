@@ -1,10 +1,39 @@
 {
-  "version": 2,
+  "version": 3,
   "profiles": {
     "ollama-local": {
       "type": "api_key",
       "provider": "ollama",
       "key": "ollama"
+    },
+    "codex-primary": {
+      "type": "cli_auth",
+      "provider": "codex",
+      "codex_config_dir": "/root/.codex",
+      "model": "gpt-5.3-codex-spark",
+      "reasoning_effort": "xhigh"
+    },
+    "codex-secondary": {
+      "type": "cli_auth",
+      "provider": "codex",
+      "codex_config_dir": "/root/.codex-secondary",
+      "model": "gpt-5.3-codex-spark",
+      "reasoning_effort": "xhigh"
+    },
+    "claude-code-max": {
+      "type": "cli_login",
+      "provider": "claude-code",
+      "model": "claude-opus-4-6"
+    }
+  },
+  "pools": {
+    "codex": {
+      "accounts": ["codex-primary", "codex-secondary"],
+      "cooldown_secs": 300
+    },
+    "claude-code": {
+      "accounts": ["claude-code-max"],
+      "cooldown_secs": 120
     }
   },
   "order": {

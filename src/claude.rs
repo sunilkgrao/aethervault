@@ -7,8 +7,9 @@ use serde_json;
 
 use crate::{
     command_spec_to_vec, env_bool, env_f64, env_optional, env_required, env_u64, env_usize,
-    jitter_ratio, parse_retry_after, run_hook_command, AgentHookRequest, AgentHookResponse,
-    AgentMessage, AgentToolCall, CommandSpec, HookSpec,
+    extract_prompt_from_request, jitter_ratio, parse_retry_after, run_hook_command,
+    run_claude_code_native, run_codex_native, run_pool_routed, AgentHookRequest,
+    AgentHookResponse, AgentMessage, AgentToolCall, CommandSpec, HookSpec,
 };
 
 const CRITIC_SYSTEM_PROMPT: &str = "\
@@ -953,6 +954,21 @@ pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Re
                 return Err(format!("API error: {e}"));
             }
         }
+    }
+
+    // Native pool routing: builtin:pool, builtin:codex, builtin:claude-code
+    let is_builtin_pool = hook_cmd == "builtin:pool" || hook_cmd == "pool";
+    let is_builtin_codex = hook_cmd == "builtin:codex";
+    let is_builtin_claude_code = hook_cmd == "builtin:claude-code";
+
+    if is_builtin_pool {
+        return run_pool_routed(request);
+    }
+    if is_builtin_codex {
+        return run_codex_native(&extract_prompt_from_request(request));
+    }
+    if is_builtin_claude_code {
+        return run_claude_code_native(&extract_prompt_from_request(request));
     }
 
     let cmd = command_spec_to_vec(&hook.command);

@@ -40,80 +40,35 @@ import re
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
+
+# Import shared utilities from common.py
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import (  # noqa: E402
+    AETHERVAULT_HOME, ENV_FILE,
+    CLAUDE_API_URL, CLAUDE_API_VERSION,
+    log, log_error, log_warn,
+    load_env, get_api_key,
+    call_claude, parse_claude_json,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-AETHERVAULT_HOME = os.environ.get("AETHERVAULT_HOME", os.path.expanduser("~/.aethervault"))
 CAPSULE_PATH = os.environ.get("CAPSULE_PATH", os.path.join(AETHERVAULT_HOME, "memory.mv2"))
 AETHERVAULT_BIN = os.environ.get("AETHERVAULT_BIN", "/usr/local/bin/aethervault")
 KNOWLEDGE_GRAPH_PATH = os.path.join(AETHERVAULT_HOME, "data", "knowledge-graph.json")
 KNOWLEDGE_GRAPH_HOOK = os.path.join(AETHERVAULT_HOME, "hooks", "knowledge-graph.py")
 MEMORY_MD_PATH = os.path.join(AETHERVAULT_HOME, "workspace", "MEMORY.md")
 DAILY_SUMMARIES_DIR = os.path.join(AETHERVAULT_HOME, "workspace", "daily-summaries")
-ENV_FILE = os.path.join(AETHERVAULT_HOME, ".env")
 LOG_DIR = os.environ.get("AETHERVAULT_LOG_DIR", "/var/log/aethervault")
 OWNER_NAME = os.environ.get("OWNER_NAME", "the user")
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
-CLAUDE_API_URL = os.environ.get("CLAUDE_API_URL", "http://127.0.0.1:11436/v1/messages")
-CLAUDE_API_VERSION = os.environ.get("CLAUDE_API_VERSION", "2023-06-01")
 MAX_LOG_TOKENS = 80000  # rough char budget for log content sent to Claude
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 5
-
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-def log(msg: str, level: str = "INFO"):
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] [{level}] {msg}"
-    print(line, flush=True)
-
-
-def log_error(msg: str):
-    log(msg, level="ERROR")
-
-
-def log_warn(msg: str):
-    log(msg, level="WARN")
-
-
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
-
-def load_env():
-    """Load environment variables from .env file if present."""
-    if os.path.isfile(ENV_FILE):
-        try:
-            with open(ENV_FILE, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "=" in line:
-                        key, _, value = line.partition("=")
-                        key = key.strip()
-                        value = value.strip().strip('"').strip("'")
-                        if key and value:
-                            os.environ.setdefault(key, value)
-        except OSError as e:
-            log_warn(f"Could not read {ENV_FILE}: {e}")
-
-
-def get_api_key() -> str:
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not key:
-        log_error("ANTHROPIC_API_KEY not set. Source .env or export it.")
-        sys.exit(1)
-    return key
 
 
 # ---------------------------------------------------------------------------
@@ -169,88 +124,6 @@ def query_agent_logs(target_date: str, limit: int = 100) -> str:
     except Exception as e:
         log_error(f"Failed to query agent logs: {e}")
         return ""
-
-
-# ---------------------------------------------------------------------------
-# Claude API
-# ---------------------------------------------------------------------------
-
-def call_claude(api_key: str, system_prompt: str, user_message: str,
-                max_tokens: int = 4096) -> str:
-    """
-    Call the Claude Messages API (non-streaming) and return the text response.
-    Retries on transient errors.
-    """
-    payload = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [
-            {"role": "user", "content": user_message}
-        ],
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": api_key,
-        "anthropic-version": CLAUDE_API_VERSION,
-    }
-
-    data = json.dumps(payload).encode("utf-8")
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            req = urllib.request.Request(
-                CLAUDE_API_URL,
-                data=data,
-                headers=headers,
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-
-            # Extract text from content blocks
-            content_blocks = body.get("content", [])
-            text_parts = []
-            for block in content_blocks:
-                if block.get("type") == "text":
-                    text_parts.append(block["text"])
-            result = "\n".join(text_parts)
-
-            usage = body.get("usage", {})
-            log(f"Claude API call OK: input={usage.get('input_tokens', '?')} "
-                f"output={usage.get('output_tokens', '?')}")
-            return result
-
-        except urllib.error.HTTPError as e:
-            err_body = ""
-            try:
-                err_body = e.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
-                pass
-            log_error(f"Claude API HTTP {e.code} (attempt {attempt}/{MAX_RETRIES}): {err_body}")
-            if e.code in (429, 500, 502, 503, 529) and attempt < MAX_RETRIES:
-                wait = RETRY_DELAY_SECONDS * attempt
-                log(f"Retrying in {wait}s...")
-                time.sleep(wait)
-                continue
-            return ""
-
-        except urllib.error.URLError as e:
-            log_error(f"Claude API URL error (attempt {attempt}/{MAX_RETRIES}): {e.reason}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_SECONDS * attempt)
-                continue
-            return ""
-
-        except Exception as e:
-            log_error(f"Claude API unexpected error (attempt {attempt}/{MAX_RETRIES}): {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_SECONDS * attempt)
-                continue
-            return ""
-
-    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -318,28 +191,19 @@ def summarize_logs(api_key: str, logs: str, target_date: str) -> dict:
         f"--- BEGIN LOGS ---\n{logs}\n--- END LOGS ---"
     )
 
-    raw = call_claude(api_key, SUMMARIZE_SYSTEM, user_msg, max_tokens=4096)
+    raw = call_claude(api_key, SUMMARIZE_SYSTEM, user_msg,
+                      max_tokens=4096, model=CLAUDE_MODEL,
+                      timeout=120, max_retries=MAX_RETRIES,
+                      retry_delay=RETRY_DELAY_SECONDS)
     if not raw:
         log_error("Claude returned empty response for summarization")
         return {}
 
-    # Parse JSON from response - handle potential markdown fences
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        # Strip markdown code fences
-        lines = cleaned.split("\n")
-        # Remove first line (```json or ```) and last line (```)
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        cleaned = "\n".join(lines)
-
     try:
-        data = json.loads(cleaned)
+        data = parse_claude_json(raw)
         log("Successfully parsed consolidation JSON")
         return data
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError) as e:
         log_error(f"Failed to parse Claude's JSON response: {e}")
         log_error(f"Raw response (first 500 chars): {raw[:500]}")
         return {}

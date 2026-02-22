@@ -17,6 +17,7 @@ mod config_file;
 mod memory_db;
 mod consolidation;
 mod skill_registry;
+mod pool_state;
 
 // Re-export all module items at crate root so cross-module references work.
 // Before this split, everything lived in main.rs and shared a single namespace.
@@ -37,6 +38,7 @@ pub(crate) use services::*;
 pub(crate) use agent_log::*;
 pub(crate) use config_file::*;
 pub(crate) use skill_registry::*;
+pub(crate) use pool_state::*;
 
 // External crate imports used directly in main()
 use std::collections::HashMap;
