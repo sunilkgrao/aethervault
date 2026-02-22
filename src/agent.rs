@@ -13,7 +13,7 @@ use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde_json;
 
-use crate::claude::{call_agent_hook, call_claude, call_critic};
+use crate::claude::{call_agent_hook, call_claude, call_claude_with_model, call_critic};
 use crate::{
     append_log_jsonl, base_tool_names, build_context_pack, build_kg_context,
     collect_mid_loop_reminders, compute_drift_score, critic_should_fire, detect_cycle, env_optional,
@@ -299,7 +299,15 @@ pub(crate) fn default_system_prompt() -> String {
 /// Estimate token count for messages (rough: chars / 4).
 pub(crate) fn estimate_tokens(messages: &[AgentMessage]) -> usize {
     messages.iter().map(|m| {
-        m.content.as_ref().map(|c| c.len()).unwrap_or(0) / 4
+        let content_chars = m.content.as_ref().map(|c| c.len()).unwrap_or(0);
+        let tool_call_chars: usize = m.tool_calls.iter().map(|tc| {
+            tc.name.len() + tc.id.len() + tc.args.to_string().len()
+        }).sum();
+        let thinking_chars: usize = m.thinking_blocks.iter().map(|tb| {
+            tb.to_string().len()
+        }).sum();
+        // ~4 chars per token, plus per-message overhead (~20 tokens for role/structure)
+        (content_chars + tool_call_chars + thinking_chars) / 4 + 20
     }).sum()
 }
 
@@ -321,12 +329,11 @@ pub(crate) fn keep_recent_turns() -> usize {
 
 /// Compact messages when context is getting large.
 /// Preserves all leading system blocks and last `keep_recent` messages verbatim.
-/// Summarizes everything in between into a compaction notice.
-/// Compact messages when context is getting large.
+/// Summarizes everything in between via a lightweight Sonnet call (no thinking).
 /// Returns the extracted GOAL from the structured summary (if any).
 pub(crate) fn compact_messages(
     messages: &mut Vec<AgentMessage>,
-    hook: &HookSpec,
+    _hook: &HookSpec,
     keep_recent: usize,
 ) -> Result<Option<String>, String> {
     if messages.len() <= keep_recent + 2 {
@@ -340,14 +347,23 @@ pub(crate) fn compact_messages(
     let to_summarize: Vec<_> = messages[summary_start..summary_end].to_vec();
     let recent: Vec<_> = messages[summary_end..].to_vec();
 
-    // Build a summary request
-    let summary_text: String = to_summarize.iter().filter_map(|m| {
+    // Build summary text with hard cap to prevent the summarizer prompt itself from blowing up.
+    // 150 chars/msg keeps it manageable; total capped at ~120K chars (~30K tokens).
+    const PER_MSG_CHARS: usize = 150;
+    const MAX_SUMMARY_CHARS: usize = 120_000;
+    let mut summary_text = String::new();
+    for m in &to_summarize {
         let role = &m.role;
-        m.content.as_ref().map(|c| {
-            let preview: String = c.chars().take(300).collect();
-            format!("[{role}] {preview}")
-        })
-    }).collect::<Vec<_>>().join("\n");
+        if let Some(c) = &m.content {
+            let preview: String = c.chars().take(PER_MSG_CHARS).collect();
+            let line = format!("[{role}] {preview}\n");
+            if summary_text.len() + line.len() > MAX_SUMMARY_CHARS {
+                summary_text.push_str("[... earlier messages truncated for compaction ...]\n");
+                break;
+            }
+            summary_text.push_str(&line);
+        }
+    }
 
     let summary_prompt = format!(
         "Summarize this conversation. Output in this format:\n\
@@ -362,6 +378,9 @@ pub(crate) fn compact_messages(
          {summary_text}"
     );
 
+    // Use Sonnet directly for compaction — lightweight, no thinking, won't blow up on token limits
+    let sonnet_model = env_optional("SONNET_MODEL")
+        .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
     let summary_request = AgentHookRequest {
         messages: vec![
             AgentMessage {
@@ -387,15 +406,16 @@ pub(crate) fn compact_messages(
         session: None,
     };
 
-    let summary_response = call_agent_hook(hook, &summary_request)?;
-    let summary = summary_response.content.unwrap_or_else(|| "(compaction failed)".to_string());
+    let summary_response = call_claude_with_model(&summary_request, Some(&sonnet_model))
+        .map_err(|e| format!("compaction summarizer failed: {e}"))?;
+    let summary = summary_response.message.content.unwrap_or_else(|| "(compaction failed)".to_string());
 
     // Extract the GOAL field from the structured summary
     let extracted_goal = summary.lines()
         .find(|line| line.starts_with("GOAL:"))
         .map(|line| line.trim_start_matches("GOAL:").trim().to_string());
 
-    // Rebuild messages: system blocks + compaction notice + recent
+    // Rebuild messages: system blocks + compaction notice + recent (thinking blocks stripped)
     *messages = system_msgs;
     messages.push(AgentMessage {
         role: "user".to_string(),
@@ -415,7 +435,11 @@ pub(crate) fn compact_messages(
         is_error: None,
         thinking_blocks: vec![],
     });
-    messages.extend(recent);
+    // Strip thinking blocks from recent messages — they're huge and stale post-compaction
+    for mut msg in recent {
+        msg.thinking_blocks.clear();
+        messages.push(msg);
+    }
     Ok(extracted_goal)
 }
 

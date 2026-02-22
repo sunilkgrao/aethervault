@@ -661,6 +661,20 @@ pub(crate) fn call_claude_with_model(
         if let Ok(fallback_model) = std::env::var("ANTHROPIC_FALLBACK_MODEL") {
             eprintln!("All primary endpoints failed, trying Sonnet fallback: {fallback_model}");
             payload["model"] = serde_json::json!(fallback_model);
+
+            // Strip thinking/output_config — Sonnet doesn't support adaptive thinking
+            if let Some(obj) = payload.as_object_mut() {
+                obj.remove("thinking");
+                obj.remove("output_config");
+            }
+            // Re-add temperature/top_p now that thinking is disabled
+            if let Some(temp) = temperature {
+                payload["temperature"] = serde_json::json!(temp);
+            }
+            if let Some(p) = top_p {
+                payload["top_p"] = serde_json::json!(p);
+            }
+
             for attempt in 0..=1 {
                 let mut request = agent
                     .post(&base_url)
