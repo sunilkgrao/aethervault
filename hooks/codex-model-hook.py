@@ -24,54 +24,13 @@ import pool_state
 from common import (
     AETHERVAULT_HOME, send_telegram, send_typing, extract_last_user_message,
     format_elapsed, make_hook_response, make_hook_error_response,
+    is_rate_limit_error, tail_file, get_file_stats, format_file_size,
 )
 
 CODEX_TIMEOUT = None  # No timeout — Codex tasks can run for hours/days
 PROGRESS_INTERVAL = 60  # Check every 60 seconds
 TEXT_UPDATE_INTERVAL = 120  # Send text update every 2 minutes
 PROGRESS_BAR_WIDTH = 14
-
-
-def tail_file(filepath, n_lines=5, max_chars=400):
-    """Read the last N lines of a file, capped at max_chars total."""
-    try:
-        file_size = os.path.getsize(filepath)
-        if file_size == 0:
-            return "(no output yet)"
-        read_size = min(file_size, 8192)
-        with open(filepath, "r", errors="replace") as f:
-            f.seek(max(0, file_size - read_size))
-            chunk = f.read(read_size)
-        lines = chunk.splitlines()
-        tail = [l.rstrip() for l in lines[-n_lines:] if l.strip()]
-        if not tail:
-            return "(no output yet)"
-        result = "\n".join(tail)
-        if len(result) > max_chars:
-            result = "..." + result[-(max_chars - 3):]
-        return result
-    except (OSError, IOError):
-        return "(output not available)"
-
-
-def count_output_stats(filepath):
-    """Get output file stats: approximate line count, byte size."""
-    try:
-        size = os.path.getsize(filepath)
-        if size == 0:
-            return 0, 0
-        if size <= 1024 * 1024:
-            with open(filepath, "r", errors="replace") as f:
-                lines = sum(1 for _ in f)
-        else:
-            with open(filepath, "r", errors="replace") as f:
-                sample = f.read(8192)
-            sample_lines = sample.count("\n") or 1
-            avg_line_len = len(sample) / sample_lines
-            lines = int(size / avg_line_len) if avg_line_len > 0 else 0
-        return lines, size
-    except (OSError, IOError):
-        return 0, 0
 
 
 def parse_progress_line(raw_line):
@@ -176,12 +135,12 @@ def progress_reporter(full_prompt, output_path, start_time, stop_event):
             send_telegram(msg)
             continue
 
-        line_count, byte_size = count_output_stats(output_path)
+        line_count, byte_size = get_file_stats(output_path)
         current_activity = tail_file(output_path, n_lines=3, max_chars=300)
         new_lines = line_count - last_line_count
         last_line_count = line_count
 
-        size_str = f"{byte_size / 1024:.1f}KB" if byte_size < 1024 * 1024 else f"{byte_size / (1024*1024):.1f}MB"
+        size_str = format_file_size(byte_size)
         msg_parts = [
             f"[Codex] {format_elapsed(elapsed)} elapsed",
             f"Output: {line_count} lines ({size_str}), +{new_lines} since last update",
@@ -220,14 +179,6 @@ def parse_codex_jsonl(filepath):
 RATE_LIMIT_PATTERNS = [
     "rate limit", "429", "too many requests", "quota exceeded", "ratelimiterror",
 ]
-
-
-def _is_rate_limit(stderr_text, exit_code):
-    """Detect rate limit from exit code and stderr patterns."""
-    if exit_code == 429:
-        return True
-    lower = stderr_text.lower()
-    return any(pat in lower for pat in RATE_LIMIT_PATTERNS)
 
 
 def _run_codex_once(prompt, account):
@@ -284,7 +235,7 @@ def _run_codex_once(prompt, account):
         except OSError:
             stderr_text = ""
 
-        if _is_rate_limit(stderr_text, proc.returncode):
+        if is_rate_limit_error(stderr_text, proc.returncode, RATE_LIMIT_PATTERNS):
             pool_state.mark_rate_limited(account)
             elapsed = time.time() - start_time
             send_telegram(
@@ -296,11 +247,11 @@ def _run_codex_once(prompt, account):
         output = parse_codex_jsonl(output_path)
 
         elapsed = time.time() - start_time
-        line_count, byte_size = count_output_stats(output_path)
+        line_count, byte_size = get_file_stats(output_path)
         pool_state.mark_success(account)
 
         if elapsed > TEXT_UPDATE_INTERVAL:
-            size_str = f"{byte_size / 1024:.1f}KB" if byte_size < 1024 * 1024 else f"{byte_size / (1024*1024):.1f}MB"
+            size_str = format_file_size(byte_size)
             status = "completed" if proc.returncode == 0 else f"exited with code {proc.returncode}"
             send_telegram(
                 f"[Codex] {status} in {format_elapsed(elapsed)} (account: {account})\n"

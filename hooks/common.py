@@ -277,3 +277,106 @@ def make_hook_response(content: str) -> str:
             "tool_calls": []
         }
     })
+
+
+# ---------------------------------------------------------------------------
+# Rate limit detection
+# ---------------------------------------------------------------------------
+
+def is_rate_limit_error(stderr_text: str, exit_code: int, patterns: list = None) -> bool:
+    """Detect rate limit from exit code and stderr patterns.
+
+    Args:
+        stderr_text: stderr output to check
+        exit_code: process exit code
+        patterns: optional list of patterns to check (default: common rate limit signals)
+
+    Returns:
+        True if rate limit detected, False otherwise
+    """
+    if patterns is None:
+        patterns = [
+            "rate limit", "429", "too many requests", "quota exceeded",
+            "ratelimiterror", "overloaded", "capacity",
+        ]
+    if exit_code == 429:
+        return True
+    lower = stderr_text.lower()
+    return any(pat in lower for pat in patterns)
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def tail_file(filepath: str, n_lines: int = 5, max_chars: int = 400) -> str:
+    """Read the last N lines of a file, capped at max_chars total.
+
+    Args:
+        filepath: path to file
+        n_lines: number of lines to read
+        max_chars: max characters to return
+
+    Returns:
+        tail text or error message
+    """
+    try:
+        file_size = os.path.getsize(filepath)
+        if file_size == 0:
+            return "(no output yet)"
+        read_size = min(file_size, 8192)
+        with open(filepath, "r", errors="replace") as f:
+            f.seek(max(0, file_size - read_size))
+            chunk = f.read(read_size)
+        lines = chunk.splitlines()
+        tail = [l.rstrip() for l in lines[-n_lines:] if l.strip()]
+        if not tail:
+            return "(no output yet)"
+        result = "\n".join(tail)
+        if len(result) > max_chars:
+            result = "..." + result[-(max_chars - 3):]
+        return result
+    except (OSError, IOError):
+        return "(output not available)"
+
+
+def get_file_stats(filepath: str) -> tuple:
+    """Get file stats: approximate line count, byte size.
+
+    Args:
+        filepath: path to file
+
+    Returns:
+        Tuple of (line_count, byte_size)
+    """
+    try:
+        size = os.path.getsize(filepath)
+        if size == 0:
+            return 0, 0
+        if size <= 1024 * 1024:
+            with open(filepath, "r", errors="replace") as f:
+                lines = sum(1 for _ in f)
+        else:
+            with open(filepath, "r", errors="replace") as f:
+                sample = f.read(8192)
+            sample_lines = sample.count("\n") or 1
+            avg_line_len = len(sample) / sample_lines
+            lines = int(size / avg_line_len) if avg_line_len > 0 else 0
+        return lines, size
+    except (OSError, IOError):
+        return 0, 0
+
+
+def format_file_size(size_bytes: int) -> str:
+    """Format bytes as human-readable size string.
+
+    Args:
+        size_bytes: size in bytes
+
+    Returns:
+        Formatted size string (e.g., "1.5MB")
+    """
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f}KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f}MB"

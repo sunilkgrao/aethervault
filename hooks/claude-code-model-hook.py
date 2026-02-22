@@ -20,23 +20,11 @@ import pool_state
 from common import (
     send_telegram, send_typing, extract_last_user_message,
     format_elapsed, make_hook_response, make_hook_error_response,
+    is_rate_limit_error,
 )
 
 PROGRESS_INTERVAL = 60
 TEXT_UPDATE_INTERVAL = 120
-
-RATE_LIMIT_PATTERNS = [
-    "rate limit", "429", "too many requests", "quota exceeded",
-    "ratelimiterror", "overloaded", "capacity",
-]
-
-
-def is_rate_limit_error(stderr_text, exit_code):
-    """Detect rate limit from exit code and stderr patterns."""
-    if exit_code == 429:
-        return True
-    lower = stderr_text.lower()
-    return any(pat in lower for pat in RATE_LIMIT_PATTERNS)
 
 
 def progress_reporter(full_prompt, start_time, stop_event):
@@ -100,7 +88,10 @@ def run_claude_code(prompt, account=None):
 
         elapsed = time.time() - start_time
 
-        if is_rate_limit_error(proc.stderr, proc.returncode):
+        if is_rate_limit_error(proc.stderr, proc.returncode, [
+            "rate limit", "429", "too many requests", "quota exceeded",
+            "ratelimiterror", "overloaded", "capacity",
+        ]):
             pool_state.mark_rate_limited(account)
             send_telegram(
                 f"[Claude Code] Rate limited (account: {account}) after {format_elapsed(elapsed)}\n"
