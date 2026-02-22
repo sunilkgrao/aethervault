@@ -91,30 +91,19 @@ impl PoolState {
         let pool = self.pools.get(service)?;
         let now = Instant::now();
 
-        let mut best: Option<(String, u32)> = None;
+        // Return first non-rate-limited account in config order (preserves priority).
         for account in &pool.accounts {
             if let Some(state) = self.accounts.get(account) {
-                // Skip rate-limited accounts
                 if let Some(until) = state.rate_limited_until {
                     if now < until {
-                        continue;
+                        continue; // skip rate-limited
                     }
                 }
-                // Pick account with fewest failures
-                match &best {
-                    None => best = Some((account.clone(), state.consecutive_failures)),
-                    Some((_, best_failures)) => {
-                        if state.consecutive_failures < *best_failures {
-                            best = Some((account.clone(), state.consecutive_failures));
-                        }
-                    }
-                }
-            } else {
-                // Unknown account (no state yet) = best candidate
-                return Some(account.clone());
             }
+            // Either no state yet (unknown = available) or not rate-limited
+            return Some(account.clone());
         }
-        best.map(|(name, _)| name)
+        None // all accounts rate-limited
     }
 
     fn mark_rate_limited(&mut self, account: &str) {
@@ -337,9 +326,10 @@ fn run_codex_once(prompt: &str, account: &str) -> Result<AgentMessage, String> {
     }
 
     if !output.status.success() && output.stdout.is_empty() {
-        pool_mark_rate_limited(account);
+        // Don't mark as rate-limited for non-rate-limit errors, but do
+        // signal the retry loop to try the next account.
         return Err(format!(
-            "codex exited with code {:?}: {}",
+            "codex account {account} failed (rate limit): exit code {:?}: {}",
             output.status.code(),
             stderr.trim()
         ));
