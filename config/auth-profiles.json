@@ -16,7 +16,7 @@
     "codex-secondary": {
       "type": "cli_auth",
       "provider": "codex",
-      "codex_config_dir": "/root/.codex-secondary",
+      "codex_config_dir": "/root/codex-alt/.codex",
       "model": "gpt-5.3-codex-spark",
       "reasoning_effort": "xhigh"
     },

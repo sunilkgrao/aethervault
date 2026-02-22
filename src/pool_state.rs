@@ -307,7 +307,12 @@ fn run_codex_once(prompt: &str, account: &str) -> Result<AgentMessage, String> {
         &format!("model_reasoning_effort=\"{reasoning}\""),
         prompt,
     ]);
-    cmd.env("CODEX_CONFIG_DIR", config_dir);
+    // Codex CLI reads config from $HOME/.codex/ — set HOME to the parent
+    // of the config dir so each account gets its own auth.
+    let config_path = std::path::Path::new(config_dir);
+    if let Some(home_dir) = config_path.parent() {
+        cmd.env("HOME", home_dir);
+    }
 
     // Use workspace as cwd if available
     let workspace = env_optional("AETHERVAULT_WORKSPACE")
