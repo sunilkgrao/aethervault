@@ -1,47 +1,8 @@
-## Subagent Lock Contention Issue
-- `subagent_invoke` can hit file lock contention on the capsule DB when parent session is active (single-process CLI mode)
-- `subagent_list` works fine
-- Fix options: (1) capsule/DB supporting concurrent access, (2) subagent uses separate capsule/workspace
-- May need to configure subagents with a different capsule path to avoid shared lock
-Codex sub-agent model preference: ALWAYS use GPT-5.3-Codex-Spark (set 2026-02-11). CLI updated to v0.100.0. Config at ~/.codex/config.json. Previous model was o3-mini.
-CRITICAL RULE: Codex (GPT-5.3) must ONLY be invoked via the CLI-based subagent (codex-yolo). NEVER use the Codex API directly. All coding tasks go through the CLI subagent exclusively. This is a permanent, non-negotiable rule from Sunil.
-## Codex Usage Rules (PERMANENT)
-1. **CLI ONLY** — Never invoke Codex via API. Always via CLI subagent using the codex-hook.sh model hook.
-2. **Flag**: `--full-auto` (formerly `--yolo`) — gives full autonomy to read/write/execute without confirmation.
-3. **Swarm pattern**: Do NOT spawn multiple Codex subagents from AetherVault. Instead, spawn ONE Codex session with `--full-auto` and instruct it to spin up its own internal swarm/parallelism within that session. This avoids lock contention and is the correct architecture.
-4. **Invocation**: `codex --full-auto "prompt here"`
-5. **Model**: GPT-5.3 (via CLI, never direct OpenAI API)
-## Agent Swarm Architecture (2026-02-11)
-- AetherVault can spin up MULTIPLE parallel subagents, each being a purpose-built agent
-- Each agent invokes Codex via CLI with --full-auto flag (NEVER API)
-- Each Codex CLI session can spin up its OWN internal swarm for sub-tasks
-- This gives us two-tier parallelism: AV-level agents × Codex-level swarms
-- Each subagent = one independent Codex process = no lock contention
-- Agents should be purpose-built with clear names and mandates (e.g., infra-auditor, code-reviewer, perf-optimizer, security-scanner)
-- When prompting Codex, explicitly tell it to "spin up a swarm" for parallel sub-tasks within its session
-- This replaces the old broken pattern of spawning multiple Codex subagents that fought over locks
-## Codex Subagent Protocol (PERMANENT — Never Forget)
+# Assistant Memory & Project State
 
-### Rules:
-1. **CLI ONLY** — Codex is ALWAYS invoked via CLI subagent hook, NEVER via API
-2. **Flag**: `--full-auto` (formerly `--yolo`) — gives full autonomy
-3. **Model**: ALWAYS use `gpt-5.3-codex-spark` — no other model
-4. **Two-Tier Swarm Architecture**:
-   - **Tier 1**: AetherVault uses `subagent_batch` to spin up N parallel named agents for distinct workstreams
-   - **Tier 2**: Each Codex agent runs `--full-auto` and can spin up its OWN internal swarm within that CLI session
-5. **Prompt pattern**: When invoking Codex, tell it to spin up a swarm itself if the task benefits from parallelism
-6. **No multi-subagent lock issues** — each Codex CLI session manages its own parallelism independently
-7. **Model hook**: `codex-yolo` (uses codex-hook.sh under the hood)
+> Operational knowledge (pool routing, hooks, backends) moved to OPERATIONS.md (2026-02-22)
+> This file contains: research notes, projects, infrastructure state, lessons learned
 
-### Invocation:
-```
-codex --model gpt-5.3-codex-spark --full-auto "prompt here"
-```
-
-### Architecture:
-- AetherVault orchestrates high-level workstreams (Tier 1)
-- Each Codex session handles its own sub-tasks internally (Tier 2)
-- Both tiers can run in parallel independently
 2026-02-11: Deep research completed on adaptive retrieval for AI agent memory systems. Covered FLARE (Jiang et al., 2023), Self-RAG (Asai et al., ICLR 2024), SKR (Wang et al., EMNLP 2024), Adaptive-RAG (Jeong et al., NAACL 2024), CRAG (Yan et al., ICML 2024), DRAGIN (Su et al., ACL 2024), Speculative RAG, RobustRAG, BlendFilter. Key finding: field converging on layered adaptive retrieval — fast query classification → self-knowledge check → complexity routing → post-retrieval validation → generation with reflection. Optimal config for AetherVault: always retrieve for personal memory/history, conditionally retrieve for general knowledge (entropy/confidence gating), never retrieve for creative/chitchat. Target retrieval overhead <500ms.
 Research completed: Hierarchical memory systems (episodic/semantic/procedural) for LLM agents. Key references: Park et al 2023 (Generative Agents - importance scoring, retrieval function), Packer et al 2023 (MemGPT - virtual memory paging), Wang et al 2023 (Voyager - skill library as code), Shinn et al 2023 (Reflexion - self-reflection as procedural memory), Zhong et al 2024 (MemoryBank - Ebbinghaus forgetting curve). Key implementation recommendations: add importance scoring to memory writes, implement Park retrieval function (recency×importance×relevance), add consolidation cycle for fact extraction and procedural pattern detection, enrich skill_store with success/failure tracking.
 PROJECT: Personal CRM — Building a relationship management system. Data model: person, last contact, notes, cadence, next action. Populated via Rhaine (LinkedIn export, calendar intel), iMessage, WhatsApp, email scanning. Weekly "relationship radar" output with proactive nudges and Rhaine-executed gestures (gifts, scheduling).
@@ -76,7 +37,6 @@ macOS VM NOVEL OPTIMIZATIONS deployed (2026-02-14 session). New code-level enhan
 ## Subagent Routing: For Codex coding tasks, use subagent_invoke(name="coder", prompt="..."). The coder subagent runs Codex CLI internally via its model_hook. Do NOT use exec to spawn codex processes directly.
 BROWSER BROKER DEPLOYED (2026-02-14). Playwright-based HTTP broker on port 4040. Node.js/Express, 3-page pool, Chromium headless. Code at /tmp/browser-broker/dist/index.js (125 lines, hand-written). Supports: goto, click, type, extract, screenshot, evaluate. Systemd service: browser-broker.service. AetherVault browser_request tool now fully functional. 282ms first response. TODO: move code from /tmp to /opt/browser-broker for persistence across reboots.
 BROWSER ARCHITECTURE DECISION (2026-02-14): Current Playwright/Express sidecar moved from /tmp to /opt/browser-broker/, systemd enabled, working at 154ms. Short-term: keep sidecar. Medium-term RIGHT ANSWER: Playwright MCP Server over stdio, spawned as child process from Rust binary. No HTTP, no ports, no separate systemd. Modify Rust binary to speak MCP protocol. Do NOT compile browser into Rust (chromiumoxide/fantoccini lag behind Playwright). Do NOT use managed APIs (latency/cost). Do NOT use browser-use/Stagehand (they want to BE the agent, we just need a browser primitive).
-## Subagent Hook: The coder subagent has model_hook=codex-hook.sh configured in config.json. No manual hook setup needed. subagent_invoke(name="coder") automatically routes through Codex CLI.
 DREAMINA/CAPCUT VIDEO MODELS (2026-02-14): dreamina.capcut.com is CapCut's AI video/image platform. Available models: Seedance 2.0 ("Video"), Seedance 1.5 Pro, Seedance 1.0 (Fast/Pro/Mini), Seaweed alpha, Veo 3/3.1 (Google), Sora 2 (OpenAI), Seedream 2.0-5.0 (images), Nano Banana (Google). No public API — requires browser login. Internal API is behind authenticated SPA. JS bundles at sf16-web-tos-buz.capcutcdn-us.com. Main bundle: main.9086ecc2.js (397KB). Also has "seedance_3_0" reference suggesting Seedance 3.0 coming soon.
 macOS VM CRASH FIX (2026-06-15): OOM killed QEMU during install (6GB guest + overhead > 8GB droplet). Fixes: (1) Reduced guest RAM 6G→5G, hugepages 3072→2560. (2) Removed invalid `iothread=iothread-net` from virtio-net-pci (not supported in QEMU 9.0.2). (3) Removed unsupported `+invtsc` CPU flag. VM restarted successfully in tmux session "macos". VNC: 159.223.165.148:5901.
 macOS VM RELAUNCHED (2026-06-15). Droplet ID 551766641, name macos-vm, NEW IP: 134.209.112.229. QEMU running in tmux session "macos" with Penryn CPU, 5GB RAM, 4 cores, OpenCore bootloader, vmxnet3 networking with user-mode NAT (dns=8.8.8.8), VNC :1 (port 5901), SSH guest port 2222. 64GB qcow2 disk created. NAT/ip_forward configured on host. BaseSystem.img = recovery installer. macOS NOT YET INSTALLED — user needs to VNC in, use Disk Utility to format drive as APFS, then install.
@@ -544,10 +504,6 @@ Location: /opt/av-evolution/ (9 scripts, 689 lines total)
 ### raoDesktop Clone: ~/aethervault/ (cloned via HTTPS, read-only). Has full src/ directory.
 
 ### Evolution Pipeline: /opt/av-evolution/ — FIXED to use WORKTREE="/root/.aethervault" (was wrong pointing at rust-src/). review.sh updated to scan src/*.rs files instead of old monolith.
-## BUG: skill_search broken — "Lexical index is not enabled" error. skill_store may work but search does not. Needs investigation — likely capsule config issue.
-## Subagent System: OPERATIONAL
-3 subagents configured (researcher, coder, critic). Use subagent_invoke for single delegation, subagent_batch for parallel fan-out. subagent_list confirms availability. For Codex coding tasks, use subagent_invoke(name="coder", prompt="..."). The coder subagent runs Codex CLI internally via its model_hook. Do NOT use exec to spawn codex processes directly.
-BUILD PENDING (2026-02-15): cargo build --release running on AV droplet (PID 468793). Once complete: cp target/release/aethervault /usr/local/bin/aethervault && systemctl restart aethervault. Fixes included: agent.rs (3 bugs), mcp.rs (timeouts+reconnect), 32 cargo warnings, evolution pipeline. All changes compile clean (cargo check passes, 0 warnings).
 ## ARCHITECTURE PRINCIPLE: NO TIMEOUTS, BACKGROUND-FIRST (2026-06-15)
 - Codex sessions should NEVER have timeouts. Let them run hours if needed (8+ hours is acceptable).
 - Use background processes (nohup, tmux, systemd) for long-running Codex tasks.
@@ -611,4 +567,3 @@ SLACK BRIDGE: Code written (1,171 lines slack.rs), wired into mod.rs/cli.rs/Carg
 SLACK BRIDGE IS LIVE AND WORKING (confirmed 2026-06-17). Bot name: "Raobot". Workspace: Tribble (T05261TL2EP). Sunil's DM channel: D0AFASN9FFG, Sunil's user ID: U0528KFHAE8. File uploads work via files.getUploadURLExternal → PUT → files.completeUploadExternal (old files.upload is deprecated). Bot token starts with xoxb-5074061682. Env vars are in /root/.secrets/master.env. DO NOT tell Sunil the Slack bridge isn't working — it IS working.
 iMESSAGE CRM PIPELINE RUNNING (2026-02-17). chat.db (560MB, 330K messages) extracted to 1,028 contact files + 424 group chats. Ollama worker (qwen3:8b on raoDesktop RTX 3090) processing all contacts sequentially (~8-14s each, ~2-3hr total). Output: ~/crm-imessage/profiles/*.json on raoDesktop. Cron on AV droplet checks every 15min — when worker finishes, auto-runs ingest_profiles.py which rsyncs profiles back and stores in capsule as crm://imessage/ frames (track: crm.imessage, kind: crm-profile). Scripts: extract_conversations.py (done), ollama_analyze.py (running on raoDesktop), ingest_profiles.py (ready on AV), check_and_ingest.sh (cron). Conversation data at /root/.aethervault/workspace/crm-imessage/conversations/ (28MB). Group chats not yet analyzed — future task.
 IDENTITY: My name is Linus. This is permanent and non-negotiable. Always refer to myself as Linus, not AetherVault or AV.
-CODEX MODEL ENFORCEMENT (2026-02-17): gpt-5.3-codex-spark is now hardcoded in ALL active configs and scripts. Verified locations: (1) AV ~/.codex/config.toml + config.json, (2) raoDesktop ~/.codex/config.toml, (3) codex-model-hook.py line 335, (4) analyze_batch.py, (5) evolution review.sh + propose.sh, (6) research-engine/research.py, (7) self-eval/*.py, (8) av-content-agent/server.py. This is PERMANENT and NON-NEGOTIABLE. Never use any other Codex model.
