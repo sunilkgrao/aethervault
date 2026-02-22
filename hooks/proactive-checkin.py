@@ -32,28 +32,28 @@ import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Import shared utilities from common.py
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import (  # noqa: E402
+    AETHERVAULT_HOME, load_env, load_env_var, log,
+    CLAUDE_API_URL, CLAUDE_API_VERSION,
+)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_API_URL = os.environ.get("CLAUDE_API_URL", "http://127.0.0.1:11436/v1/messages")
+load_env()  # Load from .env file if present
+
+TELEGRAM_BOT_TOKEN = load_env_var("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = load_env_var("TELEGRAM_CHAT_ID")
+ANTHROPIC_API_KEY = load_env_var("ANTHROPIC_API_KEY")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
 OWNER_NAME = os.environ.get("OWNER_NAME", "the user")
-
-AETHERVAULT_HOME = os.environ.get("AETHERVAULT_HOME", os.path.expanduser("~/.aethervault"))
 AETHERVAULT_DIR = Path(AETHERVAULT_HOME)
 DAILY_SUMMARIES_DIR = AETHERVAULT_DIR / "workspace" / "daily-summaries"
 KNOWLEDGE_GRAPH_SCRIPT = AETHERVAULT_DIR / "hooks" / "knowledge-graph.py"
 KNOWLEDGE_GRAPH_FILE = AETHERVAULT_DIR / "data" / "knowledge-graph.json"
-
-
-def log(msg: str):
-    """Print a timestamped log message."""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
 
 
 # ---------------------------------------------------------------------------
