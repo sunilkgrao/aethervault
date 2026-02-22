@@ -113,6 +113,7 @@ impl FileConfig {
             hooks: self.hooks,
             agent: Some(self.agent),
             extra: HashMap::new(),
+            secondary_capsules: HashMap::new(),
         }
     }
 }

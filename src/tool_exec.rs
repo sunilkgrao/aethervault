@@ -112,7 +112,7 @@ struct ExecPolicy {
 
 /// Classify a command and return an appropriate monitoring policy.
 fn classify_exec_policy(command: &str) -> ExecPolicy {
-    let cmd = command.to_ascii_lowercase();
+    let cmd = normalized_exec_command_for_policy(command).to_ascii_lowercase();
 
     // Codex CLI: immortal — legitimate multi-hour sessions
     if cmd.starts_with("codex ") || cmd.starts_with("codex-") {
@@ -156,17 +156,360 @@ fn classify_exec_policy(command: &str) -> ExecPolicy {
     }
 }
 
+fn normalized_exec_command_for_policy(command: &str) -> String {
+    let bytes = command.as_bytes();
+    let mut i = 0usize;
+
+    loop {
+        i = skip_shell_prefixes(bytes, i);
+        if i >= bytes.len() {
+            break;
+        }
+
+        let token_start = i;
+        let token_end = read_shell_token_end(bytes, i);
+        if token_end <= token_start {
+            break;
+        }
+
+        let token = &command[token_start..token_end];
+        if is_env_assignment(token) {
+            i = token_end;
+            continue;
+        }
+
+        i = match token {
+            "env" => skip_env_prefix(command, bytes, token_end),
+            "timeout" => skip_timeout_prefix(command, bytes, token_end),
+            "cd" => skip_cd_prefix(bytes, token_end),
+            "command" | "sudo" | "nohup" | "nice" | "time" => {
+                skip_option_prefix(command, bytes, token_end)
+            }
+            _ => return command[token_start..].trim_start().to_string(),
+        };
+    }
+
+    command.trim_start().to_string()
+}
+
+fn skip_shell_prefixes(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if let Some(len) = is_shell_operator_start(bytes, i) {
+            i += len;
+            continue;
+        }
+        break;
+    }
+
+    i
+}
+
+fn skip_env_prefix(command: &str, bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+
+    loop {
+        i = skip_shell_prefixes(bytes, i);
+        if i >= len {
+            return len;
+        }
+        if is_shell_operator_start(bytes, i).is_some() {
+            return i;
+        }
+
+        let token_end = read_shell_token_end(bytes, i);
+        if token_end <= i {
+            return len;
+        }
+        let token = &command[i..token_end];
+        if token.starts_with('-') || is_env_assignment(token) {
+            i = token_end;
+            continue;
+        }
+        return i;
+    }
+}
+
+fn skip_option_prefix(command: &str, bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+
+    loop {
+        i = skip_shell_prefixes(bytes, i);
+        if i >= len {
+            return len;
+        }
+        if is_shell_operator_start(bytes, i).is_some() {
+            return i;
+        }
+        let token_end = read_shell_token_end(bytes, i);
+        if token_end <= i {
+            return len;
+        }
+        if command[i..token_end].starts_with('-') {
+            i = token_end;
+            continue;
+        }
+        return i;
+    }
+}
+
+fn skip_timeout_prefix(command: &str, bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    let mut saw_duration = false;
+
+    loop {
+        i = skip_shell_prefixes(bytes, i);
+        if i >= len {
+            return len;
+        }
+        if is_shell_operator_start(bytes, i).is_some() {
+            return i;
+        }
+
+        let token_end = read_shell_token_end(bytes, i);
+        if token_end <= i {
+            return len;
+        }
+        let token = &command[i..token_end];
+        if token.starts_with('-') {
+            i = token_end;
+            continue;
+        }
+        if !saw_duration {
+            saw_duration = true;
+            i = token_end;
+            continue;
+        }
+        return i;
+    }
+}
+
+fn skip_cd_prefix(bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    loop {
+        i = skip_shell_prefixes(bytes, i);
+        if i >= len {
+            return len;
+        }
+        if is_shell_operator_start(bytes, i).is_some() {
+            return i;
+        }
+        let token_end = read_shell_token_end(bytes, i);
+        if token_end <= i {
+            return len;
+        }
+        i = token_end;
+    }
+}
+
+fn is_shell_operator_start(bytes: &[u8], i: usize) -> Option<usize> {
+    match bytes.get(i).copied() {
+        Some(b';') => Some(1),
+        Some(b'(') => Some(1),
+        Some(b')') => Some(1),
+        Some(b'{') => Some(1),
+        Some(b'}') => Some(1),
+        Some(b'!') => Some(1),
+        Some(b'\n') => Some(1),
+        Some(b'&') => {
+            if bytes.get(i + 1) == Some(&b'&') { Some(2) } else { Some(1) }
+        }
+        Some(b'|') => {
+            if bytes.get(i + 1) == Some(&b'|') { Some(2) } else { Some(1) }
+        }
+        _ => None,
+    }
+}
+
+fn read_shell_token_end(bytes: &[u8], mut i: usize) -> usize {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+
+        if in_single_quote {
+            if b == b'\'' {
+                in_single_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double_quote {
+            if b == b'\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if b == b'"' {
+                in_double_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if b == b'\'' {
+            in_single_quote = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_double_quote = true;
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_whitespace() || is_shell_operator_start(bytes, i).is_some() {
+            break;
+        }
+        i += 1;
+    }
+
+    i
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    let Some(eq_pos) = token.find('=') else {
+        return false;
+    };
+    if eq_pos == 0 {
+        return false;
+    }
+
+    let (name, _) = token.split_at(eq_pos);
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn ssh_command_has_connect_timeout(command: &str, bytes: &[u8], start: usize) -> bool {
+    let mut i = start;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            if bytes[i] == b'\n' {
+                break;
+            }
+            i += 1;
+            continue;
+        }
+
+        if is_shell_operator_start(bytes, i).is_some() {
+            break;
+        }
+
+        let token_end = read_shell_token_end(bytes, i);
+        if token_end <= i {
+            break;
+        }
+
+        let token = &command[i..token_end];
+        if token.starts_with("-o") && token.contains("ConnectTimeout") {
+            return true;
+        }
+
+        i = token_end;
+        if token == "-o" {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                if bytes[i] == b'\n' {
+                    return false;
+                }
+                i += 1;
+            }
+            if i >= bytes.len() || is_shell_operator_start(bytes, i).is_some() {
+                break;
+            }
+            let value_end = read_shell_token_end(bytes, i);
+            if value_end <= i {
+                break;
+            }
+            let value_token = &command[i..value_end];
+            if value_token.contains("ConnectTimeout") {
+                return true;
+            }
+            i = value_end;
+        }
+    }
+
+    false
+}
+
 /// Inject SSH safety flags (ConnectTimeout, ServerAliveInterval, BatchMode)
 /// into commands that invoke `ssh` without already specifying ConnectTimeout.
-/// Only applies when `ssh` appears as a standalone command (at start or after a pipe).
+/// Only applies at real command positions (start-of-command or after separators).
 fn harden_ssh_in_command(command: &str) -> String {
-    let needs_hardening = (command.starts_with("ssh ") || command.contains(" ssh ") || command.contains("| ssh "))
-        && !command.contains("ConnectTimeout");
-    if needs_hardening {
-        command.replace("ssh ", "ssh -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o BatchMode=yes ")
-    } else {
-        command.to_string()
+    const HARDEN_ARGS: &str = " -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o BatchMode=yes";
+    let bytes = command.as_bytes();
+    let mut output = String::with_capacity(command.len() + 64);
+    let mut i = 0usize;
+    let mut at_command_start = true;
+
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                if bytes[i] == b'\n' {
+                    at_command_start = true;
+                }
+                i += 1;
+            }
+            output.push_str(&command[start..i]);
+            continue;
+        }
+
+        if let Some(len) = is_shell_operator_start(bytes, i) {
+            output.push_str(&command[i..i + len]);
+            i += len;
+            at_command_start = true;
+            continue;
+        }
+
+        let token_start = i;
+        let token_end = read_shell_token_end(bytes, i);
+        if token_end <= token_start {
+            output.push(bytes[i] as char);
+            i += 1;
+            at_command_start = false;
+            continue;
+        }
+
+        let token = &command[token_start..token_end];
+        if at_command_start && token == "ssh" && !ssh_command_has_connect_timeout(command, bytes, token_end) {
+            output.push_str(token);
+            output.push_str(HARDEN_ARGS);
+            output.push(' ');
+        } else {
+            output.push_str(token);
+        }
+
+        if at_command_start && is_env_assignment(token) {
+            at_command_start = true;
+        } else {
+            at_command_start = false;
+        }
+        i = token_end;
     }
+
+    output
 }
 
 /// Result from wait_for_child_monitored — owns the captured output.
@@ -283,7 +626,7 @@ fn wait_for_child_monitored(
             Ok(None) => {
                 let now_ms = start.elapsed().as_millis() as u64;
                 let last_ms = last_activity.load(Ordering::Acquire);
-                let idle_ms = now_ms - last_ms;
+                let idle_ms = now_ms.saturating_sub(last_ms);
 
                 // Hard timeout enforcement: wall-clock deadline exceeded → kill
                 if policy.hard_timeout_ms != EXEC_NO_TIMEOUT && now_ms >= policy.hard_timeout_ms {
@@ -1021,7 +1364,7 @@ pub(crate) fn execute_tool(
             let mut cmd = build_external_command("himalaya", &[]);
             cmd.arg("envelope").arg("list").arg("--output").arg("json");
             if let Some(limit) = parsed.limit {
-                cmd.arg("--limit").arg(limit.to_string());
+                cmd.arg("--page-size").arg(limit.to_string());
             }
             if let Some(folder) = parsed.folder {
                 cmd.arg("--folder").arg(folder);

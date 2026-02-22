@@ -40,6 +40,27 @@ pub(crate) fn open_skill_db(path: &Path) -> Result<Connection, Box<dyn std::erro
     )?;
     // Migration: add description column to existing databases
     let _ = conn.execute_batch("ALTER TABLE skills ADD COLUMN description TEXT");
+    // Migrate old schema: add missing columns if table predates current schema
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(skills)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !cols.contains(&"times_used".to_string()) && cols.contains(&"use_count".to_string()) {
+        conn.execute_batch("ALTER TABLE skills RENAME COLUMN use_count TO times_used")?;
+    }
+    if !cols.contains(&"times_succeeded".to_string()) {
+        conn.execute_batch("ALTER TABLE skills ADD COLUMN times_succeeded INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !cols.contains(&"last_used".to_string()) {
+        conn.execute_batch("ALTER TABLE skills ADD COLUMN last_used TEXT")?;
+    }
+    if !cols.contains(&"created_at".to_string()) {
+        conn.execute_batch("ALTER TABLE skills ADD COLUMN created_at TEXT")?;
+    }
+    if !cols.contains(&"contexts".to_string()) {
+        conn.execute_batch("ALTER TABLE skills ADD COLUMN contexts TEXT NOT NULL DEFAULT '[]'")?;
+    }
     Ok(conn)
 }
 

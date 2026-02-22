@@ -1,21 +1,55 @@
+use std::io::Read;
 
 use serde_json;
 use tiny_http::{Method, Response, Server};
 
 use std::io;
+use std::env;
 
 use crate::{blake3_hash, try_handle_approval_chat, BridgeAgentConfig};
 use crate::bridges::run_agent_for_bridge;
 
-pub(crate) fn parse_json_body(request: &mut tiny_http::Request) -> Result<serde_json::Value, String> {
+const WEBHOOK_MAX_BODY_BYTES_ENV: &str = "AETHERVAULT_WEBHOOK_MAX_BODY_BYTES";
+const DEFAULT_WEBHOOK_MAX_BODY_BYTES: usize = 1024 * 1024;
+
+fn parse_webhook_max_body_bytes() -> usize {
+    env::var(WEBHOOK_MAX_BODY_BYTES_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WEBHOOK_MAX_BODY_BYTES)
+}
+
+fn read_request_body(request: &mut tiny_http::Request) -> Result<String, String> {
+    let max_bytes = parse_webhook_max_body_bytes();
+
+    if let Some(content_length) = request.body_length() {
+        if content_length > max_bytes {
+            return Err("payload too large".to_string());
+        }
+    }
+
     let mut body = String::new();
     request
         .as_reader()
+        .take(max_bytes.saturating_add(1) as u64)
         .read_to_string(&mut body)
         .map_err(|e| format!("read body: {e}"))?;
+
+    if body.len() > max_bytes {
+        return Err("payload too large".to_string());
+    }
+
+    Ok(body)
+}
+
+pub(crate) fn parse_json_body(request: &mut tiny_http::Request) -> Result<serde_json::Value, String> {
+    let body = read_request_body(request)?;
+
     if body.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
+
     serde_json::from_str(&body).map_err(|e| format!("json: {e}"))
 }
 
@@ -41,6 +75,13 @@ pub(crate) fn run_webhook_bridge(
         let payload = match parse_json_body(&mut request) {
             Ok(payload) => payload,
             Err(err) => {
+                if err == "payload too large" {
+                    let response = Response::from_string("payload too large")
+                        .with_status_code(413);
+                    let _ = request.respond(response);
+                    continue;
+                }
+
                 eprintln!("{name} bridge malformed JSON payload: {err}");
                 let response = Response::from_string("bad request: malformed JSON body")
                     .with_status_code(400);
