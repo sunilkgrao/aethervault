@@ -869,12 +869,16 @@ pub(crate) fn load_workspace_context(workspace: &Path) -> String {
     let mut sections = Vec::new();
     let soul = workspace.join("SOUL.md");
     let user = workspace.join("USER.md");
+    let ops = workspace.join("OPERATIONS.md");
     let memory = workspace.join("MEMORY.md");
     if let Some(text) = read_optional_file(&soul) {
         sections.push(format!("# Soul\n{text}"));
     }
     if let Some(text) = read_optional_file(&user) {
         sections.push(format!("# User\n{text}"));
+    }
+    if let Some(text) = read_optional_file(&ops) {
+        sections.push(format!("# Operations\n{text}"));
     }
     if let Some(text) = read_optional_file(&memory) {
         sections.push(format!("# Memory\n{text}"));

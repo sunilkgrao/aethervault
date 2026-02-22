@@ -113,6 +113,14 @@ cp "$BUILT_BINARY" "${DEPLOY_DIR}/${INACTIVE}/aethervault"
 chmod +x "${DEPLOY_DIR}/${INACTIVE}/aethervault"
 log "Binary copied to ${INACTIVE} slot"
 
+# Step 2a: Sync versioned workspace files (OPERATIONS.md tracks infra state)
+WORKSPACE="/root/.aethervault/assistant"
+mkdir -p "$WORKSPACE"
+if [[ -f "${REPO_DIR}/assistant/OPERATIONS.md" ]]; then
+    cp "${REPO_DIR}/assistant/OPERATIONS.md" "${WORKSPACE}/OPERATIONS.md"
+    log "Synced OPERATIONS.md to workspace"
+fi
+
 # Step 2b: Ensure runtime dependencies (npm tools the binary shells out to)
 log "Checking runtime dependencies..."
 if ! command -v agent-browser &>/dev/null; then
