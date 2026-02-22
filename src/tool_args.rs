@@ -228,6 +228,27 @@ pub(crate) struct ToolHttpRequestArgs {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct ToolExaSearchArgs {
+    pub(crate) query: String,
+    #[serde(default)]
+    pub(crate) category: Option<String>,
+    #[serde(default)]
+    pub(crate) num_results: Option<usize>,
+    #[serde(default)]
+    pub(crate) content_mode: Option<String>,
+    #[serde(default)]
+    pub(crate) max_characters: Option<usize>,
+    #[serde(default)]
+    pub(crate) include_domains: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) exclude_domains: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) start_date: Option<String>,
+    #[serde(default)]
+    pub(crate) end_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct ToolBrowserArgs {
     pub(crate) command: String,
     #[serde(default)]

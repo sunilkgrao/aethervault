@@ -315,6 +315,56 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "exa_search",
+            "description": "Search the web via Exa API. Use ONLY when free web search cannot access the data — e.g., people/company lookup, research papers, tweets, paywalled content. For general web queries, prefer browser or http_request first. Supports category filters: people, company, news, research paper, tweet. Returns full text or highlights from results.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query"
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["people", "company", "news", "research paper", "tweet"],
+                        "description": "Optional category filter. Use 'people' for person lookup, 'company' for company search, etc."
+                    },
+                    "num_results": {
+                        "type": "integer",
+                        "description": "Number of results (default 5, max 20)"
+                    },
+                    "content_mode": {
+                        "type": "string",
+                        "enum": ["text", "highlights", "none"],
+                        "description": "Content extraction mode. 'text' for full content, 'highlights' for key excerpts, 'none' for URLs only. Default: highlights"
+                    },
+                    "max_characters": {
+                        "type": "integer",
+                        "description": "Max characters per result content (default 3000)"
+                    },
+                    "include_domains": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Only search these domains (e.g. ['arxiv.org', 'github.com'])"
+                    },
+                    "exclude_domains": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Exclude these domains from results"
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Only results published after this date (YYYY-MM-DD)"
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Only results published before this date (YYYY-MM-DD)"
+                    }
+                },
+                "required": ["query"]
+            }
+        }),
+        serde_json::json!({
             "name": "browser",
             "description": "Browser automation via agent-browser CLI. Uses ref-based element selection from accessibility snapshots. Workflow: 1) 'open <url>' to navigate, 2) 'snapshot' to get element refs (@e1, @e2...), 3) interact using refs ('click @e1', 'fill @e2 text'). Sessions persist across calls. Commands: open, snapshot, click, fill, type, press, select, scroll, screenshot, pdf, get text/html/value, wait, eval, cookies, tab, back, forward, reload, close. Use 'find role/text/label' for semantic element finding.",
             "inputSchema": {
@@ -743,6 +793,7 @@ pub(crate) fn base_tool_names() -> HashSet<String> {
         "exec",
         "notify",
         "http_request",
+        "exa_search",
         "fs_list",
         "fs_read",
         "fs_write",

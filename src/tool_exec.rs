@@ -441,6 +441,7 @@ use crate::{
     ToolSignalSendArgs,
     ToolIMessageSendArgs,
     ToolHttpRequestArgs,
+    ToolExaSearchArgs,
     ToolBrowserArgs,
     ToolExcalidrawArgs,
     ToolFsListArgs,
@@ -1335,6 +1336,124 @@ pub(crate) fn execute_tool(
                     "body": truncated
                 }),
                 is_error: status >= 400,
+            })
+        }
+        "exa_search" => {
+            let parsed: ToolExaSearchArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let api_key = env_optional("EXA_API_KEY")
+                .ok_or("exa_search: EXA_API_KEY not set")?;
+
+            let num_results = parsed.num_results.unwrap_or(5).min(20);
+            let max_chars = parsed.max_characters.unwrap_or(3000);
+            let content_mode = parsed.content_mode.as_deref().unwrap_or("highlights");
+
+            // Build request body
+            let mut body = serde_json::json!({
+                "query": parsed.query,
+                "type": "auto",
+                "numResults": num_results,
+            });
+            if let Some(cat) = &parsed.category {
+                body["category"] = serde_json::json!(cat);
+            }
+            if let Some(domains) = &parsed.include_domains {
+                body["includeDomains"] = serde_json::json!(domains);
+            }
+            if let Some(domains) = &parsed.exclude_domains {
+                body["excludeDomains"] = serde_json::json!(domains);
+            }
+            if let Some(start) = &parsed.start_date {
+                body["startPublishedDate"] = serde_json::json!(format!("{start}T00:00:00.000Z"));
+            }
+            if let Some(end) = &parsed.end_date {
+                body["endPublishedDate"] = serde_json::json!(format!("{end}T00:00:00.000Z"));
+            }
+            // Content extraction
+            match content_mode {
+                "text" => {
+                    body["contents"] = serde_json::json!({
+                        "text": { "maxCharacters": max_chars }
+                    });
+                }
+                "none" => {} // no content extraction
+                _ => {
+                    // "highlights" (default)
+                    body["contents"] = serde_json::json!({
+                        "highlights": { "numSentences": 3 }
+                    });
+                }
+            }
+
+            let agent = make_http_agent(30_000);
+            let resp = agent.post("https://api.exa.ai/search")
+                .set("x-api-key", &api_key)
+                .set("content-type", "application/json")
+                .send_string(&body.to_string());
+
+            let (status, text) = match resp {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.into_string().unwrap_or_default();
+                    (status, text)
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    (code, text)
+                }
+                Err(err) => return Err(format!("exa_search failed: {err}")),
+            };
+
+            if status >= 400 {
+                return Ok(ToolExecution {
+                    output: format!("exa_search failed (HTTP {status})"),
+                    details: serde_json::json!({ "status": status, "error": text }),
+                    is_error: true,
+                });
+            }
+
+            // Parse and format results for the agent
+            let raw: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": text }));
+
+            let mut lines = Vec::new();
+            if let Some(results) = raw.get("results").and_then(|v| v.as_array()) {
+                for (i, r) in results.iter().enumerate() {
+                    let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("(no title)");
+                    let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    let date = r.get("publishedDate").and_then(|v| v.as_str()).unwrap_or("");
+                    lines.push(format!("{}. {} — {}", i + 1, title, url));
+                    if !date.is_empty() {
+                        lines.push(format!("   Published: {}", &date[..10.min(date.len())]));
+                    }
+                    // Show content based on mode
+                    if let Some(txt) = r.get("text").and_then(|v| v.as_str()) {
+                        let snippet: String = txt.chars().take(max_chars).collect();
+                        lines.push(format!("   {snippet}"));
+                    } else if let Some(highlights) = r.get("highlights").and_then(|v| v.as_array()) {
+                        for h in highlights.iter().take(3) {
+                            if let Some(s) = h.as_str() {
+                                lines.push(format!("   > {s}"));
+                            }
+                        }
+                    }
+                    lines.push(String::new());
+                }
+            }
+
+            let output = if lines.is_empty() {
+                "No results found.".to_string()
+            } else {
+                format!("Exa search: {} results for {:?}\n\n{}",
+                    raw.get("results").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+                    parsed.query,
+                    lines.join("\n"))
+            };
+
+            Ok(ToolExecution {
+                output,
+                details: raw,
+                is_error: false,
             })
         }
         "browser" => {

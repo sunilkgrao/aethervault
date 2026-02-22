@@ -49,6 +49,20 @@ No Python subprocess needed for backend selection.
 - Service: `systemctl restart aethervault`
 - Self-improve: every 6h via systemd timer
 
+## Exa Web Search (added 2026-02-22)
+
+- Tool: `exa_search` — backup web search via Exa API
+- Auth: `EXA_API_KEY` env var (in /root/.secrets/master.env)
+- **Usage policy:** Try free web search first (browser, http_request). Use Exa ONLY for:
+  - People/company lookup (category: "people", "company")
+  - Research paper search (category: "research paper")
+  - Tweet/social media search (category: "tweet")
+  - Paywalled or walled-garden content
+  - When user explicitly requests Exa search
+- Categories: people, company, news, research paper, tweet
+- Content modes: text (full), highlights (excerpts), none (URLs only)
+- No approval required (read-only search)
+
 ## Hooks Architecture (consolidated 2026-02-22)
 
 - `hooks/common.py` — shared utilities (send_telegram, load_env, call_claude, logging)
