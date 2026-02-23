@@ -79,16 +79,27 @@ SCAN_OUTPUT=$(timeout 600 aethervault agent "$MV2" \
 }
 
 # Extract JSON from scan output
-SCAN_JSON=$(echo "$SCAN_OUTPUT" | grep -oP '\{[^{}]*"target_file"[^{}]*\}' | head -1 || true)
+SCAN_JSON=$(echo "$SCAN_OUTPUT" | python3 -c "
+import sys, json, re
+text = sys.stdin.read()
+# Find JSON objects containing target_file, even multi-line
+for m in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL):
+    try:
+        obj = json.loads(m.group())
+        if 'target_file' in obj:
+            print(json.dumps(obj))
+            sys.exit(0)
+    except: pass
+" || true)
 if [[ -z "$SCAN_JSON" ]]; then
     log "Phase 1: No valid improvement proposal found. Output: $(echo "$SCAN_OUTPUT" | tail -5)"
     exit 0
 fi
 
-TARGET_FILE=$(echo "$SCAN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['target_file'])")
-DESCRIPTION=$(echo "$SCAN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['description'])")
-RISK=$(echo "$SCAN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['risk'])")
-CATEGORY=$(echo "$SCAN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['category'])")
+TARGET_FILE=$(echo "$SCAN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['target_file'])" 2>/dev/null || echo "unknown")
+DESCRIPTION=$(echo "$SCAN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['description'])" 2>/dev/null || echo "unknown")
+RISK=$(echo "$SCAN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['risk'])" 2>/dev/null || echo "unknown")
+CATEGORY=$(echo "$SCAN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['category'])" 2>/dev/null || echo "unknown")
 
 log "Phase 1 result: [$CATEGORY/$RISK] $TARGET_FILE — $DESCRIPTION"
 
@@ -157,7 +168,17 @@ IMPL_OUTPUT=$(timeout 900 aethervault agent "$MV2" \
 }
 
 # Extract implementation result
-IMPL_JSON=$(echo "$IMPL_OUTPUT" | grep -oP '\{[^{}]*"status"[^{}]*\}' | tail -1 || true)
+IMPL_JSON=$(echo "$IMPL_OUTPUT" | python3 -c "
+import sys, json, re
+text = sys.stdin.read()
+last = None
+for m in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL):
+    try:
+        obj = json.loads(m.group())
+        if 'status' in obj: last = obj
+    except: pass
+if last: print(json.dumps(last))
+" || true)
 IMPL_STATUS=$(echo "$IMPL_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo "unknown")
 
 if [[ "$IMPL_STATUS" != "success" ]]; then
