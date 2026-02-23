@@ -763,6 +763,29 @@ pub(crate) fn scan_confidence_markers(text: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Detects subagent fabrication: agent claims subagent results without having called
+/// a subagent tool recently. Returns true if fabrication is suspected.
+pub(crate) fn scan_subagent_fabrication(text: &str, recent_tool_names: &[String]) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let subagent_claims = [
+        "subagent completed",
+        "subagent finished",
+        "subagent returned",
+        "subagent produced",
+        "background task completed",
+        "task finished successfully",
+        "results from the subagent",
+        "subagent's analysis shows",
+        "according to the subagent",
+    ];
+    let has_claim = subagent_claims.iter().any(|m| lower.contains(m));
+    let had_subagent_tool = recent_tool_names.iter().any(|n|
+        n.contains("subagent") || n.contains("session") || n == "bg_status"
+    );
+    // Fabrication = claiming subagent results without having called a subagent tool
+    has_claim && !had_subagent_tool
+}
+
 pub(crate) fn critic_should_fire(
     step: usize,
     base_interval: usize,
@@ -812,6 +835,15 @@ pub(crate) fn critic_should_fire(
                 *last_critic_step = step;
                 return true;
             }
+        }
+
+        // Subagent fabrication detection: fire immediately if agent claims
+        // subagent results without having called a subagent tool
+        let recent_tool_names: Vec<String> = tool_calls.iter().map(|c| c.name.clone()).collect();
+        if scan_subagent_fabrication(last_assistant, &recent_tool_names) {
+            eprintln!("[critic] triggered: subagent fabrication markers detected");
+            *last_critic_step = step;
+            return true;
         }
 
         return false;

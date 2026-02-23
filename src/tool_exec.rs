@@ -2299,6 +2299,20 @@ pub(crate) fn execute_tool(
 
             // Non-blocking path: when bg_registry is present, register and return immediately
             if let Some((chat_id, registry)) = bg_registry.as_ref() {
+                // Concurrency gating: check if we can acquire a slot
+                {
+                    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    if !reg.try_acquire() {
+                        return Ok(ToolExecution {
+                            output: format!(
+                                "Concurrency limit reached ({} active). Wait for running subagents to complete before starting new ones. Use session_status or check background task status.",
+                                reg.max_concurrent
+                            ),
+                            details: serde_json::json!({ "throttled": true, "active": reg.active_count.load(std::sync::atomic::Ordering::Relaxed) }),
+                            is_error: true,
+                        });
+                    }
+                }
                 let task_id = {
                     let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                     reg.next_id()
@@ -2329,13 +2343,23 @@ pub(crate) fn execute_tool(
                 thread::spawn(move || {
                     let r = run_agent_for_bridge(&cfg, &prompt, session, None, None, None);
                     let mut reg = reg_clone.lock().unwrap_or_else(|e| e.into_inner());
+                    reg.release(); // free concurrency slot
                     match r {
                         Ok(output) => {
-                            reg.update_status(
-                                &tid,
-                                BackgroundTaskStatus::Completed,
-                                output.final_text,
-                            );
+                            let result_text = output.final_text.clone();
+                            // Validate output is non-trivial
+                            let has_substance = result_text.as_ref()
+                                .map(|t| t.len() > 20 && !t.to_lowercase().contains("error"))
+                                .unwrap_or(false);
+                            let status = if has_substance {
+                                BackgroundTaskStatus::Completed
+                            } else {
+                                BackgroundTaskStatus::Failed(
+                                    format!("Subagent produced no substantive output. Raw: {}",
+                                        result_text.as_deref().unwrap_or("(empty)").chars().take(200).collect::<String>())
+                                )
+                            };
+                            reg.update_status(&tid, status, result_text);
                         }
                         Err(err) => {
                             reg.update_status(
@@ -2469,7 +2493,16 @@ pub(crate) fn execute_tool(
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let mut task_ids = Vec::new();
+                let mut throttled_names = Vec::new();
                 for item in &prepared {
+                    // Concurrency gating: check if we can acquire a slot per invocation
+                    {
+                        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                        if !reg.try_acquire() {
+                            throttled_names.push(item.name.clone());
+                            continue;
+                        }
+                    }
                     let task_id = {
                         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                         reg.next_id()
@@ -2505,9 +2538,22 @@ pub(crate) fn execute_tool(
                             thread::spawn(move || {
                                 let r = run_agent_for_bridge(&cfg, &prompt, session, None, None, None);
                                 let mut reg = reg_clone.lock().unwrap_or_else(|e| e.into_inner());
+                                reg.release(); // free concurrency slot
                                 match r {
                                     Ok(output) => {
-                                        reg.update_status(&tid, BackgroundTaskStatus::Completed, output.final_text);
+                                        let result_text = output.final_text.clone();
+                                        let has_substance = result_text.as_ref()
+                                            .map(|t| t.len() > 20 && !t.to_lowercase().contains("error"))
+                                            .unwrap_or(false);
+                                        let status = if has_substance {
+                                            BackgroundTaskStatus::Completed
+                                        } else {
+                                            BackgroundTaskStatus::Failed(
+                                                format!("Subagent produced no substantive output. Raw: {}",
+                                                    result_text.as_deref().unwrap_or("(empty)").chars().take(200).collect::<String>())
+                                            )
+                                        };
+                                        reg.update_status(&tid, status, result_text);
                                     }
                                     Err(err) => {
                                         reg.update_status(&tid, BackgroundTaskStatus::Failed(err.to_string()), None);
@@ -2516,16 +2562,28 @@ pub(crate) fn execute_tool(
                             });
                         }
                         Err(err) => {
+                            // Config error — release slot immediately since no thread will run
                             let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                            reg.release();
                             reg.update_status(&task_id, BackgroundTaskStatus::Failed(err.clone()), None);
                         }
                     }
                     task_ids.push(serde_json::json!({ "task_id": task_id, "name": item.name }));
                 }
+                let output = if throttled_names.is_empty() {
+                    format!("{} background tasks started.", task_ids.len())
+                } else {
+                    format!(
+                        "{} background tasks started. {} throttled (concurrency limit): [{}]. Retry these after running tasks complete.",
+                        task_ids.len(),
+                        throttled_names.len(),
+                        throttled_names.join(", ")
+                    )
+                };
                 return Ok(ToolExecution {
-                    output: format!("{} background tasks started.", task_ids.len()),
-                    details: serde_json::json!({ "tasks": task_ids }),
-                    is_error: false,
+                    output,
+                    details: serde_json::json!({ "tasks": task_ids, "throttled": throttled_names }),
+                    is_error: !throttled_names.is_empty(),
                 });
             }
 

@@ -39,7 +39,12 @@ RESPONSE FORMAT — return ONLY this JSON:\n\
 \"correction\": \"specific behavioral instruction\"}\n\n\
 If grounded=true, issues/agent_claim/evidence_shows/correction can be empty arrays/strings.\n\
 If grounded=false, you MUST include at least one issue with specific quotes from the conversation.\n\
-Do NOT return anything outside this JSON structure.";
+Do NOT return anything outside this JSON structure.\n\n\
+ENFORCEMENT GUIDANCE:\n\
+When grounded=false and the issue involves subagent claims:\n\
+- Your correction MUST include the phrase: \"RETRACT your previous claim about subagent results.\"\n\
+- Your correction MUST instruct: \"Call session_status or check the actual tool output before making any claims about subagent results.\"\n\
+- If the agent has already been corrected for this same pattern, include: \"This is a REPEATED violation. You must NOT report subagent outcomes without first calling a status-checking tool.\"";
 
 // Critic circuit breaker: after N consecutive failures, skip critic for rest of session
 static CRITIC_CONSECUTIVE_FAILURES: AtomicUsize = AtomicUsize::new(0);

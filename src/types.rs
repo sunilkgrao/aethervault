@@ -456,14 +456,57 @@ pub(crate) struct BackgroundTask {
 pub(crate) struct BackgroundTaskRegistry {
     counter: AtomicU64,
     pub(crate) tasks: HashMap<i64, Vec<BackgroundTask>>,
+    pub(crate) active_count: Arc<AtomicU64>,
+    pub(crate) max_concurrent: usize,
 }
 
 impl BackgroundTaskRegistry {
     pub(crate) fn new() -> Self {
+        let max_concurrent = std::env::var("SUBAGENT_MAX_CONCURRENT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3);
         Self {
             counter: AtomicU64::new(1),
             tasks: HashMap::new(),
+            active_count: Arc::new(AtomicU64::new(0)),
+            max_concurrent,
         }
+    }
+
+    /// Try to acquire a concurrency slot. Returns true if acquired.
+    pub(crate) fn try_acquire(&self) -> bool {
+        let current = self.active_count.load(Ordering::Relaxed);
+        if current >= self.max_concurrent as u64 {
+            return false;
+        }
+        // CAS loop to avoid over-count
+        match self.active_count.compare_exchange(
+            current,
+            current + 1,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => true,
+            Err(_) => {
+                // Raced with another thread — retry once
+                let current = self.active_count.load(Ordering::Relaxed);
+                if current >= self.max_concurrent as u64 {
+                    return false;
+                }
+                self.active_count.compare_exchange(
+                    current,
+                    current + 1,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ).is_ok()
+            }
+        }
+    }
+
+    /// Release a concurrency slot.
+    pub(crate) fn release(&self) {
+        self.active_count.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub(crate) fn next_id(&self) -> String {

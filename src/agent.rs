@@ -995,6 +995,7 @@ pub(crate) fn run_agent_with_prompt(
     let mut wrap_up_injected = false;
     let mut consecutive_hook_failures: usize = 0;
     const MAX_CONSECUTIVE_HOOK_FAILURES: usize = 3;
+    let mut subagent_tools_restricted = false;
     while step < current_max_steps {
         // Check if user extended step budget via checkpoint response
         if let Some(ref prog) = progress {
@@ -1240,6 +1241,29 @@ pub(crate) fn run_agent_with_prompt(
             }
         }
         let tool_calls = message.tool_calls.clone();
+
+        // Block ungrounded subagent status claims (phantom status detection)
+        if let Some(ref content) = message.content {
+            let lower = content.to_lowercase();
+            let claims_subagent_success = lower.contains("completed successfully")
+                || lower.contains("finished processing")
+                || lower.contains("results are ready");
+            let has_recent_status_check = tool_calls.iter().any(|c|
+                c.name == "session_status" || c.name.contains("subagent") || c.name == "bg_status"
+            );
+            if claims_subagent_success && !has_recent_status_check {
+                messages.push(AgentMessage {
+                    role: "user".to_string(),
+                    content: Some("[Grounding Violation — Phantom Status] You claimed subagent results without checking status first. You MUST call session_status or check background task results BEFORE reporting subagent outcomes. Retract your previous claim and check actual status now.".to_string()),
+                    tool_calls: Vec::new(),
+                    name: None,
+                    tool_call_id: None,
+                    is_error: None,
+                    thinking_blocks: vec![],
+                });
+            }
+        }
+
         messages.push(message);
         if tool_calls.is_empty() {
             completed = true;
@@ -1338,6 +1362,19 @@ pub(crate) fn run_agent_with_prompt(
             );
             if tools_changed {
                 tools = tools_from_active(&tool_map, &active_tools);
+            }
+
+            // Inject grounding requirement after subagent-related tool results
+            if call.name == "subagent_invoke" || call.name == "subagent_batch" || call.name == "session_status" {
+                messages.push(AgentMessage {
+                    role: "user".to_string(),
+                    content: Some("[Grounding Rule] You just received subagent results. When reporting these to the user, you MUST directly quote the output text above. Do NOT paraphrase, embellish, or add details not present in the tool output. If the output shows errors or empty results, report that honestly.".to_string()),
+                    tool_calls: Vec::new(),
+                    name: None,
+                    tool_call_id: None,
+                    is_error: None,
+                    thinking_blocks: vec![],
+                });
             }
 
             // Update reminder state from tool result
@@ -1649,17 +1686,27 @@ pub(crate) fn run_agent_with_prompt(
                         });
                     }
                     5..=6 => {
-                        // Level 3: Log severe warning
-                        eprintln!("[critic] LEVEL 3 escalation: {violation_count} violations — consider tool restriction");
+                        // Level 3: Log severe warning + restrict subagent tools
+                        eprintln!("[critic] LEVEL 3 escalation: {violation_count} violations — restricting subagent tools");
                         messages.push(AgentMessage {
                             role: "user".to_string(),
-                            content: Some(format!("[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says.")),
+                            content: Some(format!("[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says. Subagent tools have been REVOKED.")),
                             tool_calls: Vec::new(),
                             name: None,
                             tool_call_id: None,
                             is_error: None,
                             thinking_blocks: vec![],
                         });
+                        // Enforce: restrict subagent tools to prevent further fabrication
+                        if !subagent_tools_restricted {
+                            subagent_tools_restricted = true;
+                            let subagent_tool_names = ["subagent_invoke", "subagent_batch", "session_start"];
+                            for tool_name in &subagent_tool_names {
+                                active_tools.remove(*tool_name);
+                            }
+                            tools = tools_from_active(&tool_map, &active_tools);
+                            eprintln!("[critic] LEVEL 3: subagent tools restricted");
+                        }
                         // Enforce: reduce remaining step budget by 1/3 (was halved — too aggressive)
                         let remaining = current_max_steps.saturating_sub(step);
                         current_max_steps = step + (remaining * 2 / 3).max(6);
