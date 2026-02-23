@@ -79,7 +79,7 @@ SCAN_OUTPUT=$(timeout 600 aethervault agent "$MV2" \
 }
 
 # Extract JSON from scan output
-SCAN_JSON=$(echo "$SCAN_OUTPUT" | grep -oP '\{[^{}]*"target_file"[^{}]*\}' | head -1)
+SCAN_JSON=$(echo "$SCAN_OUTPUT" | grep -oP '\{[^{}]*"target_file"[^{}]*\}' | head -1 || true)
 if [[ -z "$SCAN_JSON" ]]; then
     log "Phase 1: No valid improvement proposal found. Output: $(echo "$SCAN_OUTPUT" | tail -5)"
     exit 0
@@ -157,7 +157,7 @@ IMPL_OUTPUT=$(timeout 900 aethervault agent "$MV2" \
 }
 
 # Extract implementation result
-IMPL_JSON=$(echo "$IMPL_OUTPUT" | grep -oP '\{[^{}]*"status"[^{}]*\}' | tail -1)
+IMPL_JSON=$(echo "$IMPL_OUTPUT" | grep -oP '\{[^{}]*"status"[^{}]*\}' | tail -1 || true)
 IMPL_STATUS=$(echo "$IMPL_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo "unknown")
 
 if [[ "$IMPL_STATUS" != "success" ]]; then
