@@ -392,6 +392,8 @@ fn expand_synonyms(word: &str) -> Vec<String> {
         ("merge", &["github", "git", "pull", "branch"]),
         ("repo", &["github", "git", "repository"]),
         ("pull", &["github", "git", "merge", "branch"]),
+        ("windows", &["desktop", "raodesktop", "wsl"]),
+        ("desktop", &["windows", "raodesktop"]),
     ];
     let mut results = vec![lower.clone()];
     for (key, expansions) in synonyms {
@@ -454,7 +456,7 @@ pub(crate) fn match_skills_for_prompt(
 
 /// Bump this version whenever bootstrap skills are added or changed.
 /// Existing databases re-seed when the stored version is lower.
-const BOOTSTRAP_VERSION: u32 = 3;
+const BOOTSTRAP_VERSION: u32 = 4;
 
 /// Bootstrap essential skills, re-seeding when BOOTSTRAP_VERSION increases.
 pub(crate) fn bootstrap_skills(conn: &Connection) {
@@ -558,6 +560,23 @@ pub(crate) fn bootstrap_skills(conn: &Connection) {
             success_rate: 0.0, times_used: 0, times_succeeded: 0,
             last_used: None, created_at: now.clone(),
             contexts: vec!["commerce".into(), "reporting".into(), "revenue".into(), "sales".into()],
+        },
+        SkillRecord {
+            name: "bootstrap:windows-desktop-agent".into(),
+            description: Some("Invoke tasks on the Windows Desktop Agent (raoDesktop) via HTTP from WSL2".into()),
+            trigger: Some("running tasks on the Windows desktop, invoking the Windows agent, or using raoDesktop".into()),
+            steps: vec![
+                "Discover Windows host IP: run `cat /etc/resolv.conf | grep nameserver | awk '{print $2}'` via exec to get WIN_HOST.".into(),
+                "Health check: GET http://{WIN_HOST}:8765/health to confirm the agent is running.".into(),
+                "Send task: POST http://{WIN_HOST}:8765/agent with JSON body {\"message\": \"YOUR TASK\", \"session_id\": \"session-name\"} and --max-time 300. Response has .response (answer), .session_id, .iterations, .steps[].".into(),
+                "Use the same session_id across related requests for multi-step workflows — the agent remembers context within a session.".into(),
+                "Or use the helper: exec `bash /mnt/c/claude-bridge/client.sh \"Your task\"` or `bash /mnt/c/claude-bridge/client.sh --session myproject \"Install Node.js 20\"`.".into(),
+            ],
+            tools: vec!["exec".into(), "http_request".into()],
+            notes: Some("The agent can run PowerShell/cmd/bash, read/write files, install software — anything a Windows admin can do. Complex tasks take 30-120+ seconds. Clear a session: DELETE http://{WIN_HOST}:8765/session/{session_id}. If health check fails, the Windows agent service may not be running.".into()),
+            success_rate: 0.0, times_used: 0, times_succeeded: 0,
+            last_used: None, created_at: now.clone(),
+            contexts: vec!["windows".into(), "desktop".into(), "raodesktop".into(), "wsl2".into(), "remote".into()],
         },
     ];
 
