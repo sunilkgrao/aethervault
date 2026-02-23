@@ -465,7 +465,12 @@ impl BackgroundTaskRegistry {
         let max_concurrent = std::env::var("SUBAGENT_MAX_CONCURRENT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(3);
+            .unwrap_or_else(|| {
+                // Auto-size to pool capacity — one subagent per API account.
+                // Falls back to 5 if pool isn't configured yet.
+                let pool_size = crate::pool_total_accounts();
+                if pool_size > 0 { pool_size } else { 5 }
+            });
         Self {
             counter: AtomicU64::new(1),
             tasks: HashMap::new(),

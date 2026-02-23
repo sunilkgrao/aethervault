@@ -190,6 +190,23 @@ pub(crate) fn pool_pick_best_account(service: &str) -> Option<String> {
     state.pick_best_account(service)
 }
 
+/// Returns the total number of unique accounts across all pools.
+/// Used by BackgroundTaskRegistry to auto-size concurrency to match pool capacity.
+pub(crate) fn pool_total_accounts() -> usize {
+    let pool = global_pool();
+    let state = match pool.lock() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut unique = std::collections::HashSet::new();
+    for pool_cfg in state.pools.values() {
+        for acct in &pool_cfg.accounts {
+            unique.insert(acct.clone());
+        }
+    }
+    unique.len()
+}
+
 pub(crate) fn pool_mark_rate_limited(account: &str) {
     if let Ok(mut state) = global_pool().lock() {
         state.mark_rate_limited(account);
