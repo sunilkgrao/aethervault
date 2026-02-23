@@ -27,8 +27,10 @@ use crate::{
     ContinuationCheckpoint,
     CommandSpec, DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
     ToolExecution, BackgroundTaskRegistry, SessionRegistry,
+    SessionTaint, FailureKind, classify_failure,
     open_skill_db, list_skills, record_skill_use,
     match_skills_for_prompt, bootstrap_skills,
+    prune_low_performing_skills, rebuild_fts5_index, find_similar_skill,
 };
 
 /// Tracks blake3 hashes of observations already written this process lifetime.
@@ -477,6 +479,7 @@ fn process_tool_result(
     messages: &mut Vec<AgentMessage>,
     active_tools: &mut HashSet<String>,
     retrieved_skills: &mut Vec<String>,
+    session_taint: &mut SessionTaint,
     should_log: bool,
     session: &Option<String>,
     log_dir: &Path,
@@ -500,6 +503,48 @@ fn process_tool_result(
         is_error: Some(result.is_error),
         thinking_blocks: vec![],
     });
+
+    // ── Taint tracking (Rule of Two / AgentArmor) ──
+    // Mark session as having untrusted input when browser/http returns external content
+    match call.name.as_str() {
+        "browser" | "http_request" | "exa_search" => {
+            session_taint.mark_untrusted(&call.name);
+        }
+        _ => {}
+    }
+    // Mark session as accessing private data when memory/files are read
+    match call.name.as_str() {
+        "memory_search" | "search" | "query" | "get" | "fs_read" | "skill_search" | "context" => {
+            session_taint.mark_private_data();
+        }
+        _ => {}
+    }
+
+    // ── Failure classification — inject retry hint for transient errors ──
+    if is_error {
+        let failure_kind = classify_failure(&call.name, &result.output, &result.details);
+        match failure_kind {
+            FailureKind::Transient => {
+                messages.push(AgentMessage {
+                    role: "user".to_string(),
+                    content: Some("[System] The previous tool call failed with a transient error (timeout, rate limit, or temporary unavailability). You may retry after a brief pause. Consider using a different approach if retry also fails.".to_string()),
+                    tool_calls: Vec::new(),
+                    name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                });
+            }
+            FailureKind::Permanent => {
+                messages.push(AgentMessage {
+                    role: "user".to_string(),
+                    content: Some("[System] The previous tool call failed with a permanent error (unauthorized, not found, or invalid request). Do NOT retry the same call. Either fix the inputs, try a different approach, or ask the user for help.".to_string()),
+                    tool_calls: Vec::new(),
+                    name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                });
+            }
+            FailureKind::Semantic => {
+                // Let the LLM figure it out — no additional hint needed
+            }
+        }
+    }
 
     // Activate newly discovered tools from tool_search results
     let mut tools_changed = false;
@@ -655,6 +700,12 @@ pub(crate) fn run_agent_with_prompt(
         if let Ok(conn) = open_skill_db(&db_path) {
             // Bootstrap essential skills on first run
             bootstrap_skills(&conn);
+
+            // Prune skills with <30% success rate after 5+ uses
+            let pruned = prune_low_performing_skills(&conn, 5, 0.3);
+            if pruned > 0 {
+                rebuild_fts5_index(&conn);
+            }
 
             // Match skills relevant to this specific prompt
             let matched = match_skills_for_prompt(&conn, &prompt_text, 5);
@@ -978,6 +1029,7 @@ pub(crate) fn run_agent_with_prompt(
     let mut recent_actions: VecDeque<String> = VecDeque::with_capacity(30);
     let mut retrieved_skills: Vec<String> = Vec::new();
     retrieved_skills.extend(injected_skill_names);
+    let mut session_taint = SessionTaint::default();
     let mut turns_since_fact_extract: usize = 0;
     let fact_extract_interval: usize = env_optional("AGENT_FACT_TURNS")
         .and_then(|v| v.parse().ok())
@@ -1256,7 +1308,7 @@ pub(crate) fn run_agent_with_prompt(
                 }
             }
         }
-        let tool_calls = message.tool_calls.clone();
+        let mut tool_calls = message.tool_calls.clone();
 
         // Block ungrounded subagent status claims (phantom status detection)
         if let Some(ref content) = message.content {
@@ -1308,6 +1360,67 @@ pub(crate) fn run_agent_with_prompt(
         }
 
         let max_tool_output = 8000; // chars (~2000 tokens)
+
+        // ── Rule of Two: Block exfil tools when session is tainted ──
+        // When both untrusted input AND private data are present, block
+        // external communication tools to prevent data exfiltration.
+        if session_taint.is_tainted() {
+            let exfil_blocked: Vec<String> = tool_calls.iter()
+                .filter(|c| matches!(c.name.as_str(),
+                    "exec" | "email_send" | "gmail_send" | "signal_send" | "imessage_send" | "notify"
+                ) || (c.name == "http_request" && {
+                    let method = c.args.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_ascii_uppercase();
+                    method != "GET"
+                }))
+                .map(|c| c.name.clone())
+                .collect();
+            if !exfil_blocked.is_empty() {
+                let sources = session_taint.untrusted_sources.join(", ");
+                messages.push(AgentMessage {
+                    role: "user".to_string(),
+                    content: Some(format!(
+                        "[SECURITY] This session has ingested untrusted external content (from: {sources}) \
+                         AND accessed private data. The following tools are blocked to prevent data exfiltration: {}. \
+                         If you need to use these tools, explain to the user what you intend to send and why, \
+                         and ask for explicit approval.",
+                        exfil_blocked.join(", ")
+                    )),
+                    tool_calls: Vec::new(),
+                    name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                });
+                // Replace blocked tool calls with error results
+                let mut has_non_blocked = false;
+                for call in &tool_calls {
+                    if exfil_blocked.contains(&call.name) {
+                        tool_results.push(AgentToolResult {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            output: format!("BLOCKED: Session taint — untrusted input ({sources}) + private data. Ask user for approval."),
+                            details: serde_json::json!({ "blocked": true, "reason": "session_taint" }),
+                            is_error: true,
+                        });
+                        messages.push(AgentMessage {
+                            role: "tool".to_string(),
+                            content: Some(format!("BLOCKED: Session is tainted (untrusted input from {sources} + private data accessed). This tool call was blocked to prevent potential data exfiltration. Ask the user for explicit approval if this action is intended.")),
+                            tool_calls: Vec::new(),
+                            name: Some(call.name.clone()),
+                            tool_call_id: Some(call.id.clone()),
+                            is_error: Some(true),
+                            thinking_blocks: vec![],
+                        });
+                    } else {
+                        has_non_blocked = true;
+                    }
+                }
+                // If ALL calls were blocked, skip to next iteration
+                if !has_non_blocked {
+                    step += 1;
+                    continue;
+                }
+                // Filter out blocked calls and continue with the rest
+                tool_calls.retain(|c| !exfil_blocked.contains(&c.name));
+            }
+        }
 
         // Update progress: tool execution phase + track tools used + delegation tracking
         if let Some(ref prog) = progress {
@@ -1374,7 +1487,8 @@ pub(crate) fn run_agent_with_prompt(
             let (is_error, tools_changed) = process_tool_result(
                 call, result,
                 &mut tool_results, &mut messages, &mut active_tools,
-                &mut retrieved_skills, should_log, &session, &log_dir,
+                &mut retrieved_skills, &mut session_taint,
+                should_log, &session, &log_dir,
             );
             if tools_changed {
                 tools = tools_from_active(&tool_map, &active_tools);
@@ -1501,7 +1615,8 @@ pub(crate) fn run_agent_with_prompt(
                 let (is_error, tools_changed) = process_tool_result(
                     &call, result,
                     &mut tool_results, &mut messages, &mut active_tools,
-                    &mut retrieved_skills, should_log, &session, &log_dir,
+                    &mut retrieved_skills, &mut session_taint,
+                    should_log, &session, &log_dir,
                 );
                 if tools_changed {
                     tools = tools_from_active(&tool_map, &active_tools);
@@ -1772,6 +1887,91 @@ pub(crate) fn run_agent_with_prompt(
             if let Ok(conn) = open_skill_db(&db_path) {
                 for skill_name in &retrieved_skills {
                     let _ = record_skill_use(&conn, skill_name, completed);
+                }
+            }
+        }
+    }
+
+    // SkillRL R5: Auto skill distillation — on successful multi-step tasks,
+    // extract a reusable procedure and store it as a learned skill.
+    // Only fires when: (a) task completed successfully, (b) took 3+ steps,
+    // (c) used substantive tools (not just search/query).
+    if completed && step >= 3 {
+        let substantive_tools: HashSet<&str> = ["exec", "http_request", "browser", "fs_write", "skill_store"]
+            .iter().cloned().collect();
+        let used_substantive = tool_results.iter().any(|r| substantive_tools.contains(r.name.as_str()));
+        if used_substantive {
+            // Build a compact summary of what was done for distillation
+            let action_summary: String = tool_results.iter()
+                .filter(|r| !r.is_error)
+                .take(10)
+                .map(|r| format!("- {}: {}", r.name, r.output.chars().take(100).collect::<String>()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !action_summary.is_empty() {
+                let distill_prompt = format!(
+                    "Based on this successful task execution, extract a reusable skill.\n\
+                     Original request: {}\n\n\
+                     Actions taken:\n{}\n\n\
+                     Respond with ONLY a JSON object: {{\"name\": \"learned:short-name\", \"description\": \"one line\", \
+                     \"steps\": [\"step1\", \"step2\"], \"notes\": \"key gotchas\"}}",
+                    prompt_text.chars().take(200).collect::<String>(),
+                    action_summary
+                );
+                // Use a lightweight LLM call for distillation (best effort)
+                let distill_request = crate::AgentHookRequest {
+                    messages: vec![
+                        AgentMessage {
+                            role: "user".to_string(),
+                            content: Some(distill_prompt),
+                            tool_calls: Vec::new(),
+                            name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                        },
+                    ],
+                    tools: vec![],
+                    session: session.clone(),
+                };
+                if let Ok(response) = call_claude_with_model(&distill_request, None) {
+                    if let Some(ref text) = response.message.content {
+                        // Try to parse the JSON and store as a learned skill
+                        if let Ok(skill_json) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let (Some(name), Some(desc)) = (
+                                skill_json.get("name").and_then(|v| v.as_str()),
+                                skill_json.get("description").and_then(|v| v.as_str()),
+                            ) {
+                                if let Some(ref workspace) = agent_workspace {
+                                    let db_path = workspace.join("skills.sqlite");
+                                    if let Ok(conn) = open_skill_db(&db_path) {
+                                        // Check for duplicates before storing
+                                        if crate::find_similar_skill(&conn, desc, 0.85).is_none() {
+                                            let steps: Vec<String> = skill_json.get("steps")
+                                                .and_then(|v| v.as_array())
+                                                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                                                .unwrap_or_default();
+                                            let notes = skill_json.get("notes").and_then(|v| v.as_str()).map(String::from);
+                                            let skill = crate::SkillRecord {
+                                                name: name.to_string(),
+                                                description: Some(desc.to_string()),
+                                                trigger: None,
+                                                steps,
+                                                tools: vec![],
+                                                notes,
+                                                success_rate: 0.5, // Laplace prior
+                                                times_used: 0,
+                                                times_succeeded: 0,
+                                                last_used: None,
+                                                created_at: chrono::Utc::now().to_rfc3339(),
+                                                contexts: vec![],
+                                            };
+                                            if crate::upsert_skill(&conn, &skill).is_ok() {
+                                                eprintln!("[skill-distill] learned new skill: {name}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -853,6 +853,88 @@ pub(crate) struct ToolExecution {
     pub(crate) is_error: bool,
 }
 
+/// Tracks whether a session has ingested untrusted external input and/or
+/// accessed private data. Enforces the "Rule of Two" from AgentArmor:
+/// never allow untrusted input + private data access + external communication
+/// in the same session without human approval. Reduces attack success from
+/// 90%+ to ~3% per the research.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionTaint {
+    pub(crate) has_untrusted_input: bool,
+    pub(crate) has_private_data: bool,
+    pub(crate) untrusted_sources: Vec<String>,
+}
+
+impl SessionTaint {
+    /// Returns true when both untrusted input AND private data are present —
+    /// the "lethal trifecta" condition where exfil tools must be gated.
+    pub(crate) fn is_tainted(&self) -> bool {
+        self.has_untrusted_input && self.has_private_data
+    }
+
+    pub(crate) fn mark_untrusted(&mut self, source: &str) {
+        self.has_untrusted_input = true;
+        let s = source.to_string();
+        if !self.untrusted_sources.contains(&s) {
+            self.untrusted_sources.push(s);
+        }
+    }
+
+    pub(crate) fn mark_private_data(&mut self) {
+        self.has_private_data = true;
+    }
+}
+
+/// Classification of tool execution failures for intelligent retry logic.
+/// Transient errors are retried with backoff; permanent errors escalate immediately;
+/// semantic errors let the LLM try a different approach.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FailureKind {
+    Transient,
+    Permanent,
+    Semantic,
+}
+
+/// Classify a tool failure based on error message and HTTP status codes.
+pub(crate) fn classify_failure(tool_name: &str, error_msg: &str, details: &serde_json::Value) -> FailureKind {
+    let msg = error_msg.to_lowercase();
+    let status = details.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // HTTP status-based classification
+    if status == 429 || status == 503 || status == 502 || status == 504 {
+        return FailureKind::Transient;
+    }
+    if status == 401 || status == 403 || status == 404 || status == 405 || status == 422 {
+        return FailureKind::Permanent;
+    }
+
+    // Message-based classification
+    if msg.contains("timeout") || msg.contains("timed out") || msg.contains("connection reset")
+        || msg.contains("broken pipe") || msg.contains("rate limit")
+        || msg.contains("too many requests") || msg.contains("temporarily unavailable")
+        || msg.contains("service unavailable") || msg.contains("try again")
+    {
+        return FailureKind::Transient;
+    }
+    if msg.contains("unauthorized") || msg.contains("forbidden") || msg.contains("not found")
+        || msg.contains("invalid") || msg.contains("denied") || msg.contains("no such")
+        || msg.contains("does not exist") || msg.contains("permission")
+    {
+        return FailureKind::Permanent;
+    }
+
+    // Tool-specific heuristics
+    if tool_name == "exec" && (msg.contains("command not found") || msg.contains("no such file")) {
+        return FailureKind::Permanent;
+    }
+    if msg.contains("parse") || msg.contains("malformed") || msg.contains("args:") {
+        return FailureKind::Semantic;
+    }
+
+    // Default: let the LLM decide (semantic)
+    FailureKind::Semantic
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct ApprovalEntry {
     pub(crate) id: String,

@@ -61,7 +61,36 @@ pub(crate) fn open_skill_db(path: &Path) -> Result<Connection, Box<dyn std::erro
     if !cols.contains(&"contexts".to_string()) {
         conn.execute_batch("ALTER TABLE skills ADD COLUMN contexts TEXT NOT NULL DEFAULT '[]'")?;
     }
+
+    // FTS5 full-text search index — enables BM25 ranking instead of LIKE
+    let _ = conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
+            name, description, trigger_text, steps, notes, contexts
+        )"
+    );
+
     Ok(conn)
+}
+
+/// Sync a skill's searchable text into the FTS5 index.
+fn sync_fts5(conn: &Connection, skill: &SkillRecord, steps_json: &str, contexts_json: &str) {
+    // Delete any existing entry, then insert fresh
+    let _ = conn.execute(
+        "DELETE FROM skills_fts WHERE name = ?1",
+        params![skill.name],
+    );
+    let _ = conn.execute(
+        "INSERT INTO skills_fts(name, description, trigger_text, steps, notes, contexts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            skill.name,
+            skill.description.as_deref().unwrap_or(""),
+            skill.trigger.as_deref().unwrap_or(""),
+            steps_json,
+            skill.notes.as_deref().unwrap_or(""),
+            contexts_json,
+        ],
+    );
 }
 
 pub(crate) fn upsert_skill(
@@ -96,10 +125,71 @@ pub(crate) fn upsert_skill(
             contexts_json,
         ],
     )?;
+    // Keep FTS5 index in sync
+    sync_fts5(conn, skill, &steps_json, &contexts_json);
     Ok(())
 }
 
+/// Search skills using FTS5 (BM25 ranking) with LIKE fallback.
 pub(crate) fn search_skills(conn: &Connection, query: &str, limit: usize) -> Vec<SkillRecord> {
+    // Try FTS5 first for proper BM25 ranking
+    if let Some(results) = search_skills_fts5(conn, query, limit) {
+        if !results.is_empty() {
+            return results;
+        }
+    }
+    // Fallback to LIKE search
+    search_skills_like(conn, query, limit)
+}
+
+/// FTS5-based search with BM25 ranking.
+fn search_skills_fts5(conn: &Connection, query: &str, limit: usize) -> Option<Vec<SkillRecord>> {
+    // Build FTS5 query: quote each word, join with OR, add prefix matching
+    let fts_query: String = query.split_whitespace()
+        .filter(|w| w.len() > 1)
+        .map(|w| {
+            let cleaned: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+            format!("\"{}\"*", cleaned)
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    if fts_query.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT f.name FROM skills_fts f
+         WHERE skills_fts MATCH ?1
+         ORDER BY bm25(skills_fts)
+         LIMIT ?2"
+    ).ok()?;
+
+    let names: Vec<String> = stmt.query_map(params![fts_query, limit as i64], |row| row.get(0))
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if names.is_empty() {
+        return Some(Vec::new());
+    }
+
+    // Look up full records from the main table
+    let mut results = Vec::new();
+    for name in &names {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT name, description, trigger, steps, tools, notes, success_rate, times_used, times_succeeded, last_used, created_at, contexts
+             FROM skills WHERE name = ?1"
+        ) {
+            if let Ok(skill) = stmt.query_row(params![name], |row| Ok(row_to_skill(row))) {
+                results.push(skill);
+            }
+        }
+    }
+    Some(results)
+}
+
+/// Original LIKE-based search (fallback when FTS5 isn't available).
+fn search_skills_like(conn: &Connection, query: &str, limit: usize) -> Vec<SkillRecord> {
     let pattern = format!("%{query}%");
     let mut stmt = match conn.prepare(
         "SELECT name, description, trigger, steps, tools, notes, success_rate, times_used, times_succeeded, last_used, created_at, contexts
@@ -120,6 +210,8 @@ pub(crate) fn search_skills(conn: &Connection, query: &str, limit: usize) -> Vec
     rows.filter_map(|r| r.ok()).collect()
 }
 
+/// Record a skill use with Laplace-smoothed success rate: (successes+1)/(uses+2).
+/// This gives new skills a 0.5 prior instead of 0.0, preventing cold-start bias.
 pub(crate) fn record_skill_use(
     conn: &Connection,
     name: &str,
@@ -137,8 +229,9 @@ pub(crate) fn record_skill_use(
             params![now, name],
         )?;
     }
+    // Laplace smoothing: (successes + 1) / (uses + 2)
     conn.execute(
-        "UPDATE skills SET success_rate = CAST(times_succeeded AS REAL) / CAST(times_used AS REAL) WHERE name = ?1 AND times_used > 0",
+        "UPDATE skills SET success_rate = CAST(times_succeeded + 1 AS REAL) / CAST(times_used + 2 AS REAL) WHERE name = ?1 AND times_used > 0",
         params![name],
     )?;
     Ok(())
@@ -159,6 +252,78 @@ pub(crate) fn list_skills(conn: &Connection, limit: usize) -> Vec<SkillRecord> {
         Err(_) => return Vec::new(),
     };
     rows.filter_map(|r| r.ok()).collect()
+}
+
+/// Delete a skill by name (from both main table and FTS5 index).
+pub(crate) fn delete_skill(conn: &Connection, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute("DELETE FROM skills WHERE name = ?1", params![name])?;
+    let _ = conn.execute("DELETE FROM skills_fts WHERE name = ?1", params![name]);
+    Ok(())
+}
+
+/// Prune skills with success_rate below threshold after min_uses attempts.
+/// Skips bootstrap skills. Returns the number of skills pruned.
+pub(crate) fn prune_low_performing_skills(conn: &Connection, min_uses: u64, min_rate: f64) -> usize {
+    let mut stmt = match conn.prepare(
+        "SELECT name FROM skills WHERE times_used >= ?1 AND success_rate < ?2 AND name NOT LIKE 'bootstrap:%'"
+    ) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let names: Vec<String> = stmt.query_map(params![min_uses as i64, min_rate], |row| row.get(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    let count = names.len();
+    for name in &names {
+        let _ = delete_skill(conn, name);
+    }
+    if count > 0 {
+        eprintln!("[skill-prune] removed {count} low-performing skills (< {min_rate:.0}% after {min_uses}+ uses)");
+    }
+    count
+}
+
+/// Check for near-duplicate skills using word-level Jaccard similarity.
+/// Returns the name of the most similar existing skill if similarity >= threshold.
+pub(crate) fn find_similar_skill(conn: &Connection, description: &str, threshold: f64) -> Option<String> {
+    let new_words: HashSet<String> = description.split_whitespace()
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.len() > 2)
+        .collect();
+    if new_words.is_empty() { return None; }
+
+    let skills = list_skills(conn, 200);
+    let mut best_match: Option<(String, f64)> = None;
+
+    for skill in skills {
+        if let Some(ref desc) = skill.description {
+            let existing_words: HashSet<String> = desc.split_whitespace()
+                .map(|w| w.to_lowercase())
+                .filter(|w| w.len() > 2)
+                .collect();
+            if existing_words.is_empty() { continue; }
+            let intersection = new_words.intersection(&existing_words).count();
+            let union = new_words.union(&existing_words).count();
+            let jaccard = intersection as f64 / union as f64;
+            if jaccard >= threshold {
+                if best_match.as_ref().map(|(_, s)| jaccard > *s).unwrap_or(true) {
+                    best_match = Some((skill.name.clone(), jaccard));
+                }
+            }
+        }
+    }
+    best_match.map(|(name, _)| name)
+}
+
+/// Rebuild the FTS5 index from the skills table. Call after bulk operations
+/// or when FTS5 index gets out of sync.
+pub(crate) fn rebuild_fts5_index(conn: &Connection) {
+    let _ = conn.execute_batch("DELETE FROM skills_fts");
+    let _ = conn.execute_batch(
+        "INSERT INTO skills_fts(name, description, trigger_text, steps, notes, contexts)
+         SELECT name, COALESCE(description,''), COALESCE(trigger,''), steps, COALESCE(notes,''), contexts
+         FROM skills"
+    );
 }
 
 fn row_to_skill(row: &rusqlite::Row<'_>) -> SkillRecord {
@@ -182,12 +347,8 @@ fn row_to_skill(row: &rusqlite::Row<'_>) -> SkillRecord {
 }
 
 /// Naive English stemming: strip common suffixes to get the root form.
-/// This ensures "deploying" matches "deploy", "selling" matches "sell", etc.
 fn stem(word: &str) -> String {
     let w = word.to_lowercase();
-    // Try longer derivational suffixes first, then shorter inflectional ones.
-    // Avoid consonant+ing patterns (ling, ting, etc.) — let plain "ing" handle those
-    // so "selling" → "sell" not "sel", "hosting" → "host" not "hos".
     for suffix in &["ation", "tion", "ment", "ness", "able", "ible",
                      "ying", "ous", "ive", "ful", "ess",
                      "ing", "ied", "ies",
@@ -198,7 +359,6 @@ fn stem(word: &str) -> String {
             }
         }
     }
-    // Plural: trailing 's' (but not "ss")
     if w.ends_with('s') && !w.ends_with("ss") && w.len() > 3 {
         return w[..w.len()-1].to_string();
     }
@@ -243,7 +403,7 @@ fn expand_synonyms(word: &str) -> Vec<String> {
     results
 }
 
-/// Match skills relevant to a prompt by searching name, trigger, notes, steps, and contexts.
+/// Match skills relevant to a prompt using stemming + synonym expansion + search.
 pub(crate) fn match_skills_for_prompt(
     conn: &Connection,
     prompt: &str,
@@ -268,7 +428,6 @@ pub(crate) fn match_skills_for_prompt(
     for word in &words {
         let cleaned: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
         if cleaned.len() < 3 { continue; }
-        // Collect all search terms: original + stemmed + synonym expansions of both
         let stemmed = stem(&cleaned);
         let mut terms: HashSet<String> = HashSet::new();
         for base in [cleaned.to_lowercase(), stemmed] {
@@ -421,6 +580,9 @@ pub(crate) fn bootstrap_skills(conn: &Connection) {
         created_at: now.clone(),
         contexts: vec![],
     });
+
+    // Rebuild FTS5 index after bulk bootstrap
+    rebuild_fts5_index(conn);
 
     eprintln!("[bootstrap] seeded {} skills (bootstrap version {BOOTSTRAP_VERSION})", skills.len());
 }

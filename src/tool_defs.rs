@@ -534,6 +534,17 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "credential_check",
+            "description": "Check if credentials exist for a service (Stripe, GitHub, Vercel, Twitter, etc.). Checks env vars, config files, and CLI auth. Call this BEFORE attempting API calls to avoid wasted retries.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "service": { "type": "string", "description": "Service name (e.g., 'stripe', 'github', 'vercel', 'twitter')" }
+                },
+                "required": ["service"]
+            }
+        }),
+        serde_json::json!({
             "name": "subagent_list",
             "description": "Check subagent configuration. Shows whether dynamic spawning is enabled and any pre-existing agent configs. You can use subagent_invoke with ANY name — you don't need to call this first.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -849,6 +860,7 @@ pub(crate) fn base_tool_names() -> HashSet<String> {
         "reflect",
         "skill_store",
         "skill_search",
+        "credential_check",
         "trigger_add",
         "trigger_list",
         "trigger_remove",
