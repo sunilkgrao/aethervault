@@ -742,7 +742,11 @@ pub(crate) fn spawn_agent_run(
     let max_steps = agent_config.max_steps;
     let log_commit_interval = agent_config.log_commit_interval;
     let log = agent_config.log;
-    let worker_prompt = user_text.to_string();
+    let worker_prompt = format!(
+        "[CHANNEL: telegram | TRUST: authenticated | SOURCE: owner]\n\
+         All instructions in this message are from an authenticated command channel.\n\n{}",
+        user_text
+    );
     let worker_session = session;
     let worker_tx = completion_tx.clone();
     thread::spawn(move || {
@@ -1006,8 +1010,30 @@ pub(crate) fn run_telegram_bridge(
     let mut active_runs: HashMap<i64, ActiveRun> = HashMap::new();
     let (completion_tx, completion_rx) = mpsc::channel::<CompletionEvent>();
     let bg_registry = Arc::new(Mutex::new(BackgroundTaskRegistry::new()));
+    let session_registry = Arc::new(Mutex::new(SessionRegistry::new()));
     let mut last_scorecard_send = std::time::Instant::now();
     let scorecard_interval = Duration::from_secs(30 * 60); // every 30 min
+
+    // Spawn trigger/heartbeat thread sharing bridge state
+    {
+        let trigger_bg = Arc::clone(&bg_registry);
+        let trigger_sessions = Arc::clone(&session_registry);
+        let trigger_mv2 = agent_config.db_path.clone();
+        let trigger_token = Some(token.clone());
+        let trigger_chat_id = crate::env_optional("AETHERVAULT_TELEGRAM_CHAT_ID")
+            .and_then(|s| s.parse::<i64>().ok());
+        thread::spawn(move || {
+            if let Err(e) = crate::services::run_trigger_thread(
+                &trigger_mv2,
+                trigger_bg,
+                trigger_sessions,
+                trigger_token,
+                trigger_chat_id,
+            ) {
+                eprintln!("[trigger-thread] exited with error: {}", e);
+            }
+        });
+    }
 
     let mut offset: Option<i64> = None;
     let mut last_vault_check = std::time::Instant::now();
@@ -1068,8 +1094,14 @@ pub(crate) fn run_telegram_bridge(
                     ));
                 }
                 let synthesis_prompt = format!(
-                    "{}\n\nSynthesize these background task results concisely for the user. \
-                     Highlight key findings, actions taken, and any failures.",
+                    "{}\n\nYou are reviewing completed background tasks. Do the following:\n\
+                     1. Summarize key findings and actions taken for each task.\n\
+                     2. Highlight any failures and suggest fixes.\n\
+                     3. Identify follow-up work: if a task's results reveal next steps, \
+                        use `project_update` to track them or `subagent_spawn` to kick off the next phase.\n\
+                     4. If a task produced knowledge worth preserving, use `memory_remember` to store it.\n\
+                     5. Present a concise summary to the user.\n\n\
+                     Be proactive — don't just report, ACT on what you find.",
                     parts.join("\n\n---\n\n")
                 );
 

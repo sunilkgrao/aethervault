@@ -27,7 +27,8 @@ use crate::{
     ContinuationCheckpoint,
     CommandSpec, DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
     ToolExecution, BackgroundTaskRegistry, SessionRegistry,
-    open_skill_db, list_skills, search_skills, record_skill_use,
+    open_skill_db, list_skills, record_skill_use,
+    match_skills_for_prompt, bootstrap_skills,
 };
 
 /// Tracks blake3 hashes of observations already written this process lifetime.
@@ -647,35 +648,46 @@ pub(crate) fn run_agent_with_prompt(
     // --- SkillRL R1: Auto-inject top skills into stable prefix ---
     if let Some(workspace) = resolve_workspace(None, &agent_cfg) {
         let db_path = workspace.join("skills.sqlite");
-        if db_path.exists() {
-            if let Ok(conn) = open_skill_db(&db_path) {
-                let general = list_skills(&conn, 3);
-                let prompt_words: String = prompt_text
-                    .split_whitespace()
-                    .take(10)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let task_specific = search_skills(&conn, &prompt_words, 3);
-                let mut skill_block = String::new();
-                let mut seen: HashSet<String> = HashSet::new();
-                for s in general.iter().chain(task_specific.iter()) {
-                    if !seen.insert(s.name.clone()) {
-                        continue;
+        if let Ok(conn) = open_skill_db(&db_path) {
+            // Bootstrap essential skills on first run
+            bootstrap_skills(&conn);
+
+            // Match skills relevant to this specific prompt
+            let matched = match_skills_for_prompt(&conn, &prompt_text, 5);
+            // Also get top general skills by success rate
+            let general = list_skills(&conn, 3);
+
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut skill_block = String::new();
+            for s in matched.iter().chain(general.iter()) {
+                if !seen.insert(s.name.clone()) {
+                    continue;
+                }
+                skill_block.push_str(&format!("## Skill: {}\n", s.name));
+                if let Some(ref trigger) = s.trigger {
+                    skill_block.push_str(&format!("**When**: {trigger}\n"));
+                }
+                if !s.steps.is_empty() {
+                    skill_block.push_str("**Steps**:\n");
+                    for (i, step) in s.steps.iter().enumerate() {
+                        skill_block.push_str(&format!("{}. {step}\n", i + 1));
                     }
-                    skill_block.push_str(&format!(
-                        "- **{}**: {} (trigger: {}, success: {:.0}%, used {}x)\n",
-                        s.name,
-                        s.notes.as_deref().unwrap_or(""),
-                        s.trigger.as_deref().unwrap_or("any"),
-                        s.success_rate * 100.0,
-                        s.times_used
-                    ));
                 }
-                if !skill_block.is_empty() {
-                    system_prompt.push_str("\n\n# Learned Skills\n");
-                    system_prompt.push_str("These are proven strategies from past experience. Apply them when their trigger conditions match.\n\n");
-                    system_prompt.push_str(&skill_block);
+                if !s.tools.is_empty() {
+                    skill_block.push_str(&format!("**Tools**: {}\n", s.tools.join(", ")));
                 }
+                if let Some(ref notes) = s.notes {
+                    skill_block.push_str(&format!("**Notes**: {notes}\n"));
+                }
+                skill_block.push_str(&format!(
+                    "**Track record**: {:.0}% success ({} uses)\n\n",
+                    s.success_rate * 100.0, s.times_used
+                ));
+            }
+            if !skill_block.is_empty() {
+                system_prompt.push_str("\n\n# Relevant Procedures\n");
+                system_prompt.push_str("(Auto-loaded skills matching your task. Follow these when applicable.)\n\n");
+                system_prompt.push_str(&skill_block);
             }
         }
     }
@@ -1827,6 +1839,7 @@ pub(crate) fn run_agent_with_prompt(
             messages,
             tool_results,
             final_text: Some(continuation_marker),
+            step_count: step,
         });
     }
 
@@ -1836,5 +1849,6 @@ pub(crate) fn run_agent_with_prompt(
         messages,
         tool_results,
         final_text,
+        step_count: step,
     })
 }

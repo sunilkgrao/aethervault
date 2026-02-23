@@ -509,6 +509,25 @@ pub(crate) struct ToolSelfUpgradeArgs {
     pub(crate) skip_tests: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolProjectUpdateArgs {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[serde(default)]
+    pub(crate) current_step: Option<String>,
+    #[serde(default)]
+    pub(crate) notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolProjectListArgs {
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum LaneKind {
     Lex,

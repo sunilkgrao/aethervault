@@ -13,6 +13,8 @@ use std::thread;
 use crate::{
     env_optional, run_agent_with_prompt,
     AgentProgress, AgentRunOutput, BridgeAgentConfig, BridgeCommand,
+    load_capsule_config, open_or_create_db, resolve_workspace,
+    append_to_daily_note,
 };
 use self::telegram::run_telegram_bridge;
 use self::whatsapp::run_whatsapp_bridge;
@@ -183,7 +185,51 @@ pub(crate) fn run_agent_for_bridge(
     // No timeout — let the agent run as long as it needs.
     // The agent is bounded by max_steps, not wall-clock time.
     // Long-running tasks (dev work, swarms, batch processing) can take hours.
-    rx.recv().map_err(|err| format!("Agent channel error: {err}"))?.map_err(|e| e)
+    let output = rx.recv().map_err(|err| format!("Agent channel error: {err}"))??;
+
+    // Auto-summary: append meaningful completions to the daily note
+    if let Some(ref text) = output.final_text {
+        if text.len() > 50 {
+            let summary = if text.len() > 300 {
+                format!("{}...", &text[..text.char_indices().take_while(|&(i, _)| i < 300).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(300)])
+            } else {
+                text.clone()
+            };
+            let entry = format!("## Agent Completion [{}]\n{}\n",
+                chrono::Utc::now().format("%H:%M UTC"),
+                summary
+            );
+            // Resolve workspace and append
+            if let Ok(db) = open_or_create_db(&config.db_path) {
+                let capsule_cfg = load_capsule_config(&db).unwrap_or_default();
+                let agent_cfg = capsule_cfg.agent.unwrap_or_default();
+                if let Some(ws) = resolve_workspace(None, &agent_cfg) {
+                    if let Err(e) = append_to_daily_note(&ws, &entry) {
+                        eprintln!("[agent] failed to log completion: {}", e);
+                    }
+                    // If agent used multiple steps, note as a skill extraction candidate
+                    if output.step_count > 3 {
+                        let prompt_preview = if prompt.len() > 200 {
+                            format!("{}...", &prompt[..prompt.char_indices().take_while(|&(i, _)| i < 200).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(200)])
+                        } else {
+                            prompt.to_string()
+                        };
+                        let skill_hint = format!(
+                            "## Skill Candidate [{}]\nAgent completed {}-step task. Review for skill extraction.\nPrompt: {}\n",
+                            chrono::Utc::now().format("%H:%M UTC"),
+                            output.step_count,
+                            prompt_preview,
+                        );
+                        if let Err(e) = append_to_daily_note(&ws, &skill_hint) {
+                            eprintln!("[agent] failed to log skill candidate: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(output)
 }
 
 pub(crate) fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::error::Error>> {

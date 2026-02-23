@@ -752,6 +752,31 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "name": "project_update",
+            "description": "Create or update a project entry for tracking ongoing work across context resets. Projects are stored in capsule/projects.json.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Project name (used as unique key)" },
+                    "status": { "type": "string", "description": "Project status: active, paused, or completed" },
+                    "description": { "type": "string", "description": "Brief project description" },
+                    "current_step": { "type": "string", "description": "What is currently being worked on" },
+                    "notes": { "type": "string", "description": "A note to append to the project log" }
+                },
+                "required": ["name"]
+            }
+        }),
+        serde_json::json!({
+            "name": "project_list",
+            "description": "List all tracked projects, optionally filtered by status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "description": "Filter by status: active, paused, or completed" }
+                }
+            }
+        }),
     ]
 }
 
@@ -845,6 +870,8 @@ pub(crate) fn base_tool_names() -> HashSet<String> {
         "self_upgrade",
         "browser",
         "excalidraw",
+        "project_update",
+        "project_list",
     ]
     .into_iter()
     .map(|s| s.to_string())

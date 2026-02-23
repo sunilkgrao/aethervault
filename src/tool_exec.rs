@@ -475,6 +475,9 @@ use crate::{
     ToolMsCalendarCreateArgs,
     ToolScaleArgs,
     ToolSelfUpgradeArgs,
+    ToolProjectUpdateArgs,
+    ToolProjectListArgs,
+    ActiveProject,
     open_skill_db,
     upsert_skill,
     search_skills,
@@ -2326,6 +2329,8 @@ pub(crate) fn execute_tool(
                     task_id: task_id.clone(),
                     name: parsed.name.clone(),
                     prompt_preview: preview,
+                    full_prompt: parsed.prompt.clone(),
+                    retry_count: 0,
                     status: BackgroundTaskStatus::Running,
                     started_at_epoch: now_epoch,
                     completed_at_epoch: None,
@@ -2516,6 +2521,8 @@ pub(crate) fn execute_tool(
                         task_id: task_id.clone(),
                         name: item.name.clone(),
                         prompt_preview: preview,
+                        full_prompt: item.prompt.clone(),
+                        retry_count: 0,
                         status: BackgroundTaskStatus::Running,
                         started_at_epoch: now_epoch,
                         completed_at_epoch: None,
@@ -3421,6 +3428,110 @@ pub(crate) fn execute_tool(
                     })
                 }
             }
+        }
+        // === Project Tracking Tools ===
+        "project_update" => {
+            let parsed: ToolProjectUpdateArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let workspace = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let projects_path = workspace.join("projects.json");
+            let mut projects: Vec<ActiveProject> = if projects_path.exists() {
+                let data = fs::read_to_string(&projects_path).map_err(|e| format!("read projects: {e}"))?;
+                serde_json::from_str(&data).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let now = Utc::now().to_rfc3339();
+            if let Some(existing) = projects.iter_mut().find(|p| p.name == parsed.name) {
+                if let Some(status) = &parsed.status {
+                    existing.status = status.clone();
+                }
+                if let Some(desc) = &parsed.description {
+                    existing.description = desc.clone();
+                }
+                if let Some(step) = &parsed.current_step {
+                    existing.current_step = step.clone();
+                }
+                if let Some(note) = &parsed.notes {
+                    existing.notes.push(note.clone());
+                }
+                existing.updated_at = now.clone();
+            } else {
+                let project = ActiveProject {
+                    name: parsed.name.clone(),
+                    status: parsed.status.unwrap_or_else(|| "active".to_string()),
+                    description: parsed.description.unwrap_or_default(),
+                    current_step: parsed.current_step.unwrap_or_default(),
+                    started_at: now.clone(),
+                    updated_at: now.clone(),
+                    notes: parsed.notes.into_iter().collect(),
+                };
+                projects.push(project);
+            }
+            if let Some(parent) = projects_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+            }
+            let json = serde_json::to_string_pretty(&projects).map_err(|e| format!("json: {e}"))?;
+            fs::write(&projects_path, &json).map_err(|e| format!("write projects: {e}"))?;
+            Ok(ToolExecution {
+                output: format!("Project '{}' updated.", parsed.name),
+                details: serde_json::json!({"projects_path": projects_path.display().to_string()}),
+                is_error: false,
+            })
+        }
+        "project_list" => {
+            let parsed: ToolProjectListArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let workspace = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let projects_path = workspace.join("projects.json");
+            let projects: Vec<ActiveProject> = if projects_path.exists() {
+                let data = fs::read_to_string(&projects_path).map_err(|e| format!("read projects: {e}"))?;
+                serde_json::from_str(&data).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if projects.is_empty() {
+                return Ok(ToolExecution {
+                    output: "No projects tracked.".to_string(),
+                    details: serde_json::Value::Null,
+                    is_error: false,
+                });
+            }
+            let filtered: Vec<&ActiveProject> = if let Some(ref status) = parsed.status {
+                projects.iter().filter(|p| p.status == *status).collect()
+            } else {
+                projects.iter().collect()
+            };
+            if filtered.is_empty() {
+                return Ok(ToolExecution {
+                    output: format!("No projects with status '{}'.", parsed.status.unwrap_or_default()),
+                    details: serde_json::Value::Null,
+                    is_error: false,
+                });
+            }
+            let mut output = String::new();
+            for p in &filtered {
+                output.push_str(&format!(
+                    "**{}** [{}]\n  {}\n  Current step: {}\n  Updated: {}\n",
+                    p.name, p.status, p.description, p.current_step, p.updated_at
+                ));
+                if !p.notes.is_empty() {
+                    let recent: Vec<&String> = p.notes.iter().rev().take(3).collect();
+                    for note in recent.iter().rev() {
+                        output.push_str(&format!("  - {}\n", note));
+                    }
+                }
+                output.push('\n');
+            }
+            Ok(ToolExecution {
+                output,
+                details: serde_json::json!({"count": filtered.len()}),
+                is_error: false,
+            })
         }
         _ => Err("unknown tool".into()),
     }

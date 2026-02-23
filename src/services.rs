@@ -15,11 +15,16 @@ use serde_json;
 use url::form_urlencoded;
 
 // Re-imports from main (crate-internal helpers and types)
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
 use crate::{
     open_or_create_db, save_config_entry, load_config_entry, blake3_hash, execute_tool,
     env_optional, env_u64, tool_autonomy_for, ToolAutonomyLevel, ApprovalEntry, TriggerEntry,
     AgentConfig, CronExpr, load_capsule_config, resolve_workspace,
     build_bridge_agent_config, run_agent_for_bridge, telegram_send_message,
+    BackgroundTask, BackgroundTaskRegistry, BackgroundTaskStatus, SessionRegistry,
+    BridgeAgentConfig,
 };
 use tiny_http::{Response, Server};
 use walkdir::WalkDir;
@@ -1450,3 +1455,707 @@ pub(crate) fn qdrant_search_text(
     Ok(hits)
 }
 
+// ── Trigger Thread (shared-state, embedded in bridge) ───────────────────
+
+/// Append text to the daily note file (capsule workspace).
+pub(crate) fn append_to_daily_note(workspace: &Path, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let date = Utc::now().format("%Y-%m-%d").to_string();
+    let dir = workspace.join("memory");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{date}.md"));
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    use std::io::Write;
+    writeln!(file, "{}", text)?;
+    Ok(())
+}
+
+/// Heartbeat: check background tasks and sessions, log status, auto-restart failures.
+fn run_heartbeat(
+    bg_registry: &Arc<Mutex<BackgroundTaskRegistry>>,
+    session_registry: &Arc<Mutex<SessionRegistry>>,
+    workspace: &Path,
+    agent_config: &BridgeAgentConfig,
+    tg: &Option<TelegramNotifier>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let now = Utc::now();
+    let timestamp = now.format("%H:%M UTC").to_string();
+
+    let (running, completed, failed, stale_names) = {
+        let reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut running = 0usize;
+        let mut completed = 0usize;
+        let mut failed = 0usize;
+        for tasks in reg.tasks.values() {
+            for t in tasks {
+                match &t.status {
+                    BackgroundTaskStatus::Running => running += 1,
+                    BackgroundTaskStatus::Completed => completed += 1,
+                    BackgroundTaskStatus::Failed(_) => failed += 1,
+                }
+            }
+        }
+        let stale = reg.stale_tasks(Duration::from_secs(30 * 60));
+        let stale_names: Vec<String> = stale.iter()
+            .map(|(_, t)| format!("{}: {}", t.task_id, t.name))
+            .collect();
+        (running, completed, failed, stale_names)
+    };
+
+    let (active_sessions, stale_sessions) = {
+        let sess = session_registry.lock().unwrap_or_else(|e| e.into_inner());
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut active = 0usize;
+        let mut stale = 0usize;
+        for s in sess.sessions.values() {
+            match &s.status {
+                BackgroundTaskStatus::Running => {
+                    let elapsed = now_epoch.saturating_sub(s.started_at_epoch);
+                    if elapsed > 3600 {
+                        stale += 1;
+                    } else {
+                        active += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (active, stale)
+    };
+
+    // Auto-restart failed tasks (max 3 retries)
+    let failed_restartable: Vec<(i64, BackgroundTask)> = {
+        let reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut restartable = Vec::new();
+        for (&chat_id, tasks) in &reg.tasks {
+            for task in tasks {
+                if matches!(task.status, BackgroundTaskStatus::Failed(_))
+                    && task.retry_count < 3
+                    && !task.full_prompt.is_empty()
+                {
+                    restartable.push((chat_id, task.clone()));
+                }
+            }
+        }
+        restartable
+    };
+
+    for (chat_id, failed_task) in &failed_restartable {
+        let new_session = format!("restart:{}:{}", failed_task.name, Utc::now().timestamp());
+        eprintln!("[heartbeat] restarting failed task '{}' (attempt {})",
+            failed_task.name, failed_task.retry_count + 1);
+
+        // Remove the failed task from registry
+        {
+            let mut reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(tasks) = reg.tasks.get_mut(chat_id) {
+                tasks.retain(|t| t.task_id != failed_task.task_id);
+            }
+        }
+
+        let restart_prompt = format!(
+            "RESTARTING (attempt {}): This task previously failed. Original prompt:\n\n{}",
+            failed_task.retry_count + 1, failed_task.full_prompt
+        );
+        match run_agent_for_bridge(agent_config, &restart_prompt, new_session.clone(), None, None, None) {
+            Ok(output) => {
+                tg_notify(tg, &format!("Restarted '{}' (attempt {}) — {}",
+                    failed_task.name, failed_task.retry_count + 1,
+                    truncate_text(output.final_text.as_deref().unwrap_or("done"), 200)));
+            }
+            Err(e) => {
+                eprintln!("[heartbeat] restart of '{}' failed again: {e}", failed_task.name);
+                let mut reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
+                reg.register(*chat_id, BackgroundTask {
+                    task_id: format!("retry-{}", failed_task.task_id),
+                    name: failed_task.name.clone(),
+                    prompt_preview: failed_task.prompt_preview.clone(),
+                    full_prompt: failed_task.full_prompt.clone(),
+                    retry_count: failed_task.retry_count + 1,
+                    status: BackgroundTaskStatus::Failed(e),
+                    started_at_epoch: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs()).unwrap_or(0),
+                    completed_at_epoch: None,
+                    step_count: 0,
+                    max_steps: failed_task.max_steps,
+                    result_text: None,
+                    session: new_session,
+                });
+            }
+        }
+    }
+
+    // Only write heartbeat if there's something to report
+    if running == 0 && completed == 0 && failed == 0 && active_sessions == 0 && stale_sessions == 0
+        && failed_restartable.is_empty()
+    {
+        return Ok(());
+    }
+
+    let mut entry = format!("## Heartbeat [{timestamp}]\n");
+    entry.push_str(&format!("- Active subagents: {} running, {} completed, {} failed\n", running, completed, failed));
+    entry.push_str(&format!("- Sessions: {} active, {} stale\n", active_sessions, stale_sessions));
+    if !stale_names.is_empty() {
+        entry.push_str(&format!("- Stale tasks (>30m): [{}]\n", stale_names.join(", ")));
+    }
+    if !failed_restartable.is_empty() {
+        let names: Vec<String> = failed_restartable.iter().map(|(_, t)| t.name.clone()).collect();
+        entry.push_str(&format!("- Auto-restarted: [{}]\n", names.join(", ")));
+    }
+
+    append_to_daily_note(workspace, &entry)?;
+    eprintln!("[trigger-thread] heartbeat logged: {}R {}C {}F, {}S active, {} restarted",
+        running, completed, failed, active_sessions, failed_restartable.len());
+    Ok(())
+}
+
+/// Nightly consolidation: spawn a short-lived agent to review the day.
+fn run_nightly_consolidation(
+    agent_config: &BridgeAgentConfig,
+    tg: &Option<TelegramNotifier>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prompt = "\
+Review today's daily note and all completed background tasks. Do the following:
+
+## Part 1: Daily Review
+1. What was accomplished today
+2. What failed and why
+3. Open threads that need follow-up tomorrow
+4. Any observations or learnings worth preserving
+
+Write your summary to the daily note under \"## Daily Review\" and store \
+durable observations via memory_remember.
+
+## Part 2: Skill Extraction
+Review all successful task completions from today. For any repeatable procedure \
+(deployment, API integration, data processing, content creation, etc.):
+1. Use skill_search to check if this procedure already exists
+2. If not, use skill_store to create it with:
+   - name: descriptive kebab-case name (e.g., 'deploy-vercel-site')
+   - trigger: when this skill should activate (e.g., 'deploying a website')
+   - steps: numbered procedure steps
+   - tools: list of tools used
+   - notes: any gotchas or tips
+3. If the skill exists but the procedure improved, update it via skill_store
+
+## Part 3: Project Updates
+Update project_list entries: mark completed items, advance current_step on active ones.";
+
+    let session = format!("nightly:{}", Utc::now().format("%Y-%m-%d"));
+    eprintln!("[trigger-thread] starting nightly consolidation");
+    match run_agent_for_bridge(agent_config, prompt, session, None, None, None) {
+        Ok(output) => {
+            eprintln!("[trigger-thread] nightly consolidation completed");
+            if let Some(ref text) = output.final_text {
+                tg_notify(tg, &format!("Nightly review:\n{}", truncate_text(text, 1500)));
+            }
+        }
+        Err(e) => eprintln!("[trigger-thread] nightly consolidation failed: {e}"),
+    }
+    Ok(())
+}
+
+/// Morning kickoff: read projects + daily notes, plan the day, start working.
+fn run_morning_kickoff(
+    agent_config: &BridgeAgentConfig,
+    workspace: &Path,
+    tg: &Option<TelegramNotifier>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Read projects.json to build context for the prompt
+    let projects_path = workspace.join("projects.json");
+    let projects_summary = if projects_path.exists() {
+        fs::read_to_string(&projects_path).unwrap_or_else(|_| "[]".to_string())
+    } else {
+        "[]".to_string()
+    };
+
+    // Read yesterday's daily note for open threads
+    let yesterday = (Utc::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+    let yesterday_path = workspace.join("memory").join(format!("{yesterday}.md"));
+    let yesterday_note = if yesterday_path.exists() {
+        fs::read_to_string(&yesterday_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let yesterday_snippet: String = yesterday_note.chars().take(2000).collect();
+
+    let prompt = format!(
+        "Good morning. You are starting your autonomous work day. Review your state and act:\n\n\
+         ## Active Projects\n```json\n{projects_summary}\n```\n\n\
+         ## Yesterday's Notes (last 2000 chars)\n{yesterday_snippet}\n\n\
+         ## Instructions\n\
+         1. Read today's daily note for any early entries\n\
+         2. Check project_list for active projects with pending steps\n\
+         3. Identify the 2-3 highest-priority items that need action TODAY\n\
+         4. Write your morning plan to the daily note under \"## Morning Kickoff\"\n\
+         5. Start executing the highest-priority item immediately\n\
+         6. Check skill_search for procedures related to your planned work\n\
+         7. If you find relevant skills, follow their steps\n\
+         8. If you discover a new procedure during work, store it via skill_store\n\
+         9. Use project_update to advance current_step as you make progress\n\n\
+         Be concrete. Don't just plan — do the work. Use your tools: exec, browser, \
+         email, filesystem, subagents. If a task needs research, spawn a subagent. \
+         If it needs code, write and test it. Ship."
+    );
+
+    let session = format!("morning:{}", Utc::now().format("%Y-%m-%d"));
+    eprintln!("[trigger-thread] starting morning kickoff");
+    match run_agent_for_bridge(agent_config, &prompt, session, None, None, None) {
+        Ok(output) => {
+            eprintln!("[trigger-thread] morning kickoff completed");
+            if let Some(ref text) = output.final_text {
+                tg_notify(tg, &format!("Morning kickoff:\n{}", truncate_text(text, 1500)));
+            }
+        }
+        Err(e) => eprintln!("[trigger-thread] morning kickoff failed: {e}"),
+    }
+    Ok(())
+}
+
+/// Idle work check: when nothing is running and active projects exist, pick up work.
+fn run_idle_check(
+    agent_config: &BridgeAgentConfig,
+    bg_registry: &Arc<Mutex<BackgroundTaskRegistry>>,
+    workspace: &Path,
+    tg: &Option<TelegramNotifier>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    // Don't start idle work if subagents are already running
+    {
+        let reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
+        let running: usize = reg.tasks.values()
+            .flat_map(|t| t.iter())
+            .filter(|t| t.status == BackgroundTaskStatus::Running)
+            .count();
+        if running > 0 {
+            return Ok(false);
+        }
+    }
+
+    // Check if there are active projects
+    let projects_path = workspace.join("projects.json");
+    if !projects_path.exists() {
+        return Ok(false);
+    }
+    let data = fs::read_to_string(&projects_path).unwrap_or_else(|_| "[]".to_string());
+    let projects: Vec<crate::ActiveProject> = serde_json::from_str(&data).unwrap_or_default();
+    let active_projects: Vec<&crate::ActiveProject> = projects.iter()
+        .filter(|p| p.status == "active")
+        .collect();
+    if active_projects.is_empty() {
+        return Ok(false);
+    }
+
+    // Build a focused prompt
+    let project_names: Vec<String> = active_projects.iter()
+        .map(|p| format!("- {} (step: {})", p.name, p.current_step))
+        .collect();
+
+    let prompt = format!(
+        "You have active projects with pending work. No one is waiting on you — take initiative.\n\n\
+         ## Active Projects\n{}\n\n\
+         ## Instructions\n\
+         1. Read today's daily note for context on what's already been done\n\
+         2. Pick the project with the most urgent or impactful next step\n\
+         3. Execute that step using your tools — don't just plan, do the work\n\
+         4. Update the project via project_update with your progress\n\
+         5. Log what you did to the daily note\n\n\
+         If you determine that all active projects are genuinely blocked on external input \
+         (waiting for a human, waiting for a deploy, etc.), say so and do NOT manufacture busywork. \
+         Quality over quantity.",
+        project_names.join("\n")
+    );
+
+    let session = format!("idle:{}", Utc::now().format("%Y-%m-%dT%H:%M"));
+    eprintln!("[trigger-thread] starting idle work check ({} active projects)", active_projects.len());
+    match run_agent_for_bridge(agent_config, &prompt, session, None, None, None) {
+        Ok(output) => {
+            eprintln!("[trigger-thread] idle work completed");
+            if let Some(ref text) = output.final_text {
+                if text.len() > 50 {
+                    tg_notify(tg, &format!("Autonomous work:\n{}", truncate_text(text, 1500)));
+                }
+            }
+        }
+        Err(e) => eprintln!("[trigger-thread] idle work failed: {e}"),
+    }
+    Ok(true)
+}
+
+/// Telegram notification helper for proactive messages.
+struct TelegramNotifier {
+    agent: ureq::Agent,
+    base_url: String,
+    chat_id: i64,
+}
+
+fn tg_notify(tg: &Option<TelegramNotifier>, text: &str) {
+    if let Some(tg) = tg {
+        let _ = telegram_send_message(&tg.agent, &tg.base_url, tg.chat_id, text);
+    }
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        text.to_string()
+    } else {
+        let end = text.char_indices()
+            .take_while(|&(i, _)| i < max_chars)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(max_chars);
+        format!("{}...", &text[..end])
+    }
+}
+
+/// Self-improvement review: runs every 12 hours to identify capability gaps and create new skills.
+fn run_self_improvement(
+    agent_config: &BridgeAgentConfig,
+    tg: &Option<TelegramNotifier>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prompt = "\
+You are performing a self-improvement review. Analyze your recent performance and capabilities.
+
+## Instructions
+1. Read the last 3 days of daily notes for patterns
+2. Use skill_search with broad queries to see what skills you have
+3. Identify:
+   a. Tasks you've failed at repeatedly — what skills are missing?
+   b. Tasks that took too many steps — can you create a skill to streamline?
+   c. API keys or credentials available in your environment (check env vars via exec) \
+      that you haven't created skills for yet
+   d. Bottlenecks where you're waiting on human input unnecessarily
+4. For each gap identified:
+   - Create a new skill via skill_store OR
+   - Create a new trigger via trigger_add OR
+   - Log a proposal to the daily note under '## Improvement Proposals'
+5. Be concrete — don't just identify problems, implement solutions.
+
+Focus on capabilities that would let you operate more autonomously: \
+deploying code, managing payments, posting content, monitoring services.";
+
+    let session = format!("self-improve:{}", Utc::now().format("%Y-%m-%dT%H"));
+    eprintln!("[trigger-thread] starting self-improvement review");
+    match run_agent_for_bridge(agent_config, prompt, session, None, None, None) {
+        Ok(output) => {
+            if let Some(ref text) = output.final_text {
+                tg_notify(tg, &format!("Self-improvement review:\n{}", truncate_text(text, 1500)));
+            }
+        }
+        Err(e) => eprintln!("[trigger-thread] self-improvement failed: {e}"),
+    }
+    Ok(())
+}
+
+/// Trigger thread: evaluates triggers, runs heartbeat every 5 min, nightly consolidation at 3 AM UTC,
+/// morning kickoff at configurable hour, idle work loop every 30 min when projects are active.
+/// Shares bg_registry and session_registry with the bridge process.
+pub(crate) fn run_trigger_thread(
+    mv2: &Path,
+    bg_registry: Arc<Mutex<BackgroundTaskRegistry>>,
+    session_registry: Arc<Mutex<SessionRegistry>>,
+    telegram_token: Option<String>,
+    telegram_chat_id: Option<i64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("[trigger-thread] started");
+
+    let db = open_or_create_db(mv2)?;
+    let config = load_capsule_config(&db).unwrap_or_default();
+    let agent_cfg = config.agent.clone().unwrap_or_default();
+    let tz = resolve_timezone(&agent_cfg, None);
+    let workspace = resolve_workspace(None, &agent_cfg);
+
+    // Higher step budget for autonomous work (morning kickoff, idle work need room to act)
+    let agent_config = build_bridge_agent_config(
+        mv2.to_path_buf(),
+        None,
+        None,
+        false,
+        None,
+        8,
+        12_000,
+        40, // generous steps for autonomous work
+        true,
+        50,
+    )?;
+
+    // Set up Telegram notifier if credentials are available
+    let tg = if let (Some(token), Some(chat_id)) = (&telegram_token, telegram_chat_id) {
+        let api_base = std::env::var("TELEGRAM_API_BASE")
+            .unwrap_or_else(|_| "https://api.telegram.org".to_string());
+        let base_url = format!("{api_base}/bot{token}");
+        Some(TelegramNotifier {
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(30))
+                .timeout_read(Duration::from_secs(30))
+                .timeout_write(Duration::from_secs(30))
+                .build(),
+            base_url,
+            chat_id,
+        })
+    } else {
+        None
+    };
+
+    let mut last_heartbeat = Instant::now();
+    let mut last_idle_check = Instant::now();
+    let mut last_self_improve = Instant::now();
+    let mut last_nightly: Option<chrono::NaiveDate> = None;
+    let mut last_morning: Option<chrono::NaiveDate> = None;
+    let self_improve_interval = Duration::from_secs(12 * 3600); // every 12 hours
+
+    // Configurable morning kickoff hour (default 8 AM in user's timezone)
+    let morning_hour: u32 = env_optional("LINUS_MORNING_HOUR")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+
+    // Idle check interval (default 30 min)
+    let idle_interval_secs: u64 = env_optional("LINUS_IDLE_INTERVAL_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30 * 60);
+
+    loop {
+        // 1. Evaluate triggers (reuse existing run_watch_loop logic inline)
+        {
+            let now = Utc::now().with_timezone(&tz);
+            let db_loop = match open_or_create_db(mv2) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("[trigger-thread] db open error: {e}");
+                    thread::sleep(Duration::from_secs(60));
+                    continue;
+                }
+            };
+            let mut triggers = load_triggers(&db_loop);
+            let mut updated = false;
+
+            for trigger in triggers.iter_mut() {
+                if !trigger.enabled {
+                    continue;
+                }
+                match trigger.kind.as_str() {
+                    "cron" => {
+                        let cron_str = match &trigger.cron {
+                            Some(c) if !c.trim().is_empty() => c.clone(),
+                            _ => continue,
+                        };
+                        let cron_expr = match CronExpr::parse(&cron_str) {
+                            Ok(expr) => expr,
+                            Err(e) => {
+                                eprintln!("[trigger-thread] trigger '{}' bad cron: {e}", trigger.id);
+                                continue;
+                            }
+                        };
+                        let dow = match now.weekday() {
+                            chrono::Weekday::Sun => 0,
+                            chrono::Weekday::Mon => 1,
+                            chrono::Weekday::Tue => 2,
+                            chrono::Weekday::Wed => 3,
+                            chrono::Weekday::Thu => 4,
+                            chrono::Weekday::Fri => 5,
+                            chrono::Weekday::Sat => 6,
+                        };
+                        if cron_expr.matches(now.minute(), now.hour(), now.day(), now.month(), dow) {
+                            let current_minute = format!("{}-{:02}-{:02}T{:02}:{:02}",
+                                now.year(), now.month(), now.day(), now.hour(), now.minute());
+                            if trigger.last_fired.as_deref() == Some(&current_minute) {
+                                continue;
+                            }
+                            trigger.last_fired = Some(current_minute);
+                            updated = true;
+                            let mut prompt = trigger.prompt.clone().unwrap_or_else(|| {
+                                format!("Cron trigger '{}' fired.", trigger.name.as_deref().unwrap_or(&trigger.id))
+                            });
+                            if let Some(ref ws) = workspace {
+                                prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
+                            }
+                            let session = format!("trigger:cron:{}", trigger.id);
+                            match run_agent_for_bridge(&agent_config, &prompt, session, None, None, None) {
+                                Ok(output) => {
+                                    if let Some(ref text) = output.final_text {
+                                        if text.len() > 50 {
+                                            tg_notify(&tg, &format!("Trigger '{}':\n{}",
+                                                trigger.name.as_deref().unwrap_or(&trigger.id),
+                                                truncate_text(text, 1000)));
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!("[trigger-thread] trigger '{}' agent failed: {e}", trigger.id),
+                            }
+                        }
+                    }
+                    "email" => {
+                        let query = match &trigger.query {
+                            Some(q) if !q.trim().is_empty() => q.clone(),
+                            _ => continue,
+                        };
+                        let token = match get_oauth_token(mv2, "google") {
+                            Ok(token) => token,
+                            Err(_) => continue,
+                        };
+                        let agent = ureq::AgentBuilder::new()
+                            .timeout_connect(Duration::from_secs(30))
+                            .timeout_read(Duration::from_secs(30))
+                            .build();
+                        let mut url =
+                            "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=1"
+                                .to_string();
+                        url.push_str("&q=");
+                        url.push_str(&urlencoding::encode(&query));
+                        let resp = agent
+                            .get(&url)
+                            .set("authorization", &format!("Bearer {}", token))
+                            .call();
+                        let payload = match resp {
+                            Ok(resp) => resp.into_json::<serde_json::Value>().unwrap_or_default(),
+                            Err(_) => continue,
+                        };
+                        let id = payload
+                            .get("messages")
+                            .and_then(|m| m.as_array())
+                            .and_then(|arr| arr.get(0))
+                            .and_then(|m| m.get("id"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        if let Some(id) = id {
+                            if trigger.last_seen.as_deref() != Some(&id) {
+                                trigger.last_seen = Some(id.clone());
+                                trigger.last_fired = Some(now.to_rfc3339());
+                                updated = true;
+                                let mut prompt = trigger.prompt.clone().unwrap_or_else(|| {
+                                    "New email received. Review and take action.".to_string()
+                                });
+                                prompt.push_str(&format!(
+                                    "\n\nQuery: {query}\nMessage ID: {id}\nUse gmail_read to inspect."
+                                ));
+                                if let Some(ref ws) = workspace {
+                                    prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
+                                }
+                                let session = format!("trigger:email:{}", trigger.id);
+                                let _ = run_agent_for_bridge(&agent_config, &prompt, session, None, None, None);
+                            }
+                        }
+                    }
+                    "webhook" => {
+                        let url = match &trigger.webhook_url {
+                            Some(u) if !u.trim().is_empty() => u.clone(),
+                            _ => continue,
+                        };
+                        let method = trigger.webhook_method.as_deref().unwrap_or("GET").to_uppercase();
+                        let agent = ureq::AgentBuilder::new()
+                            .timeout_connect(Duration::from_secs(30))
+                            .timeout_read(Duration::from_secs(30))
+                            .build();
+                        let resp = match method.as_str() {
+                            "POST" => agent.post(&url).call(),
+                            _ => agent.get(&url).call(),
+                        };
+                        let payload = match resp {
+                            Ok(resp) => resp.into_string().unwrap_or_default(),
+                            Err(e) => {
+                                eprintln!("[trigger-thread] trigger '{}' webhook error: {e}", trigger.id);
+                                continue;
+                            }
+                        };
+                        let payload_hash = blake3::hash(payload.as_bytes()).to_hex().to_string();
+                        if trigger.last_seen.as_deref() == Some(&payload_hash) {
+                            continue;
+                        }
+                        if trigger.last_seen.is_none() {
+                            trigger.last_seen = Some(payload_hash);
+                            updated = true;
+                            continue;
+                        }
+                        trigger.last_seen = Some(payload_hash);
+                        trigger.last_fired = Some(now.to_rfc3339());
+                        updated = true;
+                        let mut prompt = trigger.prompt.clone().unwrap_or_else(|| {
+                            format!("Webhook trigger '{}' detected a change.", trigger.name.as_deref().unwrap_or(&trigger.id))
+                        });
+                        let preview_end = payload.char_indices()
+                            .take_while(|&(i, _)| i < 500)
+                            .last()
+                            .map(|(i, c)| i + c.len_utf8())
+                            .unwrap_or(0);
+                        prompt.push_str(&format!("\n\nWebhook URL: {url}\nResponse preview: {}", &payload[..preview_end]));
+                        if let Some(ref ws) = workspace {
+                            prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
+                        }
+                        let session = format!("trigger:webhook:{}", trigger.id);
+                        if let Err(e) = run_agent_for_bridge(&agent_config, &prompt, session, None, None, None) {
+                            eprintln!("[trigger-thread] trigger '{}' agent failed: {e}", trigger.id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if updated {
+                if let Err(e) = save_triggers(&db_loop, &triggers) {
+                    eprintln!("[trigger-thread] CRITICAL: failed to persist trigger state: {e}");
+                }
+            }
+        }
+
+        // 2. Heartbeat every 5 minutes (with auto-restart of failed tasks)
+        if last_heartbeat.elapsed() > Duration::from_secs(300) {
+            if let Some(ref ws) = workspace {
+                if let Err(e) = run_heartbeat(&bg_registry, &session_registry, ws, &agent_config, &tg) {
+                    eprintln!("[trigger-thread] heartbeat error: {e}");
+                }
+            }
+            last_heartbeat = Instant::now();
+        }
+
+        // 3. Nightly consolidation at 3 AM UTC
+        let now_utc = Utc::now();
+        let today = now_utc.date_naive();
+        if now_utc.hour() == 3 && last_nightly != Some(today) {
+            run_nightly_consolidation(&agent_config, &tg)?;
+            last_nightly = Some(today);
+        }
+
+        // 4. Morning kickoff at configured hour in user's timezone
+        {
+            let now_tz = Utc::now().with_timezone(&tz);
+            let today_tz = now_tz.date_naive();
+            if now_tz.hour() == morning_hour && now_tz.minute() == 0 && last_morning != Some(today_tz) {
+                if let Some(ref ws) = workspace {
+                    last_morning = Some(today_tz);
+                    if let Err(e) = run_morning_kickoff(&agent_config, ws, &tg) {
+                        eprintln!("[trigger-thread] morning kickoff error: {e}");
+                    }
+                }
+            }
+        }
+
+        // 5. Idle work loop: every N minutes, if active projects exist and nothing is running
+        if last_idle_check.elapsed() > Duration::from_secs(idle_interval_secs) {
+            last_idle_check = Instant::now();
+            if let Some(ref ws) = workspace {
+                match run_idle_check(&agent_config, &bg_registry, ws, &tg) {
+                    Ok(did_work) => {
+                        if did_work {
+                            // After doing work, reset the timer to avoid rapid-fire
+                            last_idle_check = Instant::now();
+                        }
+                    }
+                    Err(e) => eprintln!("[trigger-thread] idle check error: {e}"),
+                }
+            }
+        }
+
+        // 6. Self-improvement review every 12 hours
+        if last_self_improve.elapsed() > self_improve_interval {
+            let _ = run_self_improvement(&agent_config, &tg);
+            last_self_improve = Instant::now();
+        }
+
+        thread::sleep(Duration::from_secs(60));
+    }
+}

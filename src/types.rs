@@ -382,6 +382,7 @@ pub(crate) struct AgentRunOutput {
     pub(crate) messages: Vec<AgentMessage>,
     pub(crate) tool_results: Vec<AgentToolResult>,
     pub(crate) final_text: Option<String>,
+    pub(crate) step_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,6 +445,8 @@ pub(crate) struct BackgroundTask {
     pub(crate) task_id: String,
     pub(crate) name: String,
     pub(crate) prompt_preview: String,
+    pub(crate) full_prompt: String,
+    pub(crate) retry_count: u32,
     pub(crate) status: BackgroundTaskStatus,
     pub(crate) started_at_epoch: u64,
     pub(crate) completed_at_epoch: Option<u64>,
@@ -605,6 +608,26 @@ impl BackgroundTaskRegistry {
         lines.join("\n")
     }
 
+    pub(crate) fn stale_tasks(&self, threshold: std::time::Duration) -> Vec<(i64, &BackgroundTask)> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let threshold_secs = threshold.as_secs();
+        let mut result = Vec::new();
+        for (&chat_id, tasks) in &self.tasks {
+            for task in tasks {
+                if task.status == BackgroundTaskStatus::Running {
+                    let elapsed = now.saturating_sub(task.started_at_epoch);
+                    if elapsed > threshold_secs {
+                        result.push((chat_id, task));
+                    }
+                }
+            }
+        }
+        result
+    }
+
     pub(crate) fn chats_with_completed(&self) -> Vec<i64> {
         self.tasks
             .iter()
@@ -710,6 +733,19 @@ impl SessionRegistry {
         }
         lines.join("\n")
     }
+}
+
+// === Active Project Tracking ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ActiveProject {
+    pub name: String,
+    pub status: String,
+    pub description: String,
+    pub current_step: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub notes: Vec<String>,
 }
 
 pub(crate) struct CompletionEvent {
