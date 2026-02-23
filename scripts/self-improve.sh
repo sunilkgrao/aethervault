@@ -69,8 +69,7 @@ Rules:
 PROMPT
 )
 
-SCAN_OUTPUT=$(timeout 600 aethervault agent \
-    --mv2 "$MV2" \
+SCAN_OUTPUT=$(timeout 600 aethervault agent "$MV2" \
     --session "self-improve-scan-${DATE}" \
     --max-steps "$MAX_SCAN_STEPS" \
     --model-hook builtin:sonnet \
@@ -147,8 +146,7 @@ PROMPT
 # Snapshot current HEAD so we can revert if needed
 PRE_HEAD=$(cd "$REPO" && git rev-parse HEAD)
 
-IMPL_OUTPUT=$(timeout 900 aethervault agent \
-    --mv2 "$MV2" \
+IMPL_OUTPUT=$(timeout 900 aethervault agent "$MV2" \
     --session "self-improve-impl-${DATE}" \
     --max-steps "$MAX_IMPL_STEPS" \
     --model-hook builtin:claude \
@@ -223,8 +221,7 @@ git push origin main || {
 }
 
 # Call self_upgrade via agent (it needs the tool framework)
-UPGRADE_OUTPUT=$(timeout 120 aethervault agent \
-    --mv2 "$MV2" \
+UPGRADE_OUTPUT=$(timeout 120 aethervault agent "$MV2" \
     --session "self-improve-deploy-${DATE}" \
     --max-steps 8 \
     --prompt "Call self_upgrade with branch main. Report the result." 2>&1) || {
@@ -262,8 +259,7 @@ print(json.dumps({
 echo "$RECORD" >> "$LOG"
 
 # Store in capsule memory for future scan phases to find
-aethervault agent \
-    --mv2 "$MV2" \
+aethervault agent "$MV2" \
     --session "self-improve-archive-${DATE}" \
     --max-steps 4 \
     --prompt "Use reflect tool to store: Self-improvement deployed — ${DESCRIPTION} (${CATEGORY}, risk:${RISK}, commit:$(cd "$REPO" && git rev-parse --short HEAD))" \
