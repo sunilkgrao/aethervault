@@ -343,6 +343,8 @@ pub(crate) struct ToolReflectArgs {
 pub(crate) struct ToolSkillStoreArgs {
     pub(crate) name: String,
     #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[serde(default)]
     pub(crate) trigger: Option<String>,
     #[serde(default)]
     pub(crate) steps: Option<Vec<String>>,

@@ -512,6 +512,7 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
+                    "description": { "type": "string", "description": "One-line summary of what this skill does" },
                     "trigger": { "type": "string" },
                     "steps": { "type": "array", "items": { "type": "string" } },
                     "tools": { "type": "array", "items": { "type": "string" } },

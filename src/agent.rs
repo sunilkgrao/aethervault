@@ -254,6 +254,9 @@ pub(crate) fn default_system_prompt() -> String {
         "If you're unsure whether a tool exists, call tool_search first. Do not guess.",
         "When a tool is available, USE it rather than dumping generic knowledge from training data.",
         "Research with your tools FIRST, then synthesize. Never substitute memory/training data for actual tool use.",
+        "When a task requires accounts, credentials, or setup you don't have — try to obtain them yourself.",
+        "Use the browser tool to navigate dashboards, sign up, generate API keys. Check env vars, config files, CLI auth tools.",
+        "Only involve the user after you've tried at least two approaches.",
         "",
         "## Communication Style",
         "Before calling tools, briefly say what you're about to do in a natural way (e.g., 'Let me check your calendar' or 'Searching for that...').",
@@ -645,6 +648,7 @@ pub(crate) fn run_agent_with_prompt(
         }
     }
 
+    let mut injected_skill_names: Vec<String> = Vec::new();
     // --- SkillRL R1: Auto-inject top skills into stable prefix ---
     if let Some(workspace) = resolve_workspace(None, &agent_cfg) {
         let db_path = workspace.join("skills.sqlite");
@@ -660,34 +664,33 @@ pub(crate) fn run_agent_with_prompt(
             let mut seen: HashSet<String> = HashSet::new();
             let mut skill_block = String::new();
             for s in matched.iter().chain(general.iter()) {
-                if !seen.insert(s.name.clone()) {
-                    continue;
+                if !seen.insert(s.name.clone()) { continue; }
+                skill_block.push_str(&format!("- **{}**", s.name));
+                if let Some(ref desc) = s.description {
+                    skill_block.push_str(&format!(": {}", desc));
+                } else if let Some(ref trigger) = s.trigger {
+                    skill_block.push_str(&format!(" — {}", trigger));
                 }
-                skill_block.push_str(&format!("## Skill: {}\n", s.name));
-                if let Some(ref trigger) = s.trigger {
-                    skill_block.push_str(&format!("**When**: {trigger}\n"));
+                if !s.contexts.is_empty() {
+                    skill_block.push_str(&format!(" [{}]", s.contexts.join(", ")));
                 }
-                if !s.steps.is_empty() {
-                    skill_block.push_str("**Steps**:\n");
-                    for (i, step) in s.steps.iter().enumerate() {
-                        skill_block.push_str(&format!("{}. {step}\n", i + 1));
-                    }
+                if s.times_used > 0 {
+                    skill_block.push_str(&format!(" ({:.0}% success)", s.success_rate * 100.0));
                 }
-                if !s.tools.is_empty() {
-                    skill_block.push_str(&format!("**Tools**: {}\n", s.tools.join(", ")));
-                }
-                if let Some(ref notes) = s.notes {
-                    skill_block.push_str(&format!("**Notes**: {notes}\n"));
-                }
-                skill_block.push_str(&format!(
-                    "**Track record**: {:.0}% success ({} uses)\n\n",
-                    s.success_rate * 100.0, s.times_used
-                ));
+                skill_block.push('\n');
             }
+            // Track auto-injected skills for SkillRL R4 end-of-session recording
+            for s in matched.iter().chain(general.iter()) {
+                if seen.contains(&s.name) {
+                    injected_skill_names.push(s.name.clone());
+                }
+            }
+
             if !skill_block.is_empty() {
-                system_prompt.push_str("\n\n# Relevant Procedures\n");
-                system_prompt.push_str("(Auto-loaded skills matching your task. Follow these when applicable.)\n\n");
+                system_prompt.push_str("\n\n# Available Procedures\n");
+                system_prompt.push_str("You have access to these proven procedures. To use one, call `skill_search` with its name to load the full steps.\n\n");
                 system_prompt.push_str(&skill_block);
+                system_prompt.push_str("\nWhen you need a credential, API key, or account you don't have:\n1. Check env vars and config files first\n2. Try the browser tool to navigate the service's dashboard\n3. Only ask the user as a last resort — give them the exact URL and key name\n\nYou are resourceful. Figure things out. Use your tools creatively. Don't stop at the first obstacle.\n");
             }
         }
     }
@@ -974,6 +977,7 @@ pub(crate) fn run_agent_with_prompt(
     }
     let mut recent_actions: VecDeque<String> = VecDeque::with_capacity(30);
     let mut retrieved_skills: Vec<String> = Vec::new();
+    retrieved_skills.extend(injected_skill_names);
     let mut turns_since_fact_extract: usize = 0;
     let fact_extract_interval: usize = env_optional("AGENT_FACT_TURNS")
         .and_then(|v| v.parse().ok())
