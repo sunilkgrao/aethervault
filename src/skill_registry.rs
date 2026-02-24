@@ -460,7 +460,7 @@ pub(crate) fn match_skills_for_prompt(
 
 /// Bump this version whenever bootstrap skills are added or changed.
 /// Existing databases re-seed when the stored version is lower.
-const BOOTSTRAP_VERSION: u32 = 6;
+const BOOTSTRAP_VERSION: u32 = 7;
 
 /// Bootstrap essential skills, re-seeding when BOOTSTRAP_VERSION increases.
 pub(crate) fn bootstrap_skills(conn: &Connection) {
@@ -585,20 +585,20 @@ pub(crate) fn bootstrap_skills(conn: &Connection) {
         SkillRecord {
             name: "bootstrap:swarm-dev-task".into(),
             description: Some("Execute a full dev task via swarm mode: register → branch → code → test → PR → review".into()),
-            trigger: Some("implementing a feature, fixing a bug, or making a code change as a swarm task".into()),
+            trigger: Some("building an application, implementing a feature, fixing a bug, creating a project, or making code changes".into()),
             steps: vec![
-                "1. Use `swarm_create` to register the task with a descriptive name and detailed prompt".into(),
-                "2. Use `subagent_invoke` with name='swarm-coder', branch='swarm/{task-id}', and a precise prompt containing: what to change, which files, acceptance criteria, test requirements".into(),
-                "3. The coder agent will: read code → make changes → run tests → git add/commit/push → gh pr create".into(),
-                "4. Use `swarm_update` to record the PR number and URL".into(),
-                "5. The swarm-monitor cron will check CI and notify when ready for review".into(),
-                "6. For multiple independent tasks, use `subagent_batch` to spawn coders in parallel".into(),
+                "1. ALWAYS start with `swarm_create` — never skip, even for single tasks".into(),
+                "2. Decompose into parallel subtasks (frontend, backend, infra, tests)".into(),
+                "3. Use `subagent_batch` to spawn all swarm-coder agents in parallel with branch='swarm/{task-id}-{subtask}'".into(),
+                "4. Each coder: commits incrementally (1 commit per logical unit), pushes, creates PR".into(),
+                "5. Use `swarm_update` to record PR numbers. After all agents finish, verify end-to-end".into(),
+                "6. VERIFY: run the app, curl key endpoints, check docker logs. Never report success without testing".into(),
             ],
             tools: vec!["swarm_create".into(), "swarm_list".into(), "swarm_update".into(), "swarm_check".into(), "subagent_invoke".into(), "subagent_batch".into()],
             notes: Some("Each coder gets its own git worktree. Max 3 concurrent agents (pool has 3 accounts). The orchestrator (Linus) writes the prompt — coding agents just execute. Use swarm_list to check task status across restarts.".into()),
             success_rate: 0.0, times_used: 0, times_succeeded: 0,
             last_used: None, created_at: now.clone(),
-            contexts: vec!["feature".into(), "bug".into(), "fix".into(), "implement".into(), "build".into(), "code".into(), "develop".into(), "pr".into(), "pull request".into(), "swarm".into()],
+            contexts: vec!["feature".into(), "bug".into(), "fix".into(), "implement".into(), "build".into(), "code".into(), "develop".into(), "pr".into(), "pull request".into(), "swarm".into(), "app".into(), "application".into(), "project".into(), "create".into()],
         },
     ];
 

@@ -32,7 +32,7 @@
         "name": "coder",
         "description": "Code generation and engineering specialist. Use for writing code, debugging, refactoring, running tests, file system operations, and shell commands. Uses native Rust pool routing (Codex + Claude Code) with auto-failover.",
         "model_hook": "builtin:pool",
-        "system": "You are a senior software engineer working for AetherVault. Write clean, correct, well-tested code. Use exec to run commands, fs_read/fs_write for file operations. For complex coding tasks, break them into steps and execute methodically. Always verify your work compiles/runs before returning.",
+        "system": "You are a senior software engineer working for AetherVault. Write clean, correct, well-tested code. Use exec to run commands, fs_read/fs_write for file operations. For complex coding tasks, break them into steps and execute methodically. Always verify your work compiles/runs before returning. For web apps: start the server and curl key endpoints to confirm they respond correctly. For Docker builds: check `docker logs` after starting containers.",
         "tools": [
           "exec",
           "fs_list",
@@ -58,7 +58,7 @@
         "name": "coder-codex",
         "description": "Code generation specialist powered explicitly by Codex CLI. Bypasses pool router — always uses Codex directly.",
         "model_hook": "builtin:codex",
-        "system": "You are a senior software engineer working for AetherVault. Write clean, correct, well-tested code. Use exec to run commands, fs_read/fs_write for file operations. For complex coding tasks, break them into steps and execute methodically. Always verify your work compiles/runs before returning.",
+        "system": "You are a senior software engineer working for AetherVault. Write clean, correct, well-tested code. Use exec to run commands, fs_read/fs_write for file operations. For complex coding tasks, break them into steps and execute methodically. Always verify your work compiles/runs before returning. For web apps: start the server and curl key endpoints to confirm they respond correctly. For Docker builds: check `docker logs` after starting containers.",
         "tools": [
           "exec",
           "fs_list",
@@ -84,7 +84,7 @@
         "name": "coder-claude",
         "description": "Code generation specialist powered explicitly by Claude Code CLI. Bypasses pool router — always uses Claude Code directly.",
         "model_hook": "builtin:claude-code",
-        "system": "You are a senior software engineer working for AetherVault. Write clean, correct, well-tested code. Use exec to run commands, fs_read/fs_write for file operations. For complex coding tasks, break them into steps and execute methodically. Always verify your work compiles/runs before returning.",
+        "system": "You are a senior software engineer working for AetherVault. Write clean, correct, well-tested code. Use exec to run commands, fs_read/fs_write for file operations. For complex coding tasks, break them into steps and execute methodically. Always verify your work compiles/runs before returning. For web apps: start the server and curl key endpoints to confirm they respond correctly. For Docker builds: check `docker logs` after starting containers.",
         "tools": [
           "exec",
           "fs_list",
@@ -136,7 +136,7 @@
         "name": "swarm-coder",
         "description": "Isolated coding agent for swarm tasks. Runs in a git worktree, writes code, runs tests, commits, pushes, and creates PRs. Does not deviate from the task.",
         "model_hook": "builtin:pool",
-        "system": "You are a focused coding agent. Your task is given below. You have access to the full codebase in your working directory. Write clean code, run tests, commit your changes, push, and create a PR via `gh pr create --fill`. Do NOT deviate from the task. If blocked, explain clearly and stop.",
+        "system": "Write clean code and commit incrementally — one git commit per logical change (e.g., 'add models', 'add API routes', 'add tests'), never one giant commit. Run tests after each significant change. After all changes: push and create a PR via `gh pr create --fill`. Before reporting done, verify the build passes and test key endpoints with curl. Do NOT deviate. If blocked, explain clearly and stop.",
         "tools": [
           "exec",
           "fs_list",

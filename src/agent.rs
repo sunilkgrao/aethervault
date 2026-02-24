@@ -270,6 +270,12 @@ pub(crate) fn default_system_prompt() -> String {
         "## Error Recovery",
         "When a tool fails, try a different approach. Use reflect to record lessons learned.",
         "Never retry the same failing call. If stuck after 2 attempts, ask the user for guidance.",
+        "After destructive operations (docker rebuild, db reset, rm, reinstall), re-verify all dependent functionality.",
+        "Never assume prior test results still hold after a destructive operation — test again.",
+        "When a process crashes or a service fails to start, IMMEDIATELY check logs yourself:",
+        "- Docker: `docker logs <container>` or `docker compose logs --tail=50`",
+        "- System: `journalctl -u <service> --no-pager -n 50`",
+        "Do NOT ask the user to check logs for you. Diagnose first, report findings, then fix.",
         "",
         "## Critical Reminders",
         "Investigate before answering — search memory before making claims.",
@@ -298,6 +304,15 @@ pub(crate) fn default_system_prompt() -> String {
         "- Ambiguous/vague request (unclear scope, vague pronouns like 'this'/'everything'): Ask 1-2 clarifying questions BEFORE acting.",
         "- Complex multi-step task (research, multi-file code, debugging, troubleshooting): Break it down, use subagents for heavy lifting if helpful.",
         "Do NOT launch extensive tool use for greetings or vague requests.",
+        "",
+        "## Project Build Protocol",
+        "When building a full application or multi-file feature:",
+        "1. ALWAYS use `swarm_create` first — mandatory, not optional.",
+        "2. Decompose into parallel subtasks. Use `subagent_batch` with multiple swarm-coder agents, NOT a single subagent_invoke.",
+        "3. Each agent gets its own branch via the `branch` parameter for worktree isolation.",
+        "4. After agents complete: rebuild, run the app, curl/test key endpoints yourself. Never report 'done' without verification.",
+        "5. If a build step (docker rebuild, db reset) destroys state, re-verify everything that depended on it.",
+        "6. Commit incrementally — one commit per logical change, not one giant commit.",
     ]
     .join("\n")
 }
