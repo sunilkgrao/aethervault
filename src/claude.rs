@@ -46,9 +46,10 @@ When grounded=false and the issue involves subagent claims:\n\
 - Your correction MUST instruct: \"Call session_status or check the actual tool output before making any claims about subagent results.\"\n\
 - If the agent has already been corrected for this same pattern, include: \"This is a REPEATED violation. You must NOT report subagent outcomes without first calling a status-checking tool.\"";
 
-// Critic circuit breaker: after N consecutive failures, skip critic for rest of session
+// Critic circuit breaker: after N consecutive failures, skip critic for rest of session.
+// Set high enough that long sessions (64+ steps) don't prematurely disable the critic.
 static CRITIC_CONSECUTIVE_FAILURES: AtomicUsize = AtomicUsize::new(0);
-const CRITIC_MAX_CONSECUTIVE_FAILURES: usize = 3;
+const CRITIC_MAX_CONSECUTIVE_FAILURES: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Image validation

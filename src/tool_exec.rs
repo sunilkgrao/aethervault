@@ -241,15 +241,19 @@ fn classify_exec_policy(command: &str) -> ExecPolicy {
         };
     }
 
-    // Build tools: no hard timeout, stale kill at 5 minutes
+    // Build tools: no hard timeout, stale kill at 10 minutes.
+    // Docker compose builds and piped commands can produce no stdout for extended periods.
     if cmd.starts_with("cargo build") || cmd.starts_with("cargo test")
         || cmd.starts_with("cargo check") || cmd.starts_with("cargo install")
         || cmd.starts_with("npm install") || cmd.starts_with("npm run")
         || cmd.starts_with("make") || cmd.starts_with("docker build")
+        || cmd.starts_with("docker compose") || cmd.starts_with("docker-compose")
+        || cmd.starts_with("pip install") || cmd.starts_with("yarn ")
+        || cmd.starts_with("npx next build") || cmd.starts_with("alembic ")
     {
         return ExecPolicy {
             hard_timeout_ms: EXEC_NO_TIMEOUT,
-            stale_threshold_ms: 300_000,  // 5 minutes
+            stale_threshold_ms: 600_000,  // 10 minutes — builds piped through grep produce no output
         };
     }
 
@@ -960,6 +964,13 @@ const DEFAULT_EXEC_BG_URL: &str = "http://127.0.0.1:8082";
 const DEFAULT_SUBAGENT_HOOK: &str = "codex-hook.sh";
 const DEFAULT_SUBAGENT_MAX_STEPS: usize = 64;
 const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 600;
+
+fn subagent_max_steps_default() -> usize {
+    std::env::var("AETHERVAULT_SUBAGENT_MAX_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(subagent_max_steps_default)
+}
 
 fn background_exec_job_name(command: &str) -> String {
     let short: String = command.chars().take(80).collect();
@@ -2726,7 +2737,7 @@ pub(crate) fn execute_tool(
                 .unwrap_or_else(|| DEFAULT_SUBAGENT_HOOK.to_string());
             let config_max_steps = config.agent.as_ref()
                 .and_then(|a| a.subagent_max_steps)
-                .unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
+                .unwrap_or_else(subagent_max_steps_default);
             let synth_spec = SubagentSpec {
                 name: parsed.name.clone(),
                 description: None,
@@ -2785,7 +2796,7 @@ pub(crate) fn execute_tool(
             }
 
             // Resolve max_steps: invocation arg > spec > default 64
-            let max_steps = parsed.max_steps.or(spec.max_steps).unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
+            let max_steps = parsed.max_steps.or(spec.max_steps).unwrap_or_else(subagent_max_steps_default);
 
             let cfg = build_bridge_agent_config(
                 mv2.to_path_buf(),
@@ -2809,6 +2820,23 @@ pub(crate) fn execute_tool(
                 match crate::swarm::create_worktree(&repo_path, branch) {
                     Ok(wt_path) => {
                         eprintln!("[subagent_invoke] Created worktree at {} for branch {}", wt_path.display(), branch);
+                        // Auto-update matching swarm task to "running"
+                        if let Some(ref ws) = workspace_override {
+                            if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
+                                let tasks = crate::swarm::swarm_list_tasks(&sdb, Some("queued"), Some(100));
+                                for task in &tasks {
+                                    if task.branch.as_deref() == Some(branch) || task.name.contains(&branch.replace("swarm/", "")) {
+                                        let _ = crate::swarm::swarm_update_task(
+                                            &sdb, &task.id, Some("running"),
+                                            Some(branch), Some(&wt_path.to_string_lossy()),
+                                            None, None, None, None, None, None, None,
+                                        );
+                                        eprintln!("[subagent_invoke] Auto-updated swarm task {} to running", task.id);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         Some((wt_path, branch.clone()))
                     }
                     Err(e) => {
@@ -2969,7 +2997,7 @@ pub(crate) fn execute_tool(
                 let mut model_hook = inv.model_hook.clone();
                 let config_max_steps = config_snapshot.agent.as_ref()
                     .and_then(|a| a.subagent_max_steps)
-                    .unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
+                    .unwrap_or_else(subagent_max_steps_default);
                 let synth_spec = SubagentSpec {
                     name: inv.name.clone(),
                     description: None,
@@ -3001,7 +3029,7 @@ pub(crate) fn execute_tool(
                 // Resolve max_steps: invocation arg > spec > default 64
                 let max_steps = inv.max_steps
                     .or(spec.max_steps)
-                    .unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
+                    .unwrap_or_else(subagent_max_steps_default);
 
                 let cfg = build_bridge_agent_config(
                     mv2.to_path_buf(),
@@ -3654,7 +3682,7 @@ pub(crate) fn execute_tool(
                 .unwrap_or_else(|| DEFAULT_SUBAGENT_HOOK.to_string());
             let config_max_steps = config.agent.as_ref()
                 .and_then(|a| a.subagent_max_steps)
-                .unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
+                .unwrap_or_else(subagent_max_steps_default);
             let synth_spec = SubagentSpec {
                 name: parsed.name.clone(),
                 description: None,
@@ -3675,7 +3703,7 @@ pub(crate) fn execute_tool(
             if system.is_none() { system = spec.system.clone(); }
             if model_hook.is_none() { model_hook = spec.model_hook.clone(); }
 
-            let max_steps = parsed.max_steps.or(spec.max_steps).unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS);
+            let max_steps = parsed.max_steps.or(spec.max_steps).unwrap_or_else(subagent_max_steps_default);
 
             // Generate session ID and create workspace
             let session_id = {

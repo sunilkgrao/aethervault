@@ -347,7 +347,15 @@ pub(crate) fn compact_messages(
     }
     // Preserve all leading system blocks (supports cache-split: stable prefix + dynamic suffix)
     let system_end = messages.iter().take_while(|m| m.role == "system").count();
-    let summary_end = messages.len().saturating_sub(keep_recent);
+    let mut summary_end = messages.len().saturating_sub(keep_recent);
+    // Ensure we don't split in the middle of a tool_use→tool_result pair.
+    // If `recent` would start with a "tool" role message, back up to include the
+    // preceding assistant message with the corresponding tool_calls.
+    while summary_end > system_end && summary_end < messages.len()
+        && messages[summary_end].role == "tool"
+    {
+        summary_end = summary_end.saturating_sub(1);
+    }
     let summary_start = system_end.min(summary_end);
     let system_msgs: Vec<_> = messages[..system_end].to_vec();
     let to_summarize: Vec<_> = messages[summary_start..summary_end].to_vec();

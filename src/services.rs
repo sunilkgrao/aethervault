@@ -510,20 +510,32 @@ pub(crate) fn save_triggers(db: &MemoryDb, triggers: &[TriggerEntry]) -> Result<
 // ── Filesystem helpers ──────────────────────────────────────────────────
 
 pub(crate) fn allowed_fs_roots(workspace_override: &Option<PathBuf>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
     if let Some(raw) = env_optional("AETHERVAULT_FS_ROOTS") {
-        let roots: Vec<PathBuf> = raw
-            .split(':')
-            .filter(|s| !s.trim().is_empty())
-            .map(PathBuf::from)
-            .collect();
-        if !roots.is_empty() {
-            return roots;
+        for entry in raw.split(':').filter(|s| !s.trim().is_empty()) {
+            roots.push(PathBuf::from(entry));
         }
     }
     if let Some(ws) = workspace_override {
-        return vec![ws.clone()];
+        if !roots.iter().any(|r| r == ws) {
+            roots.push(ws.clone());
+        }
     }
-    vec![env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
+    // Always include swarm worktree base so subagents can access worktrees
+    let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let swarm_base = PathBuf::from(&home).join("aethervault-swarm");
+    if swarm_base.exists() && !roots.iter().any(|r| r == &swarm_base) {
+        roots.push(swarm_base);
+    }
+    // Include home directory so agents can create new project directories
+    let home_path = PathBuf::from(&home);
+    if !roots.iter().any(|r| r == &home_path) {
+        roots.push(home_path);
+    }
+    if roots.is_empty() {
+        roots.push(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    }
+    roots
 }
 
 pub(crate) fn resolve_fs_path(path: &str, roots: &[PathBuf]) -> Result<PathBuf, String> {
