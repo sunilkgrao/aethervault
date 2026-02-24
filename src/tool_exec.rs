@@ -940,6 +940,10 @@ use crate::{
     ToolProjectUpdateArgs,
     ToolProjectListArgs,
     ActiveProject,
+    ToolSwarmCreateArgs,
+    ToolSwarmListArgs,
+    ToolSwarmUpdateArgs,
+    ToolSwarmCheckArgs,
     open_skill_db,
     upsert_skill,
     search_skills,
@@ -2796,8 +2800,38 @@ pub(crate) fn execute_tool(
                 8,
             )
             .map_err(|e| e.to_string())?;
+
+            // Worktree isolation: if branch is set, create an isolated git worktree
+            let worktree_info: Option<(PathBuf, String)> = if let Some(ref branch) = parsed.branch {
+                let repo_path = PathBuf::from(
+                    std::env::var("AETHERVAULT_REPO").unwrap_or_else(|_| "/root/aethervault".to_string())
+                );
+                match crate::swarm::create_worktree(&repo_path, branch) {
+                    Ok(wt_path) => {
+                        eprintln!("[subagent_invoke] Created worktree at {} for branch {}", wt_path.display(), branch);
+                        Some((wt_path, branch.clone()))
+                    }
+                    Err(e) => {
+                        eprintln!("[subagent_invoke] Worktree creation failed: {e}");
+                        return Err(format!("Failed to create worktree for branch '{}': {}", branch, e));
+                    }
+                }
+            } else {
+                None
+            };
+
+            // If worktree was created, prepend cwd instruction to prompt
+            let prompt = if let Some((ref wt_path, _)) = worktree_info {
+                format!(
+                    "WORKING DIRECTORY: {}\nAll file operations and git commands should be run in this directory.\n\n{}",
+                    wt_path.display(),
+                    parsed.prompt
+                )
+            } else {
+                parsed.prompt.clone()
+            };
+
             let session = format!("subagent:{}:{}", parsed.name, Utc::now().timestamp());
-            let prompt = parsed.prompt.clone();
 
             // Non-blocking path: when bg_registry is present, register and return immediately
             if let Some((chat_id, registry)) = bg_registry.as_ref() {
@@ -4029,6 +4063,133 @@ pub(crate) fn execute_tool(
             Ok(ToolExecution {
                 output,
                 details: serde_json::json!({"count": filtered.len()}),
+                is_error: false,
+            })
+        }
+        // ── Swarm tools ──────────────────────────────────────────────
+        "swarm_create" => {
+            let parsed: ToolSwarmCreateArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let ws = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let conn = crate::swarm::open_swarm_db(&ws)
+                .map_err(|e| format!("swarm db: {e}"))?;
+            let task = crate::swarm::swarm_create_task(
+                &conn,
+                &parsed.name,
+                &parsed.prompt,
+                parsed.max_retries,
+            )
+            .map_err(|e| format!("create task: {e}"))?;
+            let output = format!(
+                "Swarm task created: {} ({})\nStatus: {}\nMax retries: {}",
+                task.name, task.id, task.status.as_str(), task.max_retries
+            );
+            Ok(ToolExecution {
+                output,
+                details: serde_json::to_value(&task).unwrap_or_default(),
+                is_error: false,
+            })
+        }
+        "swarm_list" => {
+            let parsed: ToolSwarmListArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let ws = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let conn = crate::swarm::open_swarm_db(&ws)
+                .map_err(|e| format!("swarm db: {e}"))?;
+            let tasks = crate::swarm::swarm_list_tasks(
+                &conn,
+                parsed.status.as_deref(),
+                parsed.limit,
+            );
+            if tasks.is_empty() {
+                return Ok(ToolExecution {
+                    output: "No swarm tasks found.".to_string(),
+                    details: serde_json::json!({ "count": 0 }),
+                    is_error: false,
+                });
+            }
+            let mut output = format!("Swarm tasks ({}):\n", tasks.len());
+            for t in &tasks {
+                output.push_str(&format!(
+                    "\n**{}** [{}] — {}\n  Status: {}",
+                    t.id, t.status.as_str(), t.name,
+                    t.status.as_str(),
+                ));
+                if let Some(ref b) = t.branch {
+                    output.push_str(&format!(" | Branch: {b}"));
+                }
+                if let Some(pr) = t.pr_number {
+                    output.push_str(&format!(" | PR #{pr}"));
+                }
+                if let Some(ref ci) = t.ci_status {
+                    output.push_str(&format!(" | CI: {ci}"));
+                }
+                if let Some(ref rv) = t.review_status {
+                    output.push_str(&format!(" | Review: {rv}"));
+                }
+                if t.retry_count > 0 {
+                    output.push_str(&format!(" | Retries: {}/{}", t.retry_count, t.max_retries));
+                }
+                output.push('\n');
+            }
+            Ok(ToolExecution {
+                output,
+                details: serde_json::json!({ "count": tasks.len() }),
+                is_error: false,
+            })
+        }
+        "swarm_update" => {
+            let parsed: ToolSwarmUpdateArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let ws = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let conn = crate::swarm::open_swarm_db(&ws)
+                .map_err(|e| format!("swarm db: {e}"))?;
+            let task = crate::swarm::swarm_update_task(
+                &conn,
+                &parsed.id,
+                parsed.status.as_deref(),
+                parsed.branch.as_deref(),
+                parsed.worktree_path.as_deref(),
+                parsed.pr_number,
+                parsed.pr_url.as_deref(),
+                parsed.ci_status.as_deref(),
+                parsed.review_status.as_deref(),
+                parsed.error_context.as_deref(),
+                parsed.agent_backend.as_deref(),
+                None, // retry_count managed internally
+            )
+            .map_err(|e| format!("update task: {e}"))?;
+            let output = format!(
+                "Updated swarm task {} — status: {}{}{}",
+                task.id,
+                task.status.as_str(),
+                task.pr_number.map(|n| format!(", PR #{n}")).unwrap_or_default(),
+                task.ci_status.as_ref().map(|s| format!(", CI: {s}")).unwrap_or_default(),
+            );
+            Ok(ToolExecution {
+                output,
+                details: serde_json::to_value(&task).unwrap_or_default(),
+                is_error: false,
+            })
+        }
+        "swarm_check" => {
+            let _parsed: ToolSwarmCheckArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let ws = workspace_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            let conn = crate::swarm::open_swarm_db(&ws)
+                .map_err(|e| format!("swarm db: {e}"))?;
+            let output = crate::swarm::swarm_check_open_tasks(&conn);
+            Ok(ToolExecution {
+                output,
+                details: serde_json::Value::Null,
                 is_error: false,
             })
         }

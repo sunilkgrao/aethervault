@@ -131,6 +131,77 @@
         "max_steps": 16,
         "timeout_secs": 120,
         "model_hook": "builtin:pool"
+      },
+      {
+        "name": "swarm-coder",
+        "description": "Isolated coding agent for swarm tasks. Runs in a git worktree, writes code, runs tests, commits, pushes, and creates PRs. Does not deviate from the task.",
+        "model_hook": "builtin:pool",
+        "system": "You are a focused coding agent. Your task is given below. You have access to the full codebase in your working directory. Write clean code, run tests, commit your changes, push, and create a PR via `gh pr create --fill`. Do NOT deviate from the task. If blocked, explain clearly and stop.",
+        "tools": [
+          "exec",
+          "fs_list",
+          "fs_read",
+          "fs_write",
+          "http_request"
+        ],
+        "disallowed_tools": [
+          "subagent_invoke",
+          "subagent_batch",
+          "skill_store",
+          "reflect",
+          "memory_search",
+          "self_upgrade",
+          "scale",
+          "notify"
+        ],
+        "max_steps": 64,
+        "timeout_secs": 1200
+      },
+      {
+        "name": "swarm-reviewer-codex",
+        "description": "Codex code reviewer — reviews PRs created by Claude Code agents. Read-only: reads diffs and posts review comments.",
+        "model_hook": "builtin:codex",
+        "system": "You are a thorough code reviewer. Read the PR diff via `gh pr diff`. Focus on: logic errors, missing error handling, race conditions, edge cases, security issues, and test coverage. Post your review as a comment via `gh pr review --comment`. Be specific — cite line numbers. Flag only real issues, not style nitpicks.",
+        "tools": [
+          "exec",
+          "fs_list",
+          "fs_read",
+          "http_request"
+        ],
+        "disallowed_tools": [
+          "fs_write",
+          "subagent_invoke",
+          "subagent_batch",
+          "skill_store",
+          "self_upgrade",
+          "scale",
+          "notify"
+        ],
+        "max_steps": 32,
+        "timeout_secs": 600
+      },
+      {
+        "name": "swarm-reviewer-claude",
+        "description": "Claude Code reviewer — reviews PRs created by Codex agents. Read-only: reads diffs and posts review comments.",
+        "model_hook": "builtin:claude-code",
+        "system": "You are a thorough code reviewer. Read the PR diff via `gh pr diff`. Focus on: logic errors, missing error handling, race conditions, edge cases, security issues, and test coverage. Post your review as a comment via `gh pr review --comment`. Be specific — cite line numbers. Flag only real issues, not style nitpicks.",
+        "tools": [
+          "exec",
+          "fs_list",
+          "fs_read",
+          "http_request"
+        ],
+        "disallowed_tools": [
+          "fs_write",
+          "subagent_invoke",
+          "subagent_batch",
+          "skill_store",
+          "self_upgrade",
+          "scale",
+          "notify"
+        ],
+        "max_steps": 32,
+        "timeout_secs": 600
       }
     ],
     "default_subagent_hook": "builtin:pool"

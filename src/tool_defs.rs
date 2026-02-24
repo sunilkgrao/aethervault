@@ -551,7 +551,7 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "subagent_invoke",
-            "description": "Spawn a subagent to perform a task. Use ANY descriptive name — the name should describe what the agent does (e.g., 'log-analyzer', 'api-tester', 'deploy-checker'). The subagent runs with its own session, tools, and memory.",
+            "description": "Spawn a subagent to perform a task. Use ANY descriptive name — the name should describe what the agent does (e.g., 'log-analyzer', 'api-tester', 'deploy-checker'). The subagent runs with its own session, tools, and memory. For swarm tasks, set branch to run in an isolated git worktree.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -559,7 +559,8 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
                     "prompt": { "type": "string", "description": "Detailed task description for the subagent. Be specific — the subagent has its own context." },
                     "system": { "type": "string", "description": "Override the subagent's system prompt" },
                     "model_hook": { "type": "string", "description": "Override the subagent's model hook" },
-                    "max_steps": { "type": "integer", "description": "Override max reasoning steps for this invocation. Default: from subagent config, fallback 64." }
+                    "max_steps": { "type": "integer", "description": "Override max reasoning steps for this invocation. Default: from subagent config, fallback 64." },
+                    "branch": { "type": "string", "description": "Git branch name for worktree isolation. When set, the agent runs in a fresh git worktree. Use for swarm dev tasks to prevent conflicts between concurrent agents." }
                 },
                 "required": ["name", "prompt"]
             }
@@ -789,6 +790,59 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        // ── Swarm tools ──────────────────────────────────────────────
+        serde_json::json!({
+            "name": "swarm_create",
+            "description": "Register a new dev task in the swarm registry. Creates a persistent task entry that survives restarts. Use with subagent_invoke (branch param) to spawn isolated coding agents.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Descriptive task name (e.g., 'fix-auth-bug', 'add-webhook-support')" },
+                    "prompt": { "type": "string", "description": "Full task prompt for the coding agent — be specific about what to change, which files, acceptance criteria" },
+                    "max_retries": { "type": "integer", "description": "Max auto-retry attempts on CI failure (default: 3)" }
+                },
+                "required": ["name", "prompt"]
+            }
+        }),
+        serde_json::json!({
+            "name": "swarm_list",
+            "description": "List swarm tasks, optionally filtered by status. Shows task history across restarts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "description": "Filter: queued, running, pr_open, reviewing, done, failed" },
+                    "limit": { "type": "integer", "description": "Max results (default: 50)" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "swarm_update",
+            "description": "Update fields on a swarm task (status, branch, PR info, CI status, etc.).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task ID (e.g., 'swarm-1')" },
+                    "status": { "type": "string", "description": "New status: queued, running, pr_open, reviewing, done, failed" },
+                    "branch": { "type": "string" },
+                    "worktree_path": { "type": "string" },
+                    "pr_number": { "type": "integer" },
+                    "pr_url": { "type": "string" },
+                    "ci_status": { "type": "string", "description": "pending, passing, or failing" },
+                    "review_status": { "type": "string", "description": "pending, approved, or changes_requested" },
+                    "error_context": { "type": "string" },
+                    "agent_backend": { "type": "string", "description": "codex or claude-code" }
+                },
+                "required": ["id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "swarm_check",
+            "description": "Check CI and review status for all open swarm tasks. Runs `gh pr checks` and `gh pr view` to update the registry. Call periodically or after spawning agents.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
     ]
 }
 
@@ -885,6 +939,10 @@ pub(crate) fn base_tool_names() -> HashSet<String> {
         "excalidraw",
         "project_update",
         "project_list",
+        "swarm_create",
+        "swarm_list",
+        "swarm_update",
+        "swarm_check",
     ]
     .into_iter()
     .map(|s| s.to_string())

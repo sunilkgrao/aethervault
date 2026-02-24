@@ -1,0 +1,16 @@
+[Unit]
+Description=AetherVault Swarm Monitor — check CI, retry failures, notify on completion
+After=aethervault.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/aethervault
+EnvironmentFile=/root/.aethervault/.env
+ExecStart=/root/aethervault/scripts/swarm-monitor.sh
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -372,6 +372,10 @@ pub(crate) struct ToolSubagentInvokeArgs {
     /// Override max_steps for this invocation.
     #[serde(default)]
     pub(crate) max_steps: Option<usize>,
+    /// Git branch name for worktree isolation (swarm mode).
+    /// When set, the agent runs in an isolated git worktree.
+    #[serde(default)]
+    pub(crate) branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -577,4 +581,52 @@ pub(crate) struct FusedCandidate {
     pub(crate) rrf_score: f32,
     pub(crate) rrf_bonus: f32,
     pub(crate) sources: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Swarm tool args
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolSwarmCreateArgs {
+    pub(crate) name: String,
+    pub(crate) prompt: String,
+    #[serde(default)]
+    pub(crate) max_retries: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolSwarmListArgs {
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolSwarmUpdateArgs {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) branch: Option<String>,
+    #[serde(default)]
+    pub(crate) worktree_path: Option<String>,
+    #[serde(default)]
+    pub(crate) pr_number: Option<i64>,
+    #[serde(default)]
+    pub(crate) pr_url: Option<String>,
+    #[serde(default)]
+    pub(crate) ci_status: Option<String>,
+    #[serde(default)]
+    pub(crate) review_status: Option<String>,
+    #[serde(default)]
+    pub(crate) error_context: Option<String>,
+    #[serde(default)]
+    pub(crate) agent_backend: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolSwarmCheckArgs {
+    // No required args — checks all open tasks
 }

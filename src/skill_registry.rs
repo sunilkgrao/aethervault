@@ -394,6 +394,10 @@ fn expand_synonyms(word: &str) -> Vec<String> {
         ("pull", &["github", "git", "merge", "branch"]),
         ("windows", &["desktop", "raodesktop", "wsl"]),
         ("desktop", &["windows", "raodesktop"]),
+        ("swarm", &["parallel", "concurrent", "branch", "worktree"]),
+        ("implement", &["build", "code", "develop", "feature", "swarm"]),
+        ("feature", &["implement", "build", "develop", "swarm"]),
+        ("develop", &["implement", "build", "code", "feature", "swarm"]),
     ];
     let mut results = vec![lower.clone()];
     for (key, expansions) in synonyms {
@@ -456,7 +460,7 @@ pub(crate) fn match_skills_for_prompt(
 
 /// Bump this version whenever bootstrap skills are added or changed.
 /// Existing databases re-seed when the stored version is lower.
-const BOOTSTRAP_VERSION: u32 = 5;
+const BOOTSTRAP_VERSION: u32 = 6;
 
 /// Bootstrap essential skills, re-seeding when BOOTSTRAP_VERSION increases.
 pub(crate) fn bootstrap_skills(conn: &Connection) {
@@ -577,6 +581,24 @@ pub(crate) fn bootstrap_skills(conn: &Connection) {
             success_rate: 0.0, times_used: 0, times_succeeded: 0,
             last_used: None, created_at: now.clone(),
             contexts: vec!["windows".into(), "desktop".into(), "raodesktop".into(), "wsl2".into(), "remote".into()],
+        },
+        SkillRecord {
+            name: "bootstrap:swarm-dev-task".into(),
+            description: Some("Execute a full dev task via swarm mode: register → branch → code → test → PR → review".into()),
+            trigger: Some("implementing a feature, fixing a bug, or making a code change as a swarm task".into()),
+            steps: vec![
+                "1. Use `swarm_create` to register the task with a descriptive name and detailed prompt".into(),
+                "2. Use `subagent_invoke` with name='swarm-coder', branch='swarm/{task-id}', and a precise prompt containing: what to change, which files, acceptance criteria, test requirements".into(),
+                "3. The coder agent will: read code → make changes → run tests → git add/commit/push → gh pr create".into(),
+                "4. Use `swarm_update` to record the PR number and URL".into(),
+                "5. The swarm-monitor cron will check CI and notify when ready for review".into(),
+                "6. For multiple independent tasks, use `subagent_batch` to spawn coders in parallel".into(),
+            ],
+            tools: vec!["swarm_create".into(), "swarm_list".into(), "swarm_update".into(), "swarm_check".into(), "subagent_invoke".into(), "subagent_batch".into()],
+            notes: Some("Each coder gets its own git worktree. Max 3 concurrent agents (pool has 3 accounts). The orchestrator (Linus) writes the prompt — coding agents just execute. Use swarm_list to check task status across restarts.".into()),
+            success_rate: 0.0, times_used: 0, times_succeeded: 0,
+            last_used: None, created_at: now.clone(),
+            contexts: vec!["feature".into(), "bug".into(), "fix".into(), "implement".into(), "build".into(), "code".into(), "develop".into(), "pr".into(), "pull request".into(), "swarm".into()],
         },
     ];
 
