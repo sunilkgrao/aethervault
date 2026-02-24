@@ -456,7 +456,7 @@ pub(crate) fn match_skills_for_prompt(
 
 /// Bump this version whenever bootstrap skills are added or changed.
 /// Existing databases re-seed when the stored version is lower.
-const BOOTSTRAP_VERSION: u32 = 4;
+const BOOTSTRAP_VERSION: u32 = 5;
 
 /// Bootstrap essential skills, re-seeding when BOOTSTRAP_VERSION increases.
 pub(crate) fn bootstrap_skills(conn: &Connection) {

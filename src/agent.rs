@@ -711,28 +711,72 @@ pub(crate) fn run_agent_with_prompt(
                 rebuild_fts5_index(&conn);
             }
 
-            // Match skills relevant to this specific prompt
-            let matched = match_skills_for_prompt(&conn, &prompt_text, 5);
+            // Match skills against session context (not just current message)
+            // so follow-up messages like "try again" still match earlier topics.
+            let match_context = if let Some(ref sess_id) = session {
+                let turns = load_session_turns(sess_id, 20);
+                let recent: String = turns.iter().rev().take(6)
+                    .map(|t| t.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{} {}", recent, &prompt_text)
+            } else {
+                prompt_text.clone()
+            };
+            let matched = match_skills_for_prompt(&conn, &match_context, 5);
             // Also get top general skills by success rate
             let general = list_skills(&conn, 3);
 
             let mut seen: HashSet<String> = HashSet::new();
             let mut skill_block = String::new();
+            let mut inline_count = 0usize;
+            // Inline full steps for top 3 matched skills; one-liner for the rest
             for s in matched.iter().chain(general.iter()) {
                 if !seen.insert(s.name.clone()) { continue; }
-                skill_block.push_str(&format!("- **{}**", s.name));
-                if let Some(ref desc) = s.description {
-                    skill_block.push_str(&format!(": {}", desc));
-                } else if let Some(ref trigger) = s.trigger {
-                    skill_block.push_str(&format!(" — {}", trigger));
+                let is_matched = matched.iter().any(|m| m.name == s.name);
+                if is_matched && inline_count < 3 && !s.steps.is_empty() {
+                    // Full inline expansion
+                    skill_block.push_str(&format!("### {}", s.name));
+                    if let Some(ref desc) = s.description {
+                        skill_block.push_str(&format!(" — {}", desc));
+                    }
+                    if s.times_used > 0 {
+                        skill_block.push_str(&format!(" ({:.0}% success)", s.success_rate * 100.0));
+                    }
+                    skill_block.push('\n');
+                    if let Some(ref trigger) = s.trigger {
+                        skill_block.push_str(&format!("**When:** {}\n", trigger));
+                    }
+                    skill_block.push_str("**Steps:**\n");
+                    for (i, step) in s.steps.iter().enumerate() {
+                        skill_block.push_str(&format!("{}. {}\n", i + 1, step));
+                    }
+                    if !s.tools.is_empty() {
+                        skill_block.push_str(&format!("**Tools:** {}\n", s.tools.join(", ")));
+                    }
+                    if let Some(ref notes) = s.notes {
+                        if !notes.is_empty() {
+                            skill_block.push_str(&format!("**Notes:** {}\n", notes));
+                        }
+                    }
+                    skill_block.push('\n');
+                    inline_count += 1;
+                } else {
+                    // One-liner summary
+                    skill_block.push_str(&format!("- **{}**", s.name));
+                    if let Some(ref desc) = s.description {
+                        skill_block.push_str(&format!(": {}", desc));
+                    } else if let Some(ref trigger) = s.trigger {
+                        skill_block.push_str(&format!(" — {}", trigger));
+                    }
+                    if !s.contexts.is_empty() {
+                        skill_block.push_str(&format!(" [{}]", s.contexts.join(", ")));
+                    }
+                    if s.times_used > 0 {
+                        skill_block.push_str(&format!(" ({:.0}% success)", s.success_rate * 100.0));
+                    }
+                    skill_block.push('\n');
                 }
-                if !s.contexts.is_empty() {
-                    skill_block.push_str(&format!(" [{}]", s.contexts.join(", ")));
-                }
-                if s.times_used > 0 {
-                    skill_block.push_str(&format!(" ({:.0}% success)", s.success_rate * 100.0));
-                }
-                skill_block.push('\n');
             }
             // Track auto-injected skills for SkillRL R4 end-of-session recording
             for s in matched.iter().chain(general.iter()) {
@@ -743,7 +787,11 @@ pub(crate) fn run_agent_with_prompt(
 
             if !skill_block.is_empty() {
                 system_prompt.push_str("\n\n# Available Procedures\n");
-                system_prompt.push_str("You have access to these proven procedures. To use one, call `skill_search` with its name to load the full steps.\n\n");
+                if inline_count > 0 {
+                    system_prompt.push_str("Follow the steps below directly when the procedure matches. For other procedures, call `skill_search` with its name to load full steps.\n\n");
+                } else {
+                    system_prompt.push_str("You have access to these proven procedures. To use one, call `skill_search` with its name to load the full steps.\n\n");
+                }
                 system_prompt.push_str(&skill_block);
                 system_prompt.push_str("\nWhen you need a credential, API key, or account you don't have:\n1. Check env vars and config files first\n2. Try the browser tool to navigate the service's dashboard\n3. Only ask the user as a last resort — give them the exact URL and key name\n\nYou are resourceful. Figure things out. Use your tools creatively. Don't stop at the first obstacle.\n");
             }
