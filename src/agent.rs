@@ -726,6 +726,7 @@ pub(crate) fn run_agent_with_prompt(
     }
 
     let mut injected_skill_names: Vec<String> = Vec::new();
+    let mut swarm_skill_matched = false;
     // --- SkillRL R1: Auto-inject top skills into stable prefix ---
     if let Some(workspace) = resolve_workspace(None, &agent_cfg) {
         let db_path = workspace.join("skills.sqlite");
@@ -811,6 +812,11 @@ pub(crate) fn run_agent_with_prompt(
                 if seen.contains(&s.name) {
                     injected_skill_names.push(s.name.clone());
                 }
+            }
+
+            // Detect swarm-dev-task skill match for proactive orchestrator enforcement
+            if matched.iter().any(|s| s.name == "bootstrap:swarm-dev-task") {
+                swarm_skill_matched = true;
             }
 
             if !skill_block.is_empty() {
@@ -1078,6 +1084,17 @@ pub(crate) fn run_agent_with_prompt(
         let allowed: std::collections::HashSet<String> = filter.iter().cloned().collect();
         active_tools.retain(|t| allowed.contains(t));
     }
+    // --- Proactive Orchestrator Enforcement ---
+    // When the swarm-dev-task skill matched the user's prompt AND this is the main agent
+    // (not a subagent), strip exec/fs_write BEFORE the first LLM call.
+    // This makes it structurally impossible for the orchestrator to code directly —
+    // it MUST delegate to swarm-coder agents.
+    let is_subagent_early = session.as_deref().map(|s| s.starts_with("subagent:")).unwrap_or(false);
+    if swarm_skill_matched && !is_subagent_early && tool_filter.is_none() {
+        active_tools.remove("exec");
+        active_tools.remove("fs_write");
+        eprintln!("[harness] PROACTIVE ORCHESTRATOR: swarm-dev-task skill matched — exec/fs_write stripped before first response");
+    }
     let mut tools = tools_from_active(&tool_map, &active_tools);
     let mut tool_results: Vec<AgentToolResult> = Vec::new();
     let should_log = log || agent_cfg.log.unwrap_or(false);
@@ -1161,7 +1178,10 @@ pub(crate) fn run_agent_with_prompt(
     // strip exec and fs_write so the orchestrator can only plan, delegate, and verify.
     // This enforces the OpenClaw pattern: orchestrator writes prompts, not code.
     let is_subagent = session.as_deref().map(|s| s.starts_with("subagent:")).unwrap_or(false);
-    let mut orchestrator_mode = false;
+    let mut orchestrator_mode = swarm_skill_matched && !is_subagent_early && tool_filter.is_none();
+    if orchestrator_mode {
+        eprintln!("[harness] ORCHESTRATOR MODE (proactive): swarm-dev-task skill matched, tools already stripped");
+    }
     if !is_subagent && tool_filter.is_none() {
         if let Some(ref ws) = workspace_env {
             if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
