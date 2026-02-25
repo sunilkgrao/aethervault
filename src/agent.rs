@@ -1062,13 +1062,12 @@ pub(crate) fn run_agent_with_prompt(
     if let Some(ref filter) = tool_filter {
         let allowed: std::collections::HashSet<&str> = filter.iter().map(|s| s.as_str()).collect();
         full_catalog.retain(|t| {
-            t.get("function")
-                .and_then(|f| f.get("name"))
+            t.get("name")
                 .and_then(|n| n.as_str())
                 .map(|name| allowed.contains(name))
                 .unwrap_or(false)
         });
-        eprintln!("[harness] tool_filter active: {} tools allowed", full_catalog.len());
+        eprintln!("[harness] tool_filter active: {} tools allowed (of {} in filter)", full_catalog.len(), allowed.len());
     }
 
     let tool_map = tool_catalog_map(&full_catalog);
