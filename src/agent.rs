@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1959,7 +1960,7 @@ pub(crate) fn run_agent_with_prompt(
                 let sess_reg_ref = &session_registry_ref;
                 let execute_regular_call = |call: &&AgentToolCall| -> (AgentToolCall, ToolExecution) {
                     let call = *call;
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
                         let local_db = open_or_create_db(mv2_ref).map_err(|e| e.to_string())?;
                         execute_tool(&call.name, call.args.clone(), mv2_ref, &local_db, false, bg_reg_ref.clone(), sess_reg_ref.clone())
                     }));
@@ -1979,11 +1980,8 @@ pub(crate) fn run_agent_with_prompt(
                             } else {
                                 "unknown panic".to_string()
                             };
-                            eprintln!("[harness] tool thread panicked on '{}': {msg}", call.name);
                             ToolExecution {
-                                output: format!(
-                                    "Internal error: tool execution panicked: {msg}"
-                                ),
+                                output: format!("Tool panicked: {msg}"),
                                 details: serde_json::json!({ "error": "panic", "message": msg }),
                                 is_error: true,
                             }
