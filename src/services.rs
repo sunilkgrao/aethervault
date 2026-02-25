@@ -1919,6 +1919,8 @@ pub(crate) fn run_trigger_thread(
     let mut last_self_improve = Instant::now();
     let mut last_nightly: Option<chrono::NaiveDate> = None;
     let mut last_morning: Option<chrono::NaiveDate> = None;
+    // Suppress critic during autonomous trigger sessions
+    unsafe { std::env::set_var("CRITIC_SUPPRESS_AUTONOMOUS", "1"); }
     let self_improve_interval = Duration::from_secs(12 * 3600); // every 12 hours
 
     // Configurable morning kickoff hour (default 8 AM in user's timezone)

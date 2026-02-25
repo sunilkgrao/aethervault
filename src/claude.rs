@@ -153,12 +153,38 @@ fn extract_critic_json(text: &str) -> Option<serde_json::Value> {
     if let Some(start) = clean.find('{') {
         if let Some(end) = clean.rfind('}') {
             if start < end {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&clean[start..=end]) {
+                let candidate = &clean[start..=end];
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+                    return Some(v);
+                }
+                // Try fixing trailing commas
+                let fixed = candidate.replace(",}", "}").replace(",]", "]");
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&fixed) {
+                    eprintln!("[critic] JSON extracted via trailing comma fix");
                     return Some(v);
                 }
             }
         }
     }
+
+    // Regex fallback: extract grounded boolean from natural language
+    let lower = clean.to_ascii_lowercase();
+    let grounded_val = if lower.contains("\"grounded\": true") || lower.contains("\"grounded\":true") {
+        Some(true)
+    } else if lower.contains("\"grounded\": false") || lower.contains("\"grounded\":false") {
+        Some(false)
+    } else if lower.contains("is grounded") || lower.contains("appears grounded") {
+        Some(true)
+    } else if lower.contains("not grounded") {
+        Some(false)
+    } else {
+        None
+    };
+    if let Some(g) = grounded_val {
+        eprintln!("[critic] verdict extracted via regex fallback (grounded={g})");
+        return Some(serde_json::json!({"grounded": g, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""}));
+    }
+
     None
 }
 
@@ -745,6 +771,12 @@ pub(crate) fn call_critic(
     max_steps: usize,
 ) -> Option<String> {
     if !env_bool("CRITIC_ENABLED", true) {
+        return None;
+    }
+
+    // Suppress critic in autonomous/trigger sessions (set by run_trigger_thread)
+    if env_bool("CRITIC_SUPPRESS_AUTONOMOUS", false) {
+        eprintln!("[critic] suppressed: autonomous session");
         return None;
     }
 
