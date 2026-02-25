@@ -916,6 +916,75 @@ pub(crate) fn handle_telegram_completion(
         }
     };
 
+    // ── Auto-continuation: if agent ran out of steps, chain to a new session ──
+    const MAX_CHAIN_DEPTH: usize = 5;
+    if output.contains("[CONTINUATION_NEEDED:") {
+        if let Some(start) = output.find("[CONTINUATION_NEEDED:") {
+            let after = &output[start + "[CONTINUATION_NEEDED:".len()..];
+            if let Some(end) = after.find(']') {
+                let checkpoint_path = &after[..end];
+                // Read checkpoint and build continuation prompt
+                if let Ok(checkpoint_json) = std::fs::read_to_string(checkpoint_path) {
+                    if let Ok(checkpoint) = serde_json::from_str::<crate::ContinuationCheckpoint>(&checkpoint_json) {
+                        if checkpoint.chain_depth < MAX_CHAIN_DEPTH {
+                            let continuation_prompt = format!(
+                                "[Continuation from previous session — chain depth {}/{}]\n\n\
+                                 ## Goal\n{}\n\n\
+                                 ## Summary of work so far\n{}\n\n\
+                                 ## Remaining work\n{}\n\n\
+                                 Continue from where you left off. Do NOT repeat completed work.",
+                                checkpoint.chain_depth, MAX_CHAIN_DEPTH,
+                                checkpoint.goal,
+                                checkpoint.summary,
+                                checkpoint.remaining_work,
+                            );
+
+                            // Send a brief status to the user (not the raw continuation marker)
+                            let status_msg = format!(
+                                "\u{1F504} Still working on it... (session {}/{})",
+                                checkpoint.chain_depth, MAX_CHAIN_DEPTH
+                            );
+                            let _ = telegram_send_message_ext(http_agent, base_url, chat_id, &status_msg, reply_to_id);
+                            eprintln!(
+                                "[auto-continuation] chaining session (depth {}/{}): {}",
+                                checkpoint.chain_depth, MAX_CHAIN_DEPTH, checkpoint.goal.chars().take(80).collect::<String>()
+                            );
+
+                            // Build session with chain depth marker
+                            let session = format!(
+                                "{}telegram:{chat_id}:chain:{}",
+                                agent_config.session_prefix, checkpoint.chain_depth
+                            );
+
+                            let progress = spawn_agent_run(
+                                agent_config,
+                                chat_id,
+                                reply_to_id,
+                                &continuation_prompt,
+                                session,
+                                completion_tx,
+                                http_agent,
+                                base_url,
+                                bg_registry,
+                            );
+                            if let Some(run) = active_runs.get_mut(&chat_id) {
+                                run.progress = progress;
+                            } else {
+                                active_runs.insert(chat_id, ActiveRun {
+                                    progress,
+                                    queued_messages: Vec::new(),
+                                });
+                            }
+                            return; // Don't fall through to normal completion handling
+                        } else {
+                            eprintln!("[auto-continuation] max chain depth {} reached, stopping", MAX_CHAIN_DEPTH);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Save conversation turns for session continuity
     let session_id = format!("{}telegram:{chat_id}", agent_config.session_prefix);
     {

@@ -759,6 +759,66 @@ fn handle_slack_completion(
         Err(err) => format!("Agent error: {err}"),
     };
 
+    // ── Auto-continuation: if agent ran out of steps, chain to a new session ──
+    const MAX_CHAIN_DEPTH: usize = 5;
+    if output.contains("[CONTINUATION_NEEDED:") {
+        if let Some(start) = output.find("[CONTINUATION_NEEDED:") {
+            let after = &output[start + "[CONTINUATION_NEEDED:".len()..];
+            if let Some(end) = after.find(']') {
+                let checkpoint_path = &after[..end];
+                if let Ok(checkpoint_json) = std::fs::read_to_string(checkpoint_path) {
+                    if let Ok(checkpoint) = serde_json::from_str::<crate::ContinuationCheckpoint>(&checkpoint_json) {
+                        if checkpoint.chain_depth < MAX_CHAIN_DEPTH {
+                            let continuation_prompt = format!(
+                                "[Continuation from previous session — chain depth {}/{}]\n\n\
+                                 ## Goal\n{}\n\n\
+                                 ## Summary of work so far\n{}\n\n\
+                                 ## Remaining work\n{}\n\n\
+                                 Continue from where you left off. Do NOT repeat completed work.",
+                                checkpoint.chain_depth, MAX_CHAIN_DEPTH,
+                                checkpoint.goal,
+                                checkpoint.summary,
+                                checkpoint.remaining_work,
+                            );
+
+                            let status_msg = format!(
+                                "\u{1F504} Still working on it... (session {}/{})",
+                                checkpoint.chain_depth, MAX_CHAIN_DEPTH
+                            );
+                            let _ = send_slack_message(
+                                http_agent, bot_token, &completion.channel_id,
+                                completion.thread_ts.as_deref(), &status_msg,
+                            );
+                            eprintln!(
+                                "[auto-continuation] slack: chaining session (depth {}/{}): {}",
+                                checkpoint.chain_depth, MAX_CHAIN_DEPTH,
+                                checkpoint.goal.chars().take(80).collect::<String>()
+                            );
+
+                            // Re-insert active run state so completion handler works for the chained run
+                            active_runs.insert(
+                                completion.session_key.clone(),
+                                SlackRunState { queued_messages: Vec::new() },
+                            );
+
+                            spawn_slack_run(
+                                config,
+                                completion_tx.clone(),
+                                completion.session_key,
+                                completion.channel_id,
+                                completion.thread_ts,
+                                continuation_prompt,
+                            );
+                            return; // Don't fall through to normal completion handling
+                        } else {
+                            eprintln!("[auto-continuation] slack: max chain depth {} reached, stopping", MAX_CHAIN_DEPTH);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     append_session_turn(&completion.session_key, "assistant", &output, config);
 
     let (directive, trailing) = parse_voice_directive(&output);

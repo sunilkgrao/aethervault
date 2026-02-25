@@ -123,22 +123,81 @@ pub(crate) fn run_agent(
 
     let prompt_for_session = prompt_text.clone();
     let session_for_save = session.clone();
-    let output = run_agent_with_prompt(
-        mv2,
-        prompt_text,
-        session,
-        model_hook,
-        system_text,
-        no_memory,
-        context_query,
-        context_results,
-        context_max_bytes,
-        max_steps,
-        log_commit_interval,
-        log,
-        None,
-        None, // tool_filter: no restrictions for CLI agent
-    )?;
+
+    // Auto-continuation loop: re-run the agent when it hits max_steps
+    const MAX_CHAIN_DEPTH: usize = 5;
+    let mut current_prompt = prompt_text;
+    let mut current_session = session;
+    let mut chain_depth: usize = 0;
+    let mut final_output: Option<AgentRunOutput> = None;
+
+    loop {
+        let output = run_agent_with_prompt(
+            mv2.clone(),
+            current_prompt.clone(),
+            current_session.clone(),
+            model_hook.clone(),
+            system_text.clone(),
+            no_memory,
+            context_query.clone(),
+            context_results,
+            context_max_bytes,
+            max_steps,
+            log_commit_interval,
+            log,
+            None,
+            None, // tool_filter: no restrictions for CLI agent
+        )?;
+
+        let needs_continuation = output.final_text.as_ref()
+            .map(|t| t.contains("[CONTINUATION_NEEDED:"))
+            .unwrap_or(false);
+
+        if needs_continuation && chain_depth < MAX_CHAIN_DEPTH {
+            // Parse checkpoint and build continuation prompt
+            if let Some(ref text) = output.final_text {
+                if let Some(start) = text.find("[CONTINUATION_NEEDED:") {
+                    let after = &text[start + "[CONTINUATION_NEEDED:".len()..];
+                    if let Some(end) = after.find(']') {
+                        let checkpoint_path = &after[..end];
+                        if let Ok(checkpoint_json) = fs::read_to_string(checkpoint_path) {
+                            if let Ok(checkpoint) = serde_json::from_str::<ContinuationCheckpoint>(&checkpoint_json) {
+                                chain_depth = checkpoint.chain_depth;
+                                eprintln!(
+                                    "[auto-continuation] chaining session (depth {}/{}): {}",
+                                    chain_depth, MAX_CHAIN_DEPTH,
+                                    checkpoint.goal.chars().take(80).collect::<String>()
+                                );
+                                current_prompt = format!(
+                                    "[Continuation from previous session — chain depth {}/{}]\n\n\
+                                     ## Goal\n{}\n\n\
+                                     ## Summary of work so far\n{}\n\n\
+                                     ## Remaining work\n{}\n\n\
+                                     Continue from where you left off. Do NOT repeat completed work.",
+                                    chain_depth, MAX_CHAIN_DEPTH,
+                                    checkpoint.goal, checkpoint.summary, checkpoint.remaining_work,
+                                );
+                                current_session = current_session.map(|s| {
+                                    if s.contains(":chain:") {
+                                        let base = s.rsplit(":chain:").last().unwrap_or(&s);
+                                        format!("{base}:chain:{chain_depth}")
+                                    } else {
+                                        format!("{s}:chain:{chain_depth}")
+                                    }
+                                });
+                                continue; // Loop back for the next chain
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        final_output = Some(output);
+        break;
+    }
+
+    let output = final_output.unwrap();
 
     // Save session turns for CLI agent continuity (mirrors Telegram bridge behaviour)
     if let Some(ref sess_id) = session_for_save {
