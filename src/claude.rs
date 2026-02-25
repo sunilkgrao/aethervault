@@ -140,14 +140,28 @@ fn repair_request_for_400(messages: &mut Vec<serde_json::Value>, error_body: &st
 // ---------------------------------------------------------------------------
 
 fn extract_critic_json(text: &str) -> Option<serde_json::Value> {
-    let clean = text
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
+    let clean = text.trim();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(clean) {
         return Some(v);
+    }
+    for marker in ["```json", "```"] {
+        if let Some(start) = clean.find(marker) {
+            let mut body = &clean[start + marker.len()..];
+            if marker == "```" {
+                if let Some(nl) = body.find('\n') {
+                    body = &body[nl + 1..];
+                }
+            }
+            if let Some(end) = body.find("```") {
+                let b = body[..end].trim();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(b) { return Some(v); }
+                let fixed = b.replace(",}", "}").replace(",]", "]");
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&fixed) {
+                    eprintln!("[critic] JSON extracted via trailing comma fix");
+                    return Some(v);
+                }
+            }
+        }
     }
     // Try to find JSON object within text
     if let Some(start) = clean.find('{') {
@@ -184,8 +198,27 @@ fn extract_critic_json(text: &str) -> Option<serde_json::Value> {
         eprintln!("[critic] verdict extracted via regex fallback (grounded={g})");
         return Some(serde_json::json!({"grounded": g, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""}));
     }
-
-    None
+    let parse_score = |line: &str| line.split_once(':').and_then(|(_, raw)| raw.split('/').next()).and_then(|v| v.trim().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse::<f64>().ok());
+    let (mut score, mut issues, mut suggestions, mut summary, mut section) = (None, Vec::<String>::new(), Vec::<String>::new(), String::new(), 0u8);
+    for raw in clean.lines() {
+        let line = raw.trim();
+        if line.is_empty() { section = 0; continue; }
+        let ll = line.to_ascii_lowercase();
+        if ll.starts_with("score") || ll.starts_with("rating") { score = score.or_else(|| parse_score(line)); section = 0; continue; }
+        if ll.starts_with("issues:") || ll.starts_with("problems:") { if let Some((_,rest))=line.split_once(':').filter(|(_,rest)| !rest.trim().is_empty()) {issues.push(rest.trim().to_string());}; section=1; continue; }
+        if ll.starts_with("suggestions:") || ll.starts_with("recommendations:") { if let Some((_,rest))=line.split_once(':').filter(|(_,rest)| !rest.trim().is_empty()) {suggestions.push(rest.trim().to_string());}; section=2; continue; }
+        if ll.starts_with("summary:") || ll.starts_with("overall:") { summary = line.split_once(':').map(|(_, rest)| rest.trim().to_string()).unwrap_or_default(); section = 3; continue; }
+        let item = line.trim_start_matches(&['-', '*', '+', '•'][..]).trim();
+        if section == 1 && !item.is_empty() { issues.push(item.to_string()); continue; }
+        if section == 2 && !item.is_empty() { suggestions.push(item.to_string()); continue; }
+        if section == 3 && !item.is_empty() {
+            if !summary.is_empty() { summary.push(' '); }
+            summary.push_str(item);
+        } else { section = 0; }
+    }
+    if score.is_none() && issues.is_empty() && suggestions.is_empty() && summary.is_empty() { None } else {
+        Some(serde_json::json!({"grounded": true, "issues": issues, "agent_claim": "", "evidence_shows": "", "correction": "", "score": score, "suggestions": suggestions, "summary": summary}))
+    }
 }
 
 // ---------------------------------------------------------------------------
