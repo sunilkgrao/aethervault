@@ -1643,6 +1643,73 @@ pub(crate) fn run_agent_with_prompt(
 
         let max_tool_output = 8000; // chars (~2000 tokens)
 
+        // ── Orchestrator Mode: Block exec/fs_write at dispatch level ──
+        // Belt-and-suspenders: even if tools leak back into active_tools,
+        // block them here with a clear error message directing the agent to use swarm tools.
+        if (orchestrator_mode || swarm_skill_matched) && !is_subagent_early {
+            let orchestrator_blocked: Vec<String> = tool_calls.iter()
+                .filter(|c| matches!(c.name.as_str(), "exec" | "fs_write"))
+                .map(|c| c.name.clone())
+                .collect();
+            if !orchestrator_blocked.is_empty() {
+                let mut has_non_blocked = false;
+                for call in &tool_calls {
+                    if orchestrator_blocked.contains(&call.name) {
+                        tool_results.push(AgentToolResult {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            output: format!(
+                                "BLOCKED: ORCHESTRATOR MODE is active. You CANNOT use {} directly. \
+                                 Use swarm_create to register tasks, then subagent_batch with swarm-coder agents \
+                                 to execute them. Your role is to orchestrate, not code.",
+                                call.name
+                            ),
+                            details: serde_json::json!({ "blocked": true, "reason": "orchestrator_mode" }),
+                            is_error: true,
+                        });
+                        messages.push(AgentMessage {
+                            role: "tool".to_string(),
+                            content: Some(format!(
+                                "BLOCKED: ORCHESTRATOR MODE — {} is disabled. \
+                                 You must delegate coding to swarm-coder agents via swarm_create + subagent_batch. \
+                                 You cannot write code or run commands directly.",
+                                call.name
+                            )),
+                            tool_calls: Vec::new(),
+                            name: Some(call.name.clone()),
+                            tool_call_id: Some(call.id.clone()),
+                            is_error: Some(true),
+                            thinking_blocks: vec![],
+                        });
+                        eprintln!("[orchestrator] BLOCKED {} — agent tried to bypass orchestrator mode", call.name);
+                    } else {
+                        has_non_blocked = true;
+                    }
+                }
+                if !has_non_blocked {
+                    // All calls were blocked — inject orchestrator reminder and skip to next step
+                    messages.push(AgentMessage {
+                        role: "user".to_string(),
+                        content: Some(
+                            "[ORCHESTRATOR MODE] You are in orchestrator mode. exec and fs_write are DISABLED. \
+                             To fix code issues, you MUST:\n\
+                             1. Use swarm_create to register each task\n\
+                             2. Use subagent_batch with name='swarm-coder' to spawn coding agents\n\
+                             3. Each agent gets a branch parameter for isolation\n\
+                             4. Monitor with swarm_list, verify results when done\n\
+                             Do NOT attempt exec or fs_write again — they will always be blocked."
+                            .to_string()
+                        ),
+                        tool_calls: Vec::new(),
+                        name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                    });
+                    step += 1;
+                    continue;
+                }
+                tool_calls.retain(|c| !orchestrator_blocked.contains(&c.name));
+            }
+        }
+
         // ── Rule of Two: Block exfil tools when session is tainted ──
         // When both untrusted input AND private data are present, block
         // external communication tools to prevent data exfiltration.
@@ -1773,6 +1840,11 @@ pub(crate) fn run_agent_with_prompt(
                 should_log, &session, &log_dir,
             );
             if tools_changed {
+                // Re-strip orchestrator-blocked tools if they leaked back via tool_search
+                if (orchestrator_mode || swarm_skill_matched) && !is_subagent_early {
+                    active_tools.remove("exec");
+                    active_tools.remove("fs_write");
+                }
                 tools = tools_from_active(&tool_map, &active_tools);
             }
 
@@ -1908,6 +1980,11 @@ pub(crate) fn run_agent_with_prompt(
                 // Collect deferred messages — pushed AFTER all tool results
                 all_deferred.extend(deferred_msgs);
                 if tools_changed {
+                    // Re-strip orchestrator-blocked tools if they leaked back via tool_search
+                    if (orchestrator_mode || swarm_skill_matched) && !is_subagent_early {
+                        active_tools.remove("exec");
+                        active_tools.remove("fs_write");
+                    }
                     tools = tools_from_active(&tool_map, &active_tools);
                 }
 
