@@ -398,6 +398,12 @@ fn expand_synonyms(word: &str) -> Vec<String> {
         ("implement", &["build", "code", "develop", "feature", "swarm"]),
         ("feature", &["implement", "build", "develop", "swarm"]),
         ("develop", &["implement", "build", "code", "feature", "swarm"]),
+        ("broken", &["fix", "bug", "repair", "debug"]),
+        ("fix", &["broken", "bug", "repair", "debug"]),
+        ("bug", &["fix", "broken", "repair", "debug"]),
+        ("debug", &["fix", "bug", "broken"]),
+        ("app", &["application", "project", "build"]),
+        ("application", &["app", "project", "build"]),
     ];
     let mut results = vec![lower.clone()];
     for (key, expansions) in synonyms {
@@ -424,7 +430,7 @@ pub(crate) fn match_skills_for_prompt(
 
     let words: Vec<&str> = prompt.split_whitespace()
         .filter(|w| w.len() > 2 && !stop_words.contains(w.to_lowercase().as_str()))
-        .take(10)
+        .take(20)
         .collect();
     if words.is_empty() {
         return Vec::new();
