@@ -1356,12 +1356,21 @@ pub(crate) fn run_agent_with_prompt(
                             }
                         }
                     }
-                    // Re-check orchestrator mode: if all tasks done, restore tools
+                    // Re-check orchestrator mode: if all tasks done, restore tools.
+                    // BUT: if orchestrator was activated proactively (skill match), only restore
+                    // when tasks were actually created AND completed — not just because the DB
+                    // has no active tasks (which is the initial state).
                     if orchestrator_mode {
                         let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(1));
                         let pr_open = crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(1));
                         let still_reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(1));
-                        if running.is_empty() && pr_open.is_empty() && still_reviewing.is_empty() {
+                        let queued = crate::swarm::swarm_list_tasks(&sdb, Some("queued"), Some(1));
+                        let no_active = running.is_empty() && pr_open.is_empty() && still_reviewing.is_empty();
+                        // When proactively enforced via skill match, never auto-restore tools.
+                        // The agent must complete its swarm tasks; tools are restored only
+                        // when orchestrator mode was triggered by existing DB tasks (not skill match).
+                        let can_restore = !swarm_skill_matched && no_active;
+                        if can_restore {
                             orchestrator_mode = false;
                             active_tools = base_tool_names();
                             if let Some(ref registry) = mcp_registry {
