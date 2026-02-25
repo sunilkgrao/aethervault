@@ -460,7 +460,7 @@ pub(crate) fn match_skills_for_prompt(
 
 /// Bump this version whenever bootstrap skills are added or changed.
 /// Existing databases re-seed when the stored version is lower.
-const BOOTSTRAP_VERSION: u32 = 7;
+const BOOTSTRAP_VERSION: u32 = 8;
 
 /// Bootstrap essential skills, re-seeding when BOOTSTRAP_VERSION increases.
 pub(crate) fn bootstrap_skills(conn: &Connection) {
@@ -584,18 +584,19 @@ pub(crate) fn bootstrap_skills(conn: &Connection) {
         },
         SkillRecord {
             name: "bootstrap:swarm-dev-task".into(),
-            description: Some("Execute a full dev task via swarm mode: register → branch → code → test → PR → review".into()),
+            description: Some("Execute a full dev task via swarm mode with orchestrator/coder separation. You are the ORCHESTRATOR — you write prompts and delegate. Coding agents write code.".into()),
             trigger: Some("building an application, implementing a feature, fixing a bug, creating a project, or making code changes".into()),
             steps: vec![
-                "1. ALWAYS start with `swarm_create` — never skip, even for single tasks".into(),
-                "2. Decompose into parallel subtasks (frontend, backend, infra, tests)".into(),
-                "3. Use `subagent_batch` to spawn all swarm-coder agents in parallel with branch='swarm/{task-id}-{subtask}'".into(),
-                "4. Each coder: commits incrementally (1 commit per logical unit), pushes, creates PR".into(),
-                "5. Use `swarm_update` to record PR numbers. After all agents finish, verify end-to-end".into(),
-                "6. VERIFY: run the app, curl key endpoints, check docker logs. Never report success without testing".into(),
+                "1. ALWAYS start with `swarm_create` to register the task. This activates ORCHESTRATOR MODE — exec/fs_write are stripped from your tools. You CANNOT code directly.".into(),
+                "2. Decompose into parallel subtasks. Write detailed prompts for each (include file paths, expected behavior, test commands).".into(),
+                "3. Use `subagent_batch` with multiple swarm-coder agents. Set branch='swarm/{task-id}-{subtask}' for worktree isolation.".into(),
+                "4. MONITOR: The system checks task status every 60 seconds automatically. You'll receive status updates without needing to call swarm_check.".into(),
+                "5. When CI passes, dispatch a cross-model reviewer (if coder was Codex, use swarm-reviewer-claude; vice versa).".into(),
+                "6. When a task FAILS, rewrite the prompt with the failure context and spawn a new agent. Don't just retry — explain what went wrong.".into(),
+                "7. DEFINITION OF DONE: PR created + CI passing + cross-model review passed + you verified with exec (tools restored when all tasks complete).".into(),
             ],
             tools: vec!["swarm_create".into(), "swarm_list".into(), "swarm_update".into(), "swarm_check".into(), "subagent_invoke".into(), "subagent_batch".into()],
-            notes: Some("Each coder gets its own git worktree. Max 3 concurrent agents (pool has 3 accounts). The orchestrator (Linus) writes the prompt — coding agents just execute. Use swarm_list to check task status across restarts.".into()),
+            notes: Some("ORCHESTRATOR MODE: When swarm tasks are active, your exec and fs_write tools are disabled at the API level. You physically cannot write code — only write prompts. Tools are restored when all tasks reach 'done'. The swarm monitor runs every 60s and injects CI/review status updates automatically.".into()),
             success_rate: 0.0, times_used: 0, times_succeeded: 0,
             last_used: None, created_at: now.clone(),
             contexts: vec!["feature".into(), "bug".into(), "fix".into(), "implement".into(), "build".into(), "code".into(), "develop".into(), "pr".into(), "pull request".into(), "swarm".into(), "app".into(), "application".into(), "project".into(), "create".into()],

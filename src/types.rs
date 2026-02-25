@@ -817,6 +817,9 @@ pub(crate) struct BridgeAgentConfig {
     pub(crate) log: bool,
     pub(crate) log_commit_interval: usize,
     pub(crate) session_prefix: String,
+    /// Runtime tool filter: if set, only these tools are available to the agent.
+    /// Enforced at the API level — tools not in this list are not sent to the model.
+    pub(crate) tool_filter: Option<Vec<String>>,
 }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]

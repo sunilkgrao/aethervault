@@ -969,7 +969,7 @@ fn subagent_max_steps_default() -> usize {
     std::env::var("AETHERVAULT_SUBAGENT_MAX_STEPS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(subagent_max_steps_default)
+        .unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS)
 }
 
 fn background_exec_job_name(command: &str) -> String {
@@ -2798,7 +2798,7 @@ pub(crate) fn execute_tool(
             // Resolve max_steps: invocation arg > spec > default 64
             let max_steps = parsed.max_steps.or(spec.max_steps).unwrap_or_else(subagent_max_steps_default);
 
-            let cfg = build_bridge_agent_config(
+            let mut cfg = build_bridge_agent_config(
                 mv2.to_path_buf(),
                 model_hook,
                 system,
@@ -2811,6 +2811,21 @@ pub(crate) fn execute_tool(
                 8,
             )
             .map_err(|e| e.to_string())?;
+
+            // Runtime tool enforcement: build API-level tool filter from spec.
+            // If spec.tools is set, only those tools are available (allowlist).
+            // If spec.disallowed_tools is set, remove them from the full catalog.
+            if !spec.tools.is_empty() {
+                cfg.tool_filter = Some(spec.tools.clone());
+                eprintln!("[subagent_invoke] tool_filter set: {} tools allowed for '{}'", spec.tools.len(), parsed.name);
+            } else if !spec.disallowed_tools.is_empty() {
+                // Build allowlist by excluding disallowed from full catalog
+                let all_tools = crate::base_tool_names();
+                let denied: std::collections::HashSet<&str> = spec.disallowed_tools.iter().map(|s| s.as_str()).collect();
+                let allowed: Vec<String> = all_tools.into_iter().filter(|t| !denied.contains(t.as_str())).collect();
+                cfg.tool_filter = Some(allowed);
+                eprintln!("[subagent_invoke] tool_filter set: {} tools denied for '{}'", spec.disallowed_tools.len(), parsed.name);
+            }
 
             // Worktree isolation: if branch is set, create an isolated git worktree
             let worktree_info: Option<(PathBuf, String)> = if let Some(ref branch) = parsed.branch {
@@ -3043,6 +3058,17 @@ pub(crate) fn execute_tool(
                     true,
                     8,
                 )
+                .map(|mut c| {
+                    // Runtime tool enforcement for batch invocations
+                    if !spec.tools.is_empty() {
+                        c.tool_filter = Some(spec.tools.clone());
+                    } else if !spec.disallowed_tools.is_empty() {
+                        let all_tools = crate::base_tool_names();
+                        let denied: std::collections::HashSet<&str> = spec.disallowed_tools.iter().map(|s| s.as_str()).collect();
+                        c.tool_filter = Some(all_tools.into_iter().filter(|t| !denied.contains(t.as_str())).collect());
+                    }
+                    c
+                })
                 .map_err(|e| e.to_string());
                 prepared.push(PreparedInvocation {
                     name: inv.name.clone(),

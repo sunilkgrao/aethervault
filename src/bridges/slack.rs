@@ -724,6 +724,7 @@ fn spawn_slack_run(
                 config.log_commit_interval,
                 config.log,
                 None,
+                None, // tool_filter
             )
             .map_err(|e| e.to_string())
         }));

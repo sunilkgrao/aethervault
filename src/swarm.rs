@@ -317,6 +317,12 @@ pub(crate) fn create_worktree(repo_path: &Path, branch_name: &str) -> Result<Pat
 
     let wt_path = base.join(branch_name);
 
+    // If worktree directory already exists and is valid, reuse it
+    if wt_path.exists() && wt_path.join(".git").exists() {
+        eprintln!("[swarm] reusing existing worktree at {}", wt_path.display());
+        return Ok(wt_path);
+    }
+
     let output = Command::new("git")
         .args(["worktree", "add", &wt_path.to_string_lossy(), "-b", branch_name])
         .current_dir(repo_path)
@@ -327,15 +333,28 @@ pub(crate) fn create_worktree(repo_path: &Path, branch_name: &str) -> Result<Pat
         let stderr = String::from_utf8_lossy(&output.stderr);
         // If branch already exists, try without -b
         if stderr.contains("already exists") {
+            // Clean up stale worktree entry if path doesn't exist
+            if !wt_path.exists() {
+                let _ = Command::new("git")
+                    .args(["worktree", "prune"])
+                    .current_dir(repo_path)
+                    .output();
+            }
             let output2 = Command::new("git")
                 .args(["worktree", "add", &wt_path.to_string_lossy(), branch_name])
                 .current_dir(repo_path)
                 .output()
                 .map_err(|e| format!("git worktree add (existing branch): {e}"))?;
             if !output2.status.success() {
+                let stderr2 = String::from_utf8_lossy(&output2.stderr);
+                // If worktree is already checked out, it's still usable
+                if stderr2.contains("already checked out") && wt_path.exists() {
+                    eprintln!("[swarm] worktree already checked out, reusing");
+                    return Ok(wt_path);
+                }
                 return Err(format!(
                     "git worktree add failed: {}",
-                    String::from_utf8_lossy(&output2.stderr)
+                    stderr2
                 ));
             }
         } else {

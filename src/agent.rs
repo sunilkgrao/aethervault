@@ -137,6 +137,7 @@ pub(crate) fn run_agent(
         log_commit_interval,
         log,
         None,
+        None, // tool_filter: no restrictions for CLI agent
     )?;
 
     // Save session turns for CLI agent continuity (mirrors Telegram bridge behaviour)
@@ -305,14 +306,17 @@ pub(crate) fn default_system_prompt() -> String {
         "- Complex multi-step task (research, multi-file code, debugging, troubleshooting): Break it down, use subagents for heavy lifting if helpful.",
         "Do NOT launch extensive tool use for greetings or vague requests.",
         "",
-        "## Project Build Protocol",
+        "## Project Build Protocol (Orchestrator/Coder Separation)",
+        "You are the ORCHESTRATOR. You write prompts and delegate to coding agents. You do NOT write code directly.",
         "When building a full application or multi-file feature:",
-        "1. ALWAYS use `swarm_create` first — mandatory, not optional.",
-        "2. Decompose into parallel subtasks. Use `subagent_batch` with multiple swarm-coder agents, NOT a single subagent_invoke.",
-        "3. Each agent gets its own branch via the `branch` parameter for worktree isolation.",
-        "4. After agents complete: rebuild, run the app, curl/test key endpoints yourself. Never report 'done' without verification.",
-        "5. If a build step (docker rebuild, db reset) destroys state, re-verify everything that depended on it.",
-        "6. Commit incrementally — one commit per logical change, not one giant commit.",
+        "1. ALWAYS use `swarm_create` first. This activates Orchestrator Mode — exec/fs_write are stripped.",
+        "2. Decompose into parallel subtasks. Write DETAILED prompts for each coder (include file paths, expected behavior, test commands).",
+        "3. Use `subagent_batch` with multiple swarm-coder agents. Set branch='swarm/{task-id}-{subtask}' for worktree isolation.",
+        "4. The swarm monitor checks status every 60s automatically. You'll get injected updates — no need to poll.",
+        "5. When CI passes, dispatch a cross-model reviewer (Codex coder → Claude reviewer, Claude coder → Codex reviewer).",
+        "6. When a task FAILS: rewrite the prompt with failure context and spawn a new agent. Don't just retry blindly.",
+        "7. DEFINITION OF DONE: PR created + CI passing + cross-model review passed + you verified with exec (tools restored when all tasks complete).",
+        "8. If a build step (docker rebuild, db reset) destroys state, re-verify everything that depended on it.",
     ]
     .join("\n")
 }
@@ -628,6 +632,7 @@ pub(crate) fn run_agent_with_prompt(
     _log_commit_interval: usize,
     log: bool,
     progress: Option<Arc<Mutex<AgentProgress>>>,
+    tool_filter: Option<Vec<String>>,
 ) -> Result<AgentRunOutput, Box<dyn std::error::Error>> {
     if prompt_text.trim().is_empty() {
         return Err("agent prompt is empty".into());
@@ -1046,6 +1051,20 @@ pub(crate) fn run_agent_with_prompt(
         None
     };
 
+    // Runtime tool enforcement: if tool_filter is set, strip tools not in the allowlist.
+    // This is the API-level enforcement — tools not in the list are never sent to the model.
+    if let Some(ref filter) = tool_filter {
+        let allowed: std::collections::HashSet<&str> = filter.iter().map(|s| s.as_str()).collect();
+        full_catalog.retain(|t| {
+            t.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|name| allowed.contains(name))
+                .unwrap_or(false)
+        });
+        eprintln!("[harness] tool_filter active: {} tools allowed", full_catalog.len());
+    }
+
     let tool_map = tool_catalog_map(&full_catalog);
     let mut active_tools = base_tool_names();
     // Add MCP tool names to active set
@@ -1053,6 +1072,11 @@ pub(crate) fn run_agent_with_prompt(
         for name in registry.route_map.keys() {
             active_tools.insert(name.clone());
         }
+    }
+    // If tool_filter is active, also restrict active_tools to the filter
+    if let Some(ref filter) = tool_filter {
+        let allowed: std::collections::HashSet<String> = filter.iter().cloned().collect();
+        active_tools.retain(|t| allowed.contains(t));
     }
     let mut tools = tools_from_active(&tool_map, &active_tools);
     let mut tool_results: Vec<AgentToolResult> = Vec::new();
@@ -1132,6 +1156,55 @@ pub(crate) fn run_agent_with_prompt(
         p.lock().ok().and_then(|g| g.session_registry.clone())
     });
 
+    // --- Orchestrator Mode ---
+    // When the main agent (not a subagent) has active swarm tasks, enter orchestrator mode:
+    // strip exec and fs_write so the orchestrator can only plan, delegate, and verify.
+    // This enforces the OpenClaw pattern: orchestrator writes prompts, not code.
+    let is_subagent = session.as_deref().map(|s| s.starts_with("subagent:")).unwrap_or(false);
+    let mut orchestrator_mode = false;
+    if !is_subagent && tool_filter.is_none() {
+        if let Some(ref ws) = workspace_env {
+            if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
+                let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(100));
+                let pr_open = crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(100));
+                let reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(100));
+                let active_count = running.len() + pr_open.len() + reviewing.len();
+                if active_count > 0 {
+                    orchestrator_mode = true;
+                    // Strip direct coding tools — orchestrator delegates, doesn't code
+                    active_tools.remove("exec");
+                    active_tools.remove("fs_write");
+                    tools = tools_from_active(&tool_map, &active_tools);
+                    eprintln!("[harness] ORCHESTRATOR MODE: {} active swarm tasks, exec/fs_write stripped", active_count);
+                    // Inject orchestrator mode notification
+                    let task_summary: Vec<String> = running.iter().chain(pr_open.iter()).chain(reviewing.iter())
+                        .map(|t| format!("  - {} ({}): {}", t.id, t.status.as_str(), t.name))
+                        .collect();
+                    messages.push(AgentMessage {
+                        role: "user".to_string(),
+                        content: Some(format!(
+                            "[System] ORCHESTRATOR MODE ACTIVE. You have {} coding agents working. \
+                             You cannot use exec or fs_write — delegate all coding to swarm agents. \
+                             Your role: write prompts, monitor progress, verify results, dispatch reviews.\n\
+                             Active tasks:\n{}",
+                            active_count, task_summary.join("\n")
+                        )),
+                        tool_calls: Vec::new(),
+                        name: None,
+                        tool_call_id: None,
+                        is_error: None,
+                        thinking_blocks: vec![],
+                    });
+                }
+            }
+        }
+    }
+
+    // --- Deterministic Swarm Monitor ---
+    // Track when we last checked swarm status. Check every 60s (deterministic, not LLM-driven).
+    let swarm_monitor_interval = std::time::Duration::from_secs(60);
+    let mut last_swarm_check = std::time::Instant::now();
+
     let mut completed = false;
     let mut current_max_steps = effective_max_steps;
     let mut step = 0;
@@ -1184,6 +1257,111 @@ pub(crate) fn run_agent_with_prompt(
                         is_error: None,
                         thinking_blocks: vec![],
                     });
+                }
+            }
+        }
+
+        // --- Deterministic Swarm Monitor: periodic check ---
+        // Every 60s, check swarm task status via gh CLI (deterministic, not LLM-driven).
+        // Inject status updates + action instructions as system messages.
+        if !is_subagent && last_swarm_check.elapsed() >= swarm_monitor_interval {
+            last_swarm_check = std::time::Instant::now();
+            if let Some(ref ws) = workspace_env {
+                if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
+                    let check_result = crate::swarm::swarm_check_open_tasks(&sdb);
+                    if !check_result.contains("No open PR tasks") && !check_result.contains("no status changes") {
+                        eprintln!("[swarm-monitor] {}", check_result);
+                        messages.push(AgentMessage {
+                            role: "user".to_string(),
+                            content: Some(format!("[SWARM MONITOR — automatic, deterministic check]\n{check_result}")),
+                            tool_calls: Vec::new(),
+                            name: None,
+                            tool_call_id: None,
+                            is_error: None,
+                            thinking_blocks: vec![],
+                        });
+                    }
+                    // Check for failed tasks that need retry (smart retry with prompt rewriting)
+                    let failed = crate::swarm::swarm_list_tasks(&sdb, Some("failed"), Some(50));
+                    for task in &failed {
+                        if task.retry_count < task.max_retries {
+                            let error_ctx = task.error_context.as_deref().unwrap_or("unknown error");
+                            let retry_prompt = format!(
+                                "[SWARM MONITOR — AUTO-RETRY NEEDED]\n\
+                                 Task '{}' (id: {}) FAILED (attempt {}/{}). Error: {}\n\
+                                 Original prompt: {}\n\n\
+                                 ACTION REQUIRED: Rewrite the prompt with failure context and spawn a new swarm-coder. \
+                                 Include what failed and instruct the agent to approach differently.",
+                                task.name, task.id, task.retry_count + 1, task.max_retries,
+                                error_ctx, task.prompt.chars().take(500).collect::<String>()
+                            );
+                            messages.push(AgentMessage {
+                                role: "user".to_string(),
+                                content: Some(retry_prompt),
+                                tool_calls: Vec::new(),
+                                name: None,
+                                tool_call_id: None,
+                                is_error: None,
+                                thinking_blocks: vec![],
+                            });
+                            eprintln!("[swarm-monitor] injected retry instruction for task {}", task.id);
+                        }
+                    }
+                    // Check for CI-passing tasks that need cross-model review
+                    let reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(50));
+                    for task in &reviewing {
+                        if task.review_status.as_deref() == Some("pending") || task.review_status.is_none() {
+                            if let Some(pr_num) = task.pr_number {
+                                let backend = task.agent_backend.as_deref().unwrap_or("unknown");
+                                let reviewer = if backend.contains("codex") {
+                                    "swarm-reviewer-claude"
+                                } else {
+                                    "swarm-reviewer-codex"
+                                };
+                                messages.push(AgentMessage {
+                                    role: "user".to_string(),
+                                    content: Some(format!(
+                                        "[SWARM MONITOR — REVIEW DISPATCH NEEDED]\n\
+                                         Task '{}' (PR #{}) has CI passing but no review yet.\n\
+                                         ACTION REQUIRED: Dispatch '{}' to review PR #{} via subagent_invoke.",
+                                        task.name, pr_num, reviewer, pr_num
+                                    )),
+                                    tool_calls: Vec::new(),
+                                    name: None,
+                                    tool_call_id: None,
+                                    is_error: None,
+                                    thinking_blocks: vec![],
+                                });
+                                eprintln!("[swarm-monitor] injected review dispatch for task {} (PR #{})", task.id, pr_num);
+                            }
+                        }
+                    }
+                    // Re-check orchestrator mode: if all tasks done, restore tools
+                    if orchestrator_mode {
+                        let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(1));
+                        let pr_open = crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(1));
+                        let still_reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(1));
+                        if running.is_empty() && pr_open.is_empty() && still_reviewing.is_empty() {
+                            orchestrator_mode = false;
+                            active_tools = base_tool_names();
+                            if let Some(ref registry) = mcp_registry {
+                                for name in registry.route_map.keys() {
+                                    active_tools.insert(name.clone());
+                                }
+                            }
+                            tools = tools_from_active(&tool_map, &active_tools);
+                            eprintln!("[harness] ORCHESTRATOR MODE OFF: all swarm tasks complete, full tools restored");
+                            messages.push(AgentMessage {
+                                role: "user".to_string(),
+                                content: Some("[System] All swarm tasks complete. Full tool access restored. You can now verify results directly with exec, curl, docker logs, etc.".to_string()),
+                                tool_calls: Vec::new(),
+                                name: None,
+                                tool_call_id: None,
+                                is_error: None,
+                                thinking_blocks: vec![],
+                            });
+                        }
+                    }
                 }
             }
         }

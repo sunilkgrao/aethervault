@@ -69,6 +69,7 @@ pub(crate) fn build_bridge_agent_config(
         log,
         log_commit_interval: log_commit_interval.max(1),
         session_prefix: String::new(),
+        tool_filter: None,
     })
 }
 
@@ -154,6 +155,7 @@ pub(crate) fn run_agent_for_bridge(
     let max_steps = config.max_steps;
     let log_commit_interval = config.log_commit_interval;
     let log = config.log;
+    let tool_filter = config.tool_filter.clone();
 
     thread::spawn(move || {
         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -171,6 +173,7 @@ pub(crate) fn run_agent_for_bridge(
                 log_commit_interval,
                 log,
                 progress,
+                tool_filter,
             )
             .map_err(|e| e.to_string())
         })) {

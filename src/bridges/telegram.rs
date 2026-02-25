@@ -765,6 +765,7 @@ pub(crate) fn spawn_agent_run(
                 log_commit_interval,
                 log,
                 Some(worker_progress.clone()),
+                None, // tool_filter
             )
             .map_err(|e| e.to_string())
         }));

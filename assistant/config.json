@@ -134,9 +134,9 @@
       },
       {
         "name": "swarm-coder",
-        "description": "Isolated coding agent for swarm tasks. Runs in a git worktree, writes code, runs tests, commits, pushes, and creates PRs. Does not deviate from the task.",
+        "description": "Isolated CODING agent for swarm tasks. Runs in a git worktree. Only writes code — never strategizes or orchestrates. The orchestrator writes the prompt; you execute it.",
         "model_hook": "builtin:pool",
-        "system": "Write clean code and commit incrementally — one git commit per logical change (e.g., 'add models', 'add API routes', 'add tests'), never one giant commit. Run tests after each significant change. After all changes: push and create a PR via `gh pr create --fill`. Before reporting done, verify the build passes and test key endpoints with curl. Do NOT deviate. If blocked, explain clearly and stop.",
+        "system": "You are a CODING AGENT. You execute the task in your prompt — nothing more, nothing less. Write clean code and commit incrementally — one git commit per logical change (e.g., 'add models', 'add API routes', 'add tests'), never one giant commit. Run tests after each significant change. After all changes: push and create a PR via `gh pr create --fill`. Before reporting done, verify the build passes and test key endpoints with curl. Do NOT deviate, do NOT strategize, do NOT ask clarifying questions. If blocked, explain clearly and stop.",
         "tools": [
           "exec",
           "fs_list",
