@@ -1951,7 +1951,11 @@ pub(crate) fn execute_tool(
         "browser" => {
             let parsed: ToolBrowserArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let browser_timeout_ms = parsed.timeout_ms.unwrap_or(DEFAULT_BROWSER_TIMEOUT_MS);
+            // Floor at 60s: Chromium cold-start alone can take 30-60s on
+            // constrained droplets, so anything under 60s guarantees timeout.
+            let browser_timeout_ms = parsed.timeout_ms
+                .map(|t| t.max(60_000))
+                .unwrap_or(DEFAULT_BROWSER_TIMEOUT_MS);
             let session = parsed.session.unwrap_or_else(|| "default".to_string());
 
             let parts = shlex::split(&parsed.command)
@@ -1998,7 +2002,11 @@ pub(crate) fn execute_tool(
                 let combined = format!("{}{}", result.stdout, result.stderr).to_ascii_lowercase();
                 let is_stale = STALE_SESSION_PATTERNS.iter().any(|p| combined.contains(p));
                 if is_stale && result.status.code() != Some(0) {
-                    let fresh = format!("{session}-fresh-{}", std::process::id());
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let fresh = format!("{session}-fresh-{ts}");
                     eprintln!("[tool:browser] stale session '{session}' detected, retrying with '{fresh}'");
                     match run_browser(&fresh) {
                         Ok(r2) => (r2.stdout, r2.stderr, r2.status),
