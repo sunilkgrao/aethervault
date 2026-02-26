@@ -198,7 +198,9 @@ pub(crate) fn run_agent(
         break;
     }
 
-    let output = final_output.unwrap();
+    let output = final_output.ok_or_else(|| {
+        io::Error::other("[Agent error: loop completed without generating output after all retries]")
+    })?;
 
     // Save session turns for CLI agent continuity (mirrors Telegram bridge behaviour)
     if let Some(ref sess_id) = session_for_save {
