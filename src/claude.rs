@@ -8,8 +8,8 @@ use serde_json;
 use crate::{
     command_spec_to_vec, env_bool, env_f64, env_optional, env_required, env_u64, env_usize,
     extract_prompt_from_request, jitter_ratio, parse_retry_after, run_hook_command,
-    run_claude_code_native, run_codex_native, run_pool_routed, AgentHookRequest,
-    AgentHookResponse, AgentMessage, AgentToolCall, CommandSpec, HookSpec,
+    run_claude_code_native, run_codex_native, run_pool_routed, should_hook_be_read_only,
+    AgentHookRequest, AgentHookResponse, AgentMessage, AgentToolCall, CommandSpec, HookSpec,
 };
 
 const CRITIC_SYSTEM_PROMPT: &str = "\
@@ -1033,13 +1033,16 @@ pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Re
     let is_builtin_claude_code = hook_cmd == "builtin:claude-code";
 
     if is_builtin_pool {
-        return run_pool_routed(request);
+        let read_only = should_hook_be_read_only(request);
+        return run_pool_routed(request, read_only);
     }
     if is_builtin_codex {
-        return run_codex_native(&extract_prompt_from_request(request));
+        let read_only = should_hook_be_read_only(request);
+        return run_codex_native(&extract_prompt_from_request(request), read_only);
     }
     if is_builtin_claude_code {
-        return run_claude_code_native(&extract_prompt_from_request(request));
+        let read_only = should_hook_be_read_only(request);
+        return run_claude_code_native(&extract_prompt_from_request(request), read_only);
     }
 
     let cmd = command_spec_to_vec(&hook.command);

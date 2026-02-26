@@ -258,7 +258,7 @@ pub(crate) fn is_rate_limit_error(text: &str, exit_code: Option<i32>) -> bool {
 // Native Codex CLI backend
 // ---------------------------------------------------------------------------
 
-pub(crate) fn run_codex_native(prompt: &str) -> Result<AgentMessage, String> {
+pub(crate) fn run_codex_native(prompt: &str, read_only: bool) -> Result<AgentMessage, String> {
     let mut tried: Vec<String> = Vec::new();
 
     loop {
@@ -273,7 +273,7 @@ pub(crate) fn run_codex_native(prompt: &str) -> Result<AgentMessage, String> {
         };
         tried.push(account.clone());
 
-        match run_codex_once(prompt, &account) {
+        match run_codex_once(prompt, &account, read_only) {
             Ok(msg) => return Ok(msg),
             Err(e) => {
                 eprintln!("[codex] Account {account} failed: {e}, trying next...");
@@ -283,7 +283,7 @@ pub(crate) fn run_codex_native(prompt: &str) -> Result<AgentMessage, String> {
     }
 }
 
-fn run_codex_once(prompt: &str, account: &str) -> Result<AgentMessage, String> {
+fn run_codex_once(prompt: &str, account: &str, read_only: bool) -> Result<AgentMessage, String> {
     let profile = pool_get_profile(account)
         .ok_or_else(|| format!("No profile for account: {account}"))?;
 
@@ -300,18 +300,27 @@ fn run_codex_once(prompt: &str, account: &str) -> Result<AgentMessage, String> {
         .as_deref()
         .unwrap_or("xhigh");
 
+    let effective_prompt = if read_only {
+        format!(
+            "[ORCHESTRATOR MODE] You are a READ-ONLY analyst. You CANNOT write files or run commands. \
+             Your job is to analyze the codebase and return a diagnosis. Do NOT attempt to fix anything — \
+             just report what you find.\n\n{prompt}"
+        )
+    } else {
+        prompt.to_string()
+    };
+
+    let reasoning_cfg = format!("model_reasoning_effort=\"{reasoning}\"");
+
     let mut cmd = std::process::Command::new("codex");
-    cmd.args([
-        "exec",
-        "-m",
-        model,
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--json",
-        "--skip-git-repo-check",
-        "-c",
-        &format!("model_reasoning_effort=\"{reasoning}\""),
-        prompt,
-    ]);
+    let mut args = vec!["exec", "-m", model];
+    if read_only {
+        args.extend(["--sandbox", "read-only"]);
+    } else {
+        args.push("--dangerously-bypass-approvals-and-sandbox");
+    }
+    args.extend(["--json", "--skip-git-repo-check", "-c", &reasoning_cfg, &effective_prompt]);
+    cmd.args(&args);
     // Codex CLI reads config from $HOME/.codex/ — set HOME to the parent
     // of the config dir so each account gets its own auth.
     let config_path = std::path::Path::new(config_dir);
@@ -328,7 +337,7 @@ fn run_codex_once(prompt: &str, account: &str) -> Result<AgentMessage, String> {
         }
     }
 
-    eprintln!("[codex] Running with account={account}, model={model}");
+    eprintln!("[codex] Running with account={account}, model={model}, read_only={read_only}");
 
     let output = cmd
         .output()
@@ -400,7 +409,7 @@ fn run_codex_once(prompt: &str, account: &str) -> Result<AgentMessage, String> {
 // Native Claude Code CLI backend
 // ---------------------------------------------------------------------------
 
-pub(crate) fn run_claude_code_native(prompt: &str) -> Result<AgentMessage, String> {
+pub(crate) fn run_claude_code_native(prompt: &str, read_only: bool) -> Result<AgentMessage, String> {
     let account = pool_pick_best_account("claude-code")
         .ok_or("All Claude Code accounts are rate-limited")?;
 
@@ -412,10 +421,25 @@ pub(crate) fn run_claude_code_native(prompt: &str) -> Result<AgentMessage, Strin
         .as_deref()
         .unwrap_or("claude-sonnet-4-6");
 
-    eprintln!("[claude-code] Running with account={account}, model={model}");
+    let effective_prompt = if read_only {
+        format!(
+            "[ORCHESTRATOR MODE] You are a READ-ONLY analyst. You CANNOT write files or run commands. \
+             Your job is to analyze the codebase and return a diagnosis. Do NOT attempt to fix anything — \
+             just report what you find.\n\n{prompt}"
+        )
+    } else {
+        prompt.to_string()
+    };
+
+    eprintln!("[claude-code] Running with account={account}, model={model}, read_only={read_only}");
+
+    let mut args = vec!["-p", &effective_prompt, "--output-format", "json", "--model", model];
+    if read_only {
+        args.extend(["--allowedTools", "Read,Grep,Glob,WebSearch,WebFetch"]);
+    }
 
     let output = std::process::Command::new("claude")
-        .args(["-p", prompt, "--output-format", "json", "--model", model])
+        .args(&args)
         .output()
         .map_err(|e| format!("Failed to spawn claude: {e}"))?;
 
@@ -507,7 +531,7 @@ pub(crate) fn run_claude_code_native(prompt: &str) -> Result<AgentMessage, Strin
 /// Backend priority for pool routing
 const POOL_BACKEND_ORDER: &[&str] = &["codex", "claude-code"];
 
-pub(crate) fn run_pool_routed(request: &AgentHookRequest) -> Result<AgentMessage, String> {
+pub(crate) fn run_pool_routed(request: &AgentHookRequest, read_only: bool) -> Result<AgentMessage, String> {
     let prompt = extract_prompt_from_request(request);
     if prompt.is_empty() {
         return Err("No user prompt found in messages".into());
@@ -522,8 +546,8 @@ pub(crate) fn run_pool_routed(request: &AgentHookRequest) -> Result<AgentMessage
         }
 
         let result = match *service {
-            "codex" => run_codex_native(&prompt),
-            "claude-code" => run_claude_code_native(&prompt),
+            "codex" => run_codex_native(&prompt, read_only),
+            "claude-code" => run_claude_code_native(&prompt, read_only),
             _ => {
                 errors.push(format!("{service}: unknown backend"));
                 continue;
@@ -556,4 +580,21 @@ pub(crate) fn extract_prompt_from_request(request: &AgentHookRequest) -> String 
         }
     }
     String::new()
+}
+
+/// Inspect the tools array on an AgentHookRequest to decide whether a CLI
+/// hook should run in read-only / sandboxed mode.  When the orchestrator
+/// strips exec and fs_write the array will be empty (or missing those
+/// tools), which means the hook must NOT be allowed to write files.
+pub(crate) fn should_hook_be_read_only(request: &AgentHookRequest) -> bool {
+    if request.tools.is_empty() {
+        return true;
+    }
+    let has_exec = request.tools.iter().any(|t| {
+        t.get("name").and_then(|n| n.as_str()) == Some("exec")
+    });
+    let has_fs_write = request.tools.iter().any(|t| {
+        t.get("name").and_then(|n| n.as_str()) == Some("fs_write")
+    });
+    !has_exec && !has_fs_write
 }
