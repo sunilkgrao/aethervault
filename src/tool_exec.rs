@@ -2046,20 +2046,65 @@ pub(crate) fn execute_tool(
             let output_text = subprocess_output_text(&stdout, &stderr, is_error);
 
             // When browser returns a short confirmation (e.g. "✓ Done" from click/fill),
-            // the agent has no evidence of what actually happened.  Append a hint so the
-            // agent knows to call `snapshot` before making claims about page state.
-            let hinted_output = if !is_error && output_text.trim().len() < 120 {
+            // the agent has no evidence of what actually happened.  Rather than just
+            // hinting (which the agent often ignores), automatically run a follow-up
+            // snapshot so the agent gets page state evidence for free.
+            let final_output = if !is_error && output_text.trim().len() < 120 {
                 let action_word = parts.first().map(|s| s.as_str()).unwrap_or("");
-                let needs_hint = matches!(action_word,
+                let is_mutation = matches!(action_word,
                     "click" | "fill" | "select" | "check" | "uncheck" | "type"
                     | "press" | "hover" | "scroll" | "submit"
                 );
-                if needs_hint {
-                    format!(
-                        "{output_text}\n[HINT: This action returned only a confirmation. \
-                         Call `browser snapshot` on session \"{session}\" to verify the page state \
-                         before making any claims about what changed.]"
-                    )
+                if is_mutation {
+                    // Auto-snapshot: run `agent-browser --session <sess> snapshot`
+                    let snap_result = {
+                        let snap_args = vec!["--session".to_string(), session.clone(), "snapshot".to_string()];
+                        let mut snap_cmd = build_external_command("agent-browser", &snap_args);
+                        snap_cmd.stdin(Stdio::null())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped());
+                        match snap_cmd.spawn() {
+                            Ok(mut child) => {
+                                let cancel = Arc::new(AtomicBool::new(false));
+                                let snap_policy = ExecPolicy {
+                                    hard_timeout_ms: 30_000, // 30s for snapshot
+                                    stale_threshold_ms: 60_000,
+                                };
+                                match wait_for_child_monitored(&mut child, "browser-auto-snap", &cancel, &snap_policy) {
+                                    Ok(r) if r.status.success() && !r.stdout.trim().is_empty() => {
+                                        eprintln!("[tool:browser] auto-snapshot after '{action_word}' ({} bytes)", r.stdout.len());
+                                        Some(r.stdout)
+                                    }
+                                    Ok(r) => {
+                                        eprintln!("[tool:browser] auto-snapshot returned empty or failed (exit={:?})", r.status.code());
+                                        None
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[tool:browser] auto-snapshot error: {e}");
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[tool:browser] auto-snapshot spawn failed: {e}");
+                                None
+                            }
+                        }
+                    };
+                    match snap_result {
+                        Some(snapshot_text) => {
+                            format!(
+                                "{output_text}\n\n[AUTO-SNAPSHOT after '{action_word}' — current page state:]\n{snapshot_text}"
+                            )
+                        }
+                        None => {
+                            format!(
+                                "{output_text}\n[HINT: This action returned only a confirmation. \
+                                 Call `browser snapshot` on session \"{session}\" to verify the page state \
+                                 before making any claims about what changed.]"
+                            )
+                        }
+                    }
                 } else {
                     output_text
                 }
@@ -2067,7 +2112,7 @@ pub(crate) fn execute_tool(
                 output_text
             };
 
-            let wrapped_output = wrap_external_content(&hinted_output, "browser");
+            let wrapped_output = wrap_external_content(&final_output, "browser");
 
             Ok(ToolExecution {
                 output: wrapped_output,

@@ -43,21 +43,26 @@ Do NOT return anything outside this JSON structure.\n\n\
 IMPORTANT — BROWSER TOOL AWARENESS:\n\
 The agent uses a `browser` tool to navigate websites and interact with pages. Key behaviors:\n\
 - `navigate` returns a page title and URL — this IS evidence the page loaded.\n\
-- `click`, `fill`, `type`, `select` return ONLY a short confirmation (e.g. '✓ Done').\n\
-  This does NOT prove what happened on the page. The agent MUST call `browser snapshot` \
-  afterward to verify page state before claiming any outcome.\n\
+- `click`, `fill`, `type`, `select` now AUTO-SNAPSHOT: the tool output includes both the \
+  action confirmation AND an [AUTO-SNAPSHOT] section with the page accessibility tree. \
+  If the auto-snapshot is present, the agent CAN make claims about page state based on it.\n\
+- If auto-snapshot failed (output shows only a HINT instead), the agent MUST call \
+  `browser snapshot` manually before claiming outcomes.\n\
 - `snapshot` returns the full accessibility tree — this IS reliable evidence of page state.\n\
 - Do NOT flag the agent for making browser calls. DO flag the agent for claiming outcomes \
-  from click/fill/type actions without a follow-up snapshot.\n\
-- If the agent calls snapshot and quotes elements from it, that IS grounded.\n\n\
+  that contradict what the auto-snapshot or manual snapshot actually shows.\n\
+- If the agent quotes elements from a snapshot (auto or manual), that IS grounded.\n\n\
 ENFORCEMENT GUIDANCE:\n\
 When grounded=false and the issue involves subagent claims:\n\
 - Your correction MUST include the phrase: \"RETRACT your previous claim about subagent results.\"\n\
 - Your correction MUST instruct: \"Call session_status or check the actual tool output before making any claims about subagent results.\"\n\
 - If the agent has already been corrected for this same pattern, include: \"This is a REPEATED violation. You must NOT report subagent outcomes without first calling a status-checking tool.\"\n\n\
 When grounded=false and the issue involves browser tool claims:\n\
-- Your correction MUST instruct: \"Call `browser snapshot` to verify the page state before claiming what happened.\"\n\
-- Do NOT count navigate/snapshot results as violations — only claims about click/fill outcomes without snapshot evidence.";
+- If auto-snapshot was present in the tool output, check if the agent's claim matches the snapshot. \
+  If it does, that is GROUNDED (not a violation).\n\
+- If auto-snapshot was NOT present and the agent made claims without a manual snapshot, \
+  instruct: \"Call `browser snapshot` to verify the page state before claiming what happened.\"\n\
+- Do NOT count navigate/snapshot results as violations — only claims that contradict available evidence.";
 
 // Critic circuit breaker: after N consecutive failures, skip critic for rest of session.
 // Set high enough that long sessions (64+ steps) don't prematurely disable the critic.

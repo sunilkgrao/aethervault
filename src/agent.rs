@@ -2242,19 +2242,29 @@ pub(crate) fn run_agent_with_prompt(
                         });
                     }
                     8..=11 => {
-                        // Level 3: Log severe warning + restrict subagent tools (raised from 5-6 to 8-11)
-                        eprintln!("[critic] LEVEL 3 escalation: {violation_count} violations — restricting subagent tools");
+                        // Level 3: Log severe warning + conditionally restrict subagent tools
+                        eprintln!("[critic] LEVEL 3 escalation: {violation_count} violations");
+                        // In orchestrator mode, subagent tools are the ONLY way the agent can
+                        // do useful work (exec/fs_write are already stripped).  Restricting them
+                        // would completely hamstring the agent.  Only restrict subagent tools
+                        // when orchestrator mode is NOT active.
+                        let skip_subagent_restriction = orchestrator_mode || swarm_skill_matched;
+                        let l3_message = if skip_subagent_restriction {
+                            format!("[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says. For browser: call snapshot after EVERY action. Your subagent tools remain available — use them to delegate work, but ground ALL claims in tool output.")
+                        } else {
+                            format!("[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says. For browser: call snapshot after EVERY action. Subagent tools have been REVOKED.")
+                        };
                         messages.push(AgentMessage {
                             role: "user".to_string(),
-                            content: Some(format!("[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says. For browser: call snapshot after EVERY action. Subagent tools have been REVOKED.")),
+                            content: Some(l3_message),
                             tool_calls: Vec::new(),
                             name: None,
                             tool_call_id: None,
                             is_error: None,
                             thinking_blocks: vec![],
                         });
-                        // Enforce: restrict subagent tools to prevent further fabrication
-                        if !subagent_tools_restricted {
+                        // Enforce: restrict subagent tools ONLY when not in orchestrator mode
+                        if !subagent_tools_restricted && !skip_subagent_restriction {
                             subagent_tools_restricted = true;
                             let subagent_tool_names = ["subagent_invoke", "subagent_batch", "session_start"];
                             for tool_name in &subagent_tool_names {
@@ -2262,6 +2272,8 @@ pub(crate) fn run_agent_with_prompt(
                             }
                             tools = tools_from_active(&tool_map, &active_tools);
                             eprintln!("[critic] LEVEL 3: subagent tools restricted");
+                        } else if skip_subagent_restriction {
+                            eprintln!("[critic] LEVEL 3: subagent tools PRESERVED (orchestrator mode active)");
                         }
                         // Enforce: reduce remaining step budget by 1/4 (was 1/3)
                         let remaining = current_max_steps.saturating_sub(step);
