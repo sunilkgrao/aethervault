@@ -2228,12 +2228,12 @@ pub(crate) fn run_agent_with_prompt(
                 // Progressive escalation based on violation count
                 let violation_count = drift_state.violations.get("critic_correction").copied().unwrap_or(0);
                 match violation_count {
-                    0..=2 => { /* Standard correction — already injected above */ }
-                    3..=4 => {
-                        // Level 2: Stronger language
+                    0..=3 => { /* Standard correction — already injected above */ }
+                    4..=7 => {
+                        // Level 2: Stronger language (raised from 3-4 to 4-7 for browser workflows)
                         messages.push(AgentMessage {
                             role: "user".to_string(),
-                            content: Some(format!("[ESCALATION WARNING] This is correction #{violation_count}. Repeated grounding violations detected. You MUST quote specific tool output for every factual claim. Failure to comply will result in reduced capabilities.")),
+                            content: Some(format!("[ESCALATION WARNING] This is correction #{violation_count}. Repeated grounding violations detected. You MUST quote specific tool output for every factual claim. For browser interactions: ALWAYS call `browser snapshot` after click/fill/type BEFORE claiming what happened. Failure to comply will result in reduced capabilities.")),
                             tool_calls: Vec::new(),
                             name: None,
                             tool_call_id: None,
@@ -2241,12 +2241,12 @@ pub(crate) fn run_agent_with_prompt(
                             thinking_blocks: vec![],
                         });
                     }
-                    5..=6 => {
-                        // Level 3: Log severe warning + restrict subagent tools
+                    8..=11 => {
+                        // Level 3: Log severe warning + restrict subagent tools (raised from 5-6 to 8-11)
                         eprintln!("[critic] LEVEL 3 escalation: {violation_count} violations — restricting subagent tools");
                         messages.push(AgentMessage {
                             role: "user".to_string(),
-                            content: Some(format!("[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says. Subagent tools have been REVOKED.")),
+                            content: Some(format!("[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says. For browser: call snapshot after EVERY action. Subagent tools have been REVOKED.")),
                             tool_calls: Vec::new(),
                             name: None,
                             tool_call_id: None,
@@ -2263,27 +2263,26 @@ pub(crate) fn run_agent_with_prompt(
                             tools = tools_from_active(&tool_map, &active_tools);
                             eprintln!("[critic] LEVEL 3: subagent tools restricted");
                         }
-                        // Enforce: reduce remaining step budget by 1/3 (was halved — too aggressive)
+                        // Enforce: reduce remaining step budget by 1/4 (was 1/3)
                         let remaining = current_max_steps.saturating_sub(step);
-                        current_max_steps = step + (remaining * 2 / 3).max(6);
+                        current_max_steps = step + (remaining * 3 / 4).max(8);
                         eprintln!("[critic] LEVEL 3 enforcement: step budget reduced to {current_max_steps} (was {})", step + remaining);
                     }
                     _ => {
-                        // Level 4: Graceful wind-down instead of hard kill.
-                        // Give the agent enough steps to write partial results.
+                        // Level 4: Graceful wind-down (raised from 7+ to 12+)
                         eprintln!("[critic] LEVEL 4 escalation: {violation_count} violations — winding down gracefully");
                         messages.push(AgentMessage {
                             role: "user".to_string(),
-                            content: Some(format!("[CRITICAL — GRACEFUL WIND-DOWN] {violation_count} grounding violations. You have 6 steps remaining. IMMEDIATELY:\n1. Write any partial results to disk (files the user requested).\n2. Summarize what you actually accomplished vs. what failed.\n3. Do NOT make new claims — only report verified facts from tool outputs.\nAfter these 6 steps, the session will end.")),
+                            content: Some(format!("[CRITICAL — GRACEFUL WIND-DOWN] {violation_count} grounding violations. You have 8 steps remaining. IMMEDIATELY:\n1. Write any partial results to disk (files the user requested).\n2. Summarize what you actually accomplished vs. what failed.\n3. Do NOT make new claims — only report verified facts from tool outputs.\nAfter these 8 steps, the session will end.")),
                             tool_calls: Vec::new(),
                             name: None,
                             tool_call_id: None,
                             is_error: None,
                             thinking_blocks: vec![],
                         });
-                        // Enforce: allow 6 steps for graceful output (was 3 — too aggressive)
-                        current_max_steps = step + 6;
-                        eprintln!("[critic] LEVEL 4 enforcement: graceful wind-down in 6 steps (step={step}, max={current_max_steps})");
+                        // Enforce: allow 8 steps for graceful output (was 6)
+                        current_max_steps = step + 8;
+                        eprintln!("[critic] LEVEL 4 enforcement: graceful wind-down in 8 steps (step={step}, max={current_max_steps})");
                     }
                 }
             }

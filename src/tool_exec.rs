@@ -1975,6 +1975,25 @@ pub(crate) fn execute_tool(
                 "context has been closed",
             ];
 
+            // Kill zombie agent-browser daemon processes that accumulate across
+            // sessions and starve memory.  Only runs once per agent process.
+            static BROWSER_CLEANUP_DONE: std::sync::Once = std::sync::Once::new();
+            BROWSER_CLEANUP_DONE.call_once(|| {
+                let _ = std::process::Command::new("pkill")
+                    .args(["-f", "agent-browser.*daemon"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("pkill")
+                    .args(["-f", "chrome-headless-shell"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                // Give OS a moment to reclaim memory
+                std::thread::sleep(Duration::from_secs(2));
+                eprintln!("[tool:browser] cleaned up stale browser daemons (one-time)");
+            });
+
             let run_browser = |sess: &str| -> Result<ChildResult, String> {
                 let mut cmd_args: Vec<String> = vec!["--session".to_string(), sess.to_string()];
                 cmd_args.extend(parts.clone());
@@ -2025,7 +2044,30 @@ pub(crate) fn execute_tool(
                 "exit_code": exit_code
             });
             let output_text = subprocess_output_text(&stdout, &stderr, is_error);
-            let wrapped_output = wrap_external_content(&output_text, "browser");
+
+            // When browser returns a short confirmation (e.g. "✓ Done" from click/fill),
+            // the agent has no evidence of what actually happened.  Append a hint so the
+            // agent knows to call `snapshot` before making claims about page state.
+            let hinted_output = if !is_error && output_text.trim().len() < 120 {
+                let action_word = parts.first().map(|s| s.as_str()).unwrap_or("");
+                let needs_hint = matches!(action_word,
+                    "click" | "fill" | "select" | "check" | "uncheck" | "type"
+                    | "press" | "hover" | "scroll" | "submit"
+                );
+                if needs_hint {
+                    format!(
+                        "{output_text}\n[HINT: This action returned only a confirmation. \
+                         Call `browser snapshot` on session \"{session}\" to verify the page state \
+                         before making any claims about what changed.]"
+                    )
+                } else {
+                    output_text
+                }
+            } else {
+                output_text
+            };
+
+            let wrapped_output = wrap_external_content(&hinted_output, "browser");
 
             Ok(ToolExecution {
                 output: wrapped_output,

@@ -40,11 +40,24 @@ RESPONSE FORMAT — return ONLY this JSON:\n\
 If grounded=true, issues/agent_claim/evidence_shows/correction can be empty arrays/strings.\n\
 If grounded=false, you MUST include at least one issue with specific quotes from the conversation.\n\
 Do NOT return anything outside this JSON structure.\n\n\
+IMPORTANT — BROWSER TOOL AWARENESS:\n\
+The agent uses a `browser` tool to navigate websites and interact with pages. Key behaviors:\n\
+- `navigate` returns a page title and URL — this IS evidence the page loaded.\n\
+- `click`, `fill`, `type`, `select` return ONLY a short confirmation (e.g. '✓ Done').\n\
+  This does NOT prove what happened on the page. The agent MUST call `browser snapshot` \
+  afterward to verify page state before claiming any outcome.\n\
+- `snapshot` returns the full accessibility tree — this IS reliable evidence of page state.\n\
+- Do NOT flag the agent for making browser calls. DO flag the agent for claiming outcomes \
+  from click/fill/type actions without a follow-up snapshot.\n\
+- If the agent calls snapshot and quotes elements from it, that IS grounded.\n\n\
 ENFORCEMENT GUIDANCE:\n\
 When grounded=false and the issue involves subagent claims:\n\
 - Your correction MUST include the phrase: \"RETRACT your previous claim about subagent results.\"\n\
 - Your correction MUST instruct: \"Call session_status or check the actual tool output before making any claims about subagent results.\"\n\
-- If the agent has already been corrected for this same pattern, include: \"This is a REPEATED violation. You must NOT report subagent outcomes without first calling a status-checking tool.\"";
+- If the agent has already been corrected for this same pattern, include: \"This is a REPEATED violation. You must NOT report subagent outcomes without first calling a status-checking tool.\"\n\n\
+When grounded=false and the issue involves browser tool claims:\n\
+- Your correction MUST instruct: \"Call `browser snapshot` to verify the page state before claiming what happened.\"\n\
+- Do NOT count navigate/snapshot results as violations — only claims about click/fill outcomes without snapshot evidence.";
 
 // Critic circuit breaker: after N consecutive failures, skip critic for rest of session.
 // Set high enough that long sessions (64+ steps) don't prematurely disable the critic.

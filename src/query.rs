@@ -799,10 +799,10 @@ pub(crate) fn critic_should_fire(
         return false;
     }
 
-    let interval = if violation_count >= 5 {
-        1
-    } else if violation_count >= 3 {
-        2
+    let interval = if violation_count >= 10 {
+        1   // Every step after 10 violations
+    } else if violation_count >= 6 {
+        2   // Every other step after 6 violations
     } else {
         base_interval
     };
