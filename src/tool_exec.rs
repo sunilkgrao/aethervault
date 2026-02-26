@@ -18,6 +18,9 @@ use walkdir::WalkDir;
 use std::sync::mpsc;
 
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 120_000;
+/// Browser gets a longer default: Chromium cold-start can take 30-60s on
+/// constrained droplets, and page loads behind Docker proxies add more.
+const DEFAULT_BROWSER_TIMEOUT_MS: u64 = 240_000;
 /// Sentinel: disable timeout for exec policies (Codex CLI, builds).
 const EXEC_NO_TIMEOUT: u64 = u64::MAX;
 
@@ -1948,33 +1951,66 @@ pub(crate) fn execute_tool(
         "browser" => {
             let parsed: ToolBrowserArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-            let browser_timeout_ms = parsed.timeout_ms.unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
+            let browser_timeout_ms = parsed.timeout_ms.unwrap_or(DEFAULT_BROWSER_TIMEOUT_MS);
             let session = parsed.session.unwrap_or_else(|| "default".to_string());
 
-            let mut cmd_args: Vec<String> = vec!["--session".to_string(), session];
             let parts = shlex::split(&parsed.command)
                 .ok_or_else(|| "browser: malformed command (unmatched quotes)".to_string())?;
             if parts.is_empty() {
                 return Err("browser: command is empty".into());
             }
-            cmd_args.extend(parts);
 
-            let mut cmd = build_external_command("agent-browser", &cmd_args);
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            // Stale session patterns that warrant an automatic retry with a
+            // fresh session.  When agent-browser's underlying Playwright
+            // context is killed (e.g. by a prior timeout), subsequent calls
+            // to the same session fail immediately with one of these errors.
+            const STALE_SESSION_PATTERNS: &[&str] = &[
+                "has been closed",
+                "target page",
+                "browser has been closed",
+                "context has been closed",
+            ];
 
-            let mut child = cmd.spawn().map_err(|e| format!("browser spawn: {e}"))?;
-            let cancel_token = Arc::new(AtomicBool::new(false));
-            let browser_policy = ExecPolicy {
-                hard_timeout_ms: browser_timeout_ms,
-                stale_threshold_ms: 180_000,  // 3 min stale for browser
+            let run_browser = |sess: &str| -> Result<ChildResult, String> {
+                let mut cmd_args: Vec<String> = vec!["--session".to_string(), sess.to_string()];
+                cmd_args.extend(parts.clone());
+                let mut cmd = build_external_command("agent-browser", &cmd_args);
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = cmd.spawn().map_err(|e| format!("browser spawn: {e}"))?;
+                let cancel_token = Arc::new(AtomicBool::new(false));
+                let browser_policy = ExecPolicy {
+                    hard_timeout_ms: browser_timeout_ms,
+                    stale_threshold_ms: 300_000,  // 5 min stale for browser
+                };
+                wait_for_child_monitored(&mut child, "browser", &cancel_token, &browser_policy)
             };
-            let result = wait_for_child_monitored(&mut child, "browser", &cancel_token, &browser_policy)?;
-            let stdout = result.stdout;
-            let stderr = result.stderr;
-            let is_error = !result.status.success();
-            let exit_code = subprocess_exit_info(&result.status);
+
+            // First attempt with the requested session
+            let result = match run_browser(&session) {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
+
+            // If the session was stale, retry once with a fresh session name
+            let (stdout, stderr, status) = {
+                let combined = format!("{}{}", result.stdout, result.stderr).to_ascii_lowercase();
+                let is_stale = STALE_SESSION_PATTERNS.iter().any(|p| combined.contains(p));
+                if is_stale && result.status.code() != Some(0) {
+                    let fresh = format!("{session}-fresh-{}", std::process::id());
+                    eprintln!("[tool:browser] stale session '{session}' detected, retrying with '{fresh}'");
+                    match run_browser(&fresh) {
+                        Ok(r2) => (r2.stdout, r2.stderr, r2.status),
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    (result.stdout, result.stderr, result.status)
+                }
+            };
+
+            let is_error = !status.success();
+            let exit_code = subprocess_exit_info(&status);
             let details = serde_json::json!({
                 "stdout": stdout,
                 "stderr": stderr,
