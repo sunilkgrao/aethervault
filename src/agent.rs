@@ -1241,25 +1241,24 @@ pub(crate) fn run_agent_with_prompt(
     if orchestrator_mode {
         eprintln!("[harness] ORCHESTRATOR MODE (proactive): swarm-dev-task skill matched, tools already stripped");
     }
-    if !is_subagent && tool_filter.is_none() {
-        if let Some(ref ws) = workspace_env {
-            if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
-                let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(100));
-                let pr_open = crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(100));
-                let reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(100));
-                let active_count = running.len() + pr_open.len() + reviewing.len();
-                if active_count > 0 {
-                    orchestrator_mode = true;
-                    // Strip direct coding tools — orchestrator delegates, doesn't code
-                    active_tools.remove("exec");
-                    active_tools.remove("fs_write");
-                    tools = tools_from_active(&tool_map, &active_tools);
-                    eprintln!("[harness] ORCHESTRATOR MODE: {} active swarm tasks, exec/fs_write stripped", active_count);
-                    // Inject orchestrator mode notification
-                    let task_summary: Vec<String> = running.iter().chain(pr_open.iter()).chain(reviewing.iter())
-                        .map(|t| format!("  - {} ({}): {}", t.id, t.status.as_str(), t.name))
-                        .collect();
-                    messages.push(AgentMessage {
+        if !is_subagent && tool_filter.is_none() {
+            if let Some(ref ws) = workspace_env {
+                if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
+                    let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(100));
+                    let queued = crate::swarm::swarm_list_tasks(&sdb, Some("queued"), Some(100));
+                    let active_count = running.len() + queued.len();
+                    if active_count > 0 {
+                        orchestrator_mode = true;
+                        // Strip direct coding tools — orchestrator delegates, doesn't code
+                        active_tools.remove("exec");
+                        active_tools.remove("fs_write");
+                        tools = tools_from_active(&tool_map, &active_tools);
+                        eprintln!("[harness] ORCHESTRATOR MODE: {} active swarm tasks, exec/fs_write stripped", active_count);
+                        // Inject orchestrator mode notification
+                        let task_summary: Vec<String> = running.iter().chain(queued.iter())
+                            .map(|t| format!("  - {} ({}): {}", t.id, t.status.as_str(), t.name))
+                            .collect();
+                        messages.push(AgentMessage {
                         role: "user".to_string(),
                         content: Some(format!(
                             "[System] ORCHESTRATOR MODE ACTIVE. You have {} coding agents working. \
@@ -1421,10 +1420,8 @@ pub(crate) fn run_agent_with_prompt(
                     // has no active tasks (which is the initial state).
                     if orchestrator_mode {
                         let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(1));
-                        let pr_open = crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(1));
-                        let still_reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(1));
                         let queued = crate::swarm::swarm_list_tasks(&sdb, Some("queued"), Some(1));
-                        let no_active = running.is_empty() && pr_open.is_empty() && still_reviewing.is_empty();
+                        let no_active = running.is_empty() && queued.is_empty();
                         // When proactively enforced via skill match, never auto-restore tools.
                         // The agent must complete its swarm tasks; tools are restored only
                         // when orchestrator mode was triggered by existing DB tasks (not skill match).
