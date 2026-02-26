@@ -414,15 +414,18 @@ pub(crate) fn approve_and_maybe_execute(mv2: &Path, id: &str, execute: bool) -> 
             break;
         }
     }
-    if entry.is_none() {
-        return Ok("Approval id not found.".to_string());
-    }
     save_approvals(&db, &approvals)?;
 
+    let entry = match entry {
+        Some(entry) => entry,
+        None => {
+            eprintln!("warning: approval id '{id}' missing before execution");
+            return Ok("Approval id not found.".to_string());
+        }
+    };
     if !execute {
         return Ok("Approved.".to_string());
     }
-    let entry = entry.unwrap();
     let result = execute_tool(&entry.tool, entry.args, mv2, &db, false, None, None);
     match result {
         Ok(exec) => Ok(exec.output),
