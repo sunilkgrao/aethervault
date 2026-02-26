@@ -495,9 +495,23 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
 // ── Triggers ────────────────────────────────────────────────────────────
 
 pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {
-    load_config_json(db, "triggers")
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default()
+    let value = match load_config_entry(db, "triggers") {
+        Some(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("[load_triggers] failed to load trigger config: {err}");
+                return Vec::new();
+            }
+        },
+        None => {
+            eprintln!("[load_triggers] failed to load trigger config: missing entry");
+            return Vec::new();
+        }
+    };
+    serde_json::from_value(value).unwrap_or_else(|err| {
+        eprintln!("[load_triggers] failed to deserialize triggers: {err:?}");
+        Vec::new()
+    })
 }
 
 pub(crate) fn save_triggers(db: &MemoryDb, triggers: &[TriggerEntry]) -> Result<(), String> {
