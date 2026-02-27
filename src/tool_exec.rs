@@ -688,6 +688,9 @@ fn wait_for_child_monitored(
     cancel_token: &Arc<AtomicBool>,
     policy: &ExecPolicy,
 ) -> Result<ChildResult, String> {
+    const MAX_OUTPUT_BYTES: usize = 2_097_152;
+    const TRUNCATION_MARKER: &str = "\n... [truncated at 2MB]";
+
     let pid = child.id();
     let start = Instant::now();
 
@@ -700,11 +703,25 @@ fn wait_for_child_monitored(
     // Shared output buffers
     let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let stdout_truncated = Arc::new(AtomicBool::new(false));
+    let stderr_truncated = Arc::new(AtomicBool::new(false));
+
+    let build_output = |buffer: &Arc<Mutex<Vec<u8>>>, truncated: &Arc<AtomicBool>| -> String {
+        let mut output = String::from_utf8_lossy(
+            &buffer.lock().unwrap_or_else(|e| e.into_inner()),
+        )
+        .to_string();
+        if truncated.load(Ordering::Acquire) {
+            output.push_str(TRUNCATION_MARKER);
+        }
+        output
+    };
 
     // Spawn reader thread for stdout
     if let Some(pipe) = stdout_pipe {
         let buf = stdout_buf.clone();
         let activity = last_activity.clone();
+        let truncated = stdout_truncated.clone();
         let t0 = start;
         thread::spawn(move || {
             let mut reader = BufReader::new(pipe);
@@ -715,7 +732,17 @@ fn wait_for_child_monitored(
                     Ok(n) => {
                         activity.store(t0.elapsed().as_millis() as u64, Ordering::Release);
                         if let Ok(mut guard) = buf.lock() {
-                            guard.extend_from_slice(&chunk[..n]);
+                            if guard.len() < MAX_OUTPUT_BYTES {
+                                let remaining = MAX_OUTPUT_BYTES - guard.len();
+                                if n > remaining {
+                                    guard.extend_from_slice(&chunk[..remaining]);
+                                    truncated.store(true, Ordering::Release);
+                                } else {
+                                    guard.extend_from_slice(&chunk[..n]);
+                                }
+                            } else {
+                                truncated.store(true, Ordering::Release);
+                            }
                         }
                     }
                     Err(_) => break,
@@ -728,6 +755,7 @@ fn wait_for_child_monitored(
     if let Some(pipe) = stderr_pipe {
         let buf = stderr_buf.clone();
         let activity = last_activity.clone();
+        let truncated = stderr_truncated.clone();
         let t0 = start;
         thread::spawn(move || {
             let mut reader = BufReader::new(pipe);
@@ -738,7 +766,17 @@ fn wait_for_child_monitored(
                     Ok(n) => {
                         activity.store(t0.elapsed().as_millis() as u64, Ordering::Release);
                         if let Ok(mut guard) = buf.lock() {
-                            guard.extend_from_slice(&chunk[..n]);
+                            if guard.len() < MAX_OUTPUT_BYTES {
+                                let remaining = MAX_OUTPUT_BYTES - guard.len();
+                                if n > remaining {
+                                    guard.extend_from_slice(&chunk[..remaining]);
+                                    truncated.store(true, Ordering::Release);
+                                } else {
+                                    guard.extend_from_slice(&chunk[..n]);
+                                }
+                            } else {
+                                truncated.store(true, Ordering::Release);
+                            }
                         }
                     }
                     Err(_) => break,
@@ -760,14 +798,8 @@ fn wait_for_child_monitored(
             Ok(Some(status)) => {
                 // Give reader threads a moment to drain remaining pipe data
                 thread::sleep(Duration::from_millis(100));
-                let stdout = String::from_utf8_lossy(
-                    &stdout_buf.lock().unwrap_or_else(|e| e.into_inner()),
-                )
-                .to_string();
-                let stderr = String::from_utf8_lossy(
-                    &stderr_buf.lock().unwrap_or_else(|e| e.into_inner()),
-                )
-                .to_string();
+                let stdout = build_output(&stdout_buf, &stdout_truncated);
+                let stderr = build_output(&stderr_buf, &stderr_truncated);
                 return Ok(ChildResult { stdout, stderr, status });
             }
             Ok(None) => {
@@ -785,14 +817,8 @@ fn wait_for_child_monitored(
                     );
                     crate::kill_process_tree(child);
                     thread::sleep(Duration::from_millis(100));
-                    let stdout = String::from_utf8_lossy(
-                        &stdout_buf.lock().unwrap_or_else(|e| e.into_inner()),
-                    )
-                    .to_string();
-                    let stderr = String::from_utf8_lossy(
-                        &stderr_buf.lock().unwrap_or_else(|e| e.into_inner()),
-                    )
-                    .to_string();
+                    let stdout = build_output(&stdout_buf, &stdout_truncated);
+                    let stderr = build_output(&stderr_buf, &stderr_truncated);
                     let stdout_tail = tail_last_chars(&stdout, 500);
                     let stderr_tail = tail_last_chars(&stderr, 500);
                     return Err(format!(
@@ -814,14 +840,8 @@ fn wait_for_child_monitored(
                     );
                     crate::kill_process_tree(child);
                     thread::sleep(Duration::from_millis(100));
-                    let stdout = String::from_utf8_lossy(
-                        &stdout_buf.lock().unwrap_or_else(|e| e.into_inner()),
-                    )
-                    .to_string();
-                    let stderr = String::from_utf8_lossy(
-                        &stderr_buf.lock().unwrap_or_else(|e| e.into_inner()),
-                    )
-                    .to_string();
+                    let stdout = build_output(&stdout_buf, &stdout_truncated);
+                    let stderr = build_output(&stderr_buf, &stderr_truncated);
                     let stdout_tail = tail_last_chars(&stdout, 500);
                     let stderr_tail = tail_last_chars(&stderr, 500);
                     return Err(format!(
