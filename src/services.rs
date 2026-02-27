@@ -976,7 +976,7 @@ pub(crate) fn bootstrap_workspace(
 pub(crate) fn parse_timezone_offset(value: &str) -> Result<chrono::FixedOffset, Box<dyn std::error::Error>> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Ok(chrono::FixedOffset::east_opt(0).unwrap());
+        return chrono::FixedOffset::east_opt(0).ok_or_else(|| "invalid zero timezone offset".into());
     }
     let sign = if trimmed.starts_with('-') { -1 } else { 1 };
     let value = trimmed.trim_start_matches(['+', '-']);
@@ -1001,7 +1001,7 @@ pub(crate) fn resolve_timezone(
 ) -> chrono::FixedOffset {
     let raw = override_value.or_else(|| agent_cfg.timezone.clone());
     raw.and_then(|v| parse_timezone_offset(&v).ok())
-        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap())
+        .unwrap_or_else(|| chrono::FixedOffset::east(0))
 }
 
 pub(crate) fn should_run_daily(
