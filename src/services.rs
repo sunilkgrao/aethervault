@@ -1001,7 +1001,7 @@ pub(crate) fn resolve_timezone(
 ) -> chrono::FixedOffset {
     let raw = override_value.or_else(|| agent_cfg.timezone.clone());
     raw.and_then(|v| parse_timezone_offset(&v).ok())
-        .unwrap_or_else(|| chrono::FixedOffset::east(0))
+        .unwrap_or_else(|| chrono::Offset::fix(&chrono::Utc))
 }
 
 pub(crate) fn should_run_daily(
