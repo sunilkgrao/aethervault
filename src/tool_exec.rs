@@ -23,6 +23,7 @@ const DEFAULT_HTTP_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_BROWSER_TIMEOUT_MS: u64 = 240_000;
 /// Sentinel: disable timeout for exec policies (Codex CLI, builds).
 const EXEC_NO_TIMEOUT: u64 = u64::MAX;
+const HTTP_RESPONSE_MAX_BYTES: usize = 5 * 1024 * 1024;
 
 /// Sanitize external content (browser output, HTTP responses) before LLM sees it.
 /// Strips HTML tags, removes invisible Unicode characters (zero-width spaces, bidi
@@ -219,6 +220,26 @@ fn oauth_api_post(mv2: &Path, provider: &str, url: &str, payload: serde_json::Va
         Err(err) => Err(format!("{label} failed: {err}")),
     }
 }
+
+fn read_http_response_body(resp: ureq::Response) -> String {
+    let mut reader = resp.into_reader().take(HTTP_RESPONSE_MAX_BYTES as u64 + 1);
+    let mut body = Vec::with_capacity(8192);
+    if reader.read_to_end(&mut body).is_err() {
+        return String::new();
+    }
+
+    let truncated = body.len() > HTTP_RESPONSE_MAX_BYTES;
+    if truncated {
+        body.truncate(HTTP_RESPONSE_MAX_BYTES);
+    }
+
+    let mut body = String::from_utf8_lossy(&body).into_owned();
+    if truncated {
+        body.push_str("\n\n[Response truncated at 5MB]");
+    }
+    body
+}
+
 const PROCESS_POLL_MS: u64 = 250;
 const STATUS_REPORT_MS: u64 = 3_000;
 
@@ -1806,11 +1827,11 @@ pub(crate) fn execute_tool(
             let (status, text) = match resp {
                 Ok(resp) => {
                     let status = resp.status();
-                    let text = resp.into_string().unwrap_or_default();
+                    let text = read_http_response_body(resp);
                     (status, text)
                 }
                 Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
+                    let text = read_http_response_body(resp);
                     (code, text)
                 }
                 Err(err) => return Err(format!("http_request failed: {err}")),
