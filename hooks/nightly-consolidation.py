@@ -93,9 +93,8 @@ def query_agent_logs(target_date: str, limit: int = 100) -> str:
         return ""
 
     cmd = [
-        binary, "query", CAPSULE_PATH,
+        binary, "query", CAPSULE_PATH, target_date,
         "--collection", "agent-log",
-        "--query", target_date,
         "--limit", str(limit),
     ]
 
