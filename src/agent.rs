@@ -1248,7 +1248,9 @@ pub(crate) fn run_agent_with_prompt(
                 if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
                     let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(100));
                     let queued = crate::swarm::swarm_list_tasks(&sdb, Some("queued"), Some(100));
-                    let active_count = running.len() + queued.len();
+                    let pr_open = crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(100));
+                    let reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(100));
+                    let active_count = running.len() + queued.len() + pr_open.len() + reviewing.len();
                     if active_count > 0 {
                         orchestrator_mode = true;
                         // Strip direct coding tools — orchestrator delegates, doesn't code
@@ -1258,6 +1260,8 @@ pub(crate) fn run_agent_with_prompt(
                         eprintln!("[harness] ORCHESTRATOR MODE: {} active swarm tasks, exec/fs_write stripped", active_count);
                         // Inject orchestrator mode notification
                         let task_summary: Vec<String> = running.iter().chain(queued.iter())
+                            .chain(pr_open.iter())
+                            .chain(reviewing.iter())
                             .map(|t| format!("  - {} ({}): {}", t.id, t.status.as_str(), t.name))
                             .collect();
                         messages.push(AgentMessage {
@@ -1423,7 +1427,9 @@ pub(crate) fn run_agent_with_prompt(
                     if orchestrator_mode {
                         let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(1));
                         let queued = crate::swarm::swarm_list_tasks(&sdb, Some("queued"), Some(1));
-                        let no_active = running.is_empty() && queued.is_empty();
+                        let pr_open = crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(1));
+                        let reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(1));
+                        let no_active = running.is_empty() && queued.is_empty() && pr_open.is_empty() && reviewing.is_empty();
                         // When proactively enforced via skill match, never auto-restore tools.
                         // The agent must complete its swarm tasks; tools are restored only
                         // when orchestrator mode was triggered by existing DB tasks (not skill match).
