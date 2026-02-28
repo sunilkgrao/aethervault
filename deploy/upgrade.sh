@@ -157,8 +157,8 @@ echo "$INACTIVE" > "$ACTIVE_FILE"
 log "Symlink swapped. Active slot is now: $INACTIVE"
 
 # Step 5: Detach restart + health check into a background process.
-# systemctl restart kills the aethervault service (which is our parent),
-# so the health check must survive independently via setsid/nohup.
+# service uses foreground bridge processes directly (no systemd unit), so restart
+# uses pkill/nohup and health checks watch bridge processes via pgrep.
 log "Spawning detached restart + health check..."
 setsid bash -c "
     LOG_FILE='${LOG_FILE}'
@@ -174,38 +174,35 @@ setsid bash -c "
         echo \"\$msg\" >> \"\$LOG_FILE\"
     }
 
-    # Graceful shutdown: send SIGTERM and wait for in-progress agent runs
-    # to finish their capsule commits. The bridge catches SIGTERM, stops
-    # accepting new messages, waits up to 60s for active runs, then exits.
-    # This prevents mid-commit capsule corruption.
-    log 'Sending SIGTERM for graceful shutdown (up to 90s)...'
-    systemctl stop aethervault --no-block
-    # Wait for the service to stop gracefully (up to 90s)
-    STOP_WAIT=0
-    while systemctl is-active --quiet aethervault && [[ \$STOP_WAIT -lt 90 ]]; do
-        sleep 2
-        STOP_WAIT=\$((STOP_WAIT + 2))
-        log \"Waiting for graceful shutdown... \${STOP_WAIT}s\"
-    done
-    if systemctl is-active --quiet aethervault; then
-        log 'Service did not stop gracefully after 90s, force killing...'
-        systemctl kill -s SIGKILL aethervault
-        sleep 1
-    fi
-    log 'Service stopped. Starting with new binary...'
-    systemctl start aethervault
+    # Kill existing bridge processes and start fresh instances.
+    log 'Killing existing bridge processes (up to 90s)...'
+    pkill -f 'aethervault bridge' || true
+    sleep 2
+    nohup /usr/local/bin/aethervault bridge telegram --log >> /var/log/aethervault-telegram.log 2>&1 &
+    log \"Telegram bridge PID: \$!\"
+    sleep 1
+    nohup /usr/local/bin/aethervault bridge slack --log >> /var/log/aethervault-slack.log 2>&1 &
+    log \"Slack bridge PID: \$!\"
+    sleep 3
 
     log \"Monitoring for \${HEALTH_CHECK_SECONDS}s...\"
     ELAPSED=0
     while [[ \$ELAPSED -lt \$HEALTH_CHECK_SECONDS ]]; do
         sleep \$HEALTH_CHECK_INTERVAL
         ELAPSED=\$((ELAPSED + HEALTH_CHECK_INTERVAL))
-        if ! systemctl is-active --quiet aethervault; then
+        if ! pgrep -f 'aethervault bridge' >/dev/null; then
             log \"Service crashed after \${ELAPSED}s! Rolling back to \${ACTIVE}...\"
             ln -sfn \"\${DEPLOY_DIR}/\${ACTIVE}/aethervault\" \"\${SYMLINK}.tmp\"
             mv -f \"\${SYMLINK}.tmp\" \"\$SYMLINK\"
             echo \"\$ACTIVE\" > \"\${DEPLOY_DIR}/active\"
-            systemctl restart aethervault
+            pkill -f 'aethervault bridge' || true
+            sleep 2
+            nohup /usr/local/bin/aethervault bridge telegram --log >> /var/log/aethervault-telegram.log 2>&1 &
+            log \"Rollback Telegram bridge PID: \$!\"
+            sleep 1
+            nohup /usr/local/bin/aethervault bridge slack --log >> /var/log/aethervault-slack.log 2>&1 &
+            log \"Rollback Slack bridge PID: \$!\"
+            sleep 5
             log \"FATAL: Rolled back to \$ACTIVE slot after crash\"
             exit 1
         fi
