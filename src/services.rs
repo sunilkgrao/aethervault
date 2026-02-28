@@ -1936,8 +1936,9 @@ pub(crate) fn run_trigger_thread(
     let mut last_self_improve = Instant::now();
     let mut last_nightly: Option<chrono::NaiveDate> = None;
     let mut last_morning: Option<chrono::NaiveDate> = None;
-    // Suppress critic during autonomous trigger sessions
-    unsafe { std::env::set_var("CRITIC_SUPPRESS_AUTONOMOUS", "1"); }
+    // NOTE: Critic suppression removed — autonomous sessions need monitoring most.
+    // The old CRITIC_SUPPRESS_AUTONOMOUS env var was process-global and blocked
+    // the critic for ALL sessions including user-initiated ones.
     let self_improve_interval = Duration::from_secs(12 * 3600); // every 12 hours
     let mut attempt: u32 = 0;
 

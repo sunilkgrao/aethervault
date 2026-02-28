@@ -853,6 +853,31 @@ fn wait_for_child_monitored(
                     ));
                 }
 
+                // Zero-output early kill: if process has produced 0 bytes total
+                // after 60 seconds, it's almost certainly hung (SSH to dead host,
+                // waiting for input, etc). Kill early instead of wasting minutes.
+                const ZERO_OUTPUT_KILL_MS: u64 = 60_000;
+                if now_ms >= ZERO_OUTPUT_KILL_MS {
+                    let so_len = stdout_buf.lock().map(|g| g.len()).unwrap_or(0);
+                    let se_len = stderr_buf.lock().map(|g| g.len()).unwrap_or(0);
+                    if so_len == 0 && se_len == 0 {
+                        eprintln!(
+                            "[tool:{label}] pid={pid} zero-output-killed: \
+                             0 bytes produced after {s}s — likely hung",
+                            s = now_ms / 1000
+                        );
+                        crate::kill_process_tree(child);
+                        thread::sleep(Duration::from_millis(100));
+                        return Err(format!(
+                            "Process killed (pid {pid}): produced zero output after \
+                             {s} seconds. The command is likely hung (connection timeout, \
+                             waiting for input, or dead host). Try a different approach \
+                             or verify the target is reachable first.",
+                            s = now_ms / 1000
+                        ));
+                    }
+                }
+
                 // Periodic status report
                 if last_report.elapsed() >= Duration::from_millis(STATUS_REPORT_MS) {
                     let elapsed_s = now_ms / 1000;

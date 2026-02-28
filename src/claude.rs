@@ -825,11 +825,12 @@ pub(crate) fn call_critic(
         return None;
     }
 
-    // Suppress critic in autonomous/trigger sessions (set by run_trigger_thread)
-    if env_bool("CRITIC_SUPPRESS_AUTONOMOUS", false) {
-        eprintln!("[critic] suppressed: autonomous session");
-        return None;
-    }
+    // NOTE: Critic was previously suppressed in autonomous sessions via
+    // CRITIC_SUPPRESS_AUTONOMOUS env var. This was removed because autonomous
+    // sessions (idle work, proactive tasks) are where the agent struggles most —
+    // the critic needs to be active there to catch grounding violations,
+    // brute-force patterns, and unacknowledged tool failures. The ~$0.01/call
+    // cost is negligible compared to the wasted compute from unmonitored agents.
 
     // Circuit breaker: skip critic after too many consecutive failures
     if CRITIC_CONSECUTIVE_FAILURES.load(Ordering::Relaxed) >= CRITIC_MAX_CONSECUTIVE_FAILURES {

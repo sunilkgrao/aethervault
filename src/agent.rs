@@ -368,6 +368,14 @@ pub(crate) fn default_system_prompt() -> String {
         "- Complex multi-step task (research, multi-file code, debugging, troubleshooting): Break it down, use subagents for heavy lifting if helpful.",
         "Do NOT launch extensive tool use for greetings or vague requests.",
         "",
+        "## Behavioral Rules (Constitutional)",
+        "These rules are non-negotiable. Follow them EVERY step:",
+        "1. DIAGNOSE BEFORE RETRY: When something fails, investigate WHY before trying again. Check logs, read error messages, verify assumptions. Never retry the exact same action that just failed.",
+        "2. QUOTE BEFORE CLAIMING: Before stating that something worked, quote the specific tool output that proves it. If the output shows an error or is empty, say so. Never claim success based on assumption.",
+        "3. POLL SPARINGLY: For long-running tasks (training, builds, deployments), check status at most once every 5 minutes. Do not burn steps polling repeatedly.",
+        "4. ESCALATE AFTER 2 FAILURES: If the same approach fails twice, try a fundamentally different strategy. If that also fails, report the situation clearly instead of continuing to brute-force.",
+        "5. VERIFY MUTATIONS: After any state change (file write, API call, config change), verify the result with a read/check operation before moving on.",
+        "",
         "## Project Build Protocol (Orchestrator/Coder Separation)",
         "You are the ORCHESTRATOR. You write prompts and delegate to coding agents. You do NOT write code directly.",
         "When building a full application or multi-file feature:",
@@ -1155,6 +1163,22 @@ pub(crate) fn run_agent_with_prompt(
         active_tools.remove("exec");
         active_tools.remove("fs_write");
         eprintln!("[harness] PROACTIVE ORCHESTRATOR: swarm-dev-task skill matched — exec/fs_write stripped before first response");
+        // Inject explicit notice so the model never attempts exec/fs_write at step 0.
+        // Without this, models hallucinate tool calls for tools not in their tool list.
+        messages.push(AgentMessage {
+            role: "user".to_string(),
+            content: Some(
+                "[IMPORTANT — TOOL AVAILABILITY] The tools `exec` and `fs_write` are NOT available to you in this session. \
+                 They have been removed from your tool list. Do NOT attempt to call them — they will fail. \
+                 To accomplish coding tasks, you MUST use `swarm_create` to register tasks and `subagent_batch` \
+                 with name='swarm-coder' to spawn coding agents that have exec/fs_write access. \
+                 Start by analyzing the situation with your available tools (browser, http_request, swarm_list, etc.), \
+                 then delegate coding work to swarm agents."
+                .to_string()
+            ),
+            tool_calls: Vec::new(),
+            name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+        });
     }
     let mut tools = tools_from_active(&tool_map, &active_tools);
     let mut tool_results: Vec<AgentToolResult> = Vec::new();
@@ -1296,6 +1320,13 @@ pub(crate) fn run_agent_with_prompt(
     let mut consecutive_hook_failures: usize = 0;
     const MAX_CONSECUTIVE_HOOK_FAILURES: usize = 3;
     let mut subagent_tools_restricted = false;
+    let mut orchestrator_blocked_count: usize = 0;
+    // Circuit breaker: track tool+args failure counts. After 3 identical failures,
+    // block the call and force the agent to try a different approach.
+    let mut tool_failure_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Failed attempts scratchpad: track what was tried and why it failed.
+    // Injected periodically so the agent doesn't repeat the same mistakes.
+    let mut failed_attempts: Vec<String> = Vec::new();
     while step < current_max_steps {
         // Check if user extended step budget via checkpoint response
         if let Some(ref prog) = progress {
@@ -1365,19 +1396,33 @@ pub(crate) fn run_agent_with_prompt(
                             thinking_blocks: vec![],
                         });
                     }
-                    // Check for failed tasks that need retry (smart retry with prompt rewriting)
+                    // Check for failed tasks that need retry (smart retry with failure classification)
                     let failed = crate::swarm::swarm_list_tasks(&sdb, Some("failed"), Some(50));
                     for task in &failed {
                         if task.retry_count < task.max_retries {
                             let error_ctx = task.error_context.as_deref().unwrap_or("unknown error");
+                            let failure_kind = classify_failure("swarm_task", error_ctx, &serde_json::json!({}));
+                            let strategy = match failure_kind {
+                                FailureKind::Transient =>
+                                    "STRATEGY: Transient error (timeout/rate-limit). Retry with same approach but add \
+                                     error handling or timeout extension in the prompt.",
+                                FailureKind::Permanent =>
+                                    "STRATEGY: Permanent error (auth/permission/not-found). Do NOT retry the same approach. \
+                                     Investigate root cause first, then try a fundamentally different method. \
+                                     If the task is impossible, mark it done with an explanation.",
+                                FailureKind::Semantic =>
+                                    "STRATEGY: Logic/parsing error. Rewrite the prompt with more specific instructions. \
+                                     Include the exact error so the new agent avoids the same mistake.",
+                            };
                             let retry_prompt = format!(
-                                "[SWARM MONITOR — AUTO-RETRY NEEDED]\n\
-                                 Task '{}' (id: {}) FAILED (attempt {}/{}). Error: {}\n\
-                                 Original prompt: {}\n\n\
-                                 ACTION REQUIRED: Rewrite the prompt with failure context and spawn a new swarm-coder. \
-                                 Include what failed and instruct the agent to approach differently.",
+                                "[SWARM MONITOR — RETRY NEEDED]\n\
+                                 Task '{}' (id: {}) FAILED (attempt {}/{}) | Type: {:?}\n\
+                                 Error: {}\n\n\
+                                 {}\n\n\
+                                 Original prompt (first 500 chars): {}",
                                 task.name, task.id, task.retry_count + 1, task.max_retries,
-                                error_ctx, task.prompt.chars().take(500).collect::<String>()
+                                failure_kind, error_ctx, strategy,
+                                task.prompt.chars().take(500).collect::<String>()
                             );
                             messages.push(AgentMessage {
                                 role: "user".to_string(),
@@ -1388,7 +1433,7 @@ pub(crate) fn run_agent_with_prompt(
                                 is_error: None,
                                 thinking_blocks: vec![],
                             });
-                            eprintln!("[swarm-monitor] injected retry instruction for task {}", task.id);
+                            eprintln!("[swarm-monitor] injected retry for task {} (failure: {:?})", task.id, failure_kind);
                         }
                     }
                     // Check for CI-passing tasks that need cross-model review
@@ -1751,7 +1796,11 @@ pub(crate) fn run_agent_with_prompt(
                     }
                 }
                 if !has_non_blocked {
-                    // All calls were blocked — inject orchestrator reminder and skip to next step
+                    // All calls were blocked — inject orchestrator reminder and retry without
+                    // burning a step. The agent gets ONE free pass (the model may hallucinate
+                    // exec despite it not being in the tool list). On repeated offenses, count
+                    // the step so we don't loop forever.
+                    orchestrator_blocked_count += 1;
                     messages.push(AgentMessage {
                         role: "user".to_string(),
                         content: Some(
@@ -1767,7 +1816,9 @@ pub(crate) fn run_agent_with_prompt(
                         tool_calls: Vec::new(),
                         name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
                     });
-                    step += 1;
+                    if orchestrator_blocked_count > 1 {
+                        step += 1; // Only count as a step on repeat offenses
+                    }
                     continue;
                 }
                 tool_calls.retain(|c| !orchestrator_blocked.contains(&c.name));
@@ -1857,6 +1908,65 @@ pub(crate) fn run_agent_with_prompt(
             }
         }
 
+        // ── Circuit Breaker: block identical tool+args that have failed 3+ times ──
+        {
+            let mut circuit_broken = Vec::new();
+            for call in &tool_calls {
+                let key = format!("{}:{:x}", call.name, {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    call.args.to_string().hash(&mut h);
+                    h.finish()
+                });
+                if let Some(&count) = tool_failure_counts.get(&key) {
+                    if count >= 3 {
+                        circuit_broken.push((call.clone(), key));
+                    }
+                }
+            }
+            if !circuit_broken.is_empty() {
+                for (call, key) in &circuit_broken {
+                    let count = tool_failure_counts.get(key).copied().unwrap_or(0);
+                    let blocked_msg = format!(
+                        "CIRCUIT BREAKER: `{}` with these arguments has failed {} times. \
+                         This exact call is BLOCKED. You must try a fundamentally different approach: \
+                         different tool, different arguments, or investigate the root cause first.",
+                        call.name, count
+                    );
+                    tool_results.push(AgentToolResult {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        output: blocked_msg.clone(),
+                        details: serde_json::json!({ "circuit_breaker": true, "failures": count }),
+                        is_error: true,
+                    });
+                    messages.push(AgentMessage {
+                        role: "tool".to_string(),
+                        content: Some(blocked_msg),
+                        tool_calls: Vec::new(),
+                        name: Some(call.name.clone()),
+                        tool_call_id: Some(call.id.clone()),
+                        is_error: Some(true),
+                        thinking_blocks: vec![],
+                    });
+                    eprintln!("[circuit-breaker] blocked {}:{} after {count} failures", call.name, &key[call.name.len()+1..std::cmp::min(key.len(), call.name.len()+9)]);
+                }
+                let broken_ids: std::collections::HashSet<String> = circuit_broken.iter().map(|(c, _)| c.id.clone()).collect();
+                tool_calls.retain(|c| !broken_ids.contains(&c.id));
+                if tool_calls.is_empty() {
+                    messages.push(AgentMessage {
+                        role: "user".to_string(),
+                        content: Some("[Circuit Breaker] All attempted tool calls were blocked due to repeated failures. \
+                            You MUST change your approach. Review what has failed (see failed attempts below) and try something different.".to_string()),
+                        tool_calls: Vec::new(),
+                        name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                    });
+                    step += 1;
+                    continue;
+                }
+            }
+        }
+
         if tool_calls.len() == 1 {
             // Single tool call — execute directly (no thread overhead)
             let call = &tool_calls[0];
@@ -1927,6 +2037,35 @@ pub(crate) fn run_agent_with_prompt(
                     is_error: None,
                     thinking_blocks: vec![],
                 });
+            }
+
+            // Circuit breaker: track failure counts per tool+args
+            {
+                let cb_key = format!("{}:{:x}", call.name, {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    call.args.to_string().hash(&mut h);
+                    h.finish()
+                });
+                if is_error {
+                    let count = tool_failure_counts.entry(cb_key).or_insert(0);
+                    *count += 1;
+                    if *count == 1 {
+                        // First failure — record in scratchpad
+                        let output_preview: String = tool_results.last()
+                            .map(|r| r.output.chars().take(200).collect())
+                            .unwrap_or_default();
+                        failed_attempts.push(format!(
+                            "FAILED: {}({}) → {}",
+                            call.name,
+                            call.args.to_string().chars().take(100).collect::<String>(),
+                            output_preview
+                        ));
+                    }
+                } else {
+                    // Success — clear failure count for this key
+                    tool_failure_counts.remove(&cb_key);
+                }
             }
 
             // Update reminder state from tool result
@@ -2047,6 +2186,33 @@ pub(crate) fn run_agent_with_prompt(
                         active_tools.remove("fs_write");
                     }
                     tools = tools_from_active(&tool_map, &active_tools);
+                }
+
+                // Circuit breaker: track failure counts per tool+args (parallel path)
+                {
+                    let cb_key = format!("{}:{:x}", call.name, {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        call.args.to_string().hash(&mut h);
+                        h.finish()
+                    });
+                    if is_error {
+                        let count = tool_failure_counts.entry(cb_key).or_insert(0);
+                        *count += 1;
+                        if *count == 1 {
+                            let output_preview: String = tool_results.last()
+                                .map(|r| r.output.chars().take(200).collect())
+                                .unwrap_or_default();
+                            failed_attempts.push(format!(
+                                "FAILED: {}({}) → {}",
+                                call.name,
+                                call.args.to_string().chars().take(100).collect::<String>(),
+                                output_preview
+                            ));
+                        }
+                    } else {
+                        tool_failure_counts.remove(&cb_key);
+                    }
                 }
 
                 // Update reminder state from parallel tool result
@@ -2307,9 +2473,24 @@ pub(crate) fn run_agent_with_prompt(
 
         // Checkpoint-and-report every 10 steps
         if step > 0 && step % 10 == 0 {
+            let mut checkpoint_msg = format!(
+                "[Checkpoint — Step {}] Summarize what you have accomplished so far and what you plan to do next. \
+                 If the user's request was vague, confirm you are on the right track.", step
+            );
+            // Inject failed attempts scratchpad so the agent doesn't repeat mistakes
+            if !failed_attempts.is_empty() {
+                checkpoint_msg.push_str(&format!(
+                    "\n\n[Failed Attempts — DO NOT RETRY these exact approaches]\n{}",
+                    failed_attempts.iter()
+                        .enumerate()
+                        .map(|(i, a)| format!("{}. {}", i + 1, a))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
             messages.push(AgentMessage {
                 role: "user".to_string(),
-                content: Some(format!("[Checkpoint — Step {}] Summarize what you have accomplished so far and what you plan to do next. If the user's request was vague, confirm you are on the right track.", step)),
+                content: Some(checkpoint_msg),
                 tool_calls: Vec::new(),
                 name: None,
                 tool_call_id: None,
