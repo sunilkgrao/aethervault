@@ -507,7 +507,7 @@ pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {
             }
         },
         None => {
-            eprintln!("[load_triggers] failed to load trigger config: missing entry");
+            // No triggers configured — this is normal (not an error).
             return Vec::new();
         }
     };
