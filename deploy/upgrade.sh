@@ -174,15 +174,17 @@ setsid bash -c "
         echo \"\$msg\" >> \"\$LOG_FILE\"
     }
 
-    # Kill existing bridge processes and start fresh instances.
+    # Capture and restart existing bridge commands with same arguments.
+    mapfile -t BRIDGE_COMMANDS < <(ps -eo args= | grep -F \"aethervault bridge\" || true)
+    log \"Captured \${#BRIDGE_COMMANDS[@]} bridge command line(s) for restart.\"
     log 'Killing existing bridge processes (up to 90s)...'
     pkill -f 'aethervault bridge' || true
     sleep 2
-    nohup /usr/local/bin/aethervault bridge telegram --log >> /var/log/aethervault-telegram.log 2>&1 &
-    log \"Telegram bridge PID: \$!\"
-    sleep 1
-    nohup /usr/local/bin/aethervault bridge slack --log >> /var/log/aethervault-slack.log 2>&1 &
-    log \"Slack bridge PID: \$!\"
+    for cmd in \"\${BRIDGE_COMMANDS[@]}\"; do
+        log \"Restarting bridge command: \$cmd\"
+        nohup bash -c \"\$cmd\" >> /var/log/aethervault-bridge.log 2>&1 &
+        log \"Bridge PID: \$!\"
+    done
     sleep 3
 
     log \"Monitoring for \${HEALTH_CHECK_SECONDS}s...\"
@@ -197,11 +199,11 @@ setsid bash -c "
             echo \"\$ACTIVE\" > \"\${DEPLOY_DIR}/active\"
             pkill -f 'aethervault bridge' || true
             sleep 2
-            nohup /usr/local/bin/aethervault bridge telegram --log >> /var/log/aethervault-telegram.log 2>&1 &
-            log \"Rollback Telegram bridge PID: \$!\"
-            sleep 1
-            nohup /usr/local/bin/aethervault bridge slack --log >> /var/log/aethervault-slack.log 2>&1 &
-            log \"Rollback Slack bridge PID: \$!\"
+            for cmd in \"\${BRIDGE_COMMANDS[@]}\"; do
+                log \"Rollback bridge command: \$cmd\"
+                nohup bash -c \"\$cmd\" >> /var/log/aethervault-bridge.log 2>&1 &
+                log \"Rollback bridge PID: \$!\"
+            done
             sleep 5
             log \"FATAL: Rolled back to \$ACTIVE slot after crash\"
             exit 1
