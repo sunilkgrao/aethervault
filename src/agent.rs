@@ -706,7 +706,7 @@ pub(crate) fn run_agent_with_prompt(
     let db = open_or_create_db(&mv2)?;
 
     // Try flat file config first (workspace/config.json), fall back to capsule.
-    let workspace_env = std::env::var("AETHERVAULT_WORKSPACE").ok().map(PathBuf::from);
+    let workspace_env = resolve_workspace(None, &crate::AgentConfig::default());
     let config = if let Some(ref ws) = workspace_env {
         let cfg_path = config_file_path(ws);
         if cfg_path.exists() {
