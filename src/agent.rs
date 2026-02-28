@@ -1433,7 +1433,7 @@ pub(crate) fn run_agent_with_prompt(
                         // When proactively enforced via skill match, never auto-restore tools.
                         // The agent must complete its swarm tasks; tools are restored only
                         // when orchestrator mode was triggered by existing DB tasks (not skill match).
-                        let can_restore = !swarm_skill_matched && no_active;
+                        let can_restore = no_active;
                         if can_restore {
                             orchestrator_mode = false;
                             active_tools = base_tool_names();
@@ -1710,7 +1710,7 @@ pub(crate) fn run_agent_with_prompt(
         // ── Orchestrator Mode: Block exec/fs_write at dispatch level ──
         // Belt-and-suspenders: even if tools leak back into active_tools,
         // block them here with a clear error message directing the agent to use swarm tools.
-        if (orchestrator_mode || swarm_skill_matched) && !is_subagent_early {
+        if orchestrator_mode && !is_subagent_early {
             let orchestrator_blocked: Vec<String> = tool_calls.iter()
                 .filter(|c| matches!(c.name.as_str(), "exec" | "fs_write"))
                 .map(|c| c.name.clone())
@@ -1905,7 +1905,7 @@ pub(crate) fn run_agent_with_prompt(
             );
             if tools_changed {
                 // Re-strip orchestrator-blocked tools if they leaked back via tool_search
-                if (orchestrator_mode || swarm_skill_matched) && !is_subagent_early {
+                if orchestrator_mode && !is_subagent_early {
                     active_tools.remove("exec");
                     active_tools.remove("fs_write");
                 }
@@ -2042,7 +2042,7 @@ pub(crate) fn run_agent_with_prompt(
                 all_deferred.extend(deferred_msgs);
                 if tools_changed {
                     // Re-strip orchestrator-blocked tools if they leaked back via tool_search
-                    if (orchestrator_mode || swarm_skill_matched) && !is_subagent_early {
+                    if orchestrator_mode && !is_subagent_early {
                         active_tools.remove("exec");
                         active_tools.remove("fs_write");
                     }
@@ -2253,7 +2253,7 @@ pub(crate) fn run_agent_with_prompt(
                         // do useful work (exec/fs_write are already stripped).  Restricting them
                         // would completely hamstring the agent.  Only restrict subagent tools
                         // when orchestrator mode is NOT active.
-                        let skip_subagent_restriction = orchestrator_mode || swarm_skill_matched;
+                        let skip_subagent_restriction = orchestrator_mode;
                         let l3_message = if skip_subagent_restriction {
                             format!("[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says. For browser: call snapshot after EVERY action. Your subagent tools remain available — use them to delegate work, but ground ALL claims in tool output.")
                         } else {
