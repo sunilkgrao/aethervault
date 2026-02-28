@@ -1939,6 +1939,7 @@ pub(crate) fn run_trigger_thread(
     // Suppress critic during autonomous trigger sessions
     unsafe { std::env::set_var("CRITIC_SUPPRESS_AUTONOMOUS", "1"); }
     let self_improve_interval = Duration::from_secs(12 * 3600); // every 12 hours
+    let mut attempt: u32 = 0;
 
     // Configurable morning kickoff hour (default 8 AM in user's timezone)
     let morning_hour: u32 = env_optional("LINUS_MORNING_HOUR")
@@ -1955,10 +1956,22 @@ pub(crate) fn run_trigger_thread(
         {
             let now = Utc::now().with_timezone(&tz);
             let db_loop = match open_or_create_db(mv2) {
-                Ok(db) => db,
+                Ok(db) => {
+                    attempt = 0;
+                    db
+                }
                 Err(e) => {
-                    eprintln!("[trigger-thread] db open error: {e}");
-                    thread::sleep(Duration::from_secs(60));
+                    attempt += 1;
+                    let backoff_ms = std::cmp::min(
+                        500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))),
+                        30_000,
+                    );
+                    if attempt <= 2 || attempt.is_power_of_two() {
+                        eprintln!(
+                            "[trigger-thread] db open error: {e} (attempt {attempt}, next retry in {backoff_ms}ms)"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
                     continue;
                 }
             };
