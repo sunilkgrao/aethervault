@@ -884,8 +884,13 @@ mod tests {
         actions.push_back("read:abc".to_string());
         actions.push_back("read:abc".to_string());
         let result = detect_cycle(&actions);
-        assert!(result.is_some());
-        let (cycle_len, repeats) = result.unwrap();
+        let (cycle_len, repeats) = match result {
+            Some(value) => value,
+            None => {
+                eprintln!("[query] detect_cycle unexpectedly returned None in detect_cycle_single_repeat");
+                (0, 0)
+            }
+        };
         assert_eq!(cycle_len, 1);
         assert_eq!(repeats, 3);
     }
@@ -907,8 +912,13 @@ mod tests {
         actions.push_back("read:abc".to_string());
         actions.push_back("write:def".to_string());
         let result = detect_cycle(&actions);
-        assert!(result.is_some());
-        let (cycle_len, _) = result.unwrap();
+        let (cycle_len, _) = match result {
+            Some(value) => value,
+            None => {
+                eprintln!("[query] detect_cycle unexpectedly returned None in detect_cycle_two_step_pattern");
+                (0, 0)
+            }
+        };
         assert_eq!(cycle_len, 2);
     }
 
