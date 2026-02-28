@@ -24,7 +24,7 @@ log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG"; }
 die() { log "FATAL: $*"; exit 1; }
 
 # Safety: don't run if service is down
-systemctl is-active --quiet aethervault || die "Service not running, skipping"
+pgrep -f "aethervault bridge" > /dev/null || die "Service not running, skipping"
 
 # Safety: don't run if repo has uncommitted changes
 cd "$REPO"
@@ -252,7 +252,7 @@ UPGRADE_OUTPUT=$(timeout 120 aethervault agent "$MV2" \
 log "Phase 4: Deploy initiated. Waiting for health check..."
 sleep 35  # Wait for blue-green health check (30s) + buffer
 
-if systemctl is-active --quiet aethervault; then
+if pgrep -f "aethervault bridge" > /dev/null; then
     log "Phase 4: Service healthy after deploy"
 else
     log "Phase 4: Service NOT healthy — upgrade.sh should auto-rollback"
