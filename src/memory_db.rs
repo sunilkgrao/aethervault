@@ -340,18 +340,31 @@ impl MemoryDb {
             }
         };
 
-        let integrity_ok = conn
-            .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
-            .map(|result| result == "ok")
-            .unwrap_or(false);
+        let mut integrity_ok = false;
+        for attempt in 1..=3 {
+            integrity_ok = conn
+                .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
+                .map(|result| result == "ok")
+                .unwrap_or(false);
+
+            if integrity_ok {
+                break;
+            }
+
+            if attempt < 3 {
+                eprintln!(
+                    "[capsule] integrity check attempt {}/3 failed, retrying...",
+                    attempt
+                );
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
 
         if !integrity_ok {
             eprintln!("warning: sqlite integrity check failed for {:?}", path);
-            drop(conn);
             return Self::recover_and_open(path);
         }
 
-        let conn = Connection::open(path)?;
         let db = Self { conn };
         db.apply_pragmas()?;
         db.init_schema()?;
@@ -370,11 +383,6 @@ impl MemoryDb {
                 path, corrupt_backup_path, err
             );
         }
-
-        let wal_path = path.with_extension("mv2-wal");
-        let shm_path = path.with_extension("mv2-shm");
-        std::fs::remove_file(&wal_path).ok();
-        std::fs::remove_file(&shm_path).ok();
 
         let backup_candidates = Self::recovery_backup_paths(path);
         for backup in backup_candidates {
