@@ -1105,6 +1105,7 @@ pub(crate) fn run_agent_with_prompt(
                     name: "excalidraw".to_string(),
                     command: cmd,
                     env: HashMap::new(),
+                    timeout_secs: None,
                 });
             }
         }

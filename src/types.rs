@@ -246,6 +246,9 @@ pub(crate) struct McpServerConfig {
     /// Environment variables to pass to the server
     #[serde(default)]
     pub(crate) env: HashMap<String, String>,
+    /// Optional timeout in seconds for MCP tools/call response polling
+    #[serde(default)]
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1138,4 +1141,3 @@ pub(crate) fn format_tool_message_content(name: &str, output: &str, details: &se
     }
     format!("{output}\n\n[details]\n{details_str}")
 }
-
