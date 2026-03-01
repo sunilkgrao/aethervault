@@ -351,52 +351,63 @@ impl MemoryDb {
                 );
             }
 
-            let recover_success = {
-                let mut recover_source = match std::process::Command::new("sqlite3")
-                    .arg(path)
-                    .arg(".recover")
-                    .stdout(std::process::Stdio::piped())
-                    .spawn()
-                {
-                    Ok(child) => child,
-                    Err(err) => {
-                        eprintln!(
-                            "warning: failed to start sqlite3 .recover for {:?}: {}",
-                            path, err
-                        );
-                        false
-                    }
-                };
-
-                if let Some(recover_stdout) = recover_source.stdout.take() {
-                    match std::process::Command::new("sqlite3")
-                        .arg(&recovered_path)
-                        .stdin(std::process::Stdio::from(recover_stdout))
-                        .stdout(std::process::Stdio::null())
-                        .spawn()
-                    {
-                        Ok(mut recover_target) => {
-                            let source_ok =
-                                recover_source.wait().map(|status| status.success()).unwrap_or(false);
-                            let target_ok =
-                                recover_target.wait().map(|status| status.success()).unwrap_or(false);
+            let recover_success = match std::process::Command::new("sqlite3")
+                .arg(path)
+                .arg(".recover")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(mut recover_source) => {
+                    if let Some(recover_stdout) = recover_source.stdout.take() {
+                        if let Ok(mut recover_target) = std::process::Command::new("sqlite3")
+                            .arg(&recovered_path)
+                            .stdin(std::process::Stdio::from(recover_stdout))
+                            .stdout(std::process::Stdio::null())
+                            .spawn()
+                        {
+                            let source_ok = match recover_source.wait() {
+                                Ok(status) => status.success(),
+                                Err(err) => {
+                                    eprintln!(
+                                        "warning: failed to wait on sqlite3 .recover for {:?}: {}",
+                                        path, err
+                                    );
+                                    false
+                                }
+                            };
+                            let target_ok = match recover_target.wait() {
+                                Ok(status) => status.success(),
+                                Err(err) => {
+                                    eprintln!(
+                                        "warning: failed to wait on sqlite3 write for {:?}: {}",
+                                        recovered_path, err
+                                    );
+                                    false
+                                }
+                            };
                             source_ok && target_ok
-                        }
-                        Err(err) => {
+                        } else {
                             eprintln!(
-                                "warning: failed to start sqlite3 write for {:?}: {}",
-                                recovered_path, err
+                                "warning: failed to start sqlite3 write for {:?}",
+                                recovered_path
                             );
                             recover_source.wait().ok();
                             false
                         }
+                    } else {
+                        eprintln!(
+                            "warning: failed to capture sqlite3 .recover output for {:?}",
+                            path
+                        );
+                        recover_source.wait().ok();
+                        false
                     }
-                } else {
+                }
+                Err(err) => {
                     eprintln!(
-                        "warning: failed to capture sqlite3 .recover output for {:?}",
-                        path
+                        "warning: failed to start sqlite3 .recover for {:?}: {}",
+                        path, err
                     );
-                    recover_source.wait().ok();
                     false
                 }
             };
