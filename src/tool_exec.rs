@@ -1121,23 +1121,21 @@ pub(crate) fn execute_tool(
             return Err("approval required but tool disabled in read-only mode".into());
         }
         let args_hash = approval_hash(name, &args);
-        let approval_id: Option<String>;
-        let mut approved = false;
-        {
+        let (approved, approval_id): (bool, Option<String>) = {
             let mut approvals = load_approvals(db);
             if let Some(pos) = approvals
                 .iter()
                 .position(|e| e.tool == name && e.args_hash == args_hash && e.status == "approved")
             {
-                approval_id = Some(approvals[pos].id.clone());
+                let approval_id = approvals[pos].id.clone();
                 approvals.remove(pos);
                 save_approvals(db, &approvals)?;
-                approved = true;
+                (true, Some(approval_id))
             } else if let Some(existing) = approvals
                 .iter()
                 .find(|e| e.tool == name && e.args_hash == args_hash && e.status == "pending")
             {
-                approval_id = Some(existing.id.clone());
+                (false, Some(existing.id.clone()))
             } else {
                 let now = chrono::Utc::now().to_rfc3339();
                 let id = format!("apr_{}_{}", now.replace(':', ""), &args_hash[..8]);
@@ -1150,9 +1148,9 @@ pub(crate) fn execute_tool(
                     created_at: now,
                 });
                 save_approvals(db, &approvals)?;
-                approval_id = Some(id);
+                (false, Some(id))
             }
-        }
+        };
         if !approved {
             let id = approval_id.clone().unwrap_or_else(|| "unknown".to_string());
             return Ok(ToolExecution {

@@ -20,6 +20,7 @@ pub(crate) struct AuthProfilesConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct AuthProfile {
     #[serde(rename = "type")]
     #[allow(dead_code)]

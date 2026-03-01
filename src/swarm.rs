@@ -366,6 +366,7 @@ pub(crate) fn create_worktree(repo_path: &Path, branch_name: &str) -> Result<Pat
     Ok(wt_path)
 }
 
+#[allow(dead_code)]
 /// Remove a git worktree and optionally delete the branch if merged.
 #[allow(dead_code)]
 pub(crate) fn cleanup_worktree(repo_path: &Path, worktree_path: &Path) -> Result<(), String> {

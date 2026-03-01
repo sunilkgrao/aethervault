@@ -550,6 +550,7 @@ impl LaneKind {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct Candidate {
     pub(crate) key: String,
     pub(crate) frame_id: u64,

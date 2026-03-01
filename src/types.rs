@@ -132,6 +132,7 @@ pub(crate) struct ContextPack {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct QueryArgs {
     pub(crate) raw_query: String,
     pub(crate) collection: Option<String>,
