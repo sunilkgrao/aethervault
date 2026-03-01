@@ -28,6 +28,7 @@ pub(crate) struct McpServerHandle {
     timeout_secs: u64,
     dead: bool,
     tools: Vec<serde_json::Value>,
+    child_pid: Option<u32>,
     runtime: Runtime,
     service: Option<RunningService<RoleClient, ()>>,
 }
@@ -234,6 +235,7 @@ impl McpServerHandle {
 
         let transport = TokioChildProcess::new(command)
             .map_err(|e| format!("mcp '{}' spawn transport: {e}", cfg.name))?;
+        let child_pid = transport.id();
         let service = runtime
             .block_on(async {
                 let service = ().serve(transport).await;
@@ -250,6 +252,7 @@ impl McpServerHandle {
             timeout_secs: cfg.timeout_secs.unwrap_or(MCP_TOOL_CALL_TIMEOUT_SECS),
             dead: false,
             tools: Vec::new(),
+            child_pid,
             runtime,
             service: Some(service),
         };
@@ -264,10 +267,13 @@ impl McpServerHandle {
             .as_ref()
             .ok_or_else(|| format!("mcp '{}' service unavailable", self.name))?;
 
-        let tools = self
-            .runtime
-            .block_on(service.list_all_tools())
-            .map_err(|e| format!("mcp '{}' tools/list failed: {e}", self.name))?;
+        let tools = match self.runtime.block_on(service.list_all_tools()) {
+            Ok(tools) => tools,
+            Err(err) => {
+                eprintln!("[mcp] refresh_tools failed for {}: {err}", self.name);
+                return Ok(());
+            }
+        };
 
         self.tools = Self::normalize_tool_list(tools);
         eprintln!(
@@ -375,11 +381,48 @@ impl McpServerHandle {
     pub(crate) fn shutdown(&mut self) -> Result<(), String> {
         let service = self.service.take();
         if let Some(service) = service {
-            self.runtime
-                .block_on(async { service.cancel().await })
-                .map_err(|e| format!("mcp '{}' shutdown: {e}", self.name))?;
+            let mut service = service;
+            match self
+                .runtime
+                .block_on(async { service.close_with_timeout(Duration::from_millis(500)).await })
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if let Some(pid) = self.child_pid {
+                        if Self::force_kill_child(pid) {
+                            eprintln!("[mcp] force-killed stubborn MCP server: {}", self.name);
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(format!("mcp '{}' shutdown: {err}", self.name));
+                }
+            }
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn force_kill_child(pid: u32) -> bool {
+        let alive = {
+            let check = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if check == 0 {
+                true
+            } else {
+                !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
+            }
+        };
+        if !alive {
+            return false;
+        }
+
+        let kill_result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        kill_result == 0
+    }
+
+    #[cfg(not(unix))]
+    fn force_kill_child(_pid: u32) -> bool {
+        false
     }
 
     fn is_dead(&self) -> bool {
