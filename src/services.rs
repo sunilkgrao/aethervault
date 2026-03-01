@@ -589,7 +589,7 @@ pub(crate) fn restore_triggers_from_backup_if_empty(db: &MemoryDb) {
 
 pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {
     match db.triggers_list() {
-        Ok(triggers) if !triggers.is_empty() => return triggers,
+        Ok(triggers) if !triggers.is_empty() => { backup_triggers(&triggers); return triggers; }
         Ok(_) => {}
         Err(err) => eprintln!("[load_triggers] failed to load trigger table: {err}"),
     };
