@@ -1121,7 +1121,7 @@ pub(crate) fn execute_tool(
             return Err("approval required but tool disabled in read-only mode".into());
         }
         let args_hash = approval_hash(name, &args);
-        let mut approval_id: Option<String> = None;
+        let approval_id: Option<String>;
         let mut approved = false;
         {
             let mut approvals = load_approvals(db);

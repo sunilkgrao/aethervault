@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::{env_optional, AgentHookRequest, AgentHookResponse, AgentMessage};
+use crate::{env_optional, AgentHookRequest, AgentMessage};
 
 // ---------------------------------------------------------------------------
 // Auth profiles config (deserialized from config/auth-profiles.json)
@@ -22,12 +22,15 @@ pub(crate) struct AuthProfilesConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AuthProfile {
     #[serde(rename = "type")]
+    #[allow(dead_code)]
     pub(crate) auth_type: Option<String>,
+    #[allow(dead_code)]
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) codex_config_dir: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
     #[serde(flatten)]
+    #[allow(dead_code)]
     pub(crate) extra: HashMap<String, serde_json::Value>,
 }
 

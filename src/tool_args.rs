@@ -556,9 +556,13 @@ pub(crate) struct Candidate {
     pub(crate) uri: String,
     pub(crate) title: Option<String>,
     pub(crate) snippet: String,
+    #[allow(dead_code)]
     pub(crate) score: Option<f32>,
+    #[allow(dead_code)]
     pub(crate) lane: LaneKind,
+    #[allow(dead_code)]
     pub(crate) query: String,
+    #[allow(dead_code)]
     pub(crate) rank: usize,
 }
 

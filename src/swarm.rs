@@ -265,6 +265,7 @@ pub(crate) fn swarm_task_by_id(conn: &Connection, id: &str) -> Result<Option<Swa
     Ok(task)
 }
 
+#[allow(dead_code)]
 pub(crate) fn swarm_cleanup_done(conn: &Connection, older_than_days: u32) -> Result<usize, String> {
     let cutoff = Utc::now() - chrono::Duration::days(older_than_days as i64);
     let cutoff_str = cutoff.to_rfc3339();
@@ -366,6 +367,7 @@ pub(crate) fn create_worktree(repo_path: &Path, branch_name: &str) -> Result<Pat
 }
 
 /// Remove a git worktree and optionally delete the branch if merged.
+#[allow(dead_code)]
 pub(crate) fn cleanup_worktree(repo_path: &Path, worktree_path: &Path) -> Result<(), String> {
     // Force-remove the worktree
     let output = Command::new("git")

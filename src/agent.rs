@@ -31,7 +31,7 @@ use crate::{
     SessionTaint, FailureKind, classify_failure,
     open_skill_db, list_skills, record_skill_use,
     match_skills_for_prompt, bootstrap_skills,
-    prune_low_performing_skills, rebuild_fts5_index, find_similar_skill,
+    prune_low_performing_skills, rebuild_fts5_index,
 };
 
 /// Tracks blake3 hashes of observations already written this process lifetime.
@@ -130,9 +130,7 @@ pub(crate) fn run_agent(
     let mut current_prompt = prompt_text;
     let mut current_session = session;
     let mut chain_depth: usize = 0;
-    let mut final_output: Option<AgentRunOutput> = None;
-
-    loop {
+    let output = loop {
         let output = run_agent_with_prompt(
             mv2.clone(),
             current_prompt.clone(),
@@ -194,13 +192,8 @@ pub(crate) fn run_agent(
             }
         }
 
-        final_output = Some(output);
-        break;
-    }
-
-    let output = final_output.ok_or_else(|| {
-        io::Error::other("[Agent error: loop completed without generating output after all retries]")
-    })?;
+        break output;
+    };
 
     // Save session turns for CLI agent continuity (mirrors Telegram bridge behaviour)
     if let Some(ref sess_id) = session_for_save {
