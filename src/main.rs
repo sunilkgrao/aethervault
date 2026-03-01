@@ -40,7 +40,6 @@ pub(crate) use agent_log::*;
 pub(crate) use config_file::*;
 pub(crate) use skill_registry::*;
 pub(crate) use pool_state::*;
-pub(crate) use swarm::*;
 
 // External crate imports used directly in main()
 use std::collections::HashMap;

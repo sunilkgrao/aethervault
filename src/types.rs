@@ -132,6 +132,7 @@ pub(crate) struct ContextPack {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct QueryArgs {
     pub(crate) raw_query: String,
     pub(crate) collection: Option<String>,
@@ -146,8 +147,11 @@ pub(crate) struct QueryArgs {
     pub(crate) rerank_hook: Option<String>,
     pub(crate) rerank_hook_timeout_ms: u64,
     pub(crate) rerank_hook_full_text: bool,
+    #[allow(dead_code)]
     pub(crate) embed_model: Option<String>,
+    #[allow(dead_code)]
     pub(crate) embed_cache: usize,
+    #[allow(dead_code)]
     pub(crate) embed_no_cache: bool,
     pub(crate) rerank_docs: usize,
     pub(crate) rerank_chunk_chars: usize,
@@ -545,6 +549,7 @@ impl BackgroundTaskRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn active_for_chat(&self, chat_id: i64) -> Vec<&BackgroundTask> {
         self.tasks
             .get(&chat_id)
@@ -697,6 +702,7 @@ impl SessionRegistry {
         self.sessions.get(session_id)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_mut(&mut self, session_id: &str) -> Option<&mut SubagentSession> {
         self.sessions.get_mut(session_id)
     }
