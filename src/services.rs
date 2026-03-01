@@ -497,30 +497,121 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
 
 // ── Triggers ────────────────────────────────────────────────────────────
 
-pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {
+fn trigger_backup_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".aethervault/data/trigger-backup.json")
+}
+
+fn load_legacy_triggers_config(db: &MemoryDb) -> Vec<TriggerEntry> {
     let value = match load_config_entry(db, "triggers") {
-        Some(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!("[load_triggers] failed to load trigger config: {err}");
-                return Vec::new();
-            }
-        },
-        None => {
-            // No triggers configured — this is normal (not an error).
+        Some(bytes) => bytes,
+        None => return Vec::new(),
+    };
+    match serde_json::from_slice(&value) {
+        Ok(triggers) => triggers,
+        Err(err) => {
+            eprintln!("[load_triggers] failed to parse legacy config: {err}");
+            Vec::new()
+        }
+    }
+}
+
+fn load_legacy_triggers_backup() -> Vec<TriggerEntry> {
+    let path = trigger_backup_path();
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            eprintln!("[load_triggers] failed to read trigger backup: {err}");
             return Vec::new();
         }
     };
-    serde_json::from_value(value).unwrap_or_else(|err| {
-        eprintln!("[load_triggers] failed to deserialize triggers: {err:?}");
-        Vec::new()
-    })
+    match serde_json::from_slice(&bytes) {
+        Ok(triggers) => triggers,
+        Err(err) => {
+            eprintln!("[load_triggers] failed to parse legacy trigger backup: {err}");
+            Vec::new()
+        }
+    }
+}
+
+pub(crate) fn backup_triggers(triggers: &[TriggerEntry]) {
+    let path = trigger_backup_path();
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            eprintln!("[trigger-backup] failed to create backup directory: {err}");
+            return;
+        }
+    }
+
+    let tmp = path.with_extension("tmp");
+    let bytes = match serde_json::to_vec(triggers) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("[trigger-backup] failed to serialize triggers: {err}");
+            return;
+        }
+    };
+
+    if let Err(err) = fs::write(&tmp, bytes) {
+        eprintln!("[trigger-backup] failed to write temporary trigger backup: {err}");
+        return;
+    }
+
+    if let Err(err) = fs::rename(&tmp, &path) {
+        eprintln!("[trigger-backup] failed to commit trigger backup: {err}");
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+pub(crate) fn restore_triggers_from_backup_if_empty(db: &MemoryDb) {
+    let existing = match db.triggers_list() {
+        Ok(triggers) => triggers.len(),
+        Err(err) => {
+            eprintln!("[trigger-restore] failed to query trigger count: {err}");
+            return;
+        }
+    };
+    if existing != 0 {
+        return;
+    }
+
+    let backup = load_legacy_triggers_backup();
+    if backup.is_empty() {
+        return;
+    }
+
+    eprintln!("Trigger table empty, restoring {} triggers from backup", backup.len());
+    if let Err(err) = save_triggers(db, &backup) {
+        eprintln!("[trigger-restore] failed to restore triggers from backup: {err}");
+    }
+}
+
+pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {
+    match db.triggers_list() {
+        Ok(triggers) if !triggers.is_empty() => return triggers,
+        Ok(_) => {}
+        Err(err) => eprintln!("[load_triggers] failed to load trigger table: {err}"),
+    };
+
+    let mut triggers = load_legacy_triggers_config(db);
+    if triggers.is_empty() {
+        triggers = load_legacy_triggers_backup();
+    }
+    if !triggers.is_empty() {
+        if let Err(err) = db.triggers_replace(&triggers) {
+            eprintln!("[load_triggers] failed to migrate legacy triggers: {err}");
+        }
+    }
+    if !triggers.is_empty() {
+        backup_triggers(&triggers);
+    }
+    triggers
 }
 
 pub(crate) fn save_triggers(db: &MemoryDb, triggers: &[TriggerEntry]) -> Result<(), String> {
-    let json = serde_json::to_value(triggers).map_err(|e| e.to_string())?;
-    let bytes = serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?;
-    save_config_entry(db, "triggers", &bytes)?;
+    db.triggers_replace(triggers)?;
+    backup_triggers(triggers);
     Ok(())
 }
 

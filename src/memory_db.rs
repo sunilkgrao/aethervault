@@ -16,6 +16,8 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+use crate::TriggerEntry;
+
 // ── Type aliases ─────────────────────────────────────────────────────────
 
 pub(crate) type FrameId = u64;
@@ -281,23 +283,42 @@ CREATE TRIGGER IF NOT EXISTS frames_au AFTER UPDATE ON frames BEGIN
             COALESCE(new.search_text, ''), COALESCE(new.text_content, ''));
 END;
 
-CREATE TABLE IF NOT EXISTS config (
-    key TEXT PRIMARY KEY,
-    value BLOB NOT NULL,
-    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-);
+    CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value BLOB NOT NULL,
+        updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+    );
 
-CREATE TABLE IF NOT EXISTS feedback (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    uri TEXT NOT NULL,
-    score REAL NOT NULL,
-    note TEXT,
+    CREATE TABLE IF NOT EXISTS triggers (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        name TEXT,
+        query TEXT,
+        prompt TEXT,
+        start TEXT,
+        end TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        last_seen TEXT,
+        last_fired TEXT,
+        cron TEXT,
+        webhook_url TEXT,
+        webhook_method TEXT,
+        schedule_name TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uri TEXT NOT NULL,
+        score REAL NOT NULL,
+        note TEXT,
     session TEXT,
     ts_utc INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_feedback_uri ON feedback(uri);
 ";
+
+const TRIGGER_ID_SEQUENCE_KEY: &str = "__trigger_id_sequence";
 
 // ── Core implementation ──────────────────────────────────────────────────
 
@@ -808,6 +829,131 @@ impl MemoryDb {
             Err(_) => return Vec::new(),
         };
         rows.filter_map(|r| r.ok()).collect()
+    }
+
+    pub(crate) fn triggers_list(&self) -> Result<Vec<TriggerEntry>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, name, query, prompt, start, end, enabled, last_seen,
+                        last_fired, cron, webhook_url, webhook_method, schedule_name
+                 FROM triggers
+                 ORDER BY rowid ASC",
+            )
+            .map_err(|e| format!("triggers_list prepare: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(TriggerEntry {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    name: row.get(2)?,
+                    query: row.get(3)?,
+                    prompt: row.get(4)?,
+                    start: row.get(5)?,
+                    end: row.get(6)?,
+                    enabled: row.get::<_, i64>(7)? != 0,
+                    last_seen: row.get(8)?,
+                    last_fired: row.get(9)?,
+                    cron: row.get(10)?,
+                    webhook_url: row.get(11)?,
+                    webhook_method: row.get(12)?,
+                    schedule_name: row.get(13)?,
+                })
+            })
+            .map_err(|e| format!("triggers_list query: {e}"))?;
+        let mut triggers = Vec::new();
+        for row in rows {
+            if let Ok(trigger) = row {
+                triggers.push(trigger);
+            }
+        }
+        Ok(triggers)
+    }
+
+    pub(crate) fn next_trigger_id(&self) -> Result<String, String> {
+        self.conn
+            .execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("next_trigger_id begin tx: {e}"))?;
+        let now = Utc::now().timestamp();
+        if let Err(err) = self.conn.execute(
+            "INSERT OR IGNORE INTO config (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            params![TRIGGER_ID_SEQUENCE_KEY, "0", now],
+        ) {
+            let _ = self.conn.execute("ROLLBACK", []);
+            return Err(format!("next_trigger_id seed: {err}"));
+        }
+        let current: i64 = match self.conn.query_row(
+            "SELECT CAST(COALESCE(CAST(value AS INTEGER), 0) AS INTEGER) FROM config WHERE key = ?1",
+            params![TRIGGER_ID_SEQUENCE_KEY],
+            |row| row.get(0),
+        ) {
+            Ok(current) => current,
+            Err(err) => {
+                let _ = self.conn.execute("ROLLBACK", []);
+                return Err(format!("next_trigger_id read: {err}"));
+            }
+        };
+        let next = current.saturating_add(1);
+        if let Err(err) = self.conn.execute(
+            "UPDATE config SET value = ?1, updated_at = ?2 WHERE key = ?3",
+            params![next.to_string(), now, TRIGGER_ID_SEQUENCE_KEY],
+        ) {
+            let _ = self.conn.execute("ROLLBACK", []);
+            return Err(format!("next_trigger_id update: {err}"));
+        }
+        self.conn
+            .execute("COMMIT", [])
+            .map_err(|e| format!("next_trigger_id commit: {e}"))?;
+        Ok(format!("trg_{next:016}"))
+    }
+
+    pub(crate) fn triggers_replace(&self, triggers: &[TriggerEntry]) -> Result<(), String> {
+        self.conn
+            .execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("triggers_replace begin tx: {e}"))?;
+        if let Err(err) = self.conn.execute("DELETE FROM triggers", []) {
+            let _ = self.conn.execute("ROLLBACK", []);
+            return Err(format!("triggers_replace clear: {err}"));
+        }
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "INSERT OR REPLACE INTO triggers (
+                        id, kind, name, query, prompt, start, end, enabled, last_seen,
+                        last_fired, cron, webhook_url, webhook_method, schedule_name
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                )
+                .map_err(|e| {
+                    let _ = self.conn.execute("ROLLBACK", []);
+                    format!("triggers_replace prepare: {e}")
+                })?;
+            for trigger in triggers {
+                if let Err(err) = stmt.execute(params![
+                    &trigger.id,
+                    &trigger.kind,
+                    trigger.name,
+                    trigger.query,
+                    trigger.prompt,
+                    trigger.start,
+                    trigger.end,
+                    if trigger.enabled { 1 } else { 0 },
+                    trigger.last_seen,
+                    trigger.last_fired,
+                    trigger.cron,
+                    trigger.webhook_url,
+                    trigger.webhook_method,
+                    trigger.schedule_name,
+                ]) {
+                    let _ = self.conn.execute("ROLLBACK", []);
+                    return Err(format!("triggers_replace insert {}: {err}", trigger.id));
+                }
+            }
+        }
+        self.conn
+            .execute("COMMIT", [])
+            .map_err(|e| format!("triggers_replace commit: {e}"))?;
+        Ok(())
     }
 
     // ── Feedback operations ──────────────────────────────────────────
@@ -1418,6 +1564,80 @@ mod tests {
         let text = db.frame_text_by_id(id2).unwrap();
         assert_eq!(text, "version 2");
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_next_trigger_id_is_monotonic() {
+        let path = temp_db_path("trigger_id_sequence");
+        let _ = std::fs::remove_file(&path);
+        let db = MemoryDb::open_or_create(&path).unwrap();
+
+        let first = db.next_trigger_id().unwrap();
+        let second = db.next_trigger_id().unwrap();
+        let third = db.next_trigger_id().unwrap();
+
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        let parse_num = |id: &str| {
+            let raw = id
+                .strip_prefix("trg_")
+                .expect("trigger id should use trg_ prefix");
+            raw.parse::<u64>().unwrap()
+        };
+        assert!(parse_num(&first) < parse_num(&second));
+        assert!(parse_num(&second) < parse_num(&third));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_triggers_roundtrip_from_db_table() {
+        let path = temp_db_path("triggers_roundtrip");
+        let _ = std::fs::remove_file(&path);
+        let db = MemoryDb::open_or_create(&path).unwrap();
+
+        let triggers = vec![
+            TriggerEntry {
+                id: "trg_1".to_string(),
+                kind: "cron".to_string(),
+                name: Some("Nightly job".to_string()),
+                query: None,
+                prompt: Some("Run backup".to_string()),
+                start: Some("0 1 * * *".to_string()),
+                end: None,
+                enabled: true,
+                last_seen: None,
+                last_fired: None,
+                cron: Some("0 1 * * *".to_string()),
+                webhook_url: None,
+                webhook_method: None,
+                schedule_name: None,
+            },
+            TriggerEntry {
+                id: "trg_2".to_string(),
+                kind: "webhook".to_string(),
+                name: None,
+                query: None,
+                prompt: Some("Handle webhook".to_string()),
+                start: None,
+                end: None,
+                enabled: false,
+                last_seen: Some("abc".to_string()),
+                last_fired: Some("2026-01-01T00:00:00Z".to_string()),
+                cron: None,
+                webhook_url: Some("https://example.com/hook".to_string()),
+                webhook_method: Some("POST".to_string()),
+                schedule_name: None,
+            },
+        ];
+        db.triggers_replace(&triggers).unwrap();
+        let reloaded = MemoryDb::open_or_create(&path).unwrap();
+        let loaded = reloaded.triggers_list().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, triggers[0].id);
+        assert_eq!(loaded[0].kind, triggers[0].kind);
+        assert_eq!(loaded[1].enabled, false);
         std::fs::remove_file(&path).ok();
     }
 

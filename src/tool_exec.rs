@@ -2439,11 +2439,7 @@ pub(crate) fn execute_tool(
             let parsed: ToolTriggerAddArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let mut triggers = load_triggers(db);
-            let id = format!(
-                "trg_{}_{}",
-                chrono::Utc::now().timestamp(),
-                triggers.len() + 1
-            );
+            let id = db.next_trigger_id().map_err(|err| format!("next trigger id: {err}"))?;
             // Validate kind-specific required fields
             match parsed.kind.as_str() {
                 "cron" => {

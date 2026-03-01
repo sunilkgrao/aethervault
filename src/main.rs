@@ -165,6 +165,12 @@ fn frame_size_bucket(size_bytes: u64) -> String {
     "10 MB+".to_string()
 }
 
+fn restore_triggers_for_service_startup(mv2: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let db = open_or_create_db(mv2)?;
+    restore_triggers_from_backup_if_empty(&db);
+    Ok(())
+}
+
 fn to_sorted_stats(map: HashMap<String, usize>) -> Vec<(String, usize)> {
     let mut entries: Vec<(String, usize)> = map.into_iter().collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -891,7 +897,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(2);
         }
 
-        Command::Mcp { mv2, read_only } => run_mcp_server(mv2, read_only),
+        Command::Mcp { mv2, read_only } => {
+            restore_triggers_for_service_startup(&mv2)?;
+            run_mcp_server(mv2, read_only)
+        }
 
         Command::Agent {
             mv2,
@@ -980,16 +989,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log,
             log_commit_interval,
             poll_seconds,
-        } => run_watch_loop(
-            mv2,
-            workspace,
-            timezone,
-            model_hook,
-            max_steps,
-            log,
-            log_commit_interval,
-            poll_seconds,
-        ),
+        } => {
+            restore_triggers_for_service_startup(&mv2)?;
+            run_watch_loop(
+                mv2,
+                workspace,
+                timezone,
+                model_hook,
+                max_steps,
+                log,
+                log_commit_interval,
+                poll_seconds,
+            )
+        }
 
         Command::Connect {
             mv2,
