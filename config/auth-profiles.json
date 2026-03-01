@@ -30,6 +30,12 @@
       "provider": "groq",
       "model": "llama-3.3-70b-versatile",
       "key": "ENV:GROQ_API_KEY"
+    },
+    "xai-grok-primary": {
+      "type": "api_key",
+      "provider": "xai",
+      "model": "grok-3-mini",
+      "key": "ENV:XAI_API_KEY"
     }
   },
   "pools": {
@@ -43,6 +49,10 @@
     },
     "groq": {
       "accounts": ["groq-primary"],
+      "cooldown_secs": 60
+    },
+    "xai-grok": {
+      "accounts": ["xai-grok-primary"],
       "cooldown_secs": 60
     }
   },
