@@ -1372,3 +1372,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::extract_critic_json;
+
+    #[test]
+    fn test_extract_critic_json_fallback_paths() {
+        let result = extract_critic_json(r#"{"verdict":"pass","reason":"looks good"}"#).unwrap();
+        assert_eq!(result.get("verdict").and_then(|v| v.as_str()), Some("pass"));
+        assert_eq!(result.get("reason").and_then(|v| v.as_str()), Some("looks good"));
+
+        let result = extract_critic_json("Here's my analysis:\n{\"verdict\": \"fail\", \"reason\": \"...\"}").unwrap();
+        assert_eq!(result.get("verdict").and_then(|v| v.as_str()), Some("fail"));
+        assert_eq!(result.get("reason").and_then(|v| v.as_str()), Some("..."));
+        let result = extract_critic_json("I think this looks fine").unwrap();
+        assert_eq!(result.get("grounded").and_then(|v| v.as_bool()), Some(true));
+    }
+}

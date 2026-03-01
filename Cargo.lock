@@ -79,6 +79,7 @@ dependencies = [
  "clap",
  "libc",
  "rayon",
+ "regex",
  "reqwest",
  "rmcp",
  "rusqlite",
