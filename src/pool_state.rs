@@ -122,6 +122,13 @@ impl PoolState {
         }
     }
 
+    fn mark_rate_limited_for_secs(&mut self, account: &str, cooldown_secs: u64) {
+        if let Some(state) = self.accounts.get_mut(account) {
+            state.rate_limited_until = Some(Instant::now() + Duration::from_secs(cooldown_secs));
+            state.consecutive_failures += 1;
+        }
+    }
+
     fn mark_success(&mut self, account: &str) {
         if let Some(state) = self.accounts.get_mut(account) {
             state.rate_limited_until = None;
@@ -214,6 +221,12 @@ pub(crate) fn pool_total_accounts() -> usize {
 pub(crate) fn pool_mark_rate_limited(account: &str) {
     if let Ok(mut state) = global_pool().lock() {
         state.mark_rate_limited(account);
+    }
+}
+
+pub(crate) fn pool_mark_rate_limited_for_secs(account: &str, cooldown_secs: u64) {
+    if let Ok(mut state) = global_pool().lock() {
+        state.mark_rate_limited_for_secs(account, cooldown_secs);
     }
 }
 
@@ -625,12 +638,118 @@ pub(crate) fn run_groq_native(prompt: &str, read_only: bool) -> Result<AgentMess
     })
 }
 
+pub(crate) fn run_xai_native(prompt: &str, read_only: bool) -> Result<AgentMessage, String> {
+    let account = pool_pick_best_account("xai-grok")
+        .ok_or("All xAI accounts are rate-limited")?;
+
+    let profile = pool_get_profile(&account)
+        .ok_or_else(|| format!("No profile for account: {account}"))?;
+
+    let key = profile
+        .extra
+        .get("key")
+        .and_then(|v| v.as_str())
+        .and_then(|raw_key| {
+            if let Some(env_key) = raw_key.strip_prefix("ENV:") {
+                std::env::var(env_key).ok()
+            } else {
+                Some(raw_key.to_string())
+            }
+        })
+        .or_else(|| env_optional("XAI_API_KEY"))
+        .ok_or("Missing XAI API key")?;
+
+    let model = profile
+        .model
+        .as_deref()
+        .unwrap_or("grok-3-mini");
+
+    let effective_prompt = if read_only {
+        format!(
+            "[ORCHESTRATOR MODE] You are a READ-ONLY analyst. You CANNOT write files or run commands. \
+             Your job is to analyze the codebase and return a diagnosis. Do NOT attempt to fix anything — \
+             just report what you find.\n\n{prompt}"
+        )
+    } else {
+        prompt.to_string()
+    };
+
+    eprintln!("[xai] Running with account={account}, model={model}, read_only={read_only}");
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post("https://api.x.ai/v1/chat/completions")
+        .timeout(Duration::from_secs(120))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": effective_prompt}],
+            "temperature": 0.3,
+            "max_tokens": 16384,
+        }))
+        .send()
+        .map_err(|e| format!("Failed to call xAI API: {e}"))?;
+
+    let status = response.status().as_u16() as i32;
+    let body = response
+        .text()
+        .map_err(|e| format!("Failed to read xAI response: {e}"))?;
+
+    if status == 429 {
+        pool_mark_rate_limited_for_secs(&account, 60);
+        return Err("xAI rate-limited".into());
+    }
+
+    if is_rate_limit_error(&body, Some(status)) {
+        pool_mark_rate_limited_for_secs(&account, 60);
+        return Err("xAI rate-limited".into());
+    }
+
+    if status >= 300 {
+        return Err(format!("xAI API error {status}: {body}"));
+    }
+
+    let parsed = serde_json::from_str::<serde_json::Value>(&body).map_err(|e| {
+        format!(
+            "xAI returned non-JSON response: {e} — body: {}",
+            &body[..body.len().min(200)]
+        )
+    })?;
+
+    let content = parsed
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            format!(
+                "xAI response missing choices[0].message.content — body: {}",
+                &body[..body.len().min(200)]
+            )
+        })?;
+
+    pool_mark_success(&account);
+
+    Ok(AgentMessage {
+        role: "assistant".to_string(),
+        content: Some(content),
+        tool_calls: Vec::new(),
+        name: None,
+        tool_call_id: None,
+        is_error: None,
+        thinking_blocks: Vec::new(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Pool router: tries backends in priority order
 // ---------------------------------------------------------------------------
 
 /// Backend priority for pool routing
-const POOL_BACKEND_ORDER: &[&str] = &["codex", "claude-code", "groq"];
+const POOL_BACKEND_ORDER: &[&str] = &["codex", "claude-code", "groq", "xai-grok"];
 
 pub(crate) fn run_pool_routed(request: &AgentHookRequest, read_only: bool) -> Result<AgentMessage, String> {
     let prompt = extract_prompt_from_request(request);
@@ -650,6 +769,7 @@ pub(crate) fn run_pool_routed(request: &AgentHookRequest, read_only: bool) -> Re
             "codex" => run_codex_native(&prompt, read_only),
             "claude-code" => run_claude_code_native(&prompt, read_only),
             "groq" => run_groq_native(&prompt, read_only),
+            "xai-grok" => run_xai_native(&prompt, read_only),
             _ => {
                 errors.push(format!("{service}: unknown backend"));
                 continue;
