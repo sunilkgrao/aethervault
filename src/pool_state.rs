@@ -528,7 +528,7 @@ pub(crate) fn run_claude_code_native(prompt: &str, read_only: bool) -> Result<Ag
     })
 }
 
-pub(crate) fn run_groq_native(prompt: &str, _read_only: bool) -> Result<AgentMessage, String> {
+pub(crate) fn run_groq_native(prompt: &str, read_only: bool) -> Result<AgentMessage, String> {
     let account = pool_pick_best_account("groq")
         .ok_or("All Groq accounts are rate-limited")?;
 
@@ -554,7 +554,17 @@ pub(crate) fn run_groq_native(prompt: &str, _read_only: bool) -> Result<AgentMes
         .as_deref()
         .unwrap_or("llama-3.3-70b-versatile");
 
-    eprintln!("[groq] Running with account={account}, model={model}");
+    let effective_prompt = if read_only {
+        format!(
+            "[ORCHESTRATOR MODE] You are a READ-ONLY analyst. You CANNOT write files or run commands. \
+             Your job is to analyze the codebase and return a diagnosis. Do NOT attempt to fix anything — \
+             just report what you find.\n\n{prompt}"
+        )
+    } else {
+        prompt.to_string()
+    };
+
+    eprintln!("[groq] Running with account={account}, model={model}, read_only={read_only}");
 
     let client = reqwest::blocking::Client::new();
     let response = client
@@ -564,7 +574,7 @@ pub(crate) fn run_groq_native(prompt: &str, _read_only: bool) -> Result<AgentMes
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": effective_prompt}],
             "temperature": 0.3,
             "max_tokens": 16384,
         }))
@@ -590,18 +600,17 @@ pub(crate) fn run_groq_native(prompt: &str, _read_only: bool) -> Result<AgentMes
         return Err(format!("Groq API error {status}: {body}"));
     }
 
-    let content = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|payload| {
-            payload
-                .get("choices")?
-                .get(0)?
-                .get("message")?
-                .get("content")?
-                .as_str()
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "(Groq returned no output)".to_string());
+    let parsed = serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|e| format!("Groq returned non-JSON response: {e} — body: {}", &body[..body.len().min(200)]))?;
+
+    let content = parsed
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("Groq response missing choices[0].message.content — body: {}", &body[..body.len().min(200)]))?;
 
     pool_mark_success(&account);
 
