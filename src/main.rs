@@ -1129,6 +1129,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if !dry_run {
+                let target = target_mem
+                    .as_ref()
+                    .ok_or_else(|| "target memory not initialized".to_string())?;
                 for frame_id in candidates {
                 let frame = source.frame_by_id(frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 if frame.status != FrameStatus::Active
@@ -1137,15 +1140,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     continue;
                 }
-                copy_frame_to_archive(&source, target_mem.as_ref().unwrap(), &frame)?;
+                copy_frame_to_archive(&source, target, &frame)?;
                 source.delete_frame(frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 archived += 1;
                 deleted += 1;
             }
-                target_mem
-                    .as_ref()
-                    .unwrap()
-                    .commit()
+                target.commit()
                     .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 source.vacuum().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
