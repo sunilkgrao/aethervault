@@ -17,8 +17,6 @@ use walkdir::WalkDir;
 
 use std::sync::mpsc;
 
-static TRIGGER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 120_000;
 /// Browser gets a longer default: Chromium cold-start can take 30-60s on
 /// constrained droplets, and page loads behind Docker proxies add more.
@@ -68,22 +66,6 @@ fn generate_session_delimiter() -> String {
     );
     let hash = blake3::hash(seed.as_bytes());
     format!("EXTDATA-{}", &hash.to_hex()[..12])
-}
-
-fn generate_trigger_id() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let sequence = TRIGGER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let seed = format!(
-        "{}:{}:{}",
-        std::process::id(),
-        now,
-        sequence
-    );
-    let hash = blake3::hash(seed.as_bytes());
-    format!("trg_{}", &hash.to_hex()[..16])
 }
 
 /// Wrap external content with randomized delimiters and sanitization.
@@ -2457,10 +2439,7 @@ pub(crate) fn execute_tool(
             let parsed: ToolTriggerAddArgs =
                 serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
             let mut triggers = load_triggers(db);
-            let mut id = generate_trigger_id();
-            while triggers.iter().any(|trigger| trigger.id == id) {
-                id = generate_trigger_id();
-            }
+            let id = db.next_trigger_id().map_err(|err| format!("next trigger id: {err}"))?;
             // Validate kind-specific required fields
             match parsed.kind.as_str() {
                 "cron" => {
@@ -2521,7 +2500,6 @@ pub(crate) fn execute_tool(
             };
             triggers.push(entry);
             save_triggers(db, &triggers)?;
-            backup_triggers(&triggers);
             Ok(ToolExecution {
                 output: "Trigger added.".to_string(),
                 details: serde_json::json!({ "id": id }),
@@ -2545,7 +2523,6 @@ pub(crate) fn execute_tool(
             let updated = triggers.len() != before;
             if updated {
                 save_triggers(db, &triggers)?;
-                backup_triggers(&triggers);
             }
             Ok(ToolExecution {
                 output: if updated {
@@ -4462,21 +4439,5 @@ pub(crate) fn execute_tool(
             })
         }
         _ => Err("unknown tool".into()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use super::*;
-
-    #[test]
-    fn test_generate_trigger_id_is_unique_for_rapid_calls() {
-        let mut ids = HashSet::new();
-        for _ in 0..2000 {
-            let id = generate_trigger_id();
-            assert!(ids.insert(id), "detected duplicate trigger id");
-        }
     }
 }
