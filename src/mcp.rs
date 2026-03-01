@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use rmcp::{
@@ -378,27 +379,34 @@ impl McpServerHandle {
         }
     }
 
-    pub(crate) fn shutdown(&mut self) -> Result<(), String> {
+pub(crate) fn shutdown(&mut self) -> Result<(), String> {
         let service = self.service.take();
+        let mut shutdown_error: Option<String> = None;
+
         if let Some(service) = service {
             let mut service = service;
             match self
                 .runtime
                 .block_on(async { service.close_with_timeout(Duration::from_millis(500)).await })
             {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    if let Some(pid) = self.child_pid {
-                        if Self::force_kill_child(pid) {
-                            eprintln!("[mcp] force-killed stubborn MCP server: {}", self.name);
-                        }
-                    }
-                }
+                Ok(_) => {}
                 Err(err) => {
-                    return Err(format!("mcp '{}' shutdown: {err}", self.name));
+                    shutdown_error = Some(format!("mcp '{}' shutdown: {err}", self.name));
                 }
             }
         }
+
+        if let Some(pid) = self.child_pid {
+            thread::sleep(Duration::from_millis(500));
+            if Self::force_kill_child(pid) {
+                eprintln!("[mcp] force-killed stubborn MCP server: {}", self.name);
+            }
+        }
+
+        if let Some(err) = shutdown_error {
+            return Err(err);
+        }
+
         Ok(())
     }
 
