@@ -328,10 +328,117 @@ impl MemoryDb {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        let conn = Connection::open(path)?;
+
+        let integrity_ok = conn
+            .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
+            .map(|result| result == "ok")
+            .unwrap_or(false);
+
+        if !integrity_ok {
+            eprintln!("warning: sqlite integrity check failed for {:?}", path);
+            drop(conn);
+
+            let now = Utc::now().format("%Y%m%d-%H%M%S");
+            let corrupt_backup_path = path.with_extension(format!("corrupt-{now}.mv2"));
+            let recovered_path = path.with_extension(format!("recovered-{now}.mv2"));
+
+            if let Err(err) = std::fs::copy(path, &corrupt_backup_path) {
+                eprintln!(
+                    "warning: failed to backup corrupt database {:?} to {:?}: {}",
+                    path, corrupt_backup_path, err
+                );
+            }
+
+            let recover_success = {
+                let mut recover_source = match std::process::Command::new("sqlite3")
+                    .arg(path)
+                    .arg(".recover")
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(child) => child,
+                    Err(err) => {
+                        eprintln!(
+                            "warning: failed to start sqlite3 .recover for {:?}: {}",
+                            path, err
+                        );
+                        false
+                    }
+                };
+
+                if let Some(recover_stdout) = recover_source.stdout.take() {
+                    match std::process::Command::new("sqlite3")
+                        .arg(&recovered_path)
+                        .stdin(std::process::Stdio::from(recover_stdout))
+                        .stdout(std::process::Stdio::null())
+                        .spawn()
+                    {
+                        Ok(mut recover_target) => {
+                            let source_ok =
+                                recover_source.wait().map(|status| status.success()).unwrap_or(false);
+                            let target_ok =
+                                recover_target.wait().map(|status| status.success()).unwrap_or(false);
+                            source_ok && target_ok
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "warning: failed to start sqlite3 write for {:?}: {}",
+                                recovered_path, err
+                            );
+                            recover_source.wait().ok();
+                            false
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "warning: failed to capture sqlite3 .recover output for {:?}",
+                        path
+                    );
+                    recover_source.wait().ok();
+                    false
+                }
+            };
+
+            let has_recovered = std::fs::metadata(&recovered_path)
+                .map(|meta| meta.len() > 0)
+                .unwrap_or(false);
+
+            if recover_success && has_recovered {
+                let mut swapped = false;
+                if std::fs::rename(&recovered_path, path).is_ok() {
+                    swapped = true;
+                } else if std::fs::remove_file(path).is_ok() {
+                    swapped = std::fs::rename(&recovered_path, path).is_ok();
+                }
+
+                if !swapped {
+                    eprintln!(
+                        "warning: failed to replace database {:?} with recovered copy {:?}",
+                        path, recovered_path
+                    );
+                    std::fs::remove_file(path).ok();
+                }
+
+                std::fs::remove_file(&recovered_path).ok();
+            } else {
+                if !recover_success {
+                    eprintln!("warning: sqlite recovery failed for {:?}", path);
+                } else if !has_recovered {
+                    eprintln!("warning: recovered database is missing or empty for {:?}", path);
+                }
+                std::fs::remove_file(path).ok();
+                std::fs::remove_file(&recovered_path).ok();
+            }
+        }
+
         let conn = Connection::open(path)?;
         let db = Self { conn };
         db.apply_pragmas()?;
         db.init_schema()?;
+        db.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(db)
     }
 
