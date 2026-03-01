@@ -190,15 +190,18 @@ pub(crate) fn put_with_consolidation(
 mod tests {
     use super::*;
     use crate::memory_db::MemoryDb;
+    use std::error::Error;
     use std::path::PathBuf;
 
-    fn temp_db_path(name: &str) -> PathBuf {
+    type TestResult<T> = std::result::Result<T, Box<dyn Error>>;
+
+    fn temp_db_path(name: &str) -> TestResult<PathBuf> {
         let dir = std::env::temp_dir().join("aethervault_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(format!(
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir.join(format!(
             "test_consolidation_{}_{name}.sqlite",
             std::process::id()
-        ))
+        )))
     }
 
     // ── token_jaccard tests ─────────────────────────────────────────
@@ -237,30 +240,31 @@ mod tests {
     // ── consolidate() integration tests ─────────────────────────────
 
     #[test]
-    fn test_consolidate_add_new() {
-        let path = temp_db_path("add_new");
+    fn test_consolidate_add_new() -> TestResult<()> {
+        let path = temp_db_path("add_new")?;
         let _ = std::fs::remove_file(&path);
-        let db = MemoryDb::open_or_create(&path).unwrap();
+        let db = MemoryDb::open_or_create(&path)?;
 
         let decision =
             consolidate(&db, b"brand new content here", Some("brand new content here"), None);
         assert_eq!(decision, ConsolidationDecision::Add);
 
         std::fs::remove_file(&path).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_consolidate_noop_duplicate() {
-        let path = temp_db_path("noop_dup");
+    fn test_consolidate_noop_duplicate() -> TestResult<()> {
+        let path = temp_db_path("noop_dup")?;
         let _ = std::fs::remove_file(&path);
-        let db = MemoryDb::open_or_create(&path).unwrap();
+        let db = MemoryDb::open_or_create(&path)?;
 
         let content = b"Sunil prefers dark roast coffee in the morning and green tea in the afternoon";
         let mut opts = PutOptions::default();
         opts.uri = Some("aethervault://memory/test/1".to_string());
         opts.search_text = Some(String::from_utf8_lossy(content).to_string());
         opts.track = Some("aethervault.observation".to_string());
-        db.put_bytes_with_options(content, opts).unwrap();
+        db.put_bytes_with_options(content, opts)?;
 
         // Exact same bytes -> NOOP via checksum
         let decision = consolidate(
@@ -272,20 +276,21 @@ mod tests {
         assert!(matches!(decision, ConsolidationDecision::Noop { .. }));
 
         std::fs::remove_file(&path).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_consolidate_update_similar() {
-        let path = temp_db_path("update_sim");
+    fn test_consolidate_update_similar() -> TestResult<()> {
+        let path = temp_db_path("update_sim")?;
         let _ = std::fs::remove_file(&path);
-        let db = MemoryDb::open_or_create(&path).unwrap();
+        let db = MemoryDb::open_or_create(&path)?;
 
         let original = "Sunil prefers dark roast coffee and reads in the morning every day";
         let mut opts = PutOptions::default();
         opts.uri = Some("aethervault://memory/test/orig".to_string());
         opts.search_text = Some(original.to_string());
         opts.track = Some("aethervault.observation".to_string());
-        db.put_bytes_with_options(original.as_bytes(), opts).unwrap();
+        db.put_bytes_with_options(original.as_bytes(), opts)?;
 
         // Similar but different content (>50% overlap, <85% overlap)
         let updated = "Sunil prefers dark roast coffee and works out in the morning every day instead of reading";
@@ -304,20 +309,21 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_consolidate_different_track_isolation() {
-        let path = temp_db_path("track_iso");
+    fn test_consolidate_different_track_isolation() -> TestResult<()> {
+        let path = temp_db_path("track_iso")?;
         let _ = std::fs::remove_file(&path);
-        let db = MemoryDb::open_or_create(&path).unwrap();
+        let db = MemoryDb::open_or_create(&path)?;
 
         let content = b"important fact about the weather today being sunny and warm";
         let mut opts = PutOptions::default();
         opts.uri = Some("aethervault://memory/track_a/1".to_string());
         opts.search_text = Some(String::from_utf8_lossy(content).to_string());
         opts.track = Some("aethervault.reflection".to_string());
-        db.put_bytes_with_options(content, opts).unwrap();
+        db.put_bytes_with_options(content, opts)?;
 
         // Same content on a different track — checksum match doesn't scope by track
         // but FTS search does scope by track, so behavior depends on checksum path
@@ -334,20 +340,22 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_put_consolidation_full_flow() {
-        let path = temp_db_path("put_flow");
+    fn test_put_consolidation_full_flow() -> TestResult<()> {
+        let path = temp_db_path("put_flow")?;
         let _ = std::fs::remove_file(&path);
-        let db = MemoryDb::open_or_create(&path).unwrap();
+        let db = MemoryDb::open_or_create(&path)?;
 
         // First write: ADD
         let mut opts = PutOptions::default();
         opts.uri = Some("aethervault://memory/observation/100".to_string());
         opts.search_text = Some("the quick brown fox jumps over the lazy dog".to_string());
         opts.track = Some("aethervault.observation".to_string());
-        let result = put_with_consolidation(&db, b"the quick brown fox jumps over the lazy dog", opts).unwrap();
+        let result =
+            put_with_consolidation(&db, b"the quick brown fox jumps over the lazy dog", opts)?;
         assert!(matches!(result.decision, ConsolidationDecision::Add));
         assert!(result.frame_id.is_some());
 
@@ -356,7 +364,11 @@ mod tests {
         opts2.uri = Some("aethervault://memory/observation/101".to_string());
         opts2.search_text = Some("the quick brown fox jumps over the lazy dog".to_string());
         opts2.track = Some("aethervault.observation".to_string());
-        let result2 = put_with_consolidation(&db, b"the quick brown fox jumps over the lazy dog", opts2).unwrap();
+        let result2 = put_with_consolidation(
+            &db,
+            b"the quick brown fox jumps over the lazy dog",
+            opts2,
+        )?;
         assert!(matches!(result2.decision, ConsolidationDecision::Noop { .. }));
         assert!(result2.frame_id.is_none());
 
@@ -365,10 +377,15 @@ mod tests {
         opts3.uri = Some("aethervault://memory/observation/102".to_string());
         opts3.search_text = Some("quantum physics explains particle behavior at subatomic scales".to_string());
         opts3.track = Some("aethervault.observation".to_string());
-        let result3 = put_with_consolidation(&db, b"quantum physics explains particle behavior at subatomic scales", opts3).unwrap();
+        let result3 = put_with_consolidation(
+            &db,
+            b"quantum physics explains particle behavior at subatomic scales",
+            opts3,
+        )?;
         assert!(matches!(result3.decision, ConsolidationDecision::Add));
         assert!(result3.frame_id.is_some());
 
         std::fs::remove_file(&path).ok();
+        Ok(())
     }
 }
