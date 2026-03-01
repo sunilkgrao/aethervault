@@ -11,6 +11,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use rusqlite::{params, Connection};
@@ -318,7 +321,38 @@ END;
 CREATE INDEX IF NOT EXISTS idx_feedback_uri ON feedback(uri);
 ";
 
-const TRIGGER_ID_SEQUENCE_KEY: &str = "__trigger_id_sequence";
+static TRIGGER_ID_COUNTER: OnceLock<AtomicU64> = OnceLock::new();
+
+fn parse_trigger_counter(id: &str) -> Option<u64> {
+    let raw = id.strip_prefix("trg_")?;
+    let suffix = raw.rsplit('_').next()?;
+    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
+fn ensure_trigger_id_counter_seed(minimum: u64) {
+    let counter = TRIGGER_ID_COUNTER.get_or_init(|| AtomicU64::new(minimum));
+    let mut current = counter.load(Ordering::Relaxed);
+    while current < minimum {
+        match counter.compare_exchange(current, minimum, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn next_trigger_id_counter() -> &'static AtomicU64 {
+    TRIGGER_ID_COUNTER.get_or_init(|| AtomicU64::new(0))
+}
+
+fn current_unix_time_nanos() -> Result<u128, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .map_err(|err| format!("timestamp: {err}"))
+}
 
 // ── Core implementation ──────────────────────────────────────────────────
 
@@ -368,6 +402,7 @@ impl MemoryDb {
         let db = Self { conn };
         db.apply_pragmas()?;
         db.init_schema()?;
+        db.seed_trigger_id_counter_from_db()?;
         db.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(db)
@@ -395,6 +430,7 @@ impl MemoryDb {
                     let db = Self { conn };
                     db.apply_pragmas()?;
                     db.init_schema()?;
+                    db.seed_trigger_id_counter_from_db()?;
                     db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
                     return Ok(db);
                 }
@@ -424,6 +460,7 @@ impl MemoryDb {
         let db = Self { conn };
         db.apply_pragmas()?;
         db.init_schema()?;
+        db.seed_trigger_id_counter_from_db()?;
         db.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(db)
@@ -1082,40 +1119,36 @@ impl MemoryDb {
     }
 
     pub(crate) fn next_trigger_id(&self) -> Result<String, String> {
-        self.conn
-            .execute("BEGIN IMMEDIATE", [])
-            .map_err(|e| format!("next_trigger_id begin tx: {e}"))?;
-        let now = Utc::now().timestamp();
-        if let Err(err) = self.conn.execute(
-            "INSERT OR IGNORE INTO config (key, value, updated_at) VALUES (?1, ?2, ?3)",
-            params![TRIGGER_ID_SEQUENCE_KEY, "0", now],
-        ) {
-            let _ = self.conn.execute("ROLLBACK", []);
-            return Err(format!("next_trigger_id seed: {err}"));
-        }
-        let current: i64 = match self.conn.query_row(
-            "SELECT CAST(COALESCE(CAST(value AS INTEGER), 0) AS INTEGER) FROM config WHERE key = ?1",
-            params![TRIGGER_ID_SEQUENCE_KEY],
-            |row| row.get(0),
-        ) {
-            Ok(current) => current,
-            Err(err) => {
-                let _ = self.conn.execute("ROLLBACK", []);
-                return Err(format!("next_trigger_id read: {err}"));
+        let nanos = current_unix_time_nanos()?;
+        let counter = next_trigger_id_counter().fetch_add(1, Ordering::Relaxed);
+        Ok(format!("trg_{nanos}_{counter}"))
+    }
+
+    fn seed_trigger_id_counter_from_db(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM triggers")
+            .map_err(|e| format!("seed_trigger_id_counter_from_db prepare: {e}"))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("seed_trigger_id_counter_from_db query: {e}"))?;
+
+        let mut maximum = 0u64;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("seed_trigger_id_counter_from_db row: {e}"))?
+        {
+            let id: String = row
+                .get(0)
+                .map_err(|e| format!("seed_trigger_id_counter_from_db read: {e}"))?;
+            if let Some(counter) = parse_trigger_counter(&id) {
+                if counter > maximum {
+                    maximum = counter;
+                }
             }
-        };
-        let next = current.saturating_add(1);
-        if let Err(err) = self.conn.execute(
-            "UPDATE config SET value = ?1, updated_at = ?2 WHERE key = ?3",
-            params![next.to_string(), now, TRIGGER_ID_SEQUENCE_KEY],
-        ) {
-            let _ = self.conn.execute("ROLLBACK", []);
-            return Err(format!("next_trigger_id update: {err}"));
         }
-        self.conn
-            .execute("COMMIT", [])
-            .map_err(|e| format!("next_trigger_id commit: {e}"))?;
-        Ok(format!("trg_{next:016}"))
+        ensure_trigger_id_counter_seed(maximum);
+        Ok(())
     }
 
     pub(crate) fn triggers_replace(&self, triggers: &[TriggerEntry]) -> Result<(), String> {
@@ -1715,7 +1748,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let db = MemoryDb::open_or_create(&path).unwrap();
         assert_eq!(db.frame_count(), 0);
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&*path).ok();
     }
 
     #[test]
@@ -1746,7 +1779,7 @@ mod tests {
         let payload = db.frame_canonical_payload(id).unwrap();
         assert_eq!(payload, b"hello world content");
 
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&*path).ok();
     }
 
     #[test]
@@ -1775,7 +1808,7 @@ mod tests {
         let text = db.frame_text_by_id(id2).unwrap();
         assert_eq!(text, "version 2");
 
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&*path).ok();
     }
 
     #[test]
@@ -1791,15 +1824,41 @@ mod tests {
         assert_ne!(first, second);
         assert_ne!(second, third);
         let parse_num = |id: &str| {
-            let raw = id
-                .strip_prefix("trg_")
-                .expect("trigger id should use trg_ prefix");
+            let raw = id.rsplit('_').next().expect("trigger id should include counter suffix");
             raw.parse::<u64>().unwrap()
         };
         assert!(parse_num(&first) < parse_num(&second));
         assert!(parse_num(&second) < parse_num(&third));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_next_trigger_id_parallel_is_unique() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let path = temp_db_path("trigger_id_parallel");
+        let _ = std::fs::remove_file(&path);
+        let path = Arc::new(path);
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                thread::spawn(move || {
+                    let db = MemoryDb::open_or_create(&path).unwrap();
+                    db.next_trigger_id().unwrap()
+                })
+            })
+            .collect();
+
+        let mut ids = Vec::with_capacity(handles.len());
+        for handle in handles {
+            ids.push(handle.join().expect("worker should join"));
+        }
+
+        assert_eq!(ids.len(), ids.iter().collect::<HashSet<_>>().len());
+        std::fs::remove_file(&*path).ok();
     }
 
     #[test]
