@@ -2521,6 +2521,7 @@ pub(crate) fn execute_tool(
             };
             triggers.push(entry);
             save_triggers(db, &triggers)?;
+            backup_triggers(&triggers);
             Ok(ToolExecution {
                 output: "Trigger added.".to_string(),
                 details: serde_json::json!({ "id": id }),
@@ -2544,6 +2545,7 @@ pub(crate) fn execute_tool(
             let updated = triggers.len() != before;
             if updated {
                 save_triggers(db, &triggers)?;
+                backup_triggers(&triggers);
             }
             Ok(ToolExecution {
                 output: if updated {
