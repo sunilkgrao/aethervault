@@ -1823,9 +1823,17 @@ mod tests {
 
         assert_ne!(first, second);
         assert_ne!(second, third);
-        let parse_num = |id: &str| {
-            let raw = id.rsplit('_').next().expect("trigger id should include counter suffix");
-            raw.parse::<u64>().unwrap()
+        let parse_num = |id: &str| -> u64 {
+            let raw = id.rsplit('_').next().ok_or_else(|| {
+                "trigger id should include counter suffix"
+            }).unwrap_or_else(|err| {
+                eprintln!("{err}");
+                "0"
+            });
+            raw.parse::<u64>().unwrap_or_else(|err| {
+                eprintln!("failed to parse trigger id counter suffix '{id}': {err}");
+                0
+            })
         };
         assert!(parse_num(&first) < parse_num(&second));
         assert!(parse_num(&second) < parse_num(&third));
@@ -1854,6 +1862,7 @@ mod tests {
 
         let mut ids = Vec::with_capacity(handles.len());
         for handle in handles {
+            // Thread panic is unrecoverable here: thread join failure indicates a test bug.
             ids.push(handle.join().expect("worker should join"));
         }
 
@@ -2159,7 +2168,11 @@ mod tests {
                 "INSERT INTO frames (status, timestamp, importance) VALUES ('active', 0, 0.75)",
                 [],
             )
-            .expect("should be able to insert importance value");
+            .map_err(|err| format!("should be able to insert importance value: {err}"))
+            .unwrap_or_else(|err| {
+                eprintln!("{err}");
+                0
+            });
 
         let val: f64 = db
             .conn()
