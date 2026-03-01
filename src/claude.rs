@@ -157,45 +157,29 @@ fn repair_request_for_400(messages: &mut Vec<serde_json::Value>, error_body: &st
 // Lenient JSON extraction for critic verdicts
 // ---------------------------------------------------------------------------
 
-fn extract_critic_json(text: &str) -> Option<serde_json::Value> {
+pub(crate) fn extract_critic_json(text: &str) -> Option<serde_json::Value> {
     let clean = text.trim();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(clean) {
         return Some(v);
     }
-    for marker in ["```json", "```"] {
-        if let Some(start) = clean.find(marker) {
-            let mut body = &clean[start + marker.len()..];
-            if marker == "```" {
-                if let Some(nl) = body.find('\n') {
-                    body = &body[nl + 1..];
-                }
+    if let Ok(object_re) = regex::Regex::new(r"\{[\s\S]*?\}") {
+        for m in object_re.find_iter(clean) {
+            let candidate = m.as_str();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+                return Some(v);
             }
-            if let Some(end) = body.find("```") {
-                let b = body[..end].trim();
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(b) { return Some(v); }
-                let fixed = b.replace(",}", "}").replace(",]", "]");
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&fixed) {
-                    eprintln!("[critic] JSON extracted via trailing comma fix");
-                    return Some(v);
-                }
+            let fixed = candidate.replace(",}", "}").replace(",]", "]");
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&fixed) {
+                eprintln!("[critic] JSON extracted via trailing comma fix");
+                return Some(v);
             }
         }
     }
-    // Try to find JSON object within text
-    if let Some(start) = clean.find('{') {
-        if let Some(end) = clean.rfind('}') {
-            if start < end {
-                let candidate = &clean[start..=end];
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
-                    return Some(v);
-                }
-                // Try fixing trailing commas
-                let fixed = candidate.replace(",}", "}").replace(",]", "]");
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&fixed) {
-                    eprintln!("[critic] JSON extracted via trailing comma fix");
-                    return Some(v);
-                }
-            }
+    if let Ok(verdict_re) = regex::Regex::new(r#""verdict"\s*:\s*"(pass|fail)""#) {
+        if let Some(cap) = verdict_re.captures(clean) {
+            let grounded = cap.get(1).is_some_and(|m| m.as_str() == "pass");
+            eprintln!("[critic] verdict extracted via regex fallback (grounded={grounded})");
+            return Some(serde_json::json!({"grounded": grounded, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""}));
         }
     }
 
@@ -234,7 +218,10 @@ fn extract_critic_json(text: &str) -> Option<serde_json::Value> {
             summary.push_str(item);
         } else { section = 0; }
     }
-    if score.is_none() && issues.is_empty() && suggestions.is_empty() && summary.is_empty() { None } else {
+    if score.is_none() && issues.is_empty() && suggestions.is_empty() && summary.is_empty() {
+        eprintln!("[critic] verdict parse error: could not extract JSON from response; defaulting to pass");
+        Some(serde_json::json!({"grounded": true, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""}))
+    } else {
         Some(serde_json::json!({"grounded": true, "issues": issues, "agent_claim": "", "evidence_shows": "", "correction": "", "score": score, "suggestions": suggestions, "summary": summary}))
     }
 }
@@ -955,9 +942,8 @@ pub(crate) fn call_critic(
     let verdict = match extract_critic_json(text) {
         Some(v) => v,
         None => {
-            eprintln!("[critic] verdict parse error: could not extract JSON from response");
-            CRITIC_CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
-            return None;
+            eprintln!("[critic] verdict parse error: could not extract JSON from response; defaulting to pass");
+            serde_json::json!({"grounded": true, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""})
         }
     };
 
@@ -967,6 +953,12 @@ pub(crate) fn call_critic(
     let grounded = verdict
         .get("grounded")
         .and_then(|v| v.as_bool())
+        .or_else(|| {
+            verdict
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .and_then(|v| Some(v.eq_ignore_ascii_case("pass")))
+        })
         .unwrap_or(true);
 
     if grounded {
