@@ -678,6 +678,10 @@ pub(crate) fn collect_mid_loop_reminders(
     if reminder_state.no_progress_streak >= 3 {
         out.push("No observable progress for several turns. Re-state your hypothesis, then pick one high-confidence next step.".to_string());
     }
+    if reminder_state.remote_host_seen && !reminder_state.remote_env_verified {
+        out.push("You are working on a REMOTE machine but have not verified its environment. \
+                  Run df -h and nvidia-smi before proceeding.".to_string());
+    }
     out
 }
 

@@ -28,7 +28,7 @@ use crate::{
     ContinuationCheckpoint,
     CommandSpec, DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
     ToolExecution, BackgroundTaskRegistry, SessionRegistry,
-    SessionTaint, FailureKind, classify_failure,
+    SessionTaint, FailureKind, classify_failure, LearnedFailure,
     open_skill_db, list_skills, record_skill_use,
     match_skills_for_prompt, bootstrap_skills,
     prune_low_performing_skills, rebuild_fts5_index,
@@ -368,6 +368,8 @@ pub(crate) fn default_system_prompt() -> String {
         "3. POLL SPARINGLY: For long-running tasks (training, builds, deployments), check status at most once every 5 minutes. Do not burn steps polling repeatedly.",
         "4. ESCALATE AFTER 2 FAILURES: If the same approach fails twice, try a fundamentally different strategy. If that also fails, report the situation clearly instead of continuing to brute-force.",
         "5. VERIFY MUTATIONS: After any state change (file write, API call, config change), verify the result with a read/check operation before moving on.",
+        "6. PRE-FLIGHT ON REMOTE: When connecting to any remote machine (SSH, RunPod, cloud instance), ALWAYS run environment discovery first: df -h, nvidia-smi, python3 --version, echo $HF_HOME. Never assume a remote environment matches your expectations.",
+        "7. READ BEFORE CALLING: Before using any API endpoint for the first time, read its documentation or schema. Never guess request payloads — verify the expected format first.",
         "",
         "## Project Build Protocol (Orchestrator/Coder Separation)",
         "You are the ORCHESTRATOR. You write prompts and delegate to coding agents. You do NOT write code directly.",
@@ -617,6 +619,45 @@ fn process_tool_result(
     // ── Failure classification — defer retry hints until after all tool results ──
     if is_error {
         let failure_kind = classify_failure(&call.name, &result.output, &result.details);
+
+        // Root-Cause Analysis: inject structured diagnostic questions before retry hints
+        let rca_prompt = match call.name.as_str() {
+            "exec" => {
+                let exit_code = result.details.get("exit_code").and_then(|v| v.as_i64());
+                Some(format!(
+                    "[Root-Cause Analysis Required]\n\
+                     The `exec` command failed{}.\n\
+                     Before retrying, answer these questions:\n\
+                     1. What EXACT error message was returned? Quote it.\n\
+                     2. Is this a missing dependency, wrong path, permission issue, or syntax error?\n\
+                     3. On a REMOTE machine, have you verified: disk space (df -h), available tools (which <cmd>), environment vars?\n\
+                     4. What is ONE specific thing you will change before retrying?",
+                    exit_code.map(|c| format!(" (exit code {c})")).unwrap_or_default()
+                ))
+            }
+            "http_request" => {
+                let status = result.details.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
+                Some(format!(
+                    "[Root-Cause Analysis Required]\n\
+                     HTTP request failed with status {status}.\n\
+                     Before retrying, answer these questions:\n\
+                     1. What does status {status} mean for THIS specific API?\n\
+                     2. Did you READ the API docs/schema first, or are you guessing the endpoint/payload?\n\
+                     3. Is the request body schema correct? Compare your payload against the documented schema.\n\
+                     4. What is ONE specific thing you will change before retrying?"
+                ))
+            }
+            _ => None,
+        };
+        if let Some(rca) = rca_prompt {
+            deferred.push(AgentMessage {
+                role: "user".to_string(),
+                content: Some(rca),
+                tool_calls: Vec::new(),
+                name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+            });
+        }
+
         match failure_kind {
             FailureKind::Transient => {
                 deferred.push(AgentMessage {
@@ -630,6 +671,21 @@ fn process_tool_result(
                 deferred.push(AgentMessage {
                     role: "user".to_string(),
                     content: Some("[System] The previous tool call failed with a permanent error (unauthorized, not found, or invalid request). Do NOT retry the same call. Either fix the inputs, try a different approach, or ask the user for help.".to_string()),
+                    tool_calls: Vec::new(),
+                    name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                });
+            }
+            FailureKind::ApiMisuse => {
+                deferred.push(AgentMessage {
+                    role: "user".to_string(),
+                    content: Some(
+                        "[System] API MISUSE DETECTED. Your request was rejected because the schema/parameters are WRONG. \
+                         Do NOT retry with the same payload. You MUST:\n\
+                         1. READ the API documentation or schema (use http_request GET on the docs endpoint, or search for the API spec)\n\
+                         2. Compare your request against the documented schema\n\
+                         3. Fix the specific validation error before retrying\n\
+                         NEVER guess API schemas. Always read docs first.".to_string()
+                    ),
                     tool_calls: Vec::new(),
                     name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
                 });
@@ -1217,6 +1273,16 @@ pub(crate) fn run_agent_with_prompt(
             // violations from previous sessions were causing new sessions to
             // immediately hit LEVEL 3/4 thresholds.
             drift_state.critic_history = persisted.critic_history;
+            // Carry forward learned failures (cap at 20, FIFO)
+            drift_state.learned_failures = persisted.learned_failures;
+            if drift_state.learned_failures.len() > 20 {
+                drift_state.learned_failures = drift_state.learned_failures
+                    .split_off(drift_state.learned_failures.len() - 20);
+            }
+            if !drift_state.learned_failures.is_empty() {
+                eprintln!("[drift] loaded {} learned failures from previous sessions",
+                    drift_state.learned_failures.len());
+            }
             let prev_count = persisted.violations.get("critic_correction").copied().unwrap_or(0);
             eprintln!("[drift] loaded {prev_count} persisted violations (reset to 0 for new session)");
         }
@@ -1321,6 +1387,24 @@ pub(crate) fn run_agent_with_prompt(
     // Failed attempts scratchpad: track what was tried and why it failed.
     // Injected periodically so the agent doesn't repeat the same mistakes.
     let mut failed_attempts: Vec<String> = Vec::new();
+
+    // Inject learned failures from previous sessions as context
+    if !drift_state.learned_failures.is_empty() {
+        let lessons: Vec<String> = drift_state.learned_failures.iter()
+            .map(|lf| format!("- {}: {} → {}", lf.tool, lf.pattern, lf.lesson))
+            .collect();
+        messages.push(AgentMessage {
+            role: "user".to_string(),
+            content: Some(format!(
+                "[Lessons from Previous Sessions]\n\
+                 These patterns caused repeated failures before. Do NOT repeat them:\n{}",
+                lessons.join("\n")
+            )),
+            tool_calls: Vec::new(),
+            name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+        });
+    }
+
     while step < current_max_steps {
         // Check if user extended step budget via checkpoint response
         if let Some(ref prog) = progress {
@@ -1404,6 +1488,10 @@ pub(crate) fn run_agent_with_prompt(
                                     "STRATEGY: Permanent error (auth/permission/not-found). Do NOT retry the same approach. \
                                      Investigate root cause first, then try a fundamentally different method. \
                                      If the task is impossible, mark it done with an explanation.",
+                                FailureKind::ApiMisuse =>
+                                    "STRATEGY: API misuse (wrong request shape/schema). The request payload doesn't match the API spec. \
+                                     Rewrite the prompt to include the EXACT API schema. Tell the agent to read the API docs first, \
+                                     then construct the request. Include the validation error so the agent knows what field is wrong.",
                                 FailureKind::Semantic =>
                                     "STRATEGY: Logic/parsing error. Rewrite the prompt with more specific instructions. \
                                      Include the exact error so the new agent avoids the same mistake.",
@@ -1944,6 +2032,18 @@ pub(crate) fn run_agent_with_prompt(
                         thinking_blocks: vec![],
                     });
                     eprintln!("[circuit-breaker] blocked {}:{} after {count} failures", call.name, &key[call.name.len()+1..std::cmp::min(key.len(), call.name.len()+9)]);
+
+                    // Extract a learned failure lesson when circuit breaker triggers
+                    let lesson = LearnedFailure {
+                        tool: call.name.clone(),
+                        pattern: format!("{}({}...)", call.name,
+                            call.args.to_string().chars().take(80).collect::<String>()),
+                        lesson: format!("This exact call failed {} times. Try a different approach, different arguments, or verify prerequisites first.", count),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    if !drift_state.learned_failures.iter().any(|lf| lf.tool == lesson.tool && lf.pattern == lesson.pattern) {
+                        drift_state.learned_failures.push(lesson);
+                    }
                 }
                 let broken_ids: std::collections::HashSet<String> = circuit_broken.iter().map(|(c, _)| c.id.clone()).collect();
                 tool_calls.retain(|c| !broken_ids.contains(&c.id));
@@ -2019,6 +2119,38 @@ pub(crate) fn run_agent_with_prompt(
             // Push deferred messages (failure hints) AFTER the tool result
             // Safe here because single-call path has only one tool_use/tool_result pair
             messages.extend(deferred_msgs);
+
+            // Detect SSH connection to remote host
+            if call.name == "exec" && !is_error && !reminder_state.remote_host_seen {
+                let args_str = call.args.to_string().to_lowercase();
+                if args_str.contains("ssh ") || args_str.contains("ssh-") || args_str.contains("scp ") {
+                    reminder_state.remote_host_seen = true;
+                    messages.push(AgentMessage {
+                        role: "user".to_string(),
+                        content: Some(
+                            "[System: Remote Environment Detected]\n\
+                             You just connected to a remote machine. BEFORE doing any real work, run these discovery commands:\n\
+                             1. `df -h` — check available disk space (especially /tmp and working directories)\n\
+                             2. `nvidia-smi` or equivalent — check GPU availability and memory\n\
+                             3. `which python3 && python3 --version` — verify runtime availability\n\
+                             4. `echo $HF_HOME $CUDA_HOME` — check critical environment variables\n\
+                             5. `free -h` — check available RAM\n\
+                             Do NOT skip this step. Many failures come from wrong assumptions about the remote environment.".to_string()
+                        ),
+                        tool_calls: Vec::new(),
+                        name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                    });
+                }
+            }
+            // Track env verification
+            if call.name == "exec" && !is_error && reminder_state.remote_host_seen {
+                if let Some(last_result) = tool_results.last() {
+                    let output_lower = last_result.output.to_lowercase();
+                    if output_lower.contains("filesystem") || output_lower.contains("nvidia-smi") || output_lower.contains("memory") {
+                        reminder_state.remote_env_verified = true;
+                    }
+                }
+            }
 
             // Inject grounding requirement after subagent-related tool results
             if call.name == "subagent_invoke" || call.name == "subagent_batch" || call.name == "session_status" {
@@ -2224,6 +2356,42 @@ pub(crate) fn run_agent_with_prompt(
             // Push deferred messages (failure hints) AFTER all tool results are in place.
             // This preserves tool_use→tool_result adjacency required by the Claude API.
             messages.extend(all_deferred);
+
+            // Detect SSH connection to remote host (parallel path)
+            for call in &tool_calls {
+                if call.name == "exec" && !reminder_state.remote_host_seen {
+                    let args_str = call.args.to_string().to_lowercase();
+                    if args_str.contains("ssh ") || args_str.contains("ssh-") || args_str.contains("scp ") {
+                        reminder_state.remote_host_seen = true;
+                        messages.push(AgentMessage {
+                            role: "user".to_string(),
+                            content: Some(
+                                "[System: Remote Environment Detected]\n\
+                                 You just connected to a remote machine. BEFORE doing any real work, run these discovery commands:\n\
+                                 1. `df -h` — check available disk space (especially /tmp and working directories)\n\
+                                 2. `nvidia-smi` or equivalent — check GPU availability and memory\n\
+                                 3. `which python3 && python3 --version` — verify runtime availability\n\
+                                 4. `echo $HF_HOME $CUDA_HOME` — check critical environment variables\n\
+                                 5. `free -h` — check available RAM\n\
+                                 Do NOT skip this step. Many failures come from wrong assumptions about the remote environment.".to_string()
+                            ),
+                            tool_calls: Vec::new(),
+                            name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                        });
+                        break;
+                    }
+                }
+            }
+            // Track env verification (parallel path)
+            if reminder_state.remote_host_seen && !reminder_state.remote_env_verified {
+                for tr in tool_results.iter().rev().take(tool_calls.len()) {
+                    let output_lower = tr.output.to_lowercase();
+                    if output_lower.contains("filesystem") || output_lower.contains("nvidia-smi") || output_lower.contains("memory") {
+                        reminder_state.remote_env_verified = true;
+                        break;
+                    }
+                }
+            }
         }
 
         // Track recent actions for cycle detection
@@ -2478,6 +2646,16 @@ pub(crate) fn run_agent_with_prompt(
                     failed_attempts.iter()
                         .enumerate()
                         .map(|(i, a)| format!("{}. {}", i + 1, a))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+            // Include learned failures in checkpoint for cross-session awareness
+            if !drift_state.learned_failures.is_empty() {
+                checkpoint_msg.push_str(&format!(
+                    "\n\n[Lessons Learned — avoid these patterns]\n{}",
+                    drift_state.learned_failures.iter()
+                        .map(|lf| format!("- {}: {}", lf.tool, lf.lesson))
                         .collect::<Vec<_>>()
                         .join("\n")
                 ));

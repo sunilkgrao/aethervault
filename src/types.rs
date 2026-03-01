@@ -775,6 +775,8 @@ pub(crate) struct ReminderState {
     pub(crate) approval_required_count: usize,
     pub(crate) sequential_read_ops: usize,
     pub(crate) no_progress_streak: usize,
+    pub(crate) remote_host_seen: bool,
+    pub(crate) remote_env_verified: bool,
 }
 
 /// Tracks a single critic correction event within an agent session.
@@ -784,6 +786,15 @@ pub(crate) struct CriticCorrection {
     pub(crate) step: usize,
     pub(crate) issues: Vec<String>,
     pub(crate) correction_text: String,
+}
+
+/// A lesson learned from repeated failures, persisted across sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LearnedFailure {
+    pub(crate) tool: String,
+    pub(crate) pattern: String,
+    pub(crate) lesson: String,
+    pub(crate) created_at: String,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -796,6 +807,8 @@ pub(crate) struct DriftState {
     /// History of critic corrections issued during this session.
     /// Used by the agent loop to track escalation and decide critic frequency.
     pub(crate) critic_history: Vec<CriticCorrection>,
+    #[serde(default)]
+    pub(crate) learned_failures: Vec<LearnedFailure>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -904,6 +917,7 @@ impl SessionTaint {
 pub(crate) enum FailureKind {
     Transient,
     Permanent,
+    ApiMisuse,  // Wrong request shape, fixable by reading docs
     Semantic,
 }
 
@@ -916,8 +930,12 @@ pub(crate) fn classify_failure(tool_name: &str, error_msg: &str, details: &serde
     if status == 429 || status == 503 || status == 502 || status == 504 {
         return FailureKind::Transient;
     }
-    if status == 401 || status == 403 || status == 404 || status == 405 || status == 422 {
+    if status == 401 || status == 403 || status == 404 || status == 405 {
         return FailureKind::Permanent;
+    }
+    // 422 is ApiMisuse (validation error = wrong request shape, fixable by reading docs)
+    if status == 422 {
+        return FailureKind::ApiMisuse;
     }
 
     // Message-based classification
@@ -928,6 +946,19 @@ pub(crate) fn classify_failure(tool_name: &str, error_msg: &str, details: &serde
     {
         return FailureKind::Transient;
     }
+    // API misuse patterns (wrong request shape, fixable by reading docs)
+    if msg.contains("validation error") || msg.contains("unknown field")
+        || msg.contains("required field") || msg.contains("unexpected argument")
+        || msg.contains("missing parameter") || msg.contains("invalid argument")
+        || msg.contains("graphql_validation_failed") || msg.contains("schema")
+        || msg.contains("did you mean") || msg.contains("no query string")
+        || msg.contains("unknown mutation") || msg.contains("unknown query")
+        || msg.contains("does not have field") || msg.contains("wrong type")
+        || msg.contains("expected type")
+    {
+        return FailureKind::ApiMisuse;
+    }
+
     if msg.contains("unauthorized") || msg.contains("forbidden") || msg.contains("not found")
         || msg.contains("invalid") || msg.contains("denied") || msg.contains("no such")
         || msg.contains("does not exist") || msg.contains("permission")
