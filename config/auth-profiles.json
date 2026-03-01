@@ -24,6 +24,12 @@
       "type": "cli_login",
       "provider": "claude-code",
       "model": "claude-opus-4-6"
+    },
+    "groq-primary": {
+      "type": "api_key",
+      "provider": "groq",
+      "model": "llama-3.3-70b-versatile",
+      "key": "ENV:GROQ_API_KEY"
     }
   },
   "pools": {
@@ -34,6 +40,10 @@
     "claude-code": {
       "accounts": ["claude-code-max"],
       "cooldown_secs": 120
+    },
+    "groq": {
+      "accounts": ["groq-primary"],
+      "cooldown_secs": 60
     }
   },
   "order": {
