@@ -2034,11 +2034,22 @@ pub(crate) fn run_agent_with_prompt(
                     eprintln!("[circuit-breaker] blocked {}:{} after {count} failures", call.name, &key[call.name.len()+1..std::cmp::min(key.len(), call.name.len()+9)]);
 
                     // Extract a learned failure lesson when circuit breaker triggers
+                    let pattern_detail = match call.name.as_str() {
+                        "exec" => call.args.get("command")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.chars().take(120).collect::<String>())
+                            .unwrap_or_else(|| call.args.to_string().chars().take(80).collect()),
+                        "http_request" => {
+                            let method = call.args.get("method").and_then(|v| v.as_str()).unwrap_or("?");
+                            let url = call.args.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+                            format!("{} {}", method, url.chars().take(100).collect::<String>())
+                        }
+                        _ => call.args.to_string().chars().take(80).collect(),
+                    };
                     let lesson = LearnedFailure {
                         tool: call.name.clone(),
-                        pattern: format!("{}({}...)", call.name,
-                            call.args.to_string().chars().take(80).collect::<String>()),
-                        lesson: format!("This exact call failed {} times. Try a different approach, different arguments, or verify prerequisites first.", count),
+                        pattern: pattern_detail,
+                        lesson: format!("Failed {} times and was blocked by circuit breaker. Try a fundamentally different approach or verify prerequisites.", count),
                         created_at: chrono::Utc::now().to_rfc3339(),
                     };
                     if !drift_state.learned_failures.iter().any(|lf| lf.tool == lesson.tool && lf.pattern == lesson.pattern) {
@@ -2123,7 +2134,7 @@ pub(crate) fn run_agent_with_prompt(
             // Detect SSH connection to remote host
             if call.name == "exec" && !is_error && !reminder_state.remote_host_seen {
                 let args_str = call.args.to_string().to_lowercase();
-                if args_str.contains("ssh ") || args_str.contains("ssh-") || args_str.contains("scp ") {
+                if args_str.contains("ssh ") || args_str.contains("scp ") {
                     reminder_state.remote_host_seen = true;
                     messages.push(AgentMessage {
                         role: "user".to_string(),
@@ -2146,7 +2157,7 @@ pub(crate) fn run_agent_with_prompt(
             if call.name == "exec" && !is_error && reminder_state.remote_host_seen {
                 if let Some(last_result) = tool_results.last() {
                     let output_lower = last_result.output.to_lowercase();
-                    if output_lower.contains("filesystem") || output_lower.contains("nvidia-smi") || output_lower.contains("memory") {
+                    if output_lower.contains("filesystem") || output_lower.contains("nvidia-smi") || output_lower.contains("mem:") {
                         reminder_state.remote_env_verified = true;
                     }
                 }
@@ -2187,6 +2198,33 @@ pub(crate) fn run_agent_with_prompt(
                             call.args.to_string().chars().take(100).collect::<String>(),
                             output_preview
                         ));
+                    }
+                    // Extract learned failure on 2nd consecutive failure (before circuit breaker at 3)
+                    if *count == 2 {
+                        let err_snippet: String = tool_results.last()
+                            .map(|r| r.output.chars().take(150).collect())
+                            .unwrap_or_default();
+                        let pattern_detail = match call.name.as_str() {
+                            "exec" => call.args.get("command")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.chars().take(120).collect::<String>())
+                                .unwrap_or_else(|| call.args.to_string().chars().take(80).collect()),
+                            "http_request" => {
+                                let method = call.args.get("method").and_then(|v| v.as_str()).unwrap_or("?");
+                                let url = call.args.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+                                format!("{} {}", method, url.chars().take(100).collect::<String>())
+                            }
+                            _ => call.args.to_string().chars().take(80).collect(),
+                        };
+                        let lesson = LearnedFailure {
+                            tool: call.name.clone(),
+                            pattern: pattern_detail,
+                            lesson: format!("Failed twice with: {}. Change approach or verify prerequisites.", err_snippet),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        };
+                        if !drift_state.learned_failures.iter().any(|lf| lf.tool == lesson.tool && lf.pattern == lesson.pattern) {
+                            drift_state.learned_failures.push(lesson);
+                        }
                     }
                 } else {
                     // Success — clear failure count for this key
@@ -2336,6 +2374,33 @@ pub(crate) fn run_agent_with_prompt(
                                 output_preview
                             ));
                         }
+                        // Extract learned failure on 2nd consecutive failure (parallel path)
+                        if *count == 2 {
+                            let err_snippet: String = tool_results.last()
+                                .map(|r| r.output.chars().take(150).collect())
+                                .unwrap_or_default();
+                            let pattern_detail = match call.name.as_str() {
+                                "exec" => call.args.get("command")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.chars().take(120).collect::<String>())
+                                    .unwrap_or_else(|| call.args.to_string().chars().take(80).collect()),
+                                "http_request" => {
+                                    let method = call.args.get("method").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let url = call.args.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+                                    format!("{} {}", method, url.chars().take(100).collect::<String>())
+                                }
+                                _ => call.args.to_string().chars().take(80).collect(),
+                            };
+                            let lesson = LearnedFailure {
+                                tool: call.name.clone(),
+                                pattern: pattern_detail,
+                                lesson: format!("Failed twice with: {}. Change approach or verify prerequisites.", err_snippet),
+                                created_at: chrono::Utc::now().to_rfc3339(),
+                            };
+                            if !drift_state.learned_failures.iter().any(|lf| lf.tool == lesson.tool && lf.pattern == lesson.pattern) {
+                                drift_state.learned_failures.push(lesson);
+                            }
+                        }
                     } else {
                         tool_failure_counts.remove(&cb_key);
                     }
@@ -2361,7 +2426,7 @@ pub(crate) fn run_agent_with_prompt(
             for call in &tool_calls {
                 if call.name == "exec" && !reminder_state.remote_host_seen {
                     let args_str = call.args.to_string().to_lowercase();
-                    if args_str.contains("ssh ") || args_str.contains("ssh-") || args_str.contains("scp ") {
+                    if args_str.contains("ssh ") || args_str.contains("scp ") {
                         reminder_state.remote_host_seen = true;
                         messages.push(AgentMessage {
                             role: "user".to_string(),
@@ -2386,7 +2451,7 @@ pub(crate) fn run_agent_with_prompt(
             if reminder_state.remote_host_seen && !reminder_state.remote_env_verified {
                 for tr in tool_results.iter().rev().take(tool_calls.len()) {
                     let output_lower = tr.output.to_lowercase();
-                    if output_lower.contains("filesystem") || output_lower.contains("nvidia-smi") || output_lower.contains("memory") {
+                    if output_lower.contains("filesystem") || output_lower.contains("nvidia-smi") || output_lower.contains("mem:") {
                         reminder_state.remote_env_verified = true;
                         break;
                     }
