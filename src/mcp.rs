@@ -61,12 +61,14 @@ pub(crate) struct McpServerHandle {
     msg_rx: mpsc::Receiver<ReaderEvent>,
     child: std::process::Child,
     next_id: i64,
+    timeout_secs: u64,
     dead: bool,
     /// Tools discovered from this server (original names)
     tools: Vec<serde_json::Value>,
 }
 
 const MCP_POLL_INTERVAL_MS: u64 = 250;
+const MCP_TOOL_CALL_TIMEOUT_SECS: u64 = 30;
 
 pub(crate) struct McpRegistry {
     servers: Vec<McpServerHandle>,
@@ -133,6 +135,8 @@ impl McpRegistry {
         let (server_idx, original_name) = self.route_map.get(prefixed_name)
             .ok_or_else(|| format!("mcp: unknown tool '{prefixed_name}'"))?
             .clone();
+        let timeout_secs = self.servers[server_idx].timeout_secs;
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
         let mut retries = 0u8;
 
@@ -190,6 +194,13 @@ impl McpRegistry {
                 let mut should_retry = false;
 
                 loop {
+                    if Instant::now() > deadline {
+                        return Err(format!(
+                            "mcp '{}': timed out after {timeout_secs}s while calling '{}'",
+                            handle.name, prefixed_name
+                        ));
+                    }
+
                     let msg = match handle.read_msg_timeout(Duration::from_millis(MCP_POLL_INTERVAL_MS)) {
                         Ok(msg) => msg,
                         Err(err) => {
@@ -334,6 +345,7 @@ impl McpServerHandle {
             child,
             msg_rx,
             next_id: 1,
+            timeout_secs: cfg.timeout_secs.unwrap_or(MCP_TOOL_CALL_TIMEOUT_SECS),
             dead: false,
             tools: Vec::new(),
         };
