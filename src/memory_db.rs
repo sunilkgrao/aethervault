@@ -10,7 +10,7 @@
 //! with the same JSON wire format (critical for hook I/O and session serialization).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use rusqlite::{params, Connection};
@@ -363,7 +363,6 @@ impl MemoryDb {
     fn recover_and_open(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let now = Utc::now().format("%Y%m%d-%H%M%S%.f");
         let corrupt_backup_path = path.with_extension(format!("corrupt-{now}.mv2"));
-        let recovered_path = path.with_extension(format!("recovered-{now}.mv2"));
 
         if let Err(err) = std::fs::copy(path, &corrupt_backup_path) {
             eprintln!(
@@ -377,121 +376,40 @@ impl MemoryDb {
         std::fs::remove_file(&wal_path).ok();
         std::fs::remove_file(&shm_path).ok();
 
-        let recover_success = match std::process::Command::new("sqlite3")
-            .arg(path)
-            .arg(".recover")
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(mut recover_source) => {
-                if let Some(recover_stdout) = recover_source.stdout.take() {
-                    if let Ok(mut recover_target) = std::process::Command::new("sqlite3")
-                        .arg(&recovered_path)
-                        .stdin(std::process::Stdio::from(recover_stdout))
-                        .stdout(std::process::Stdio::null())
-                        .spawn()
-                    {
-                        let source_ok = match recover_source.wait() {
-                            Ok(status) => status.success(),
-                            Err(err) => {
-                                eprintln!(
-                                    "warning: failed to wait on sqlite3 .recover for {:?}: {}",
-                                    path, err
-                                );
-                                false
-                            }
-                        };
-                        let target_ok = match recover_target.wait() {
-                            Ok(status) => status.success(),
-                            Err(err) => {
-                                eprintln!(
-                                    "warning: failed to wait on sqlite3 write for {:?}: {}",
-                                    recovered_path, err
-                                );
-                                false
-                            }
-                        };
-                        source_ok && target_ok
-                    } else {
-                        eprintln!(
-                            "warning: failed to start sqlite3 write for {:?}",
-                            recovered_path
-                        );
-                        recover_source.wait().ok();
-                        false
-                    }
-                } else {
+        let backup_candidates = Self::recovery_backup_paths(path);
+        for backup in backup_candidates {
+            if !backup.exists() {
+                continue;
+            }
+            match Self::try_restore_from_backup(path, &backup) {
+                Ok(Some(conn)) => {
+                    eprintln!("[capsule-recovery] Restored from backup: {:?}", backup);
+                    let db = Self { conn };
+                    db.apply_pragmas()?;
+                    db.init_schema()?;
+                    db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                    return Ok(db);
+                }
+                Ok(None) => {}
+                Err(err) => {
                     eprintln!(
-                        "warning: failed to capture sqlite3 .recover output for {:?}",
-                        path
+                        "[capsule-recovery] warning: failed restore attempt from {:?}: {}",
+                        backup, err
                     );
-                    recover_source.wait().ok();
-                    false
                 }
             }
-            Err(err) => {
-                eprintln!(
-                    "warning: failed to start sqlite3 .recover for {:?}: {}",
-                    path, err
-                );
-                false
-            }
-        };
+        }
 
-        let has_recovered = std::fs::metadata(&recovered_path)
-            .map(|meta| meta.len() > 0)
-            .unwrap_or(false);
-
-        if recover_success && has_recovered {
-            if let Err(rename_err) = std::fs::rename(&recovered_path, path) {
-                if path.exists() {
-                    if let Err(remove_err) = std::fs::remove_file(path) {
-                        return Err(std::io::Error::new(
-                            remove_err.kind(),
-                            format!(
-                                "failed to replace database {:?} with recovered copy {:?}: {} (and failed to remove old db: {})",
-                                path, recovered_path, rename_err, remove_err
-                            ),
-                        )
-                        .into());
-                    }
-                    if let Err(retry_err) = std::fs::rename(&recovered_path, path) {
-                        return Err(std::io::Error::new(
-                            retry_err.kind(),
-                            format!(
-                                "failed to replace database {:?} with recovered copy {:?}: {}",
-                                path, recovered_path, retry_err
-                            ),
-                        )
-                        .into());
-                    }
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "failed to replace database {:?} with recovered copy {:?}: {}",
-                        path, recovered_path, rename_err
-                    ),
+        eprintln!(
+            "[capsule-recovery] No valid backups found, starting with empty database"
+        );
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|err| {
+                std::io::Error::new(
+                    err.kind(),
+                    format!("failed to remove corrupt database {:?}: {}", path, err),
                 )
-                .into());
-            }
-
-            std::fs::remove_file(&recovered_path).ok();
-        } else {
-            if !recover_success {
-                eprintln!("warning: sqlite recovery failed for {:?}", path);
-            } else if !has_recovered {
-                eprintln!("warning: recovered database is missing or empty for {:?}", path);
-            }
-            if path.exists() {
-                std::fs::remove_file(path).map_err(|err| {
-                    std::io::Error::new(
-                        err.kind(),
-                        format!("failed to remove corrupt database {:?}: {}", path, err),
-                    )
-                })?;
-            }
-            std::fs::remove_file(&recovered_path).ok();
+            })?;
         }
 
         let conn = Connection::open(path)?;
@@ -501,6 +419,123 @@ impl MemoryDb {
         db.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(db)
+    }
+
+    fn recovery_backup_paths(path: &Path) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+
+        if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
+            candidates.push(path.with_extension(format!("{extension}.bak")));
+        } else {
+            candidates.push(path.with_extension("bak"));
+        }
+
+        let rebuilt_backup = if let Some(file_stem) = path.file_stem() {
+            if let Some(ext) = path.extension() {
+                path.with_file_name(format!(
+                    "{}-rebuilt.{}",
+                    file_stem.to_string_lossy(),
+                    ext.to_string_lossy()
+                ))
+            } else {
+                path.with_file_name(format!("{}-rebuilt", file_stem.to_string_lossy()))
+            }
+        } else {
+            path.with_file_name("memory-rebuilt.mv2")
+        };
+        candidates.push(rebuilt_backup);
+
+        let file_name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name.to_owned(),
+            None => return candidates,
+        };
+        let search_prefix = format!("{file_name}.backup-");
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut wildcard_backups = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => continue,
+                };
+            let entry_file_name = entry.file_name();
+            let file_name = match entry_file_name.to_str() {
+                Some(name) => name,
+                None => continue,
+            };
+
+            if !file_name.starts_with(&search_prefix) {
+                continue;
+            }
+
+            let entry_path = entry.path();
+            if entry_path.is_file() {
+                wildcard_backups.push(entry_path);
+            }
+        }
+        }
+
+        wildcard_backups.sort_by(|a, b| {
+            let a_name = a.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            let b_name = b.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            b_name.cmp(a_name)
+        });
+        candidates.extend(wildcard_backups);
+
+        candidates
+    }
+
+    fn try_restore_from_backup(
+        path: &Path,
+        backup_path: &Path,
+    ) -> Result<Option<Connection>, String> {
+        let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Connection, String> {
+            std::fs::copy(backup_path, path).map_err(|err| {
+                format!(
+                    "failed to copy backup file {:?} to {:?}: {}",
+                    backup_path, path, err
+                )
+            })?;
+
+            let conn = Connection::open(path).map_err(|err| {
+                format!("failed to open recovered copy {:?} from {:?}: {}", path, backup_path, err)
+            })?;
+
+            let integrity_ok = conn
+                .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
+                .map(|result| result == "ok")
+                .map_err(|err| {
+                    format!(
+                        "failed to run integrity check for {:?} after restore from {:?}: {}",
+                        path, backup_path, err
+                    )
+                })?;
+
+            if !integrity_ok {
+                Err(format!(
+                    "integrity check failed for {:?} after restore from {:?}",
+                    path, backup_path
+                ))?;
+            }
+
+            Ok(conn)
+        }));
+
+        match recovered {
+            Ok(Ok(conn)) => Ok(Some(conn)),
+            Ok(Err(err)) => {
+                std::fs::remove_file(path).ok();
+                Err(err)
+            }
+            Err(_) => {
+                std::fs::remove_file(path).ok();
+                Err(format!(
+                    "restore panicked while processing backup {:?}",
+                    backup_path
+                ))
+            }
+        }
     }
 
     fn apply_pragmas(&self) -> Result<(), Box<dyn std::error::Error>> {
