@@ -12,6 +12,7 @@ serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
 rayon = "1.10.0"
 tokio = { version = "1.44.0", features = ["rt-multi-thread", "macros"] }
+rmcp = { version = "0.17.0", default-features = false, features = ["client", "transport-child-process"] }
 walkdir = "2.5.0"
 ureq = { version = "2.10.1", default-features = false, features = ["json", "tls"] }
 tungstenite = { version = "0.26.2", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
