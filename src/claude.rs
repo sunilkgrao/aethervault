@@ -555,7 +555,9 @@ pub(crate) fn call_claude_with_model(
             let blocks: Vec<serde_json::Value> = system_blocks.iter().enumerate().map(|(i, text)| {
                 let mut block = serde_json::json!({"type": "text", "text": text});
                 if i == 0 {
-                    block.as_object_mut().unwrap().insert("cache_control".to_string(), cache.clone());
+                    if let Some(obj) = block.as_object_mut() {
+                        obj.insert("cache_control".to_string(), cache.clone());
+                    }
                 }
                 block
             }).collect();
