@@ -595,8 +595,19 @@ pub(crate) fn restore_triggers_from_backup_if_empty(db: &MemoryDb) {
 }
 
 pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {
+    // Circuit breaker: after one failed migration, stop retrying until
+    // the DB is rebuilt. Without this, a corrupt triggers table causes
+    // `triggers_replace` to fail every 60 seconds forever (the DELETE
+    // must traverse the corrupt B-tree rootpage and always fails).
+    static MIGRATION_FAILED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     match db.triggers_list() {
-        Ok(triggers) if !triggers.is_empty() => { backup_triggers(&triggers); return triggers; }
+        Ok(triggers) if !triggers.is_empty() => {
+            MIGRATION_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
+            backup_triggers(&triggers);
+            return triggers;
+        }
         Ok(_) => {}
         Err(err) => eprintln!("[load_triggers] failed to load trigger table: {err}"),
     };
@@ -605,11 +616,10 @@ pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {
     if triggers.is_empty() {
         triggers = load_legacy_triggers_backup();
     }
-    if !triggers.is_empty() {
-        if !LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
-            if let Err(err) = db.triggers_replace(&triggers) {
-                eprintln!("[load_triggers] failed to migrate legacy triggers: {err}");
-            }
+    if !triggers.is_empty() && !MIGRATION_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Err(err) = db.triggers_replace(&triggers) {
+            eprintln!("[load_triggers] migration failed (will not retry): {err}");
+            MIGRATION_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
     if !triggers.is_empty() {
