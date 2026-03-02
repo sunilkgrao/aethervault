@@ -129,11 +129,12 @@ Category: $CATEGORY
 
 Instructions:
 1. Read the target file: exec "cat /root/aethervault/$TARGET_FILE"
-2. Implement the change using fs_write or exec with sed
+2. Implement the change using exec with sed -i commands. IMPORTANT: Do NOT use fs_write — it may be restricted to workspace paths. Always use exec "sed -i '...' /root/aethervault/TARGET" to modify files directly.
 3. Run: exec "cd /root/aethervault && cargo check" — the change MUST compile
 4. If cargo check fails, fix the issue or revert and report failure
 5. Run: exec "cd /root/aethervault && cargo test" — existing tests must pass
 6. If tests fail, fix or revert
+7. Verify your changes are visible: exec "cd /root/aethervault && git diff --stat" — this MUST show modified files
 
 Output EXACTLY this JSON when done:
 {
@@ -195,6 +196,13 @@ if ! cargo check 2>&1 | tail -5; then
     git checkout -- .
     exit 1
 fi
+
+DIFF_STAT=$(cd "$REPO" && git diff --stat)
+if [[ -z "$DIFF_STAT" ]]; then
+    log "Phase 2: Agent reported success but no source files were modified. Implementation was a no-op."
+    exit 0
+fi
+log "Phase 2: Verified changes: $DIFF_STAT"
 
 # ═══════════════════════════════════════════
 # PHASE 3: VALIDATION (Regression Battery)
