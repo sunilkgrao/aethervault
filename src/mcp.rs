@@ -23,6 +23,39 @@ fn is_recoverable_mcp_error(msg: &str) -> bool {
         || msg.contains("transport closed")
 }
 
+fn normalize_mcp_id(id: &serde_json::Value) -> serde_json::Value {
+    match id {
+        serde_json::Value::String(text) => text
+            .parse::<i64>()
+            .map(|v| serde_json::json!(v))
+            .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
+        serde_json::Value::Number(num) => {
+            if let Some(v) = num.as_i64() {
+                serde_json::json!(v)
+            } else if let Some(v) = num.as_u64() {
+                if v <= i64::MAX as u64 {
+                    serde_json::json!(v as i64)
+                } else {
+                    serde_json::Value::Number(num.clone())
+                }
+            } else if let Some(v) = num.as_f64() {
+                if v.fract() == 0.0 {
+                    serde_json::json!(v as i64)
+                } else {
+                    serde_json::Value::Number(num.clone())
+                }
+            } else {
+                serde_json::Value::Number(num.clone())
+            }
+        }
+        _ => id.clone(),
+    }
+}
+
+fn mcp_id_matches(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    normalize_mcp_id(a) == normalize_mcp_id(b)
+}
+
 pub(crate) struct McpServerHandle {
     name: String,
     config: super::McpServerConfig,
@@ -522,7 +555,9 @@ pub(crate) fn run_mcp_server(
             break;
         };
         let id = msg.get("id").cloned();
-        let has_id = id.as_ref().is_some_and(|v| !v.is_null());
+        let has_id = id
+            .as_ref()
+            .is_some_and(|value| !value.is_null() && mcp_id_matches(value, value));
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = msg
             .get("params")
@@ -618,4 +653,28 @@ pub(crate) fn run_mcp_server(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mcp_id_normalization_matches_integral_variants() {
+        let id_number = serde_json::json!(1);
+        let id_float = serde_json::json!(1.0);
+        let id_string = serde_json::json!("1");
+
+        assert!(mcp_id_matches(&id_number, &id_float));
+        assert!(mcp_id_matches(&id_number, &id_string));
+        assert!(mcp_id_matches(&id_float, &id_string));
+    }
+
+    #[test]
+    fn test_mcp_id_normalization_distinguishes_non_integral_numbers() {
+        let id_int = serde_json::json!(1);
+        let id_float = serde_json::json!(1.1);
+
+        assert!(!mcp_id_matches(&id_int, &id_float));
+    }
 }
