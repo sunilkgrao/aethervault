@@ -22,6 +22,7 @@ ACTIVE_FILE="${DEPLOY_DIR}/active"
 SYMLINK="/usr/local/bin/aethervault"
 REPO_DIR="/root/aethervault"
 LOG_FILE="${DEPLOY_DIR}/upgrade.log"
+SERVICE_NAME="${AV_SERVICE_NAME:-aethervault-telegram}"
 HEALTH_CHECK_SECONDS=30
 HEALTH_CHECK_INTERVAL=5
 
@@ -71,6 +72,7 @@ else
 fi
 
 log "=== Upgrade started: branch=$BRANCH, active=$ACTIVE, target=$INACTIVE ==="
+log "Using systemd service: $SERVICE_NAME"
 
 # Step 1: Pull latest code from git (the source of truth)
 log "Pulling branch $BRANCH..."
