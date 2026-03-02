@@ -404,7 +404,10 @@ impl MemoryDb {
         db.init_schema()?;
         db.seed_trigger_id_counter_from_db()?;
         db.conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            // PASSIVE checkpoint: never blocks other connections.
+            // TRUNCATE requires EXCLUSIVE lock → "database is locked" when
+            // trigger-thread and agent sessions open the DB concurrently.
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);").ok();
         Ok(db)
     }
 
@@ -431,7 +434,7 @@ impl MemoryDb {
                     db.apply_pragmas()?;
                     db.init_schema()?;
                     db.seed_trigger_id_counter_from_db()?;
-                    db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                    let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
                     return Ok(db);
                 }
                 Ok(None) => {}
@@ -462,7 +465,10 @@ impl MemoryDb {
         db.init_schema()?;
         db.seed_trigger_id_counter_from_db()?;
         db.conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            // PASSIVE checkpoint: never blocks other connections.
+            // TRUNCATE requires EXCLUSIVE lock → "database is locked" when
+            // trigger-thread and agent sessions open the DB concurrently.
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);").ok();
         Ok(db)
     }
 

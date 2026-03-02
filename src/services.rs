@@ -2043,31 +2043,41 @@ pub(crate) fn run_trigger_thread(
         .and_then(|v| v.parse().ok())
         .unwrap_or(30 * 60);
 
+    // Keep a persistent DB connection for the trigger loop.
+    // Re-opening on every iteration caused PRAGMA wal_checkpoint(TRUNCATE) to
+    // request exclusive locks, fighting with concurrent agent sessions.
+    let mut db_persistent = open_or_create_db(mv2)?;
+
     loop {
-        // 1. Evaluate triggers (reuse existing run_watch_loop logic inline)
+        // 1. Evaluate triggers
         {
             let now = Utc::now().with_timezone(&tz);
-            let db_loop = match open_or_create_db(mv2) {
-                Ok(db) => {
-                    attempt = 0;
-                    db
-                }
-                Err(e) => {
-                    attempt += 1;
-                    let backoff_ms = std::cmp::min(
-                        500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))),
-                        30_000,
-                    );
-                    if attempt <= 2 || attempt.is_power_of_two() {
-                        eprintln!(
-                            "[trigger-thread] db open error: {e} (attempt {attempt}, next retry in {backoff_ms}ms)"
-                        );
+            // Verify the persistent connection is still usable; reconnect if not
+            let db_ok = db_persistent.triggers_list().is_ok();
+            if !db_ok {
+                match open_or_create_db(mv2) {
+                    Ok(fresh) => {
+                        db_persistent = fresh;
+                        attempt = 0;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
-                    continue;
+                    Err(e) => {
+                        attempt += 1;
+                        let backoff_ms = std::cmp::min(
+                            500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))),
+                            30_000,
+                        );
+                        if attempt <= 2 || attempt.is_power_of_two() {
+                            eprintln!(
+                                "[trigger-thread] db reconnect error: {e} (attempt {attempt}, next retry in {backoff_ms}ms)"
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                        continue;
+                    }
                 }
-            };
-            let mut triggers = load_triggers(&db_loop);
+            }
+            let db_loop = &db_persistent;
+            let mut triggers = load_triggers(db_loop);
             let mut updated = false;
 
             for trigger in triggers.iter_mut() {
@@ -2232,7 +2242,7 @@ pub(crate) fn run_trigger_thread(
             }
 
             if updated {
-                if let Err(e) = save_triggers(&db_loop, &triggers) {
+                if let Err(e) = save_triggers(db_loop, &triggers) {
                     eprintln!("[trigger-thread] CRITICAL: failed to persist trigger state: {e}");
                 }
             }
