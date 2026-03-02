@@ -57,6 +57,12 @@ pub(crate) fn blake3_hash(bytes: &[u8]) -> Hash {
 }
 
 pub(crate) fn open_or_create_db(path: &Path) -> Result<crate::memory_db::MemoryDb, Box<dyn std::error::Error>> {
+    if path.is_dir() {
+        return Err(format!(
+            "Path '{}' is a directory, expected a file path for database",
+            path.display()
+        ).into());
+    }
     use crate::memory_db::MemoryDb;
 
     // If the file doesn't exist yet, just create a fresh SQLite DB.
@@ -469,4 +475,3 @@ pub(crate) fn resolve_workspace(cli: Option<PathBuf>, agent_cfg: &AgentConfig) -
     }
     Some(PathBuf::from(DEFAULT_WORKSPACE_DIR))
 }
-
