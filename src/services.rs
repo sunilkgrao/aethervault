@@ -16,6 +16,7 @@ use url::form_urlencoded;
 
 // Re-imports from main (crate-internal helpers and types)
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::{
@@ -498,6 +499,9 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
 
 // ── Triggers ────────────────────────────────────────────────────────────
 
+/// Skip legacy trigger migration after first attempt to prevent repeated failed DB writes.
+static LEGACY_MIGRATION_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
 fn trigger_backup_path() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home).join(".aethervault/data/trigger-backup.json")
@@ -583,8 +587,10 @@ pub(crate) fn restore_triggers_from_backup_if_empty(db: &MemoryDb) {
     }
 
     eprintln!("Trigger table empty, restoring {} triggers from backup", backup.len());
-    if let Err(err) = save_triggers(db, &backup) {
-        eprintln!("[trigger-restore] failed to restore triggers from backup: {err}");
+    if !LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
+        if let Err(err) = save_triggers(db, &backup) {
+            eprintln!("[trigger-restore] failed to restore triggers from backup: {err}");
+        }
     }
 }
 
@@ -600,8 +606,10 @@ pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {
         triggers = load_legacy_triggers_backup();
     }
     if !triggers.is_empty() {
-        if let Err(err) = db.triggers_replace(&triggers) {
-            eprintln!("[load_triggers] failed to migrate legacy triggers: {err}");
+        if !LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
+            if let Err(err) = db.triggers_replace(&triggers) {
+                eprintln!("[load_triggers] failed to migrate legacy triggers: {err}");
+            }
         }
     }
     if !triggers.is_empty() {
