@@ -31,6 +31,7 @@ use walkdir::WalkDir;
 
 const DEFAULT_OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS: u64 = 10_000;
 const OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS_ENV: &str = "OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS";
+const MAX_TRIGGER_DB_RETRIES: u32 = 3;
 
 // ── Memory helpers ──────────────────────────────────────────────────────
 
@@ -2032,6 +2033,7 @@ pub(crate) fn run_trigger_thread(
     // the critic for ALL sessions including user-initiated ones.
     let self_improve_interval = Duration::from_secs(12 * 3600); // every 12 hours
     let mut attempt: u32 = 0;
+    let mut trigger_json_only = false;
 
     // Configurable morning kickoff hour (default 8 AM in user's timezone)
     let morning_hour: u32 = env_optional("LINUS_MORNING_HOUR")
@@ -2053,31 +2055,56 @@ pub(crate) fn run_trigger_thread(
         {
             let now = Utc::now().with_timezone(&tz);
             // Verify the persistent connection is still usable; reconnect if not
-            let db_ok = db_persistent.triggers_list().is_ok();
-            if !db_ok {
-                match open_or_create_db(mv2) {
-                    Ok(fresh) => {
-                        db_persistent = fresh;
-                        attempt = 0;
-                    }
-                    Err(e) => {
-                        attempt += 1;
-                        let backoff_ms = std::cmp::min(
-                            500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))),
-                            30_000,
-                        );
-                        if attempt <= 2 || attempt.is_power_of_two() {
-                            eprintln!(
-                                "[trigger-thread] db reconnect error: {e} (attempt {attempt}, next retry in {backoff_ms}ms)"
-                            );
+            if !trigger_json_only {
+                let db_ok = db_persistent.triggers_list().is_ok();
+                if !db_ok {
+                    if let Some(err) = db_persistent.triggers_list().err() {
+                        let msg = err.to_string().to_ascii_lowercase();
+                        if msg.contains("malformed") || msg.contains("disk i/o error") || msg.contains("locking protocol")
+                        {
+                            attempt += 1;
+                            if attempt >= MAX_TRIGGER_DB_RETRIES {
+                                eprintln!(
+                                    "[trigger-thread] trigger DB failed {attempt} times, switching to JSON-only backup mode"
+                                );
+                                trigger_json_only = true;
+                                continue;
+                            }
+                        } else {
+                            attempt = 0;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
-                        continue;
                     }
+                    match open_or_create_db(mv2) {
+                        Ok(fresh) => {
+                            db_persistent = fresh;
+                            attempt = 0;
+                        }
+                        Err(e) => {
+                            attempt += 1;
+                            let backoff_ms = std::cmp::min(
+                                500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))),
+                                30_000,
+                            );
+                            if attempt <= 2 || attempt.is_power_of_two() {
+                                eprintln!(
+                                    "[trigger-thread] db reconnect error: {e} (attempt {attempt}, next retry in {backoff_ms}ms)"
+                                );
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                            continue;
+                        }
+                    }
+                } else {
+                    attempt = 0;
                 }
+            } else {
+                attempt = 0;
             }
-            let db_loop = &db_persistent;
-            let mut triggers = load_triggers(db_loop);
+            let mut triggers = if trigger_json_only {
+                load_legacy_triggers_backup()
+            } else {
+                load_triggers(&db_persistent)
+            };
             let mut updated = false;
 
             for trigger in triggers.iter_mut() {
@@ -2242,7 +2269,9 @@ pub(crate) fn run_trigger_thread(
             }
 
             if updated {
-                if let Err(e) = save_triggers(db_loop, &triggers) {
+                if trigger_json_only {
+                    backup_triggers(&triggers);
+                } else if let Err(e) = save_triggers(&db_persistent, &triggers) {
                     eprintln!("[trigger-thread] CRITICAL: failed to persist trigger state: {e}");
                 }
             }
