@@ -1774,6 +1774,24 @@ pub(crate) fn execute_tool(
                 });
             }
 
+            // Block sqlite3 CLI from touching the production database.
+            // The system sqlite3 (different version from bundled rusqlite)
+            // corrupts WAL/SHM state when accessing a DB held open by the
+            // Rust process, causing "disk I/O error" in all other connections.
+            {
+                let cmd_lower = parsed.command.to_ascii_lowercase();
+                if cmd_lower.contains("sqlite3") && (cmd_lower.contains("memory.mv2") || cmd_lower.contains(".aethervault")) {
+                    return Ok(ToolExecution {
+                        output: "BLOCKED: Do not use the sqlite3 CLI on the production database. \
+                                 The system sqlite3 version differs from the embedded one and will \
+                                 corrupt the WAL index. Use the query/put tools instead, or run \
+                                 sqlite3 on a COPY of the database file.".to_string(),
+                        details: serde_json::json!({"blocked": true, "reason": "sqlite3_production_db"}),
+                        is_error: true,
+                    });
+                }
+            }
+
             // SSH hardening: inject safety flags before spawning
             let hardened_command = harden_ssh_in_command(&parsed.command);
 

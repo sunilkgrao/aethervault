@@ -131,9 +131,11 @@ pub(crate) fn open_or_create_db(path: &Path) -> Result<crate::memory_db::MemoryD
             eprintln!("[migrate] Rolling back — restoring original MV2");
             drop(db);
             let _ = std::fs::remove_file(path);
-            // Clean up WAL/SHM files SQLite may have created
-            let _ = std::fs::remove_file(format!("{}-wal", path.display()));
-            let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+            // NOTE: Do NOT delete WAL/SHM files here.  Other connections
+            // may hold mmap references to the SHM; deleting it causes
+            // "disk I/O error" in every concurrent reader/writer.
+            // The rename below overwrites the DB file, and SQLite will
+            // recreate WAL/SHM lazily on the next open.
             std::fs::rename(&backup, path)
                 .map_err(|e2| format!("rollback also failed: {e2} (original: {e})"))?;
             Err(format!("MV2 auto-migration failed: {e}").into())

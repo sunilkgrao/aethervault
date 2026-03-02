@@ -377,9 +377,11 @@ impl MemoryDb {
         // Set WAL mode and busy_timeout FIRST, before any reads.
         // If another connection already has WAL active, opening in default
         // (delete) journal mode and reading can cause mode mismatches.
+        // busy_timeout = 60s: must be high because multiple agent sessions,
+        // trigger thread, and observation consolidation all share this DB.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = 5000;"
+             PRAGMA busy_timeout = 60000;"
         )?;
 
         // Lightweight open check: verify we can read from the DB.
@@ -397,14 +399,12 @@ impl MemoryDb {
         }
 
         let db = Self { conn };
-        db.apply_pragmas()?; // Sets remaining pragmas (synchronous, cache_size, busy_timeout=30s)
+        db.apply_pragmas()?;
         db.init_schema()?;
         db.seed_trigger_id_counter_from_db()?;
-        db.conn
-            // PASSIVE checkpoint: never blocks other connections.
-            // TRUNCATE requires EXCLUSIVE lock → "database is locked" when
-            // trigger-thread and agent sessions open the DB concurrently.
-            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);").ok();
+        // NOTE: Do NOT checkpoint here.  Manual wal_checkpoint(PASSIVE) on
+        // every open races with concurrent connections and can corrupt the
+        // WAL index (SHM).  Let SQLite's auto-checkpoint handle it.
         Ok(db)
     }
 
@@ -422,12 +422,11 @@ impl MemoryDb {
                         );
                         // Try opening the existing DB without recovery
                         let conn = Connection::open(path)?;
-                        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+                        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 60000;")?;
                         let db = Self { conn };
                         db.apply_pragmas()?;
                         db.init_schema()?;
                         db.seed_trigger_id_counter_from_db()?;
-                        let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
                         return Ok(db);
                     }
                 }
@@ -441,7 +440,7 @@ impl MemoryDb {
         let current_frame_count = Connection::open(path)
             .ok()
             .and_then(|c| {
-                c.execute_batch("PRAGMA busy_timeout = 5000;").ok()?;
+                c.execute_batch("PRAGMA busy_timeout = 60000;").ok()?;
                 c.query_row("SELECT count(*) FROM frames", [], |row| row.get::<_, i64>(0)).ok()
             })
             .unwrap_or(0);
@@ -468,7 +467,6 @@ impl MemoryDb {
                     db.apply_pragmas()?;
                     db.init_schema()?;
                     db.seed_trigger_id_counter_from_db()?;
-                    let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
                     return Ok(db);
                 }
                 Ok(None) => {}
@@ -489,12 +487,11 @@ impl MemoryDb {
              (frame_count={current_frame_count}). Will NOT start fresh."
         );
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 60000;")?;
         let db = Self { conn };
         db.apply_pragmas()?;
         db.init_schema()?;
         db.seed_trigger_id_counter_from_db()?;
-        let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
         Ok(db)
     }
 
@@ -595,7 +592,7 @@ impl MemoryDb {
             // integrity_check can produce false negatives in WAL mode and is
             // extremely slow on large DBs.  A sqlite_master read + frame count
             // verifies the DB is structurally openable.
-            conn.execute_batch("PRAGMA busy_timeout = 5000;").map_err(|err| {
+            conn.execute_batch("PRAGMA busy_timeout = 60000;").map_err(|err| {
                 format!("failed to set busy_timeout after restore from {:?}: {}", backup_path, err)
             })?;
             let read_ok = conn
@@ -634,15 +631,15 @@ impl MemoryDb {
     }
 
     fn apply_pragmas(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // NOTE: mmap_size intentionally removed. PRAGMA mmap_size = 64MB
-        // caused "database disk image is malformed" and "disk I/O error"
-        // when multiple connections share the same WAL-mode DB: a checkpoint
-        // by one connection overwrites WAL frames that another's mmap view
-        // still references, returning stale/garbage pages.
+        // NOTE: mmap_size intentionally removed — caused page duplication
+        // corruption when multiple connections share the same WAL-mode DB.
+        // NOTE: wal_checkpoint intentionally NOT called — manual checkpoints
+        // race with concurrent connections and corrupt the WAL index (SHM).
+        // SQLite's auto-checkpoint (every 1000 pages) handles this safely.
         self.conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA busy_timeout = 30000;
+             PRAGMA busy_timeout = 60000;
              PRAGMA cache_size = -8000;",
         )?;
         Ok(())
@@ -858,9 +855,11 @@ impl MemoryDb {
         Ok(())
     }
 
-    /// No-op in WAL mode (each statement auto-commits). Performs a passive WAL checkpoint.
+    /// No-op in WAL mode (each statement auto-commits).
+    /// Previously did PRAGMA wal_checkpoint(PASSIVE) here, but manual
+    /// checkpoints from multiple concurrent connections corrupt the WAL
+    /// index (SHM file).  SQLite auto-checkpoints every 1000 pages safely.
     pub(crate) fn commit(&self) -> Result<(), String> {
-        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
         Ok(())
     }
 
