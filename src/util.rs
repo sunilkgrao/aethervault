@@ -64,6 +64,11 @@ pub(crate) fn open_or_create_db(path: &Path) -> Result<crate::memory_db::MemoryD
         return MemoryDb::open_or_create(path);
     }
 
+    if path.is_dir() {
+        return Err(format!("Path '{}' is a directory, expected a file path for database", path.display()).into());
+    }
+
+
     // File exists — check whether it's already SQLite or an MV2 vault.
     if is_sqlite_file(path) {
         return MemoryDb::open_or_create(path);
