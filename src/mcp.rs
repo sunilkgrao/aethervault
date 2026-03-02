@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -13,6 +13,30 @@ fn is_recoverable_mcp_error(msg: &str) -> bool {
     msg.contains("server closed connection")
         || msg.contains("reader disconnected")
         || msg.contains("reader reached eof")
+}
+
+fn normalize_mcp_id(id: &serde_json::Value) -> serde_json::Value {
+    match id {
+        serde_json::Value::String(text) => {
+            if let Ok(v) = text.parse::<i64>() {
+                serde_json::json!(v)
+            } else {
+                serde_json::Value::String(text.clone())
+            }
+        }
+        serde_json::Value::Number(num) => {
+            if let Some(v) = num.as_i64() {
+                serde_json::json!(v)
+            } else {
+                serde_json::Value::Number(num.clone())
+            }
+        }
+        _ => id.clone(),
+    }
+}
+
+fn mcp_id_matches(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    normalize_mcp_id(a) == normalize_mcp_id(b)
 }
 
 enum ReaderEvent {
@@ -64,6 +88,7 @@ pub(crate) struct McpServerHandle {
     dead: bool,
     /// Tools discovered from this server (original names)
     tools: Vec<serde_json::Value>,
+    pending_responses: VecDeque<serde_json::Value>,
 }
 
 const MCP_POLL_INTERVAL_MS: u64 = 250;
@@ -183,6 +208,7 @@ impl McpRegistry {
                     continue;
                 }
             };
+            let expected_id = serde_json::json!(call_id);
 
             let (response, should_retry) = {
                 let handle = &mut self.servers[server_idx];
@@ -190,6 +216,11 @@ impl McpRegistry {
                 let mut should_retry = false;
 
                 loop {
+                    if let Some(msg) = handle.take_pending_response_for_id(&expected_id) {
+                        response = Some(msg);
+                        break;
+                    }
+
                     let msg = match handle.read_msg_timeout(Duration::from_millis(MCP_POLL_INTERVAL_MS)) {
                         Ok(msg) => msg,
                         Err(err) => {
@@ -210,16 +241,14 @@ impl McpRegistry {
                         eprintln!("[mcp:{}] skipping notification: {method}", handle.name);
                         continue;
                     }
-                    if let Some(resp_id) = msg.get("id").and_then(|v| v.as_i64()) {
-                        if resp_id != call_id {
-                            return Err(format!(
-                                "mcp '{}': response id mismatch (expected {call_id}, got {resp_id})",
-                                handle.name
-                            ));
+                    if let Some(resp_id) = msg.get("id") {
+                        if mcp_id_matches(resp_id, &expected_id) {
+                            response = Some(msg);
+                            break;
                         }
+                        handle.cache_unmatched_response(msg);
+                        continue;
                     }
-                    response = Some(msg);
-                    break;
                 }
 
                 (response, should_retry)
@@ -336,6 +365,7 @@ impl McpServerHandle {
             next_id: 1,
             dead: false,
             tools: Vec::new(),
+            pending_responses: VecDeque::new(),
         };
 
         handle.bootstrap()?;
@@ -395,6 +425,21 @@ impl McpServerHandle {
         let replacement = Self::start(&config)?;
         *self = replacement;
         Ok(())
+    }
+
+    fn take_pending_response_for_id(
+        &mut self,
+        expected_id: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let idx = self.pending_responses.iter().position(|msg| {
+            msg.get("id")
+                .is_some_and(|id| mcp_id_matches(id, expected_id))
+        });
+        idx.and_then(|i| self.pending_responses.remove(i))
+    }
+
+    fn cache_unmatched_response(&mut self, msg: serde_json::Value) {
+        self.pending_responses.push_back(msg);
     }
 
     pub(crate) fn send_msg(&mut self, msg: &serde_json::Value) -> Result<(), String> {
