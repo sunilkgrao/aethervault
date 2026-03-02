@@ -28,7 +28,7 @@ use crate::{
     ContinuationCheckpoint,
     CommandSpec, DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
     ToolExecution, BackgroundTaskRegistry, SessionRegistry,
-    SessionTaint, FailureKind, classify_failure, LearnedFailure,
+    SessionTaint, FailureKind, classify_failure, LearnedFailure, detect_invisible_unicode,
     open_skill_db, list_skills, record_skill_use,
     match_skills_for_prompt, bootstrap_skills,
     prune_low_performing_skills, rebuild_fts5_index,
@@ -614,6 +614,21 @@ fn process_tool_result(
             session_taint.mark_private_data();
         }
         _ => {}
+    }
+
+    // ── Invisible Unicode detection — scan ALL tool outputs for injection markers ──
+    // Browser/HTTP outputs are already stripped by sanitize_external_content(), but exec,
+    // fs_read, and other tool outputs are not. Detect and warn the LLM when invisible
+    // chars are found — this is strong evidence of prompt injection.
+    if let Some(warning) = detect_invisible_unicode(&result.output) {
+        eprintln!("[security] invisible unicode detected in {} output", call.name);
+        session_taint.mark_untrusted(&format!("{} (invisible unicode)", call.name));
+        deferred.push(AgentMessage {
+            role: "user".to_string(),
+            content: Some(warning),
+            tool_calls: Vec::new(),
+            name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+        });
     }
 
     // ── Failure classification — defer retry hints until after all tool results ──
