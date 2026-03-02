@@ -39,9 +39,19 @@ pub(crate) fn token_jaccard(a: &str, b: &str) -> f32 {
     };
     let set_a = normalize(a);
     let set_b = normalize(b);
+
     if set_a.is_empty() && set_b.is_empty() {
-        return 1.0;
+        return 0.0;
     }
+
+    if set_a.len() < 2 || set_b.len() < 2 {
+        return if a.eq_ignore_ascii_case(b) {
+            1.0
+        } else {
+            0.0
+        };
+    }
+
     let intersection = set_a.intersection(&set_b).count();
     let union = set_a.union(&set_b).count();
     if union == 0 {
@@ -228,13 +238,20 @@ mod tests {
 
     #[test]
     fn test_jaccard_empty() {
-        // Both empty -> 1.0 (convention)
-        assert!((token_jaccard("", "") - 1.0).abs() < f32::EPSILON);
+        // Both empty -> now intentionally treated as non-similar
+        assert!(token_jaccard("", "").abs() < f32::EPSILON);
         // Short words filtered out: "a" and "be" are < 3 chars
-        assert!((token_jaccard("a be", "a be") - 1.0).abs() < f32::EPSILON);
+        assert!(token_jaccard("a be", "a be").abs() < f32::EPSILON);
         // One empty, one not
         let score = token_jaccard("hello world", "");
         assert!(score.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_jaccard_short_inputs_fallback() {
+        assert!(token_jaccard("DB locked", "Timer fired").abs() < f32::EPSILON);
+        assert!(token_jaccard("the a", "an the").abs() < f32::EPSILON);
+        assert!((token_jaccard("Hello", "Hello") - 1.0).abs() < f32::EPSILON);
     }
 
     // ── consolidate() integration tests ─────────────────────────────
