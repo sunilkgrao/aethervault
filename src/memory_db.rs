@@ -374,12 +374,19 @@ impl MemoryDb {
             }
         };
 
+        // Set WAL mode and busy_timeout FIRST, before any reads.
+        // If another connection already has WAL active, opening in default
+        // (delete) journal mode and reading can cause mode mismatches.
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;"
+        )?;
+
         // Lightweight open check: verify we can read from the DB.
         // DO NOT use PRAGMA integrity_check here — it causes false corruption
         // detections in WAL mode with concurrent connections, triggering
         // unnecessary recovery that replaces the DB with a stale backup.
         // Full integrity_check should only run on explicit user request.
-        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
         let read_ok = conn
             .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
             .is_ok();
@@ -390,7 +397,7 @@ impl MemoryDb {
         }
 
         let db = Self { conn };
-        db.apply_pragmas()?;
+        db.apply_pragmas()?; // Sets remaining pragmas (synchronous, cache_size, busy_timeout=30s)
         db.init_schema()?;
         db.seed_trigger_id_counter_from_db()?;
         db.conn
@@ -627,18 +634,36 @@ impl MemoryDb {
     }
 
     fn apply_pragmas(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // NOTE: mmap_size intentionally removed. PRAGMA mmap_size = 64MB
+        // caused "database disk image is malformed" and "disk I/O error"
+        // when multiple connections share the same WAL-mode DB: a checkpoint
+        // by one connection overwrites WAL frames that another's mmap view
+        // still references, returning stale/garbage pages.
         self.conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 30000;
-             PRAGMA cache_size = -8000;
-             PRAGMA mmap_size = 67108864;",
+             PRAGMA cache_size = -8000;",
         )?;
         Ok(())
     }
 
     fn init_schema(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.conn.execute_batch(SCHEMA_SQL)?;
+        // Only run full DDL if the schema doesn't exist yet.
+        // Running CREATE VIRTUAL TABLE / CREATE TRIGGER on every open causes
+        // FTS5 metadata corruption when multiple connections are active
+        // (e.g. trigger-thread persistent conn + agent session).
+        let tables_exist = self.conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='frames'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) > 0;
+
+        if !tables_exist {
+            self.conn.execute_batch(SCHEMA_SQL)?;
+        }
 
         // Backward-compatible migrations (silently ignore if already applied)
         self.conn
