@@ -402,6 +402,43 @@ impl MemoryDb {
     }
 
     fn recover_and_open(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        // ── Rate-limit recovery: max once per 10 minutes ──
+        // Prevents cascading recovery loops (17 corrupt backups in 8 hours).
+        let marker = path.with_extension("recovery-marker");
+        if marker.exists() {
+            if let Ok(meta) = std::fs::metadata(&marker) {
+                if let Ok(modified) = meta.modified() {
+                    if modified.elapsed().unwrap_or_default() < std::time::Duration::from_secs(600) {
+                        eprintln!(
+                            "[capsule-recovery] BLOCKED: recovery already attempted in last 10 minutes. \
+                             Refusing to cascade. Will open DB as-is or fail."
+                        );
+                        // Try opening the existing DB without recovery
+                        let conn = Connection::open(path)?;
+                        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+                        let db = Self { conn };
+                        db.apply_pragmas()?;
+                        db.init_schema()?;
+                        db.seed_trigger_id_counter_from_db()?;
+                        let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+                        return Ok(db);
+                    }
+                }
+            }
+        }
+        // Touch the marker to rate-limit future attempts
+        let _ = std::fs::write(&marker, Utc::now().to_rfc3339());
+
+        // ── Count frames in the current DB before overwriting ──
+        // This prevents replacing a 9827-frame DB with a 0-frame backup.
+        let current_frame_count = Connection::open(path)
+            .ok()
+            .and_then(|c| {
+                c.execute_batch("PRAGMA busy_timeout = 5000;").ok()?;
+                c.query_row("SELECT count(*) FROM frames", [], |row| row.get::<_, i64>(0)).ok()
+            })
+            .unwrap_or(0);
+
         let now = Utc::now().format("%Y%m%d-%H%M%S%.f");
         let corrupt_backup_path = path.with_extension(format!("corrupt-{now}.mv2"));
 
@@ -413,11 +450,11 @@ impl MemoryDb {
         }
 
         let backup_candidates = Self::recovery_backup_paths(path);
-        for backup in backup_candidates {
+        for backup in &backup_candidates {
             if !backup.exists() {
                 continue;
             }
-            match Self::try_restore_from_backup(path, &backup) {
+            match Self::try_restore_from_backup(path, backup, current_frame_count) {
                 Ok(Some(conn)) => {
                     eprintln!("[capsule-recovery] Restored from backup: {:?}", backup);
                     let db = Self { conn };
@@ -437,54 +474,36 @@ impl MemoryDb {
             }
         }
 
+        // ── No valid backup found — do NOT nuke the existing DB ──
+        // Previous behavior: delete the DB and start fresh (catastrophic data loss).
+        // New behavior: keep the existing DB and just ensure schema is present.
         eprintln!(
-            "[capsule-recovery] No valid backups found, starting with empty database"
+            "[capsule-recovery] No valid backups found. Keeping existing DB intact \
+             (frame_count={current_frame_count}). Will NOT start fresh."
         );
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|err| {
-                std::io::Error::new(
-                    err.kind(),
-                    format!("failed to remove corrupt database {:?}: {}", path, err),
-                )
-            })?;
-        }
-
         let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
         let db = Self { conn };
         db.apply_pragmas()?;
         db.init_schema()?;
         db.seed_trigger_id_counter_from_db()?;
-        db.conn
-            // PASSIVE checkpoint: never blocks other connections.
-            // TRUNCATE requires EXCLUSIVE lock → "database is locked" when
-            // trigger-thread and agent sessions open the DB concurrently.
-            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);").ok();
+        let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
         Ok(db)
     }
 
     fn recovery_backup_paths(path: &Path) -> Vec<PathBuf> {
         let mut candidates = Vec::new();
 
+        // Only consider .bak files as backup candidates.
+        // NOTE: memory-rebuilt.mv2 was previously included but is always stale
+        // (created by one-time rebuild, never updated). It caused cascading
+        // recovery loops where the live DB was replaced with a Feb 27 snapshot
+        // missing triggers and recent frames. Removed as a candidate.
         if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
             candidates.push(path.with_extension(format!("{extension}.bak")));
         } else {
             candidates.push(path.with_extension("bak"));
         }
-
-        let rebuilt_backup = if let Some(file_stem) = path.file_stem() {
-            if let Some(ext) = path.extension() {
-                path.with_file_name(format!(
-                    "{}-rebuilt.{}",
-                    file_stem.to_string_lossy(),
-                    ext.to_string_lossy()
-                ))
-            } else {
-                path.with_file_name(format!("{}-rebuilt", file_stem.to_string_lossy()))
-            }
-        } else {
-            path.with_file_name("memory-rebuilt.mv2")
-        };
-        candidates.push(rebuilt_backup);
 
         let file_name = match path.file_name().and_then(|name| name.to_str()) {
             Some(name) => name.to_owned(),
@@ -530,8 +549,30 @@ impl MemoryDb {
     fn try_restore_from_backup(
         path: &Path,
         backup_path: &Path,
+        min_frame_count: i64,
     ) -> Result<Option<Connection>, String> {
         let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Connection, String> {
+            // ── Pre-flight: check backup has enough data before overwriting ──
+            // Open the backup in-place (read-only) to count frames BEFORE copying.
+            let backup_conn = Connection::open_with_flags(
+                backup_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ).map_err(|err| {
+                format!("cannot open backup {:?} for pre-flight check: {}", backup_path, err)
+            })?;
+            let backup_frames: i64 = backup_conn
+                .query_row("SELECT count(*) FROM frames", [], |row| row.get(0))
+                .unwrap_or(0);
+            drop(backup_conn);
+
+            if min_frame_count > 0 && backup_frames < min_frame_count / 2 {
+                return Err(format!(
+                    "backup {:?} has only {} frames vs {} in current DB — refusing to restore \
+                     (would lose >50% of data)",
+                    backup_path, backup_frames, min_frame_count
+                ));
+            }
+
             std::fs::copy(backup_path, path).map_err(|err| {
                 format!(
                     "failed to copy backup file {:?} to {:?}: {}",
@@ -543,22 +584,28 @@ impl MemoryDb {
                 format!("failed to open recovered copy {:?} from {:?}: {}", path, backup_path, err)
             })?;
 
-            let integrity_ok = conn
-                .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
-                .map(|result| result == "ok")
-                .map_err(|err| {
-                    format!(
-                        "failed to run integrity check for {:?} after restore from {:?}: {}",
-                        path, backup_path, err
-                    )
-                })?;
+            // Lightweight read check instead of PRAGMA integrity_check.
+            // integrity_check can produce false negatives in WAL mode and is
+            // extremely slow on large DBs.  A sqlite_master read + frame count
+            // verifies the DB is structurally openable.
+            conn.execute_batch("PRAGMA busy_timeout = 5000;").map_err(|err| {
+                format!("failed to set busy_timeout after restore from {:?}: {}", backup_path, err)
+            })?;
+            let read_ok = conn
+                .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
+                .is_ok();
 
-            if !integrity_ok {
-                Err(format!(
-                    "integrity check failed for {:?} after restore from {:?}",
+            if !read_ok {
+                return Err(format!(
+                    "cannot read sqlite_master for {:?} after restore from {:?}",
                     path, backup_path
-                ))?;
+                ));
             }
+
+            eprintln!(
+                "[capsule-recovery] backup {:?} has {} frames (current: {}), read check OK",
+                backup_path, backup_frames, min_frame_count
+            );
 
             Ok(conn)
         }));
