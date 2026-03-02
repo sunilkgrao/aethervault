@@ -374,28 +374,18 @@ impl MemoryDb {
             }
         };
 
-        let mut integrity_ok = false;
-        for attempt in 1..=3 {
-            integrity_ok = conn
-                .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
-                .map(|result| result == "ok")
-                .unwrap_or(false);
+        // Lightweight open check: verify we can read from the DB.
+        // DO NOT use PRAGMA integrity_check here — it causes false corruption
+        // detections in WAL mode with concurrent connections, triggering
+        // unnecessary recovery that replaces the DB with a stale backup.
+        // Full integrity_check should only run on explicit user request.
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        let read_ok = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
+            .is_ok();
 
-            if integrity_ok {
-                break;
-            }
-
-            if attempt < 3 {
-                eprintln!(
-                    "[capsule] integrity check attempt {}/3 failed, retrying...",
-                    attempt
-                );
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-        }
-
-        if !integrity_ok {
-            eprintln!("warning: sqlite integrity check failed for {:?}", path);
+        if !read_ok {
+            eprintln!("[capsule] Cannot read DB at {:?}, attempting recovery...", path);
             return Self::recover_and_open(path);
         }
 
