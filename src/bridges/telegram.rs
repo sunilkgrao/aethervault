@@ -1013,10 +1013,8 @@ pub(crate) fn spawn_agent_run(
             prev_stream_phase = stream_phase;
 
             // === Non-streaming progress (original behavior) ===
+            // Mark first ack as sent (no canned message) so progress updates start flowing
             if first_ack_needed {
-                let _ = telegram_send_message(
-                    &prog_agent, &prog_url, chat_id, "Got it, working on it...",
-                );
                 if let Ok(mut guard) = prog_ref.lock() {
                     guard.first_ack_sent = true;
                 }
@@ -1038,7 +1036,14 @@ pub(crate) fn spawn_agent_run(
                     let step = guard.step;
                     let preview = guard.text_preview.clone();
                     if tools.is_empty() && step == 0 {
-                        format!("Thinking... ({elapsed}s)")
+                        if let Some(ref preview_text) = preview {
+                            // Show actual thinking content, not a canned message
+                            let truncated: String = preview_text.chars().take(200).collect();
+                            format!("\u{1F4AD} {truncated}\n({elapsed}s)")
+                        } else {
+                            // No thinking content yet — skip this tick
+                            continue;
+                        }
                     } else if let Some(ref preview_text) = preview {
                         let truncated: String = preview_text.chars().take(80).collect();
                         if tools.is_empty() {
