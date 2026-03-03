@@ -53,7 +53,7 @@ fn check_capsule_health(mv2: &Path) {
 /// Returns true if an observation is worth persisting to long-term memory.
 fn observation_is_useful(text: &str) -> bool {
     let trimmed = text.trim();
-    // Keep concise facts (e.g. short names or year statements) while filtering out tiny chatter.
+    // 10 chars filters noise (ok, yes, done) while keeping short facts (Emile born 2025)
     if trimmed.len() < 10 {
         return false;
     }
@@ -178,12 +178,18 @@ pub(crate) fn run_agent(
             None, // tool_filter: no restrictions for CLI agent
         )?;
 
-        let continuation_marker_line = output.final_text.as_ref().and_then(|text| {
-            text
-                .lines()
-                .find(|line| line.starts_with(CONTINUATION_MARKER_PREFIX))
-        });
-        let needs_continuation = continuation_marker_line.is_some();
+        let needs_continuation = output.final_text.as_ref()
+            .map(|text| text.lines().last()
+                .map(|l| l.trim().starts_with(CONTINUATION_MARKER_PREFIX))
+                .unwrap_or(false))
+            .unwrap_or(false);
+        let continuation_marker_line = if needs_continuation {
+            output.final_text.as_ref().and_then(|text| {
+                text.lines().find(|line| line.starts_with(CONTINUATION_MARKER_PREFIX))
+            })
+        } else {
+            None
+        };
 
         if needs_continuation && chain_depth < MAX_CHAIN_DEPTH {
             // Parse checkpoint and build continuation prompt
