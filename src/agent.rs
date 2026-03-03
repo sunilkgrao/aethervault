@@ -53,10 +53,6 @@ fn check_capsule_health(mv2: &Path) {
 /// Returns true if an observation is worth persisting to long-term memory.
 fn observation_is_useful(text: &str) -> bool {
     let trimmed = text.trim();
-    // 10 chars filters noise (ok, yes, done) while keeping short facts (Emile born 2025)
-    if trimmed.len() < 10 {
-        return false;
-    }
     let lower = trimmed.to_lowercase();
 
     // Filter strategy: drop obvious meta-phrases and status boilerplate,
@@ -114,8 +110,26 @@ fn observation_is_useful(text: &str) -> bool {
         "api", "token", "endpoint", "port", "version", "config",
     ];
     let has_specificity = specificity_markers.iter().any(|m| lower.contains(m));
+    let is_meaningful = has_number || has_proper_noun || has_specificity;
 
-    has_number || has_proper_noun || has_specificity
+    if trimmed.len() < 15 && !is_meaningful {
+        return false;
+    }
+
+    is_meaningful
+}
+
+fn continuation_marker_path<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with(prefix) {
+        return None;
+    }
+    let after = &trimmed[prefix.len()..];
+    let (path, suffix) = after.split_once(']')?;
+    if !suffix.trim().is_empty() {
+        return None;
+    }
+    Some(path)
 }
 
 pub(crate) fn run_agent(
@@ -178,60 +192,47 @@ pub(crate) fn run_agent(
             None, // tool_filter: no restrictions for CLI agent
         )?;
 
-        let needs_continuation = output.final_text.as_ref()
-            .map(|text| text.lines().last()
-                .map(|l| l.trim().starts_with(CONTINUATION_MARKER_PREFIX))
-                .unwrap_or(false))
-            .unwrap_or(false);
-        let continuation_marker_line = if needs_continuation {
-            output.final_text.as_ref().and_then(|text| {
-                text.lines().find(|line| line.starts_with(CONTINUATION_MARKER_PREFIX))
-            })
-        } else {
-            None
-        };
+        let continuation_marker = output.final_text.as_ref()
+            .and_then(|text| text.lines().last())
+            .and_then(|line| continuation_marker_path(line, CONTINUATION_MARKER_PREFIX));
 
-        if needs_continuation && chain_depth < MAX_CHAIN_DEPTH {
+        if continuation_marker.is_some() && chain_depth < MAX_CHAIN_DEPTH {
             // Parse checkpoint and build continuation prompt
-            if let Some(marker_line) = continuation_marker_line {
-                let after = &marker_line[CONTINUATION_MARKER_PREFIX.len()..];
-                if let Some(end) = after.find(']') {
-                    let checkpoint_path = &after[..end];
-                    if let Ok(checkpoint_json) = fs::read_to_string(checkpoint_path) {
-                        if let Ok(checkpoint) = serde_json::from_str::<ContinuationCheckpoint>(&checkpoint_json) {
-                            chain_depth = if checkpoint.chain_depth <= MAX_CHECKPOINT_CHAIN_DEPTH {
-                                checkpoint.chain_depth
-                            } else {
-                                eprintln!(
-                                    "[auto-continuation] checkpoint chain_depth {} outside 0..={}; resetting to 0",
-                                    checkpoint.chain_depth, MAX_CHECKPOINT_CHAIN_DEPTH
-                                );
-                                0
-                            };
+            if let Some(checkpoint_path) = continuation_marker {
+                if let Ok(checkpoint_json) = fs::read_to_string(checkpoint_path) {
+                    if let Ok(checkpoint) = serde_json::from_str::<ContinuationCheckpoint>(&checkpoint_json) {
+                        chain_depth = if checkpoint.chain_depth <= MAX_CHECKPOINT_CHAIN_DEPTH {
+                            checkpoint.chain_depth
+                        } else {
                             eprintln!(
-                                "[auto-continuation] chaining session (depth {}/{}): {}",
-                                chain_depth, MAX_CHAIN_DEPTH,
-                                checkpoint.goal.chars().take(80).collect::<String>()
+                                "[auto-continuation] checkpoint chain_depth {} outside 0..={}; resetting to 0",
+                                checkpoint.chain_depth, MAX_CHECKPOINT_CHAIN_DEPTH
                             );
-                            current_prompt = format!(
-                                "[Continuation from previous session — chain depth {}/{}]\n\n\
-                                 ## Goal\n{}\n\n\
-                                 ## Summary of work so far\n{}\n\n\
-                                 ## Remaining work\n{}\n\n\
-                                 Continue from where you left off. Do NOT repeat completed work.",
-                                chain_depth, MAX_CHAIN_DEPTH,
-                                checkpoint.goal, checkpoint.summary, checkpoint.remaining_work,
-                            );
-                            current_session = current_session.map(|s| {
-                                if s.contains(":chain:") {
-                                    let base = s.rsplit(":chain:").last().unwrap_or(&s);
-                                    format!("{base}:chain:{chain_depth}")
-                                } else {
-                                    format!("{s}:chain:{chain_depth}")
-                                }
-                            });
-                            continue; // Loop back for the next chain
-                        }
+                            0
+                        };
+                        eprintln!(
+                            "[auto-continuation] chaining session (depth {}/{}): {}",
+                            chain_depth, MAX_CHAIN_DEPTH,
+                            checkpoint.goal.chars().take(80).collect::<String>()
+                        );
+                        current_prompt = format!(
+                            "[Continuation from previous session — chain depth {}/{}]\n\n\
+                             ## Goal\n{}\n\n\
+                             ## Summary of work so far\n{}\n\n\
+                             ## Remaining work\n{}\n\n\
+                             Continue from where you left off. Do NOT repeat completed work.",
+                            chain_depth, MAX_CHAIN_DEPTH,
+                            checkpoint.goal, checkpoint.summary, checkpoint.remaining_work,
+                        );
+                        current_session = current_session.map(|s| {
+                            if s.contains(":chain:") {
+                                let base = s.rsplit(":chain:").last().unwrap_or(&s);
+                                format!("{base}:chain:{chain_depth}")
+                            } else {
+                                format!("{s}:chain:{chain_depth}")
+                            }
+                        });
+                        continue; // Loop back for the next chain
                     }
                 }
             }
@@ -1019,7 +1020,11 @@ pub(crate) fn run_agent_with_prompt(
     }
 
     // Resource-aware orchestration: inject compute delegation guide for long-running tasks
-    let is_continuation = prompt_text.contains("[Continuation from previous session");
+    let is_continuation = prompt_text
+        .lines()
+        .next()
+        .map(|line| line.trim().starts_with("[Continuation from previous session"))
+        .unwrap_or(false);
     let long_run_mode = env_optional("AGENT_LONG_RUN").map(|v| v == "1").unwrap_or(false)
         || is_continuation;
     if long_run_mode {
