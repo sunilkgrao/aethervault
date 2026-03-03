@@ -2116,24 +2116,33 @@ pub(crate) fn execute_tool(
                 "context has been closed",
             ];
 
-            // Kill zombie agent-browser daemon processes that accumulate across
-            // sessions and starve memory.  Only runs once per agent process.
-            static BROWSER_CLEANUP_DONE: std::sync::Once = std::sync::Once::new();
-            BROWSER_CLEANUP_DONE.call_once(|| {
-                let _ = std::process::Command::new("pkill")
-                    .args(["-f", "agent-browser.*daemon"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                let _ = std::process::Command::new("pkill")
-                    .args(["-f", "chrome-headless-shell"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                // Give OS a moment to reclaim memory
-                std::thread::sleep(Duration::from_secs(2));
-                eprintln!("[tool:browser] cleaned up stale browser daemons (one-time)");
-            });
+            // Kill zombie agent-browser daemon + Chromium processes that
+            // accumulate across sessions and starve CPU/memory.
+            // Runs once per session (keyed by session name), not once per process.
+            {
+                use std::sync::Mutex;
+                static CLEANED_SESSIONS: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+                    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+                let mut cleaned = CLEANED_SESSIONS.lock().unwrap();
+                if cleaned.insert(session.clone()) {
+                    // First browser call for this session — kill any stale daemons
+                    // for ALL sessions, then close this specific session cleanly.
+                    let _ = std::process::Command::new("agent-browser")
+                        .args(["--session", &session, "close"])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    // Also kill any orphaned Chromium processes (grandchildren
+                    // of previous agent-browser daemons that survived SIGTERM).
+                    let _ = std::process::Command::new("pkill")
+                        .args(["-f", "chrome-headless-shell"])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    std::thread::sleep(Duration::from_millis(500));
+                    eprintln!("[tool:browser] cleaned up stale daemons for session '{session}'");
+                }
+            }
 
             let run_browser = |sess: &str| -> Result<ChildResult, String> {
                 let mut cmd_args: Vec<String> = vec!["--session".to_string(), sess.to_string()];
@@ -2146,7 +2155,7 @@ pub(crate) fn execute_tool(
                 let cancel_token = Arc::new(AtomicBool::new(false));
                 let browser_policy = ExecPolicy {
                     hard_timeout_ms: browser_timeout_ms,
-                    stale_threshold_ms: 300_000,  // 5 min stale for browser
+                    stale_threshold_ms: 120_000,  // 2 min stale for browser (was 5 min)
                 };
                 wait_for_child_monitored(&mut child, "browser", &cancel_token, &browser_policy)
             };
@@ -2208,8 +2217,8 @@ pub(crate) fn execute_tool(
                             Ok(mut child) => {
                                 let cancel = Arc::new(AtomicBool::new(false));
                                 let snap_policy = ExecPolicy {
-                                    hard_timeout_ms: 30_000, // 30s for snapshot
-                                    stale_threshold_ms: 60_000,
+                                    hard_timeout_ms: 15_000,  // 15s hard cap for snapshot
+                                    stale_threshold_ms: 15_000, // kill if no output in 15s
                                 };
                                 match wait_for_child_monitored(&mut child, "browser-auto-snap", &cancel, &snap_policy) {
                                     Ok(r) if r.status.success() && !r.stdout.trim().is_empty() => {
@@ -2222,6 +2231,13 @@ pub(crate) fn execute_tool(
                                     }
                                     Err(e) => {
                                         eprintln!("[tool:browser] auto-snapshot error: {e}");
+                                        // Snapshot timed out — kill the daemon to prevent
+                                        // zombie Chromium processes from accumulating.
+                                        let _ = std::process::Command::new("agent-browser")
+                                            .args(["--session", &session, "close"])
+                                            .stdout(Stdio::null())
+                                            .stderr(Stdio::null())
+                                            .status();
                                         None
                                     }
                                 }

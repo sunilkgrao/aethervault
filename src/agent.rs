@@ -2911,6 +2911,20 @@ pub(crate) fn run_agent_with_prompt(
             checkpoint_path.display()
         );
 
+        // Clean up browser daemons before returning
+        if let Some(ref sess_id) = session {
+            let _ = std::process::Command::new("agent-browser")
+                .args(["--session", sess_id, "close"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        let _ = std::process::Command::new("agent-browser")
+            .args(["--session", "default", "close"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
         return Ok(AgentRunOutput {
             session,
             context: context_pack,
@@ -2920,6 +2934,22 @@ pub(crate) fn run_agent_with_prompt(
             step_count: step,
         });
     }
+
+    // Clean up browser daemons that this session may have spawned.
+    // Without this, each agent session leaves a detached Node.js daemon +
+    // Chromium renderer running, consuming 50%+ CPU indefinitely.
+    if let Some(ref sess_id) = session {
+        let _ = std::process::Command::new("agent-browser")
+            .args(["--session", sess_id, "close"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = std::process::Command::new("agent-browser")
+        .args(["--session", "default", "close"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 
     Ok(AgentRunOutput {
         session,
