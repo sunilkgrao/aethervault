@@ -54,7 +54,8 @@ fn check_capsule_health(mv2: &Path) {
 fn observation_is_useful(text: &str) -> bool {
     let trimmed = text.trim();
     // Too short to be useful
-    if trimmed.len() < 30 {
+    // Keep short but concrete observations, as useful signals can be concise.
+    if trimmed.len() < 10 {
         return false;
     }
     let lower = trimmed.to_lowercase();
@@ -148,9 +149,12 @@ pub(crate) fn run_agent(
             None, // tool_filter: no restrictions for CLI agent
         )?;
 
-        let needs_continuation = output.final_text.as_ref()
-            .map(|t| t.contains("[CONTINUATION_NEEDED:"))
-            .unwrap_or(false);
+        let needs_continuation = output.final_text.as_ref().map(|t| {
+            t.lines()
+                .last()
+                .map(|l| l.trim().starts_with("[CONTINUATION_NEEDED:]"))
+                .unwrap_or(false)
+        }).unwrap_or(false);
 
         if needs_continuation && chain_depth < MAX_CHAIN_DEPTH {
             // Parse checkpoint and build continuation prompt
