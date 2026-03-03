@@ -813,39 +813,61 @@ pub(crate) fn spawn_agent_run(
                 }
             }
 
-            let (done, should_checkpoint, first_ack_needed) = {
+            let (done, should_checkpoint, first_ack_needed, should_progress) = {
                 let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
                 let done = guard.phase == "done";
                 let effective_max = guard.extended_max_steps.unwrap_or(guard.max_steps);
                 let at_checkpoint = guard.step >= effective_max * 3 / 4
                     && !guard.checkpoint_sent
                     && effective_max > 4;
-                // Send a first ack after ~12s if nothing has been sent yet and agent is working
+                // Send first ack after ~4s — don't wait for step > 0
                 let needs_first_ack = !guard.first_ack_sent
-                    && tick_count >= 3  // ~12 seconds
-                    && guard.step > 0   // agent has started processing
+                    && tick_count >= 1
                     && !done;
-                (done, at_checkpoint, needs_first_ack)
+                // Send periodic progress every ~20s (5 ticks) after first ack
+                let needs_progress = guard.first_ack_sent
+                    && tick_count % 5 == 0
+                    && guard.step > 0
+                    && !done;
+                (done, at_checkpoint, needs_first_ack, needs_progress)
             };
             if done {
                 break;
             }
 
-            // First-response acknowledgment after ~12s of silence
+            // Immediate acknowledgment after first 4s tick
             if first_ack_needed {
-                let ack_msg = {
-                    let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
-                    let tools: Vec<String> = guard.tools_used.keys().take(3).cloned().collect();
-                    if tools.is_empty() {
-                        "Working on it...".to_string()
-                    } else {
-                        format!("On it \u{2014} using {}...", tools.join(", "))
-                    }
-                };
-                let _ = telegram_send_message(&prog_agent, &prog_url, chat_id, &ack_msg);
+                let _ = telegram_send_message(
+                    &prog_agent, &prog_url, chat_id, "Got it, working on it...",
+                );
                 if let Ok(mut guard) = prog_ref.lock() {
                     guard.first_ack_sent = true;
                 }
+            }
+            // Periodic progress update every ~20s showing what's happening
+            if should_progress {
+                let progress_msg = {
+                    let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
+                    let elapsed = guard.started_at.elapsed().as_secs();
+                    let tools: Vec<String> = {
+                        let mut sorted: Vec<_> = guard.tools_used.iter()
+                            .map(|(k, v)| (k.clone(), *v))
+                            .collect();
+                        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                        sorted.into_iter().take(3)
+                            .map(|(k, v)| format!("{k} ({v}x)"))
+                            .collect()
+                    };
+                    let phase = &guard.phase;
+                    let step = guard.step;
+                    if tools.is_empty() {
+                        format!("Still working... step {step}, {elapsed}s elapsed")
+                    } else {
+                        format!("Step {step} \u{2014} {phase} \u{2014} used: {} ({elapsed}s)",
+                            tools.join(", "))
+                    }
+                };
+                let _ = telegram_send_message(&prog_agent, &prog_url, chat_id, &progress_msg);
             }
             if should_checkpoint {
                 // Build checkpoint message from progress state
