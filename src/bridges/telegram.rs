@@ -950,7 +950,7 @@ pub(crate) fn spawn_agent_run(
                     // clear stream_message_id so response gets a new message
                     if prev_stream_phase == StreamPhase::Thinking && stream_phase == StreamPhase::Responding {
                         // Edit thinking message one last time with full content
-                        if let (Some(msg_id), Some(ref thinking)) = (stream_msg_id, &stream_thinking) {
+                        if let (Some(msg_id), Some(thinking)) = (stream_msg_id, stream_thinking.as_ref()) {
                             let final_text: String = thinking.chars().take(4000).collect();
                             let display = format!("\u{1F4AD} Thinking:\n{final_text}");
                             telegram_edit_message(&prog_agent, &prog_url, chat_id, msg_id, &display);
@@ -968,7 +968,7 @@ pub(crate) fn spawn_agent_run(
                     if stream_rev != last_stream_rev {
                         last_stream_rev = stream_rev;
 
-                        let (display_text, is_thinking) = match stream_phase {
+                        let (display_text, _is_thinking) = match stream_phase {
                             StreamPhase::Thinking => {
                                 let content = stream_thinking.as_deref().unwrap_or("");
                                 let truncated: String = content.chars().take(3950).collect();
