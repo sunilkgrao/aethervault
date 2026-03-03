@@ -79,15 +79,11 @@ fn observation_is_useful(text: &str) -> bool {
     if blocked_prefix.iter().any(|phrase| has_prefix(&lower, phrase)) {
         return false;
     }
-
-    // Generic status checks
-    let status_noise = [
-        "all services are", "everything is running", "everything is working",
-        "currently up", "currently running", "currently active",
-        "all systems", "is currently ok", "are currently ok",
-        "no issues found", "nothing to report",
-    ];
-    if status_noise.iter().any(|pattern| has_prefix(&lower, pattern)) {
+    // Generic status check phrases that are typically non-actionable
+    if lower == "nothing to report" || lower == "nothing to report." {
+        return false;
+    }
+    if lower == "no issues found" || lower == "no issues found." {
         return false;
     }
 
