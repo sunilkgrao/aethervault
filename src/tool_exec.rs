@@ -24,6 +24,7 @@ const DEFAULT_BROWSER_TIMEOUT_MS: u64 = 240_000;
 /// Sentinel: disable timeout for exec policies (Codex CLI, builds).
 const EXEC_NO_TIMEOUT: u64 = u64::MAX;
 const HTTP_RESPONSE_MAX_BYTES: usize = 5 * 1024 * 1024;
+const OBSERVATION_DEDUP_MAX: usize = 10_000;
 
 /// Returns true if a character is an invisible Unicode character used for injection.
 fn is_invisible_unicode(c: char) -> bool {
@@ -96,16 +97,15 @@ pub(crate) fn detect_invisible_unicode(text: &str) -> Option<String> {
 /// Strips HTML tags, removes invisible Unicode characters (zero-width spaces, bidi
 /// overrides, directional isolates), and truncates to prevent context stuffing.
 fn sanitize_external_content(raw: &str, max_chars: usize) -> String {
+    let truncated = raw.chars().take(max_chars).collect::<String>();
     // Use ammonia to strip all HTML to plain text
-    let cleaned = ammonia::clean_text(raw);
+    let cleaned = ammonia::clean_text(&truncated);
     // Remove invisible/control Unicode characters that can hide injection payloads
     let sanitized: String = cleaned.chars()
         .filter(|c| !is_invisible_unicode(*c))
         .collect();
-    // Truncate to prevent context stuffing
-    if sanitized.len() > max_chars {
-        let truncated: String = sanitized.chars().take(max_chars).collect();
-        format!("{truncated}...[truncated at {max_chars} chars]")
+    if raw.chars().count() > max_chars {
+        format!("{sanitized}...[truncated at {max_chars} chars]")
     } else {
         sanitized
     }
@@ -185,9 +185,32 @@ pub(crate) fn check_credential_chain(service: &str) -> (bool, String) {
                 _ => &[".env"],
             };
             for path in config_paths {
-                let expanded = path.replace('~', &std::env::var("HOME").unwrap_or_default());
+                let home = std::env::var("HOME").unwrap_or_default();
+                let expanded = if path.starts_with("~/") {
+                    format!("{}{}", home, &path[2..])
+                } else {
+                    path.to_string()
+                };
                 if Path::new(&expanded).exists() {
-                    return (true, format!("Config file exists: {path}"));
+                    let valid_credentials = fs::read_to_string(&expanded)
+                        .map(|content| {
+                            content
+                                .lines()
+                                .map(|line| line.trim())
+                                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                                .filter_map(|line| line.split_once('='))
+                                .any(|(key, value)| {
+                                    !value.trim().is_empty()
+                                        && (key.contains("API_KEY")
+                                            || key.contains("TOKEN")
+                                            || key.contains("SECRET"))
+                                })
+                        })
+                        .unwrap_or(false);
+
+                    if valid_credentials {
+                        return (true, format!("Config file exists: {path}"));
+                    }
                 }
             }
             let instructions = match *svc {
@@ -2124,6 +2147,9 @@ pub(crate) fn execute_tool(
                 static CLEANED_SESSIONS: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
                     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
                 let mut cleaned = CLEANED_SESSIONS.lock().unwrap();
+                if cleaned.len() >= OBSERVATION_DEDUP_MAX {
+                    cleaned.clear();
+                }
                 if cleaned.insert(session.clone()) {
                     // First browser call for this session — kill any stale daemons
                     // for ALL sessions, then close this specific session cleanly.
