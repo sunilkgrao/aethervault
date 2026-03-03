@@ -23,6 +23,11 @@ pub(crate) struct SkillRecord {
 pub(crate) fn open_skill_db(path: &Path) -> Result<Connection, Box<dyn std::error::Error>> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 60000;
+         PRAGMA synchronous = NORMAL;"
+    )?;
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS skills (
             name TEXT PRIMARY KEY,
             description TEXT,

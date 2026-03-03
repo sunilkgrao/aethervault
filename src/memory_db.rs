@@ -409,6 +409,29 @@ impl MemoryDb {
     }
 
     fn recover_and_open(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        // ── Exclusive file lock: prevent concurrent recovery/migration ──
+        // Without this, one thread can fs::copy/rename the DB while another
+        // thread holds an active connection, corrupting the WAL index.
+        let lock_path = path.with_extension("recovery-lock");
+        let lock_file = std::fs::File::create(&lock_path)?;
+        use std::os::unix::io::AsRawFd;
+        let lock_fd = lock_file.as_raw_fd();
+        let lock_result = unsafe { libc::flock(lock_fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if lock_result != 0 {
+            eprintln!(
+                "[capsule-recovery] BLOCKED: another thread is already running recovery. \
+                 Opening DB as-is."
+            );
+            let conn = Connection::open(path)?;
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 60000;")?;
+            let db = Self { conn };
+            db.apply_pragmas()?;
+            db.init_schema()?;
+            db.seed_trigger_id_counter_from_db()?;
+            return Ok(db);
+        }
+        // Lock acquired — this thread owns recovery. Lock released on drop.
+
         // ── Rate-limit recovery: max once per 10 minutes ──
         // Prevents cascading recovery loops (17 corrupt backups in 8 hours).
         let marker = path.with_extension("recovery-marker");

@@ -73,6 +73,11 @@ pub(crate) fn open_swarm_db(workspace: &Path) -> Result<Connection, String> {
     let db_path = workspace.join("swarm.sqlite");
     let conn = Connection::open(&db_path).map_err(|e| format!("open swarm db: {e}"))?;
     conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 60000;
+         PRAGMA synchronous = NORMAL;"
+    ).map_err(|e| format!("swarm db pragmas: {e}"))?;
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS swarm_tasks (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
