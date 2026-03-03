@@ -81,17 +81,6 @@ fn has_dotenv_key(path: &Path, key: &str) -> bool {
     false
 }
 
-fn has_expected_cli_credentials_dir(path: &Path, service: &str) -> bool {
-    let expected = match service {
-        "github" => &["hosts.yml"][..],
-        "stripe" => &["config.toml"][..],
-        "vercel" => &["auth.json"][..],
-        _ => &[],
-    };
-
-    expected.iter().any(|file| path.join(file).exists())
-}
-
 /// Detect invisible Unicode characters in text. Returns a warning string if any are
 /// found, listing the character types and count. Used to alert the LLM that content
 /// may contain prompt injection payloads hidden via invisible characters.
@@ -228,11 +217,11 @@ pub(crate) fn check_credential_chain(service: &str) -> (bool, String) {
     let service_lower = service.to_lowercase();
     for (svc, env_checks) in checks {
         if service_lower.contains(svc) {
-            for (label, var_name) in *env_checks {
-                if let Ok(val) = std::env::var(var_name) {
-                    if !val.is_empty() {
-                        let preview = if val.len() > 8 {
-                            format!("{}...{}", &val[..4], &val[val.len()-4..])
+        for (label, var_name) in *env_checks {
+            if let Ok(val) = std::env::var(var_name) {
+                if !val.is_empty() {
+                    let preview = if val.len() > 8 {
+                        format!("{}...{}", &val[..4], &val[val.len()-4..])
                         } else {
                             "****".to_string()
                         };
@@ -250,16 +239,32 @@ pub(crate) fn check_credential_chain(service: &str) -> (bool, String) {
             for path in config_paths {
                 let expanded = expand_home_path(path);
                 let expanded_path = Path::new(&expanded);
-                if expanded_path.file_name().and_then(|name| name.to_str()) == Some(".env") &&
-                    env_checks.iter().any(|(_, var_name)| has_dotenv_key(expanded_path, var_name))
-                {
-                    return (true, format!("Config file contains credentials: {path}"));
+                if expanded_path.file_name().and_then(|name| name.to_str()) == Some(".env") {
+                    if env_checks.iter().any(|(_, var_name)| has_dotenv_key(expanded_path, var_name)) {
+                        return (true, format!("Config file contains credentials: {path}"));
+                    }
+                    continue;
                 }
                 if expanded_path.is_file() {
-                    return (true, format!("Config file exists: {path}"));
-                }
-                if expanded_path.is_dir() && has_expected_cli_credentials_dir(expanded_path, svc) {
-                    return (true, format!("Config directory contains credentials: {path}"));
+                    let valid_credentials = fs::read_to_string(&expanded)
+                        .map(|content| {
+                            content
+                                .lines()
+                                .map(|line| line.trim())
+                                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                                .filter_map(|line| line.split_once('='))
+                                .any(|(key, value)| {
+                                    !value.trim().is_empty()
+                                        && (key.contains("API_KEY")
+                                            || key.contains("TOKEN")
+                                            || key.contains("SECRET"))
+                                })
+                        })
+                        .unwrap_or(false);
+
+                    if valid_credentials {
+                        return (true, format!("Config file exists: {path}"));
+                    }
                 }
             }
             let instructions = match *svc {
