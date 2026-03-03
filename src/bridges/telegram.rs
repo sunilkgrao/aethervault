@@ -880,11 +880,25 @@ pub(crate) fn spawn_agent_run(
                     };
                     let phase = &guard.phase;
                     let step = guard.step;
-                    if tools.is_empty() {
-                        format!("Still thinking... ({elapsed}s)")
-                    } else {
-                        format!("Step {step} \u{2014} {phase} \u{2014} used: {} ({elapsed}s)",
+                    let preview = guard.text_preview.clone();
+                    if tools.is_empty() && step == 0 {
+                        // Still on first API call — no tools used yet
+                        format!("Thinking... ({elapsed}s)")
+                    } else if let Some(ref preview_text) = preview {
+                        // Show what the agent last said + what it's doing now
+                        let truncated: String = preview_text.chars().take(80).collect();
+                        if tools.is_empty() {
+                            format!("{truncated}... ({elapsed}s)")
+                        } else {
+                            format!("{truncated}...\n[step {step} | {phase} | {} | {elapsed}s]",
+                                tools.join(", "))
+                        }
+                    } else if !tools.is_empty() {
+                        // No text yet but tools are running
+                        format!("[step {step} | {phase} | {} | {elapsed}s]",
                             tools.join(", "))
+                    } else {
+                        format!("Working... ({elapsed}s)")
                     }
                 };
                 eprintln!("[progress-reporter] sending progress: {progress_msg}");

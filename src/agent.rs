@@ -1698,6 +1698,27 @@ pub(crate) fn run_agent_with_prompt(
                 }
             }
         };
+        // Update progress text_preview from thinking blocks (even without text content)
+        if !message.thinking_blocks.is_empty() {
+            if let Some(ref prog) = progress {
+                if let Ok(mut p) = prog.lock() {
+                    let thinking_text: String = message.thinking_blocks.iter()
+                        .filter_map(|tb| tb.get("thinking").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !thinking_text.is_empty() {
+                        // Take the LAST 100 chars of thinking (most recent reasoning)
+                        let chars: Vec<char> = thinking_text.chars().collect();
+                        let snippet = if chars.len() > 100 {
+                            format!("...{}", chars[chars.len()-97..].iter().collect::<String>())
+                        } else {
+                            thinking_text
+                        };
+                        p.text_preview = Some(snippet);
+                    }
+                }
+            }
+        }
         if let Some(content) = message.content.clone() {
             final_text = Some(content.clone());
             // Update progress: text preview + last_output for session status
