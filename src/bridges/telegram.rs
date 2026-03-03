@@ -813,7 +813,7 @@ pub(crate) fn spawn_agent_run(
                 }
             }
 
-            let (done, should_checkpoint, first_ack_needed, should_progress) = {
+            let (done, should_checkpoint, first_ack_needed, should_progress, timed_out) = {
                 let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
                 let done = guard.phase == "done";
                 let effective_max = guard.extended_max_steps.unwrap_or(guard.max_steps);
@@ -824,14 +824,34 @@ pub(crate) fn spawn_agent_run(
                 let needs_first_ack = !guard.first_ack_sent
                     && tick_count >= 1
                     && !done;
-                // Send periodic progress every ~20s (5 ticks) after first ack
+                // Send periodic progress every ~20s (5 ticks) after first ack.
+                // Note: we no longer require step > 0 — if the agent is stuck on the
+                // first API call, the user still deserves to know we're alive.
                 let needs_progress = guard.first_ack_sent
                     && tick_count % 5 == 0
-                    && guard.step > 0
                     && !done;
-                (done, at_checkpoint, needs_first_ack, needs_progress)
+                // Hard timeout: if session exceeds 8 minutes, notify user
+                let elapsed_secs = guard.started_at.elapsed().as_secs();
+                let timed_out = elapsed_secs > 480 && !done;
+                (done, at_checkpoint, needs_first_ack, needs_progress, timed_out)
             };
             if done {
+                eprintln!("[progress-reporter] session complete, exiting");
+                break;
+            }
+
+            // Hard timeout — if session stuck for >8 min, tell user and stop reporting
+            if timed_out {
+                let elapsed = {
+                    let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.started_at.elapsed().as_secs()
+                };
+                let mins = elapsed / 60;
+                eprintln!("[progress-reporter] SESSION TIMEOUT after {mins}m — notifying user");
+                let _ = telegram_send_message(
+                    &prog_agent, &prog_url, chat_id,
+                    &format!("This is taking unusually long ({mins}m). The session may be stuck. I'll keep trying, but you can send a new message to start fresh."),
+                );
                 break;
             }
 
@@ -861,12 +881,13 @@ pub(crate) fn spawn_agent_run(
                     let phase = &guard.phase;
                     let step = guard.step;
                     if tools.is_empty() {
-                        format!("Still working... step {step}, {elapsed}s elapsed")
+                        format!("Still thinking... ({elapsed}s)")
                     } else {
                         format!("Step {step} \u{2014} {phase} \u{2014} used: {} ({elapsed}s)",
                             tools.join(", "))
                     }
                 };
+                eprintln!("[progress-reporter] sending progress: {progress_msg}");
                 let _ = telegram_send_message(&prog_agent, &prog_url, chat_id, &progress_msg);
             }
             if should_checkpoint {

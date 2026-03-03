@@ -1391,6 +1391,8 @@ pub(crate) fn run_agent_with_prompt(
     let mut completed = false;
     let mut current_max_steps = effective_max_steps;
     let mut step = 0;
+    let session_start = std::time::Instant::now();
+    const SESSION_HARD_TIMEOUT_SECS: u64 = 600; // 10 minute hard ceiling
     let mut wrap_up_injected = false;
     let mut consecutive_hook_failures: usize = 0;
     const MAX_CONSECUTIVE_HOOK_FAILURES: usize = 3;
@@ -1443,6 +1445,27 @@ pub(crate) fn run_agent_with_prompt(
                         thinking_blocks: vec![],
                     });
                 }
+            }
+        }
+
+        // Hard wall-clock timeout: prevent infinite sessions
+        if session_start.elapsed().as_secs() > SESSION_HARD_TIMEOUT_SECS {
+            let mins = session_start.elapsed().as_secs() / 60;
+            eprintln!("[harness] SESSION TIMEOUT after {mins}m — forcing wrap-up");
+            if !wrap_up_injected {
+                wrap_up_injected = true;
+                messages.push(AgentMessage {
+                    role: "user".to_string(),
+                    content: Some(
+                        "[SYSTEM: SESSION TIMEOUT] You have exceeded the maximum session time. \
+                         Provide your best answer NOW with whatever information you have. \
+                         Do NOT make any more tool calls. Respond directly.".to_string()
+                    ),
+                    tool_calls: Vec::new(),
+                    name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                });
+                // Give the LLM one more turn to respond, then the step limit will end it
+                current_max_steps = step + 2;
             }
         }
 
