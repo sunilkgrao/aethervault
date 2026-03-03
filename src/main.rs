@@ -114,6 +114,9 @@ fn frame_collection_name(frame: &Frame) -> String {
 
 fn frame_matches_collection(frame: &Frame, collection: &str) -> bool {
     let expected = normalize_collection(collection);
+    if expected.is_empty() {
+        return false;
+    }
     if frame.track.as_deref() == Some(expected.as_str()) {
         return true;
     }
@@ -167,7 +170,15 @@ fn frame_size_bucket(size_bytes: u64) -> String {
 
 fn restore_triggers_for_service_startup(mv2: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let db = open_or_create_db(mv2)?;
-    restore_triggers_from_backup_if_empty(&db);
+    match restore_triggers_from_backup_if_empty(&db) {
+        Ok(count) => {
+            eprintln!("Restored {count} trigger(s) from backup");
+        }
+        Err(err) => {
+            eprintln!("WARNING: failed to restore triggers from backup: {err}");
+            return Err(err.into());
+        }
+    }
     Ok(())
 }
 
