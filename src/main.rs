@@ -114,6 +114,9 @@ fn frame_collection_name(frame: &Frame) -> String {
 
 fn frame_matches_collection(frame: &Frame, collection: &str) -> bool {
     let expected = normalize_collection(collection);
+    if expected.is_empty() {
+        return false;
+    }
     if frame.track.as_deref() == Some(expected.as_str()) {
         return true;
     }
@@ -167,7 +170,11 @@ fn frame_size_bucket(size_bytes: u64) -> String {
 
 fn restore_triggers_for_service_startup(mv2: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let db = open_or_create_db(mv2)?;
-    restore_triggers_from_backup_if_empty(&db);
+    let restored = restore_triggers_from_backup_if_empty(&db)
+        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    if restored > 0 {
+        eprintln!("Startup trigger restore complete: restored {restored} triggers");
+    }
     Ok(())
 }
 
@@ -185,15 +192,33 @@ fn copy_frame_to_archive(
     let payload = source.frame_canonical_payload(frame.id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     let mut options = PutOptions::default();
     options.timestamp = Some(frame.timestamp);
-    options.track = frame.track.clone();
-    options.kind = frame.kind.clone();
-    options.uri = frame.uri.clone();
-    options.title = frame.title.clone();
-    options.metadata = frame.metadata.clone();
-    options.search_text = frame.search_text.clone();
-    options.tags = frame.tags.clone();
-    options.labels = frame.labels.clone();
-    options.extra_metadata = frame.extra_metadata.clone();
+    if let Some(track) = frame.track.as_deref() {
+        options.track = Some(track.to_string());
+    }
+    if let Some(kind) = frame.kind.as_deref() {
+        options.kind = Some(kind.to_string());
+    }
+    if let Some(uri) = frame.uri.as_deref() {
+        options.uri = Some(uri.to_string());
+    }
+    if let Some(title) = frame.title.as_deref() {
+        options.title = Some(title.to_string());
+    }
+    if let Some(metadata) = frame.metadata.as_ref() {
+        options.metadata = Some(metadata.clone());
+    }
+    if let Some(search_text) = frame.search_text.as_deref() {
+        options.search_text = Some(search_text.to_string());
+    }
+    if !frame.tags.is_empty() {
+        options.tags = frame.tags.clone();
+    }
+    if !frame.labels.is_empty() {
+        options.labels = frame.labels.clone();
+    }
+    if !frame.extra_metadata.is_empty() {
+        options.extra_metadata = frame.extra_metadata.clone();
+    }
     options.role = frame.role;
     options.parent_id = frame.parent_id;
     let id = archive.put_bytes_with_options(&payload, options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
