@@ -16,7 +16,7 @@ use base64::Engine;
 
 use crate::{
     AgentProgress, BridgeAgentConfig, CompletionEvent, ActiveRun,
-    BackgroundTaskRegistry, SessionRegistry,
+    BackgroundTaskRegistry, SessionRegistry, StreamPhase,
     SessionTurn, load_session_turns, save_session_turns,
     run_agent_with_prompt, try_handle_approval_chat,
 };
@@ -697,6 +697,71 @@ pub(crate) fn telegram_send_message_ext(
     Ok(())
 }
 
+/// Edit an existing Telegram message. Silently ignores "message is not modified" errors.
+fn telegram_edit_message(
+    agent: &ureq::Agent,
+    base_url: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) {
+    let url = format!("{base_url}/editMessageText");
+    // Truncate to Telegram's 4096 char limit with margin
+    let truncated: String = text.chars().take(4000).collect();
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": truncated,
+    });
+    match agent.post(&url)
+        .set("content-type", "application/json")
+        .send_json(payload)
+    {
+        Ok(_) => {}
+        Err(ureq::Error::Status(400, resp)) => {
+            // "message is not modified" is expected when content hasn't changed
+            let body = resp.into_string().unwrap_or_default();
+            if !body.contains("message is not modified") {
+                eprintln!("[telegram-edit] 400: {}", &body[..body.len().min(200)]);
+            }
+        }
+        Err(e) => {
+            eprintln!("[telegram-edit] error: {e}");
+        }
+    }
+}
+
+/// Send a Telegram message and return its message_id for subsequent edits.
+fn telegram_send_message_returning_id(
+    agent: &ureq::Agent,
+    base_url: &str,
+    chat_id: i64,
+    text: &str,
+) -> Option<i64> {
+    let url = format!("{base_url}/sendMessage");
+    let truncated: String = text.chars().take(4000).collect();
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": truncated,
+    });
+    match agent.post(&url)
+        .set("content-type", "application/json")
+        .send_json(payload)
+    {
+        Ok(resp) => {
+            let body = resp.into_string().ok()?;
+            let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+            json.get("result")
+                .and_then(|r| r.get("message_id"))
+                .and_then(|m| m.as_i64())
+        }
+        Err(e) => {
+            eprintln!("[telegram-send-returning-id] error: {e}");
+            None
+        }
+    }
+}
+
 pub(crate) fn spawn_agent_run(
     agent_config: &BridgeAgentConfig,
     chat_id: i64,
@@ -728,6 +793,11 @@ pub(crate) fn spawn_agent_run(
         chat_id: Some(chat_id),
         last_output: None,
         session_registry: Some(session_registry),
+        stream_thinking: None,
+        stream_response: None,
+        stream_phase: StreamPhase::Idle,
+        stream_message_id: None,
+        stream_revision: 0,
     }));
 
     // Worker thread -- calls run_agent_with_prompt directly (no middle thread)
@@ -790,14 +860,23 @@ pub(crate) fn spawn_agent_run(
         let _ = worker_tx.send(event);
     });
 
-    // Progress reporter thread -- interim messages + typing indicators + checkpoint
+    // Progress reporter thread -- streaming display + interim messages + typing + checkpoint
     let prog_ref = progress.clone();
     let prog_agent = http_agent.clone();
     let prog_url = base_url.to_string();
     thread::spawn(move || {
         let mut tick_count: usize = 0;
+        let mut last_stream_rev: u64 = 0;
+        // Track the previous phase to detect thinking→responding transitions
+        let mut prev_stream_phase = StreamPhase::Idle;
         loop {
-            thread::sleep(Duration::from_secs(4));
+            // Sleep interval: 1s when streaming is active, 4s otherwise
+            let is_streaming = {
+                let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
+                matches!(guard.stream_phase, StreamPhase::Thinking | StreamPhase::Responding)
+            };
+            let sleep_dur = if is_streaming { Duration::from_secs(1) } else { Duration::from_secs(4) };
+            thread::sleep(sleep_dur);
             tick_count += 1;
 
             // Drain and send any interim messages from the agent
@@ -807,41 +886,49 @@ pub(crate) fn spawn_agent_run(
             };
             for msg in &pending {
                 let _ = telegram_send_message(&prog_agent, &prog_url, chat_id, msg);
-                // Mark that we've sent something
                 if let Ok(mut guard) = prog_ref.lock() {
                     guard.first_ack_sent = true;
                 }
             }
 
-            let (done, should_checkpoint, first_ack_needed, should_progress, timed_out) = {
+            // Read stream state + general state in one lock
+            let (
+                done, should_checkpoint, first_ack_needed, should_progress, timed_out,
+                stream_phase, stream_rev, stream_thinking, stream_response, stream_msg_id,
+            ) = {
                 let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
                 let done = guard.phase == "done";
                 let effective_max = guard.extended_max_steps.unwrap_or(guard.max_steps);
                 let at_checkpoint = guard.step >= effective_max * 3 / 4
                     && !guard.checkpoint_sent
                     && effective_max > 4;
-                // Send first ack after ~4s — don't wait for step > 0
                 let needs_first_ack = !guard.first_ack_sent
                     && tick_count >= 1
                     && !done;
-                // Send periodic progress after first ack. Throttle based on elapsed time:
-                //   first 2 min: every 20s (5 ticks)
-                //   after 2 min: every 60s (15 ticks) — avoid spamming "Thinking..." 20x
+                // In streaming mode, suppress the old progress messages — streaming handles display
+                let in_stream = matches!(guard.stream_phase, StreamPhase::Thinking | StreamPhase::Responding);
                 let progress_interval = if guard.started_at.elapsed().as_secs() < 120 { 5 } else { 15 };
+                // Convert tick_count to equivalent 4s ticks for throttle comparison
+                let equiv_ticks = if is_streaming { tick_count / 4 } else { tick_count };
                 let needs_progress = guard.first_ack_sent
-                    && tick_count % progress_interval == 0
-                    && !done;
-                // Hard timeout: if session exceeds 8 minutes, notify user
+                    && equiv_ticks % progress_interval == 0
+                    && !done
+                    && !in_stream; // suppress when streaming
                 let elapsed_secs = guard.started_at.elapsed().as_secs();
                 let timed_out = elapsed_secs > 480 && !done;
-                (done, at_checkpoint, needs_first_ack, needs_progress, timed_out)
+                (
+                    done, at_checkpoint, needs_first_ack, needs_progress, timed_out,
+                    guard.stream_phase.clone(), guard.stream_revision,
+                    guard.stream_thinking.clone(), guard.stream_response.clone(),
+                    guard.stream_message_id,
+                )
             };
+
             if done {
                 eprintln!("[progress-reporter] session complete, exiting");
                 break;
             }
 
-            // Hard timeout — if session stuck for >8 min, tell user and stop reporting
             if timed_out {
                 let elapsed = {
                     let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
@@ -856,7 +943,76 @@ pub(crate) fn spawn_agent_run(
                 break;
             }
 
-            // Immediate acknowledgment after first 4s tick
+            // === Streaming display logic ===
+            match stream_phase {
+                StreamPhase::Thinking | StreamPhase::Responding => {
+                    // On transition from Thinking to Responding: finalize thinking message,
+                    // clear stream_message_id so response gets a new message
+                    if prev_stream_phase == StreamPhase::Thinking && stream_phase == StreamPhase::Responding {
+                        // Edit thinking message one last time with full content
+                        if let (Some(msg_id), Some(ref thinking)) = (stream_msg_id, &stream_thinking) {
+                            let final_text: String = thinking.chars().take(4000).collect();
+                            let display = format!("\u{1F4AD} Thinking:\n{final_text}");
+                            telegram_edit_message(&prog_agent, &prog_url, chat_id, msg_id, &display);
+                        }
+                        // Clear message_id so responding phase creates a new message
+                        if let Ok(mut guard) = prog_ref.lock() {
+                            guard.stream_message_id = None;
+                        }
+                        last_stream_rev = stream_rev; // reset to avoid double-edit
+                        prev_stream_phase = stream_phase.clone();
+                        continue;
+                    }
+
+                    // Only update Telegram if stream content has changed
+                    if stream_rev != last_stream_rev {
+                        last_stream_rev = stream_rev;
+
+                        let (display_text, is_thinking) = match stream_phase {
+                            StreamPhase::Thinking => {
+                                let content = stream_thinking.as_deref().unwrap_or("");
+                                let truncated: String = content.chars().take(3950).collect();
+                                (format!("\u{1F4AD} Thinking:\n{truncated}"), true)
+                            }
+                            StreamPhase::Responding => {
+                                let content = stream_response.as_deref().unwrap_or("");
+                                let truncated: String = content.chars().take(4000).collect();
+                                (truncated, false)
+                            }
+                            _ => unreachable!(),
+                        };
+
+                        if display_text.trim().is_empty() {
+                            // Nothing to display yet
+                            prev_stream_phase = stream_phase.clone();
+                            continue;
+                        }
+
+                        match stream_msg_id {
+                            Some(msg_id) => {
+                                telegram_edit_message(&prog_agent, &prog_url, chat_id, msg_id, &display_text);
+                            }
+                            None => {
+                                if let Some(new_id) = telegram_send_message_returning_id(
+                                    &prog_agent, &prog_url, chat_id, &display_text,
+                                ) {
+                                    if let Ok(mut guard) = prog_ref.lock() {
+                                        guard.stream_message_id = Some(new_id);
+                                        guard.first_ack_sent = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    prev_stream_phase = stream_phase.clone();
+                    continue; // Skip old-style progress when streaming
+                }
+                _ => {}
+            }
+            prev_stream_phase = stream_phase;
+
+            // === Non-streaming progress (original behavior) ===
             if first_ack_needed {
                 let _ = telegram_send_message(
                     &prog_agent, &prog_url, chat_id, "Got it, working on it...",
@@ -865,7 +1021,6 @@ pub(crate) fn spawn_agent_run(
                     guard.first_ack_sent = true;
                 }
             }
-            // Periodic progress update every ~20s showing what's happening
             if should_progress {
                 let progress_msg = {
                     let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
@@ -883,10 +1038,8 @@ pub(crate) fn spawn_agent_run(
                     let step = guard.step;
                     let preview = guard.text_preview.clone();
                     if tools.is_empty() && step == 0 {
-                        // Still on first API call — no tools used yet
                         format!("Thinking... ({elapsed}s)")
                     } else if let Some(ref preview_text) = preview {
-                        // Show what the agent last said + what it's doing now
                         let truncated: String = preview_text.chars().take(80).collect();
                         if tools.is_empty() {
                             format!("{truncated}... ({elapsed}s)")
@@ -895,7 +1048,6 @@ pub(crate) fn spawn_agent_run(
                                 tools.join(", "))
                         }
                     } else if !tools.is_empty() {
-                        // No text yet but tools are running
                         format!("[step {step} | {phase} | {} | {elapsed}s]",
                             tools.join(", "))
                     } else {
@@ -906,7 +1058,6 @@ pub(crate) fn spawn_agent_run(
                 let _ = telegram_send_message(&prog_agent, &prog_url, chat_id, &progress_msg);
             }
             if should_checkpoint {
-                // Build checkpoint message from progress state
                 let (step, max, tools, preview, elapsed) = {
                     let mut guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
                     guard.checkpoint_sent = true;

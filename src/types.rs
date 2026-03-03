@@ -366,6 +366,30 @@ pub(crate) struct AgentHookResponse {
     pub(crate) message: AgentMessage,
 }
 
+// === Claude Streaming Types ===
+
+#[derive(Debug, Clone)]
+pub(crate) enum ClaudeStreamEvent {
+    BlockStart { index: usize, block_type: String, tool_id: Option<String>, tool_name: Option<String> },
+    BlockDelta { index: usize, delta_type: String, text: String },
+    BlockStop { index: usize },
+    MessageDelta { stop_reason: Option<String> },
+    MessageStop,
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StreamPhase {
+    Idle,
+    Thinking,
+    Responding,
+    Done,
+}
+
+impl Default for StreamPhase {
+    fn default() -> Self { StreamPhase::Idle }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct AgentToolResult {
     pub(crate) id: String,
@@ -436,6 +460,17 @@ pub(crate) struct AgentProgress {
     pub(crate) last_output: Option<Arc<Mutex<Option<String>>>>,
     /// Registry of interactive subagent sessions (shared with tool_exec).
     pub(crate) session_registry: Option<Arc<Mutex<SessionRegistry>>>,
+    // --- Streaming fields ---
+    /// Accumulated thinking text from streaming (updated live by consumer)
+    pub(crate) stream_thinking: Option<String>,
+    /// Accumulated response text from streaming (updated live by consumer)
+    pub(crate) stream_response: Option<String>,
+    /// Current streaming phase (Idle/Thinking/Responding/Done)
+    pub(crate) stream_phase: StreamPhase,
+    /// Telegram message ID for the live-updating message
+    pub(crate) stream_message_id: Option<i64>,
+    /// Monotonically increasing counter bumped on each delta (used by reporter to detect changes)
+    pub(crate) stream_revision: u64,
 }
 
 // === Background Task Registry ===

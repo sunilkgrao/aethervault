@@ -4165,6 +4165,11 @@ pub(crate) fn execute_tool(
                 chat_id: None,
                 last_output: Some(last_output_handle.clone()),
                 session_registry: Some(sess_reg.clone()),
+                stream_thinking: None,
+                stream_response: None,
+                stream_phase: crate::StreamPhase::Idle,
+                stream_message_id: None,
+                stream_revision: 0,
             }));
 
             let now_epoch = std::time::SystemTime::now()

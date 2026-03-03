@@ -1,5 +1,6 @@
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use crate::{
     command_spec_to_vec, env_bool, env_f64, env_optional, env_required, env_u64, env_usize,
     extract_prompt_from_request, jitter_ratio, parse_retry_after, run_hook_command,
     run_claude_code_native, run_codex_native, run_pool_routed, should_hook_be_read_only,
-    AgentHookRequest, AgentHookResponse, AgentMessage, AgentToolCall, CommandSpec, HookSpec,
+    AgentHookRequest, AgentHookResponse, AgentMessage, AgentToolCall, ClaudeStreamEvent, CommandSpec, HookSpec,
 };
 
 const CRITIC_SYSTEM_PROMPT: &str = "\
@@ -1116,4 +1117,236 @@ fn is_hook_error_retryable(err: &str) -> bool {
     ]
     .iter()
     .any(|p| err.contains(p))
+}
+
+// === Streaming API ===
+
+/// Send a streaming request to the Claude API and return a receiver of stream events.
+/// Fails fast — no retries. Caller should fall back to blocking `call_claude` on error.
+pub(crate) fn call_claude_streaming(
+    request: &AgentHookRequest,
+) -> Result<mpsc::Receiver<ClaudeStreamEvent>, String> {
+    let api_key = env_required("ANTHROPIC_API_KEY").map_err(|e| e.to_string())?;
+    let model = env_required("ANTHROPIC_MODEL").map_err(|e| e.to_string())?;
+    let base_url = env_optional("ANTHROPIC_BASE_URL")
+        .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".to_string());
+    let max_tokens = env_u64("ANTHROPIC_MAX_TOKENS", 8192).map_err(|e| e.to_string())?;
+    let timeout = env_u64("ANTHROPIC_TIMEOUT", 180).map_err(|e| e.to_string())?;
+    let version = env_optional("ANTHROPIC_VERSION").unwrap_or_else(|| "2023-06-01".to_string());
+    let beta = env_optional("ANTHROPIC_BETA");
+    let token_efficient = env_bool("ANTHROPIC_TOKEN_EFFICIENT", false);
+    let mut beta_values: Vec<String> = Vec::new();
+    if let Some(b) = beta {
+        for item in b.split(',') {
+            let trimmed = item.trim();
+            if !trimmed.is_empty() {
+                beta_values.push(trimmed.to_string());
+            }
+        }
+    }
+    if token_efficient {
+        beta_values.push("token-efficient-tools-2025-02-19".to_string());
+    }
+
+    let system_blocks = collect_system_blocks(&request.messages);
+    let use_prompt_cache = env_bool("ANTHROPIC_PROMPT_CACHE", false);
+    let cache_ttl = env_optional("ANTHROPIC_PROMPT_CACHE_TTL");
+    let cache_control = if use_prompt_cache {
+        let mut obj = serde_json::Map::new();
+        obj.insert("type".to_string(), serde_json::json!("ephemeral"));
+        if let Some(ttl) = cache_ttl {
+            if !ttl.trim().is_empty() {
+                obj.insert("ttl".to_string(), serde_json::json!(ttl));
+            }
+        }
+        Some(serde_json::Value::Object(obj))
+    } else {
+        None
+    };
+
+    let thinking_mode = env_optional("ANTHROPIC_THINKING").unwrap_or_default();
+    let thinking_enabled = thinking_mode == "adaptive";
+    let thinking_effort = env_optional("ANTHROPIC_THINKING_EFFORT")
+        .unwrap_or_else(|| "high".to_string());
+
+    let effective_max_tokens = if thinking_enabled {
+        max_tokens.max(16384)
+    } else {
+        max_tokens
+    };
+
+    let mut payload = serde_json::json!({
+        "model": model,
+        "max_tokens": effective_max_tokens,
+        "messages": to_anthropic_messages(&request.messages),
+        "stream": true,
+    });
+
+    if thinking_enabled {
+        payload["thinking"] = serde_json::json!({ "type": "adaptive" });
+        payload["output_config"] = serde_json::json!({ "effort": thinking_effort });
+    }
+
+    if !system_blocks.is_empty() {
+        if let Some(cache) = cache_control.clone() {
+            let blocks: Vec<serde_json::Value> = system_blocks.iter().enumerate().map(|(i, text)| {
+                let mut block = serde_json::json!({"type": "text", "text": text});
+                if i == 0 {
+                    if let Some(obj) = block.as_object_mut() {
+                        obj.insert("cache_control".to_string(), cache.clone());
+                    }
+                }
+                block
+            }).collect();
+            payload["system"] = serde_json::json!(blocks);
+        } else {
+            payload["system"] = serde_json::json!(system_blocks.join("\n\n"));
+        }
+    }
+    let tools = to_anthropic_tools(&request.tools, cache_control);
+    if !tools.is_empty() {
+        payload["tools"] = serde_json::json!(tools);
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(timeout))
+        // No read timeout — SSE streams need to stay open for minutes
+        .timeout_read(Duration::from_secs(0))
+        .timeout_write(Duration::from_secs(timeout))
+        .build();
+
+    let mut req = agent
+        .post(&base_url)
+        .set("content-type", "application/json")
+        .set("x-api-key", &api_key)
+        .set("anthropic-version", &version);
+    if !beta_values.is_empty() {
+        req = req.set("anthropic-beta", &beta_values.join(","));
+    }
+
+    let response = req.send_json(payload).map_err(|e| format!("streaming request failed: {e}"))?;
+
+    let reader = response.into_reader();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        parse_sse_stream(reader, tx);
+    });
+
+    Ok(rx)
+}
+
+/// Parse an SSE stream from the Claude API and send events over the channel.
+fn parse_sse_stream(reader: Box<dyn Read + Send>, tx: mpsc::Sender<ClaudeStreamEvent>) {
+    let buf_reader = BufReader::new(reader);
+    let mut current_event_type = String::new();
+    let mut data_buf = String::new();
+
+    for line_result in buf_reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = tx.send(ClaudeStreamEvent::Error(format!("read error: {e}")));
+                return;
+            }
+        };
+
+        if line.is_empty() {
+            // End of event — process accumulated data
+            if !data_buf.is_empty() && !current_event_type.is_empty() {
+                if let Some(evt) = parse_sse_event(&current_event_type, &data_buf) {
+                    let is_stop = matches!(evt, ClaudeStreamEvent::MessageStop);
+                    if tx.send(evt).is_err() {
+                        return; // receiver dropped
+                    }
+                    if is_stop {
+                        return;
+                    }
+                }
+            }
+            current_event_type.clear();
+            data_buf.clear();
+            continue;
+        }
+
+        if let Some(event_type) = line.strip_prefix("event: ") {
+            current_event_type = event_type.to_string();
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            if !data_buf.is_empty() {
+                data_buf.push('\n');
+            }
+            data_buf.push_str(data);
+        }
+    }
+    // Stream ended without MessageStop — send it anyway
+    let _ = tx.send(ClaudeStreamEvent::MessageStop);
+}
+
+/// Map an SSE event type + JSON data to a ClaudeStreamEvent.
+fn parse_sse_event(event_type: &str, data: &str) -> Option<ClaudeStreamEvent> {
+    let json: serde_json::Value = serde_json::from_str(data).ok()?;
+
+    match event_type {
+        "content_block_start" => {
+            let index = json.get("index")?.as_u64()? as usize;
+            let block = json.get("content_block")?;
+            let block_type = block.get("type")?.as_str()?.to_string();
+            let tool_id = block.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let tool_name = block.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+            Some(ClaudeStreamEvent::BlockStart { index, block_type, tool_id, tool_name })
+        }
+        "content_block_delta" => {
+            let index = json.get("index")?.as_u64()? as usize;
+            let delta = json.get("delta")?;
+            let delta_type = delta.get("type")?.as_str()?.to_string();
+            // Text can come from "text" (text blocks), "thinking" (thinking blocks),
+            // or "partial_json" (tool_use input deltas)
+            let text = delta.get("text")
+                .or_else(|| delta.get("thinking"))
+                .or_else(|| delta.get("partial_json"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(ClaudeStreamEvent::BlockDelta { index, delta_type, text })
+        }
+        "content_block_stop" => {
+            let index = json.get("index")?.as_u64()? as usize;
+            Some(ClaudeStreamEvent::BlockStop { index })
+        }
+        "message_delta" => {
+            let delta = json.get("delta")?;
+            let stop_reason = delta.get("stop_reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+            Some(ClaudeStreamEvent::MessageDelta { stop_reason })
+        }
+        "message_stop" => Some(ClaudeStreamEvent::MessageStop),
+        "error" => {
+            let err = json.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown stream error")
+                .to_string();
+            Some(ClaudeStreamEvent::Error(err))
+        }
+        _ => None, // message_start, ping, etc. — ignored
+    }
+}
+
+/// Try to get a streaming channel for builtin:claude hooks.
+/// Returns Err for non-claude hooks (codex, pool, external) so caller falls back to blocking.
+pub(crate) fn call_agent_hook_streaming(
+    hook: &HookSpec,
+    request: &AgentHookRequest,
+) -> Result<mpsc::Receiver<ClaudeStreamEvent>, String> {
+    let hook_cmd = match &hook.command {
+        CommandSpec::String(cmd) => cmd.trim().to_ascii_lowercase(),
+        CommandSpec::Array(items) => items
+            .first()
+            .map(|cmd| cmd.trim().to_ascii_lowercase())
+            .unwrap_or_default(),
+    };
+    let is_builtin_claude = hook_cmd == "builtin:claude" || hook_cmd == "claude";
+    if !is_builtin_claude {
+        return Err("streaming only supported for builtin:claude".to_string());
+    }
+    call_claude_streaming(request)
 }

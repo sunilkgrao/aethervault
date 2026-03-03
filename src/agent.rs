@@ -3,9 +3,9 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, mpsc as std_mpsc};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use crate::memory_db::PutOptions;
 use crate::consolidation::put_with_consolidation;
@@ -14,7 +14,7 @@ use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde_json;
 
-use crate::claude::{call_agent_hook, call_claude, call_claude_with_model, call_critic};
+use crate::claude::{call_agent_hook, call_agent_hook_streaming, call_claude, call_claude_with_model, call_critic};
 use crate::{
     append_log_jsonl, base_tool_names, build_context_pack, build_kg_context,
     collect_mid_loop_reminders, compute_drift_score, critic_should_fire, detect_cycle, env_optional,
@@ -25,9 +25,9 @@ use crate::{
     save_session_turns, tool_catalog_map, tool_definitions_json,
     tools_from_active, AgentHookRequest, AgentLogEntry, AgentMessage,
     AgentProgress, AgentRunOutput, AgentSession, AgentToolCall, AgentToolResult,
-    ContinuationCheckpoint,
+    ClaudeStreamEvent, ContinuationCheckpoint,
     CommandSpec, DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
-    ToolExecution, BackgroundTaskRegistry, SessionRegistry,
+    StreamPhase, ToolExecution, BackgroundTaskRegistry, SessionRegistry,
     SessionTaint, FailureKind, classify_failure, LearnedFailure, detect_invisible_unicode,
     open_skill_db, list_skills, record_skill_use,
     match_skills_for_prompt, bootstrap_skills,
@@ -117,6 +117,161 @@ fn observation_is_useful(text: &str) -> bool {
     let has_specificity = specificity_markers.iter().any(|m| lower.contains(m));
 
     has_number || has_proper_noun || has_specificity
+}
+
+/// Consume a streaming channel from call_claude_streaming and assemble an AgentMessage.
+/// Updates progress.stream_thinking / stream_response / stream_phase live so the
+/// Telegram progress reporter can push edits to the user in real-time.
+fn consume_stream(
+    rx: std_mpsc::Receiver<ClaudeStreamEvent>,
+    progress: &Arc<Mutex<AgentProgress>>,
+) -> Result<AgentMessage, String> {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<AgentToolCall> = Vec::new();
+    let mut thinking_blocks: Vec<serde_json::Value> = Vec::new();
+
+    // Per-block accumulators (keyed by block index)
+    let mut block_types: HashMap<usize, String> = HashMap::new();
+    let mut block_texts: HashMap<usize, String> = HashMap::new();
+    let mut block_tool_ids: HashMap<usize, String> = HashMap::new();
+    let mut block_tool_names: HashMap<usize, String> = HashMap::new();
+
+    let recv_timeout = StdDuration::from_secs(180);
+
+    loop {
+        let event = rx.recv_timeout(recv_timeout)
+            .map_err(|_| "stream recv timeout (180s)".to_string())?;
+
+        match event {
+            ClaudeStreamEvent::BlockStart { index, block_type, tool_id, tool_name } => {
+                block_types.insert(index, block_type.clone());
+                block_texts.insert(index, String::new());
+                if let Some(id) = tool_id {
+                    block_tool_ids.insert(index, id);
+                }
+                if let Some(name) = tool_name {
+                    block_tool_names.insert(index, name);
+                }
+
+                match block_type.as_str() {
+                    "thinking" => {
+                        if let Ok(mut p) = progress.lock() {
+                            p.stream_phase = StreamPhase::Thinking;
+                            if p.stream_thinking.is_none() {
+                                p.stream_thinking = Some(String::new());
+                            }
+                        }
+                    }
+                    "text" => {
+                        if let Ok(mut p) = progress.lock() {
+                            p.stream_phase = StreamPhase::Responding;
+                            if p.stream_response.is_none() {
+                                p.stream_response = Some(String::new());
+                            }
+                        }
+                    }
+                    _ => {} // tool_use, redacted_thinking — no streaming display
+                }
+            }
+            ClaudeStreamEvent::BlockDelta { index, delta_type, text } => {
+                if let Some(buf) = block_texts.get_mut(&index) {
+                    buf.push_str(&text);
+                }
+                let btype = block_types.get(&index).map(|s| s.as_str()).unwrap_or("");
+                match (btype, delta_type.as_str()) {
+                    ("thinking", "thinking_delta") => {
+                        if let Ok(mut p) = progress.lock() {
+                            if let Some(ref mut t) = p.stream_thinking {
+                                t.push_str(&text);
+                            }
+                            p.stream_revision += 1;
+                            // Also update text_preview with latest thinking snippet
+                            if let Some(ref t) = p.stream_thinking {
+                                let chars: Vec<char> = t.chars().collect();
+                                let snippet = if chars.len() > 100 {
+                                    format!("...{}", chars[chars.len()-97..].iter().collect::<String>())
+                                } else {
+                                    t.clone()
+                                };
+                                p.text_preview = Some(snippet);
+                            }
+                        }
+                    }
+                    ("text", "text_delta") => {
+                        if let Ok(mut p) = progress.lock() {
+                            if let Some(ref mut r) = p.stream_response {
+                                r.push_str(&text);
+                            }
+                            p.stream_revision += 1;
+                        }
+                    }
+                    _ => {} // input_json_delta for tool_use, etc.
+                }
+            }
+            ClaudeStreamEvent::BlockStop { index } => {
+                let btype = block_types.get(&index).map(|s| s.as_str()).unwrap_or("").to_string();
+                let accumulated = block_texts.remove(&index).unwrap_or_default();
+
+                match btype.as_str() {
+                    "thinking" => {
+                        if !accumulated.is_empty() {
+                            thinking_blocks.push(serde_json::json!({
+                                "type": "thinking",
+                                "thinking": accumulated,
+                            }));
+                        }
+                    }
+                    "redacted_thinking" => {
+                        thinking_blocks.push(serde_json::json!({
+                            "type": "redacted_thinking",
+                        }));
+                    }
+                    "text" => {
+                        if !accumulated.is_empty() {
+                            text_parts.push(accumulated);
+                        }
+                    }
+                    "tool_use" => {
+                        let id = block_tool_ids.remove(&index).unwrap_or_default();
+                        let name = block_tool_names.remove(&index).unwrap_or_default();
+                        let args: serde_json::Value = serde_json::from_str(&accumulated)
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        tool_calls.push(AgentToolCall { id, name, args });
+                    }
+                    _ => {}
+                }
+            }
+            ClaudeStreamEvent::MessageDelta { .. } => {
+                // stop_reason available here but we wait for MessageStop
+            }
+            ClaudeStreamEvent::MessageStop => {
+                if let Ok(mut p) = progress.lock() {
+                    p.stream_phase = StreamPhase::Done;
+                    p.stream_revision += 1;
+                }
+                break;
+            }
+            ClaudeStreamEvent::Error(e) => {
+                return Err(format!("stream error: {e}"));
+            }
+        }
+    }
+
+    let content_text = if text_parts.is_empty() {
+        None
+    } else {
+        Some(text_parts.join("\n"))
+    };
+
+    Ok(AgentMessage {
+        role: "assistant".to_string(),
+        content: content_text,
+        tool_calls,
+        name: None,
+        tool_call_id: None,
+        is_error: None,
+        thinking_blocks,
+    })
 }
 
 pub(crate) fn run_agent(
@@ -1703,38 +1858,124 @@ pub(crate) fn run_agent_with_prompt(
             tools: tools.clone(),
             session: session.clone(),
         };
-        let message = match call_agent_hook(&model_spec, &request) {
-            Ok(msg) => {
-                consecutive_hook_failures = 0;
-                msg
-            }
-            Err(e) => {
-                consecutive_hook_failures += 1;
-                eprintln!(
-                    "[harness] hook failed ({consecutive_hook_failures}/{MAX_CONSECUTIVE_HOOK_FAILURES}): {e}"
-                );
-                if consecutive_hook_failures >= MAX_CONSECUTIVE_HOOK_FAILURES {
-                    eprintln!(
-                        "[harness] {MAX_CONSECUTIVE_HOOK_FAILURES} consecutive failures, ending run"
-                    );
-                    final_text = Some(format!(
-                        "(Agent terminated: model hook failed {MAX_CONSECUTIVE_HOOK_FAILURES} \
-                         consecutive times. Last error: {e})"
-                    ));
-                    break; // Exits loop -> continuation checkpoint created
+
+        // Try streaming first when a progress handle is available (Telegram bridge).
+        // This enables live thinking/response display. Falls back to blocking on any error.
+        let message = if progress.is_some() {
+            match call_agent_hook_streaming(&model_spec, &request) {
+                Ok(rx) => {
+                    let prog = progress.as_ref().unwrap();
+                    // Set phase to Thinking before consuming
+                    if let Ok(mut p) = prog.lock() {
+                        p.stream_phase = StreamPhase::Thinking;
+                        p.stream_thinking = None;
+                        p.stream_response = None;
+                        p.stream_message_id = None;
+                    }
+                    match consume_stream(rx, prog) {
+                        Ok(msg) => {
+                            consecutive_hook_failures = 0;
+                            // Reset streaming state after successful consumption
+                            if let Ok(mut p) = prog.lock() {
+                                p.stream_phase = StreamPhase::Idle;
+                                p.stream_thinking = None;
+                                p.stream_response = None;
+                                p.stream_message_id = None;
+                            }
+                            msg
+                        }
+                        Err(e) => {
+                            eprintln!("[harness] streaming failed ({e}), falling back to blocking");
+                            if let Ok(mut p) = prog.lock() {
+                                p.stream_phase = StreamPhase::Idle;
+                                p.stream_thinking = None;
+                                p.stream_response = None;
+                                p.stream_message_id = None;
+                            }
+                            // Fall back to blocking call
+                            match call_agent_hook(&model_spec, &request) {
+                                Ok(msg) => { consecutive_hook_failures = 0; msg }
+                                Err(e2) => {
+                                    consecutive_hook_failures += 1;
+                                    eprintln!(
+                                        "[harness] hook failed ({consecutive_hook_failures}/{MAX_CONSECUTIVE_HOOK_FAILURES}): {e2}"
+                                    );
+                                    if consecutive_hook_failures >= MAX_CONSECUTIVE_HOOK_FAILURES {
+                                        final_text = Some(format!(
+                                            "(Agent terminated: model hook failed {MAX_CONSECUTIVE_HOOK_FAILURES} \
+                                             consecutive times. Last error: {e2})"
+                                        ));
+                                        break;
+                                    }
+                                    AgentMessage {
+                                        role: "assistant".to_string(),
+                                        content: Some(format!("(Model hook error on attempt {consecutive_hook_failures}: {e2}. Will retry on next step.)")),
+                                        tool_calls: Vec::new(), name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                // Inject error as assistant message — agent sees it next iteration
-                AgentMessage {
-                    role: "assistant".to_string(),
-                    content: Some(format!(
-                        "(Model hook error on attempt {consecutive_hook_failures}: {e}. \
-                         Will retry on next step.)"
-                    )),
-                    tool_calls: Vec::new(),
-                    name: None,
-                    tool_call_id: None,
-                    is_error: None,
-                    thinking_blocks: vec![],
+                Err(_) => {
+                    // Non-claude hook or streaming not supported — use blocking path
+                    match call_agent_hook(&model_spec, &request) {
+                        Ok(msg) => { consecutive_hook_failures = 0; msg }
+                        Err(e) => {
+                            consecutive_hook_failures += 1;
+                            eprintln!(
+                                "[harness] hook failed ({consecutive_hook_failures}/{MAX_CONSECUTIVE_HOOK_FAILURES}): {e}"
+                            );
+                            if consecutive_hook_failures >= MAX_CONSECUTIVE_HOOK_FAILURES {
+                                final_text = Some(format!(
+                                    "(Agent terminated: model hook failed {MAX_CONSECUTIVE_HOOK_FAILURES} \
+                                     consecutive times. Last error: {e})"
+                                ));
+                                break;
+                            }
+                            AgentMessage {
+                                role: "assistant".to_string(),
+                                content: Some(format!("(Model hook error on attempt {consecutive_hook_failures}: {e}. Will retry on next step.)")),
+                                tool_calls: Vec::new(), name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // No progress handle — blocking path only (CLI mode, subagents)
+            match call_agent_hook(&model_spec, &request) {
+                Ok(msg) => {
+                    consecutive_hook_failures = 0;
+                    msg
+                }
+                Err(e) => {
+                    consecutive_hook_failures += 1;
+                    eprintln!(
+                        "[harness] hook failed ({consecutive_hook_failures}/{MAX_CONSECUTIVE_HOOK_FAILURES}): {e}"
+                    );
+                    if consecutive_hook_failures >= MAX_CONSECUTIVE_HOOK_FAILURES {
+                        eprintln!(
+                            "[harness] {MAX_CONSECUTIVE_HOOK_FAILURES} consecutive failures, ending run"
+                        );
+                        final_text = Some(format!(
+                            "(Agent terminated: model hook failed {MAX_CONSECUTIVE_HOOK_FAILURES} \
+                             consecutive times. Last error: {e})"
+                        ));
+                        break;
+                    }
+                    AgentMessage {
+                        role: "assistant".to_string(),
+                        content: Some(format!(
+                            "(Model hook error on attempt {consecutive_hook_failures}: {e}. \
+                             Will retry on next step.)"
+                        )),
+                        tool_calls: Vec::new(),
+                        name: None,
+                        tool_call_id: None,
+                        is_error: None,
+                        thinking_blocks: vec![],
+                    }
                 }
             }
         };
