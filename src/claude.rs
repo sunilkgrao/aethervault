@@ -480,7 +480,7 @@ pub(crate) fn call_claude_with_model(
         .map(|v| v.parse::<f64>())
         .transpose()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid ANTHROPIC_TOP_P"))?;
-    let timeout = env_u64("ANTHROPIC_TIMEOUT", u64::MAX)?;
+    let timeout = env_u64("ANTHROPIC_TIMEOUT", 180)?; // 3 min default, was infinite
     let max_retries = env_usize("ANTHROPIC_MAX_RETRIES", 2)?;
     let retry_base = env_f64("ANTHROPIC_RETRY_BASE", 0.5)?;
     let retry_max = env_f64("ANTHROPIC_RETRY_MAX", 4.0)?;

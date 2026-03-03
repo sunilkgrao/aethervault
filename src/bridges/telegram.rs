@@ -824,11 +824,12 @@ pub(crate) fn spawn_agent_run(
                 let needs_first_ack = !guard.first_ack_sent
                     && tick_count >= 1
                     && !done;
-                // Send periodic progress every ~20s (5 ticks) after first ack.
-                // Note: we no longer require step > 0 — if the agent is stuck on the
-                // first API call, the user still deserves to know we're alive.
+                // Send periodic progress after first ack. Throttle based on elapsed time:
+                //   first 2 min: every 20s (5 ticks)
+                //   after 2 min: every 60s (15 ticks) — avoid spamming "Thinking..." 20x
+                let progress_interval = if guard.started_at.elapsed().as_secs() < 120 { 5 } else { 15 };
                 let needs_progress = guard.first_ack_sent
-                    && tick_count % 5 == 0
+                    && tick_count % progress_interval == 0
                     && !done;
                 // Hard timeout: if session exceeds 8 minutes, notify user
                 let elapsed_secs = guard.started_at.elapsed().as_secs();
