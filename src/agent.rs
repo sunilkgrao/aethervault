@@ -35,6 +35,7 @@ use crate::{
 };
 
 /// Tracks blake3 hashes of observations already written this process lifetime.
+const OBSERVATION_DEDUP_CAP: usize = 10_000;
 static OBSERVATION_DEDUP: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -1834,15 +1835,18 @@ pub(crate) fn run_agent_with_prompt(
                         if let Ok(response) = call_claude(&extract_request) {
                             if let Some(facts) = response.message.content {
                                 if !facts.trim().is_empty() && observation_is_useful(&facts) {
-                                    // Dedup guard: skip if we already wrote identical observation this session
-                                    let hash = blake3::hash(facts.as_bytes()).to_hex().to_string();
-                                    {
-                                        let mut seen = OBSERVATION_DEDUP.lock().unwrap_or_else(|e| e.into_inner());
-                                        if !seen.insert(hash) {
-                                            eprintln!("[observation-dedup] skipped duplicate: {}...", &facts.chars().take(60).collect::<String>());
-                                            return;
-                                        }
+                                // Dedup guard: skip if we already wrote identical observation this session
+                                let hash = blake3::hash(facts.as_bytes()).to_hex().to_string();
+                                {
+                                    let mut seen = OBSERVATION_DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+                                    if seen.len() >= OBSERVATION_DEDUP_CAP {
+                                        seen.clear();
                                     }
+                                    if !seen.insert(hash) {
+                                        eprintln!("[observation-dedup] skipped duplicate: {}...", &facts.chars().take(60).collect::<String>());
+                                        return;
+                                    }
+                                }
                                     let uri = format!(
                                         "aethervault://memory/observation/{}",
                                         Utc::now().timestamp()

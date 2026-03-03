@@ -38,6 +38,60 @@ fn is_invisible_unicode(c: char) -> bool {
     )
 }
 
+fn expand_home_path(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    if let Some(suffix) = path.strip_prefix("~/") {
+        format!("{home}/{suffix}")
+    } else if path == "~" {
+        home
+    } else {
+        path.to_string()
+    }
+}
+
+fn has_dotenv_key(path: &Path, key: &str) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+
+    for line in raw.lines() {
+        let mut line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("export ") {
+            line = rest.trim_start();
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+        let mut value = value.trim();
+        if let Some(hash_idx) = value.find('#') {
+            value = value[..hash_idx].trim();
+        }
+        let value = value.trim_matches(&['\"', '\''][..]).trim();
+        if !value.is_empty() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_expected_cli_credentials_dir(path: &Path, service: &str) -> bool {
+    let expected = match service {
+        "github" => &["hosts.yml"][..],
+        "stripe" => &["config.toml"][..],
+        "vercel" => &["auth.json"][..],
+        _ => &[],
+    };
+
+    expected.iter().any(|file| path.join(file).exists())
+}
+
 /// Detect invisible Unicode characters in text. Returns a warning string if any are
 /// found, listing the character types and count. Used to alert the LLM that content
 /// may contain prompt injection payloads hidden via invisible characters.
@@ -97,14 +151,23 @@ pub(crate) fn detect_invisible_unicode(text: &str) -> Option<String> {
 /// Strips HTML tags, removes invisible Unicode characters (zero-width spaces, bidi
 /// overrides, directional isolates), and truncates to prevent context stuffing.
 fn sanitize_external_content(raw: &str, max_chars: usize) -> String {
-    let truncated = raw.chars().take(max_chars).collect::<String>();
+    let truncated_input = if max_chars == 0 {
+        ""
+    } else {
+        raw.char_indices()
+            .nth(max_chars)
+            .map(|(idx, _)| &raw[..idx])
+            .unwrap_or(raw)
+    };
+    let was_truncated = raw.char_indices().nth(max_chars).is_some();
+
     // Use ammonia to strip all HTML to plain text
-    let cleaned = ammonia::clean_text(&truncated);
+    let cleaned = ammonia::clean_text(truncated_input);
     // Remove invisible/control Unicode characters that can hide injection payloads
     let sanitized: String = cleaned.chars()
         .filter(|c| !is_invisible_unicode(*c))
         .collect();
-    if raw.chars().count() > max_chars {
+    if was_truncated {
         format!("{sanitized}...[truncated at {max_chars} chars]")
     } else {
         sanitized
@@ -185,32 +248,18 @@ pub(crate) fn check_credential_chain(service: &str) -> (bool, String) {
                 _ => &[".env"],
             };
             for path in config_paths {
-                let home = std::env::var("HOME").unwrap_or_default();
-                let expanded = if path.starts_with("~/") {
-                    format!("{}{}", home, &path[2..])
-                } else {
-                    path.to_string()
-                };
-                if Path::new(&expanded).exists() {
-                    let valid_credentials = fs::read_to_string(&expanded)
-                        .map(|content| {
-                            content
-                                .lines()
-                                .map(|line| line.trim())
-                                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                                .filter_map(|line| line.split_once('='))
-                                .any(|(key, value)| {
-                                    !value.trim().is_empty()
-                                        && (key.contains("API_KEY")
-                                            || key.contains("TOKEN")
-                                            || key.contains("SECRET"))
-                                })
-                        })
-                        .unwrap_or(false);
-
-                    if valid_credentials {
-                        return (true, format!("Config file exists: {path}"));
-                    }
+                let expanded = expand_home_path(path);
+                let expanded_path = Path::new(&expanded);
+                if expanded_path.file_name().and_then(|name| name.to_str()) == Some(".env") &&
+                    env_checks.iter().any(|(_, var_name)| has_dotenv_key(expanded_path, var_name))
+                {
+                    return (true, format!("Config file contains credentials: {path}"));
+                }
+                if expanded_path.is_file() {
+                    return (true, format!("Config file exists: {path}"));
+                }
+                if expanded_path.is_dir() && has_expected_cli_credentials_dir(expanded_path, svc) {
+                    return (true, format!("Config directory contains credentials: {path}"));
                 }
             }
             let instructions = match *svc {
