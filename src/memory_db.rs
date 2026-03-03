@@ -1279,6 +1279,7 @@ impl MemoryDb {
                     trigger.webhook_method,
                     trigger.schedule_name,
                 ]) {
+                    eprintln!("[trigger-restore] failed to restore trigger {}: {err}", trigger.id);
                     let _ = self.conn.execute("ROLLBACK", []);
                     return Err(format!("triggers_replace insert {}: {err}", trigger.id));
                 }

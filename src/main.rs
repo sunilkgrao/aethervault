@@ -177,6 +177,18 @@ fn restore_triggers_for_service_startup(mv2: &Path) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+fn ensure_collection_exists(db: &MemoryDb, collection: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let collection = normalize_collection(collection);
+    if collection.is_empty() {
+        return Err("collection name cannot be empty".into());
+    }
+    let scope = scope_prefix(&collection);
+    if db.collect_active_frame_ids(Some(&scope)).is_empty() {
+        return Err(format!("collection '{collection}' does not exist").into());
+    }
+    Ok(())
+}
+
 fn to_sorted_stats(map: HashMap<String, usize>) -> Vec<(String, usize)> {
     let mut entries: Vec<(String, usize)> = map.into_iter().collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -421,6 +433,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => {
             let db = open_or_create_db(&mv2)?;
+            let collection = collection.as_deref().map(normalize_collection);
+            if let Some(collection) = collection.as_deref() {
+                ensure_collection_exists(&db, collection)?;
+            }
             let scope = collection.as_deref().map(scope_prefix);
 
             let request = SearchRequest {
@@ -486,6 +502,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             feedback_weight,
         } => {
             let db = open_or_create_db(&mv2)?;
+            let collection = collection.as_deref().map(normalize_collection);
+            if let Some(collection) = collection.as_deref() {
+                ensure_collection_exists(&db, collection)?;
+            }
 
             let args = QueryArgs {
                 raw_query: query.clone(),
@@ -610,6 +630,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             feedback_weight,
         } => {
             let db = open_or_create_db(&mv2)?;
+            let collection = collection.as_deref().map(normalize_collection);
+            if let Some(collection) = collection.as_deref() {
+                ensure_collection_exists(&db, collection)?;
+            }
+
             let args = QueryArgs {
                 raw_query: query.clone(),
                 collection,
@@ -1110,6 +1135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dry_run,
         } => {
             let source_path = mv2.display().to_string();
+            let collection = normalize_collection(&collection);
             let target = target.unwrap_or_else(|| {
                 mv2.parent()
                     .unwrap_or(Path::new("."))
@@ -1124,6 +1150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let source = open_or_create_db(&mv2)?;
+            ensure_collection_exists(&source, &collection)?;
             let target_mem = if dry_run {
                 None
             } else {
