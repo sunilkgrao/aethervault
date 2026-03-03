@@ -573,7 +573,6 @@ pub(crate) fn restore_triggers_from_backup_if_empty(db: &MemoryDb) -> Result<usi
     let existing = match db.triggers_list() {
         Ok(triggers) => triggers.len(),
         Err(err) => {
-            eprintln!("[trigger-restore] failed to query trigger count: {err}");
             return Err(format!("[trigger-restore] failed to query trigger count: {err}"));
         }
     };
@@ -587,15 +586,15 @@ pub(crate) fn restore_triggers_from_backup_if_empty(db: &MemoryDb) -> Result<usi
     }
 
     eprintln!("Trigger table empty, restoring {} triggers from backup", backup.len());
-    if !LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
-        if let Err(err) = save_triggers(db, &backup) {
-            eprintln!("[trigger-restore] failed to restore triggers from backup: {err}");
-            return Err(format!("[trigger-restore] failed to restore triggers from backup: {err}"));
-        }
-        return Ok(backup.len());
+    if LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
+        return Ok(0);
     }
 
-    Ok(0)
+    if let Err(err) = save_triggers(db, &backup) {
+        eprintln!("[trigger-restore] failed to restore triggers from backup: {err}");
+        return Err(format!("[trigger-restore] failed to restore triggers from backup: {err}"));
+    }
+    Ok(backup.len())
 }
 
 pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {

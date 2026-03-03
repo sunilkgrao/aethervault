@@ -170,10 +170,9 @@ fn frame_size_bucket(size_bytes: u64) -> String {
 
 fn restore_triggers_for_service_startup(mv2: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let db = open_or_create_db(mv2)?;
-    let restored = restore_triggers_from_backup_if_empty(&db)
-        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-    if restored > 0 {
-        eprintln!("Startup trigger restore complete: restored {restored} triggers");
+    match restore_triggers_from_backup_if_empty(&db) {
+        Ok(count) => eprintln!("[startup] Restored {} triggers from backup", count),
+        Err(e) => eprintln!("[startup] WARNING: trigger restore failed: {}", e),
     }
     Ok(())
 }
