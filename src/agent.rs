@@ -35,6 +35,7 @@ use crate::{
 };
 
 /// Tracks blake3 hashes of observations already written this process lifetime.
+const OBSERVATION_DEDUP_CAP: usize = 10_000;
 static OBSERVATION_DEDUP: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -53,15 +54,32 @@ fn check_capsule_health(mv2: &Path) {
 /// Returns true if an observation is worth persisting to long-term memory.
 fn observation_is_useful(text: &str) -> bool {
     let trimmed = text.trim();
-    // Too short to be useful
-    if trimmed.len() < 30 {
+    // Keep concise facts (e.g. short names or year statements) while filtering out tiny chatter.
+    if trimmed.len() < 10 {
         return false;
     }
     let lower = trimmed.to_lowercase();
-    // Meta-observations about the agent itself
-    if lower.starts_with("the assistant") || lower.starts_with("the agent") {
+
+    // Filter strategy: drop obvious meta-phrases and status boilerplate,
+    // while requiring a concrete signal (number, proper noun, or explicit marker) for everything else.
+    let blocked_prefix = [
+        "the assistant", "the agent",
+        "i will now", "let me help", "here is", "here are",
+        "as an assistant", "as your assistant",
+    ];
+
+    let has_prefix = |text: &str, phrase: &str| {
+        text.starts_with(phrase)
+            && text
+                .get(phrase.len()..)
+                .and_then(|rest| rest.chars().next())
+                .map_or(true, |next| !next.is_alphabetic())
+    };
+
+    if blocked_prefix.iter().any(|phrase| has_prefix(&lower, phrase)) {
         return false;
     }
+
     // Generic status checks
     let status_noise = [
         "all services are", "everything is running", "everything is working",
@@ -69,22 +87,33 @@ fn observation_is_useful(text: &str) -> bool {
         "all systems", "is currently ok", "are currently ok",
         "no issues found", "nothing to report",
     ];
-    for pattern in &status_noise {
-        if lower.contains(pattern) {
-            return false;
-        }
+    if status_noise.iter().any(|pattern| has_prefix(&lower, pattern)) {
+        return false;
     }
-    // Must contain something specific: a number, a proper noun, a technology name,
-    // a concrete preference, or a lesson learned
+
+    let proper_noun_lookalikes = [
+        "i", "a", "the", "an", "in", "on", "at", "to", "for", "and", "but", "or", "is", "it", "my",
+        "this", "that", "these", "those", "there", "here", "we", "you", "your",
+    ];
+
+    let is_title_case_word = |token: &str| {
+        let cleaned = token.trim_matches(|c: char| !c.is_alphanumeric());
+        cleaned.len() > 1
+            && cleaned
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_uppercase())
+            && !proper_noun_lookalikes.contains(&cleaned)
+    };
+
+    // Must contain something specific: a number, a proper noun, a technology name, a concrete preference, or a lesson learned.
     let has_number = trimmed.chars().any(|c| c.is_ascii_digit());
-    let has_proper_noun = trimmed.split_whitespace().skip(1).any(|w| {
-        w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-            && w.len() > 1
-            && !["I", "A", "The", "An", "In", "On", "At", "To", "For", "And", "But", "Or", "Is", "It", "My"].contains(&w)
-    });
-    let specificity_markers = ["because", "prefers", "always", "never", "important",
+    let has_proper_noun = trimmed.split_whitespace().any(is_title_case_word);
+    let specificity_markers = [
+        "because", "prefers", "always", "never", "important",
         "learned", "rule", "policy", "deadline", "budget", "password", "key",
-        "api", "token", "endpoint", "port", "version", "config"];
+        "api", "token", "endpoint", "port", "version", "config",
+    ];
     let has_specificity = specificity_markers.iter().any(|m| lower.contains(m));
 
     has_number || has_proper_noun || has_specificity
@@ -127,6 +156,8 @@ pub(crate) fn run_agent(
 
     // Auto-continuation loop: re-run the agent when it hits max_steps
     const MAX_CHAIN_DEPTH: usize = 5;
+    const MAX_CHECKPOINT_CHAIN_DEPTH: usize = 10;
+    const CONTINUATION_MARKER_PREFIX: &str = "[CONTINUATION_NEEDED:";
     let mut current_prompt = prompt_text;
     let mut current_session = session;
     let mut chain_depth: usize = 0;
@@ -148,44 +179,53 @@ pub(crate) fn run_agent(
             None, // tool_filter: no restrictions for CLI agent
         )?;
 
-        let needs_continuation = output.final_text.as_ref()
-            .map(|t| t.contains("[CONTINUATION_NEEDED:"))
-            .unwrap_or(false);
+        let continuation_marker_line = output.final_text.as_ref().and_then(|text| {
+            text
+                .lines()
+                .find(|line| line.starts_with(CONTINUATION_MARKER_PREFIX))
+        });
+        let needs_continuation = continuation_marker_line.is_some();
 
         if needs_continuation && chain_depth < MAX_CHAIN_DEPTH {
             // Parse checkpoint and build continuation prompt
-            if let Some(ref text) = output.final_text {
-                if let Some(start) = text.find("[CONTINUATION_NEEDED:") {
-                    let after = &text[start + "[CONTINUATION_NEEDED:".len()..];
-                    if let Some(end) = after.find(']') {
-                        let checkpoint_path = &after[..end];
-                        if let Ok(checkpoint_json) = fs::read_to_string(checkpoint_path) {
-                            if let Ok(checkpoint) = serde_json::from_str::<ContinuationCheckpoint>(&checkpoint_json) {
-                                chain_depth = checkpoint.chain_depth;
+            if let Some(marker_line) = continuation_marker_line {
+                let after = &marker_line[CONTINUATION_MARKER_PREFIX.len()..];
+                if let Some(end) = after.find(']') {
+                    let checkpoint_path = &after[..end];
+                    if let Ok(checkpoint_json) = fs::read_to_string(checkpoint_path) {
+                        if let Ok(checkpoint) = serde_json::from_str::<ContinuationCheckpoint>(&checkpoint_json) {
+                            chain_depth = if checkpoint.chain_depth <= MAX_CHECKPOINT_CHAIN_DEPTH {
+                                checkpoint.chain_depth
+                            } else {
                                 eprintln!(
-                                    "[auto-continuation] chaining session (depth {}/{}): {}",
-                                    chain_depth, MAX_CHAIN_DEPTH,
-                                    checkpoint.goal.chars().take(80).collect::<String>()
+                                    "[auto-continuation] checkpoint chain_depth {} outside 0..={}; resetting to 0",
+                                    checkpoint.chain_depth, MAX_CHECKPOINT_CHAIN_DEPTH
                                 );
-                                current_prompt = format!(
-                                    "[Continuation from previous session — chain depth {}/{}]\n\n\
-                                     ## Goal\n{}\n\n\
-                                     ## Summary of work so far\n{}\n\n\
-                                     ## Remaining work\n{}\n\n\
-                                     Continue from where you left off. Do NOT repeat completed work.",
-                                    chain_depth, MAX_CHAIN_DEPTH,
-                                    checkpoint.goal, checkpoint.summary, checkpoint.remaining_work,
-                                );
-                                current_session = current_session.map(|s| {
-                                    if s.contains(":chain:") {
-                                        let base = s.rsplit(":chain:").last().unwrap_or(&s);
-                                        format!("{base}:chain:{chain_depth}")
-                                    } else {
-                                        format!("{s}:chain:{chain_depth}")
-                                    }
-                                });
-                                continue; // Loop back for the next chain
-                            }
+                                0
+                            };
+                            eprintln!(
+                                "[auto-continuation] chaining session (depth {}/{}): {}",
+                                chain_depth, MAX_CHAIN_DEPTH,
+                                checkpoint.goal.chars().take(80).collect::<String>()
+                            );
+                            current_prompt = format!(
+                                "[Continuation from previous session — chain depth {}/{}]\n\n\
+                                 ## Goal\n{}\n\n\
+                                 ## Summary of work so far\n{}\n\n\
+                                 ## Remaining work\n{}\n\n\
+                                 Continue from where you left off. Do NOT repeat completed work.",
+                                chain_depth, MAX_CHAIN_DEPTH,
+                                checkpoint.goal, checkpoint.summary, checkpoint.remaining_work,
+                            );
+                            current_session = current_session.map(|s| {
+                                if s.contains(":chain:") {
+                                    let base = s.rsplit(":chain:").last().unwrap_or(&s);
+                                    format!("{base}:chain:{chain_depth}")
+                                } else {
+                                    format!("{s}:chain:{chain_depth}")
+                                }
+                            });
+                            continue; // Loop back for the next chain
                         }
                     }
                 }
@@ -1795,15 +1835,18 @@ pub(crate) fn run_agent_with_prompt(
                         if let Ok(response) = call_claude(&extract_request) {
                             if let Some(facts) = response.message.content {
                                 if !facts.trim().is_empty() && observation_is_useful(&facts) {
-                                    // Dedup guard: skip if we already wrote identical observation this session
-                                    let hash = blake3::hash(facts.as_bytes()).to_hex().to_string();
-                                    {
-                                        let mut seen = OBSERVATION_DEDUP.lock().unwrap_or_else(|e| e.into_inner());
-                                        if !seen.insert(hash) {
-                                            eprintln!("[observation-dedup] skipped duplicate: {}...", &facts.chars().take(60).collect::<String>());
-                                            return;
-                                        }
+                                // Dedup guard: skip if we already wrote identical observation this session
+                                let hash = blake3::hash(facts.as_bytes()).to_hex().to_string();
+                                {
+                                    let mut seen = OBSERVATION_DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+                                    if seen.len() >= OBSERVATION_DEDUP_CAP {
+                                        seen.clear();
                                     }
+                                    if !seen.insert(hash) {
+                                        eprintln!("[observation-dedup] skipped duplicate: {}...", &facts.chars().take(60).collect::<String>());
+                                        return;
+                                    }
+                                }
                                     let uri = format!(
                                         "aethervault://memory/observation/{}",
                                         Utc::now().timestamp()
