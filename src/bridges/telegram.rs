@@ -1056,7 +1056,8 @@ pub(crate) fn spawn_agent_run(
                         format!("[step {step} | {phase} | {} | {elapsed}s]",
                             tools.join(", "))
                     } else {
-                        format!("Working... ({elapsed}s)")
+                        // No content yet — skip this tick entirely
+                        continue;
                     }
                 };
                 eprintln!("[progress-reporter] sending progress: {progress_msg}");
@@ -1155,8 +1156,9 @@ pub(crate) fn handle_telegram_completion(
 
                             // Send a brief status to the user (not the raw continuation marker)
                             let status_msg = format!(
-                                "\u{1F504} Still working on it... (session {}/{})",
-                                checkpoint.chain_depth, MAX_CHAIN_DEPTH
+                                "Continuing — session {}/{}\nGoal: {}",
+                                checkpoint.chain_depth, MAX_CHAIN_DEPTH,
+                                checkpoint.goal.chars().take(120).collect::<String>(),
                             );
                             let _ = telegram_send_message_ext(http_agent, base_url, chat_id, &status_msg, reply_to_id);
                             eprintln!(
@@ -1516,15 +1518,21 @@ pub(crate) fn run_telegram_bridge(
                         guard.checkpoint_response = Some(true);
                         guard.checkpoint_sent = false; // allow another checkpoint at new 75%
                         drop(guard);
-                        let _ = telegram_send_message(&http_agent, &base_url, chat_id,
-                            &format!("Got it, extending by {} more steps.", run.progress.lock().unwrap_or_else(|e| e.into_inner()).max_steps));
+                        {
+                            let guard = run.progress.lock().unwrap_or_else(|e| e.into_inner());
+                            let preview = guard.text_preview.clone().unwrap_or_default();
+                            let truncated: String = preview.chars().take(100).collect();
+                            let new_max = guard.extended_max_steps.unwrap_or(guard.max_steps);
+                            drop(guard);
+                            let _ = telegram_send_message(&http_agent, &base_url, chat_id,
+                                &format!("Extended to {new_max} steps.\n{truncated}"));
+                        }
                         continue;
                     } else if lower.contains("wrap") || lower.contains("stop") || lower.contains("finish") || lower.contains("no") {
                         let mut guard = run.progress.lock().unwrap_or_else(|e| e.into_inner());
                         guard.checkpoint_response = Some(false);
                         drop(guard);
-                        let _ = telegram_send_message(&http_agent, &base_url, chat_id,
-                            "Wrapping up with what I have so far.");
+                        // No canned ack — agent will wrap up and deliver final response
                         continue;
                     }
                     // Not a clear checkpoint response -- treat as queued message
@@ -1538,7 +1546,7 @@ pub(crate) fn run_telegram_bridge(
                 if run.queued_messages.len() < MAX_QUEUED_PER_CHAT {
                     run.queued_messages.push((user_text, reply_to_id));
                 }
-                let _ = telegram_send_message(&http_agent, &base_url, chat_id, "Got it \u{2014} I'll work that in.");
+                // No canned ack — the agent will see the steering message and respond naturally
                 continue;
             }
 
