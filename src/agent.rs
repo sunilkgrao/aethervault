@@ -1781,14 +1781,32 @@ pub(crate) fn run_agent_with_prompt(
                     // when tasks were actually created AND completed — not just because the DB
                     // has no active tasks (which is the initial state).
                     if orchestrator_mode {
+                        // Auto-fail stale "running" tasks (>2 hours with no update)
+                        {
+                            let stale_running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(100));
+                            let now_utc = chrono::Utc::now();
+                            for task in &stale_running {
+                                if let Ok(updated) = chrono::NaiveDateTime::parse_from_str(&task.updated_at, "%Y-%m-%dT%H:%M:%S%.fZ")
+                                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(&task.updated_at, "%Y-%m-%dT%H:%M:%SZ"))
+                                {
+                                    let age = now_utc.naive_utc() - updated;
+                                    if age > chrono::Duration::hours(2) {
+                                        eprintln!("[harness] Auto-failing stale swarm task {} (running for {}h)", task.id, age.num_hours());
+                                        let _ = crate::swarm::swarm_update_task(
+                                            &sdb, &task.id, Some("failed"),
+                                            None, None, None, None, None, None,
+                                            Some("auto-failed: stale, no update for 2+ hours"), None, None,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(1));
                         let queued = crate::swarm::swarm_list_tasks(&sdb, Some("queued"), Some(1));
                         let pr_open = crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(1));
                         let reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(1));
                         let no_active = running.is_empty() && queued.is_empty() && pr_open.is_empty() && reviewing.is_empty();
-                        // When proactively enforced via skill match, never auto-restore tools.
-                        // The agent must complete its swarm tasks; tools are restored only
-                        // when orchestrator mode was triggered by existing DB tasks (not skill match).
+                        // Restore tools when no active tasks remain (including after stale auto-fail).
                         let can_restore = no_active;
                         if can_restore {
                             orchestrator_mode = false;
