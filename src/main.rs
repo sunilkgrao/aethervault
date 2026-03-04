@@ -114,6 +114,7 @@ fn frame_collection_name(frame: &Frame) -> String {
 
 fn frame_matches_collection(frame: &Frame, collection: &str) -> bool {
     let expected = normalize_collection(collection);
+    // If the incoming collection normalizes to empty, don't match anything.
     if expected.is_empty() {
         return false;
     }
