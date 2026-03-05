@@ -379,10 +379,13 @@ pub(crate) fn to_anthropic_tools(
         if let Some(schema) = obj.get("inputSchema").or_else(|| obj.get("input_schema")) {
             entry.insert("input_schema".to_string(), schema.clone());
         }
-        if let Some(cache) = cache_control.clone() {
-            entry.insert("cache_control".to_string(), cache);
-        }
         out.push(serde_json::Value::Object(entry));
+    }
+    // Anthropic allows max 4 cache_control blocks; apply only to the last tool
+    if let Some(cache) = cache_control {
+        if let Some(last) = out.last_mut().and_then(|v| v.as_object_mut()) {
+            last.insert("cache_control".to_string(), cache);
+        }
     }
     out
 }
