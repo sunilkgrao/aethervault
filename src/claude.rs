@@ -314,7 +314,11 @@ pub(crate) fn to_anthropic_messages(messages: &[AgentMessage]) -> Vec<serde_json
                 let mut blocks = Vec::new();
                 // Thinking blocks must come first in assistant content
                 for tb in &msg.thinking_blocks {
-                    blocks.push(tb.clone());
+                    let mut cleaned = tb.clone();
+                    if let Some(obj) = cleaned.as_object_mut() {
+                        obj.remove("cache_control");
+                    }
+                    blocks.push(cleaned);
                 }
                 if let Some(content) = &msg.content {
                     if !content.is_empty() {
@@ -430,7 +434,11 @@ pub(crate) fn parse_claude_response(
             }
             "thinking" | "redacted_thinking" => {
                 // Preserve thinking blocks for multi-turn tool-use conversations
-                thinking_blocks.push(block.clone());
+                let mut cleaned = block.clone();
+                if let Some(obj) = cleaned.as_object_mut() {
+                    obj.remove("cache_control");
+                }
+                thinking_blocks.push(cleaned);
             }
             _ => {}
         }
