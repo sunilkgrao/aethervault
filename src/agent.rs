@@ -132,11 +132,13 @@ fn consume_stream(
     let mut block_tool_ids: HashMap<usize, String> = HashMap::new();
     let mut block_tool_names: HashMap<usize, String> = HashMap::new();
 
-    let recv_timeout = StdDuration::from_secs(180);
+    let timeout_secs: u64 = std::env::var("ANTHROPIC_TIMEOUT")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+    let recv_timeout = StdDuration::from_secs(timeout_secs);
 
     loop {
         let event = rx.recv_timeout(recv_timeout)
-            .map_err(|_| "stream recv timeout (180s)".to_string())?;
+            .map_err(|_| format!("stream recv timeout ({}s)", timeout_secs))?;
 
         match event {
             ClaudeStreamEvent::BlockStart { index, block_type, tool_id, tool_name } => {
@@ -1316,7 +1318,7 @@ pub(crate) fn run_agent_with_prompt(
 
     // Insert session history as proper user/assistant messages (not in system prompt)
     if let Some(ref sess_id) = session {
-        let session_turns = load_session_turns(sess_id, 20);
+        let session_turns = load_session_turns(sess_id, 10);
         for turn in &session_turns {
             messages.push(AgentMessage {
                 role: turn.role.clone(),
