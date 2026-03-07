@@ -1923,10 +1923,9 @@ pub(crate) fn run_agent_with_prompt(
 
         // Try streaming first when a progress handle is available (Telegram bridge).
         // This enables live thinking/response display. Falls back to blocking on any error.
-        let message = if progress.is_some() {
+        let message = if let Some(prog) = progress.as_ref() {
             match call_agent_hook_streaming(&model_spec, &request) {
                 Ok(rx) => {
-                    let prog = progress.as_ref().unwrap();
                     // Set phase to Thinking before consuming
                     if let Ok(mut p) = prog.lock() {
                         p.stream_phase = StreamPhase::Thinking;
