@@ -15,17 +15,16 @@ use serde_json;
 use url::form_urlencoded;
 
 // Re-imports from main (crate-internal helpers and types)
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::{
-    open_or_create_db, save_config_entry, load_config_entry, blake3_hash, execute_tool,
-    env_optional, env_u64, tool_autonomy_for, ToolAutonomyLevel, ApprovalEntry, TriggerEntry,
-    AgentConfig, CronExpr, load_capsule_config, resolve_workspace,
-    build_bridge_agent_config, run_agent_for_bridge, telegram_send_message,
-    BackgroundTask, BackgroundTaskRegistry, BackgroundTaskStatus, SessionRegistry,
-    BridgeAgentConfig,
+    AgentConfig, ApprovalEntry, BackgroundTask, BackgroundTaskRegistry, BackgroundTaskStatus,
+    BridgeAgentConfig, CronExpr, SessionRegistry, ToolAutonomyLevel, TriggerEntry, blake3_hash,
+    build_bridge_agent_config, env_optional, env_u64, execute_tool, load_capsule_config,
+    load_config_entry, open_or_create_db, resolve_workspace, run_agent_for_bridge,
+    save_config_entry, telegram_send_message, tool_autonomy_for,
 };
 use tiny_http::{Response, Server};
 use walkdir::WalkDir;
@@ -45,7 +44,6 @@ pub(crate) fn read_optional_file(path: &Path) -> Option<String> {
         }
     })
 }
-
 
 pub(crate) fn daily_memory_path(workspace: &Path) -> PathBuf {
     let date = Utc::now().format("%Y-%m-%d").to_string();
@@ -74,8 +72,11 @@ pub(crate) fn sync_memory_file(
     options.kind = Some("text/markdown".to_string());
     options.track = Some(track.to_string());
     options.search_text = Some(text.clone());
-    let id = db.put_bytes_with_options(text.as_bytes(), options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-    db.commit().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    let id = db
+        .put_bytes_with_options(text.as_bytes(), options)
+        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    db.commit()
+        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     Ok(id)
 }
 
@@ -206,7 +207,12 @@ pub(crate) fn build_oauth_redirect(base: &str, provider: &str) -> String {
     format!("{base}/oauth/{provider}/callback")
 }
 
-pub(crate) fn build_google_auth_url(client_id: &str, redirect_uri: &str, scope: &str, state: &str) -> String {
+pub(crate) fn build_google_auth_url(
+    client_id: &str,
+    redirect_uri: &str,
+    scope: &str,
+    state: &str,
+) -> String {
     format!(
         "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id={}&redirect_uri={}&scope={}&access_type=offline&prompt=consent&state={}",
         urlencoding::encode(client_id),
@@ -238,7 +244,11 @@ pub(crate) fn exchange_oauth_code(
     redirect_uri: &str,
     code: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let timeout_ms = env_u64(OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS_ENV, DEFAULT_OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS)?.max(1);
+    let timeout_ms = env_u64(
+        OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS_ENV,
+        DEFAULT_OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS,
+    )?
+    .max(1);
     let timeout = Duration::from_millis(timeout_ms);
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(timeout)
@@ -347,7 +357,8 @@ pub(crate) fn run_oauth_broker(
         let key = format!("oauth.{provider}");
         let payload = serde_json::to_vec_pretty(&token)?;
         let db = open_or_create_db(&mv2)?;
-        save_config_entry(&db, &key, &payload).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+        save_config_entry(&db, &key, &payload)
+            .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
         let response = Response::from_string("Authorized. You can close this tab.");
         let _ = request.respond(response);
         println!("Stored token in config key: {key}");
@@ -405,7 +416,11 @@ pub(crate) fn parse_approval_chat_command(text: &str) -> Option<ApprovalChatComm
     }
 }
 
-pub(crate) fn approve_and_maybe_execute(mv2: &Path, id: &str, execute: bool) -> Result<String, String> {
+pub(crate) fn approve_and_maybe_execute(
+    mv2: &Path,
+    id: &str,
+    execute: bool,
+) -> Result<String, String> {
     let db = open_or_create_db(mv2).map_err(|e| e.to_string())?;
     let mut approvals = load_approvals(&db);
     let mut entry: Option<ApprovalEntry> = None;
@@ -490,9 +505,7 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
                 .to_ascii_uppercase();
             method != "GET"
         }
-        "scale" => {
-            args.get("action").and_then(|v| v.as_str()) == Some("resize")
-        }
+        "scale" => args.get("action").and_then(|v| v.as_str()) == Some("resize"),
         _ => false,
     }
 }
@@ -574,7 +587,9 @@ pub(crate) fn restore_triggers_from_backup_if_empty(db: &MemoryDb) -> Result<usi
         Ok(triggers) => triggers.len(),
         Err(err) => {
             eprintln!("[trigger-restore] failed to query trigger count: {err}");
-            return Err(format!("[trigger-restore] failed to query trigger count: {err}"));
+            return Err(format!(
+                "[trigger-restore] failed to query trigger count: {err}"
+            ));
         }
     };
     if existing != 0 {
@@ -586,11 +601,16 @@ pub(crate) fn restore_triggers_from_backup_if_empty(db: &MemoryDb) -> Result<usi
         return Ok(0);
     }
 
-    eprintln!("Trigger table empty, restoring {} triggers from backup", backup.len());
+    eprintln!(
+        "Trigger table empty, restoring {} triggers from backup",
+        backup.len()
+    );
     if !LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
         if let Err(err) = save_triggers(db, &backup) {
             eprintln!("[trigger-restore] failed to restore triggers from backup: {err}");
-            return Err(format!("[trigger-restore] failed to restore triggers from backup: {err}"));
+            return Err(format!(
+                "[trigger-restore] failed to restore triggers from backup: {err}"
+            ));
         }
         return Ok(backup.len());
     }
@@ -747,7 +767,8 @@ fn refresh_oauth_token(
     }
     let db = open_or_create_db(mv2)?;
     let bytes = serde_json::to_vec_pretty(&new_token)?;
-    save_config_entry(&db, config_key, &bytes).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    save_config_entry(&db, config_key, &bytes)
+        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     Ok(new_token)
 }
 
@@ -777,11 +798,17 @@ pub(crate) fn refresh_microsoft_token(
         "MICROSOFT_CLIENT_SECRET",
         "https://login.microsoftonline.com/common/oauth2/v2.0/token",
         "oauth.microsoft",
-        &[("scope", "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Calendars.ReadWrite")],
+        &[(
+            "scope",
+            "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Calendars.ReadWrite",
+        )],
     )
 }
 
-pub(crate) fn get_oauth_token(mv2: &Path, provider: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn get_oauth_token(
+    mv2: &Path,
+    provider: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let db = open_or_create_db(mv2)?;
     let key = format!("oauth.{provider}");
     let token = load_config_json(&db, &key).ok_or("missing oauth token")?;
@@ -852,7 +879,10 @@ pub(crate) fn tokenize_words(text: &str) -> HashSet<String> {
 
 /// Token containment coefficient: what fraction of b's tokens appear in a?
 /// Better than Jaccard for asymmetric sets (long query vs short entity name).
-pub(crate) fn token_containment(query_tokens: &HashSet<String>, entity_tokens: &HashSet<String>) -> f64 {
+pub(crate) fn token_containment(
+    query_tokens: &HashSet<String>,
+    entity_tokens: &HashSet<String>,
+) -> f64 {
     if entity_tokens.is_empty() {
         return 0.0;
     }
@@ -866,14 +896,22 @@ pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let b_chars: Vec<char> = b.chars().collect();
     let m = a_chars.len();
     let n = b_chars.len();
-    if m == 0 { return n; }
-    if n == 0 { return m; }
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
     let mut prev = (0..=n).collect::<Vec<_>>();
     let mut curr = vec![0; n + 1];
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
             curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
@@ -907,7 +945,9 @@ pub(crate) fn find_kg_entities(text: &str, graph: &KgGraph) -> Vec<String> {
     for node in &graph.nodes {
         let name = node.name.as_deref().unwrap_or(&node.id);
         let char_count = name.chars().count();
-        if char_count < 3 { continue; }
+        if char_count < 3 {
+            continue;
+        }
         let name_lower = name.to_lowercase();
         let mut score: f64 = 0.0;
 
@@ -926,7 +966,9 @@ pub(crate) fn find_kg_entities(text: &str, graph: &KgGraph) -> Vec<String> {
                 }
                 // Move past this occurrence and try the next
                 search_start = abs_pos + name_lower.len().max(1);
-                if search_start >= text_lower.len() { break; }
+                if search_start >= text_lower.len() {
+                    break;
+                }
             }
         } else if text_lower.contains(&name_lower) {
             score = 1.0;
@@ -947,7 +989,9 @@ pub(crate) fn find_kg_entities(text: &str, graph: &KgGraph) -> Vec<String> {
             let name_char_count = name_lower.chars().count();
             for word in &text_tokens {
                 let word_char_count = word.chars().count();
-                if word_char_count < 3 { continue; }
+                if word_char_count < 3 {
+                    continue;
+                }
                 // Skip if length difference is too large (can't meet 0.7 threshold)
                 let len_diff = (word_char_count as isize - name_char_count as isize).unsigned_abs();
                 let max_len = word_char_count.max(name_char_count);
@@ -978,15 +1022,17 @@ pub(crate) fn find_kg_entities(text: &str, graph: &KgGraph) -> Vec<String> {
 pub(crate) fn build_kg_context(entity_names: &[String], graph: &KgGraph) -> String {
     let mut ctx = String::new();
     for name in entity_names {
-        let node = graph.nodes.iter().find(|n| {
-            n.name.as_deref().unwrap_or(&n.id) == name
-        });
+        let node = graph
+            .nodes
+            .iter()
+            .find(|n| n.name.as_deref().unwrap_or(&n.id) == name);
         if let Some(node) = node {
             let node_type = node.node_type.as_deref().unwrap_or("unknown");
             ctx.push_str(&format!("## {} ({})\n", name, node_type));
             if let Some(ref props) = node.properties {
                 if !props.is_empty() {
-                    let props_str: Vec<String> = props.iter()
+                    let props_str: Vec<String> = props
+                        .iter()
                         .filter(|(k, _)| *k != "name" && *k != "type")
                         .map(|(k, v)| format!("{}={}", k, v))
                         .collect();
@@ -1087,10 +1133,13 @@ pub(crate) fn bootstrap_workspace(
 
 // ── Timezone / Scheduling ───────────────────────────────────────────────
 
-pub(crate) fn parse_timezone_offset(value: &str) -> Result<chrono::FixedOffset, Box<dyn std::error::Error>> {
+pub(crate) fn parse_timezone_offset(
+    value: &str,
+) -> Result<chrono::FixedOffset, Box<dyn std::error::Error>> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return chrono::FixedOffset::east_opt(0).ok_or_else(|| "invalid zero timezone offset".into());
+        return chrono::FixedOffset::east_opt(0)
+            .ok_or_else(|| "invalid zero timezone offset".into());
     }
     let sign = if trimmed.starts_with('-') { -1 } else { 1 };
     let value = trimmed.trim_start_matches(['+', '-']);
@@ -1233,9 +1282,9 @@ pub(crate) fn run_schedule_loop(
                             .timeout_read(Duration::from_secs(86400))
                             .build();
                         let base_url = match std::env::var("TELEGRAM_API_BASE") {
-    Ok(base) => format!("{base}/bot{token}"),
-    Err(_) => format!("https://api.telegram.org/bot{token}"),
-};
+                            Ok(base) => format!("{base}/bot{token}"),
+                            Err(_) => format!("https://api.telegram.org/bot{token}"),
+                        };
                         if let Ok(chat_id) = chat_id.parse::<i64>() {
                             let _ = telegram_send_message(&agent, &base_url, chat_id, &text);
                         }
@@ -1335,8 +1384,14 @@ pub(crate) fn run_watch_loop(
                                 prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
                             }
                             let session = format!("trigger:email:{}", trigger.id);
-                            let _ =
-                                run_agent_for_bridge(&agent_config, &prompt, session, None, None, None);
+                            let _ = run_agent_for_bridge(
+                                &agent_config,
+                                &prompt,
+                                session,
+                                None,
+                                None,
+                                None,
+                            );
                         }
                     }
                 }
@@ -1396,8 +1451,14 @@ pub(crate) fn run_watch_loop(
                                 prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
                             }
                             let session = format!("trigger:calendar:{}", trigger.id);
-                            let _ =
-                                run_agent_for_bridge(&agent_config, &prompt, session, None, None, None);
+                            let _ = run_agent_for_bridge(
+                                &agent_config,
+                                &prompt,
+                                session,
+                                None,
+                                None,
+                                None,
+                            );
                         }
                     }
                 }
@@ -1423,29 +1484,34 @@ pub(crate) fn run_watch_loop(
                         chrono::Weekday::Fri => 5,
                         chrono::Weekday::Sat => 6,
                     };
-                    if cron_expr.matches(
-                        now.minute(),
-                        now.hour(),
-                        now.day(),
-                        now.month(),
-                        dow,
-                    ) {
+                    if cron_expr.matches(now.minute(), now.hour(), now.day(), now.month(), dow) {
                         // Don't fire more than once in the same minute
-                        let current_minute = format!("{}-{:02}-{:02}T{:02}:{:02}",
-                            now.year(), now.month(), now.day(), now.hour(), now.minute());
+                        let current_minute = format!(
+                            "{}-{:02}-{:02}T{:02}:{:02}",
+                            now.year(),
+                            now.month(),
+                            now.day(),
+                            now.hour(),
+                            now.minute()
+                        );
                         if trigger.last_fired.as_deref() == Some(&current_minute) {
                             continue;
                         }
                         trigger.last_fired = Some(current_minute);
                         updated = true;
                         let mut prompt = trigger.prompt.clone().unwrap_or_else(|| {
-                            format!("Cron trigger '{}' fired.", trigger.name.as_deref().unwrap_or(&trigger.id))
+                            format!(
+                                "Cron trigger '{}' fired.",
+                                trigger.name.as_deref().unwrap_or(&trigger.id)
+                            )
                         });
                         if let Some(ws) = &workspace {
                             prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
                         }
                         let session = format!("trigger:cron:{}", trigger.id);
-                        if let Err(e) = run_agent_for_bridge(&agent_config, &prompt, session, None, None, None) {
+                        if let Err(e) =
+                            run_agent_for_bridge(&agent_config, &prompt, session, None, None, None)
+                        {
                             eprintln!("[watch] trigger '{}' agent failed: {e}", trigger.id);
                         }
                     }
@@ -1455,7 +1521,11 @@ pub(crate) fn run_watch_loop(
                         Some(u) if !u.trim().is_empty() => u.clone(),
                         _ => continue,
                     };
-                    let method = trigger.webhook_method.as_deref().unwrap_or("GET").to_uppercase();
+                    let method = trigger
+                        .webhook_method
+                        .as_deref()
+                        .unwrap_or("GET")
+                        .to_uppercase();
                     let agent = ureq::AgentBuilder::new()
                         .timeout_connect(Duration::from_secs(86400))
                         .timeout_read(Duration::from_secs(86400))
@@ -1486,19 +1556,28 @@ pub(crate) fn run_watch_loop(
                     trigger.last_fired = Some(now.to_rfc3339());
                     updated = true;
                     let mut prompt = trigger.prompt.clone().unwrap_or_else(|| {
-                        format!("Webhook trigger '{}' detected a change.", trigger.name.as_deref().unwrap_or(&trigger.id))
+                        format!(
+                            "Webhook trigger '{}' detected a change.",
+                            trigger.name.as_deref().unwrap_or(&trigger.id)
+                        )
                     });
-                    let preview_end = payload.char_indices()
+                    let preview_end = payload
+                        .char_indices()
                         .take_while(|&(i, _)| i < 500)
                         .last()
                         .map(|(i, c)| i + c.len_utf8())
                         .unwrap_or(0);
-                    prompt.push_str(&format!("\n\nWebhook URL: {url}\nResponse preview: {}", &payload[..preview_end]));
+                    prompt.push_str(&format!(
+                        "\n\nWebhook URL: {url}\nResponse preview: {}",
+                        &payload[..preview_end]
+                    ));
                     if let Some(ws) = &workspace {
                         prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
                     }
                     let session = format!("trigger:webhook:{}", trigger.id);
-                    if let Err(e) = run_agent_for_bridge(&agent_config, &prompt, session, None, None, None) {
+                    if let Err(e) =
+                        run_agent_for_bridge(&agent_config, &prompt, session, None, None, None)
+                    {
                         eprintln!("[watch] trigger '{}' agent failed: {e}", trigger.id);
                     }
                 }
@@ -1530,7 +1609,11 @@ pub(crate) fn qdrant_search_text(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchHit>, String> {
-    let url = format!("{}/collections/{}/points/query", base_url.trim_end_matches('/'), collection);
+    let url = format!(
+        "{}/collections/{}/points/query",
+        base_url.trim_end_matches('/'),
+        collection
+    );
     let body = serde_json::json!({
         "query": query,
         "limit": limit,
@@ -1542,7 +1625,8 @@ pub(crate) fn qdrant_search_text(
         .timeout_read(Duration::from_secs(86400))
         .build();
 
-    let resp = agent.post(&url)
+    let resp = agent
+        .post(&url)
         .set("content-type", "application/json")
         .send_string(&serde_json::to_string(&body).map_err(|e| e.to_string())?)
         .map_err(|e| format!("qdrant request: {e}"))?;
@@ -1552,12 +1636,17 @@ pub(crate) fn qdrant_search_text(
     // Check for Qdrant error status before extracting points
     if let Some(status) = result.get("status").and_then(|s| s.as_str()) {
         if status == "error" {
-            let msg = result.get("result").and_then(|r| r.get("description")).and_then(|m| m.as_str()).unwrap_or("unknown");
+            let msg = result
+                .get("result")
+                .and_then(|r| r.get("description"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown");
             return Err(format!("qdrant error: {msg}"));
         }
     }
 
-    let points = result.get("result")
+    let points = result
+        .get("result")
         .or_else(|| result.get("points"))
         .and_then(|v| v.as_array())
         .cloned()
@@ -1567,18 +1656,24 @@ pub(crate) fn qdrant_search_text(
     for (rank, point) in points.iter().enumerate() {
         let score = point.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
         let payload = point.get("payload").cloned().unwrap_or_default();
-        let uri = payload.get("uri").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let title = payload.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let text = payload.get("text")
+        let uri = payload
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = payload
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let text = payload
+            .get("text")
             .or_else(|| payload.get("snippet"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .chars()
             .take(300)
             .collect::<String>();
-        let frame_id = point.get("id")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let frame_id = point.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
 
         hits.push(SearchHit {
             rank,
@@ -1601,7 +1696,10 @@ pub(crate) fn qdrant_search_text(
 // ── Trigger Thread (shared-state, embedded in bridge) ───────────────────
 
 /// Append text to the daily note file (capsule workspace).
-pub(crate) fn append_to_daily_note(workspace: &Path, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn append_to_daily_note(
+    workspace: &Path,
+    text: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let date = Utc::now().format("%Y-%m-%d").to_string();
     let dir = workspace.join("memory");
     fs::create_dir_all(&dir)?;
@@ -1641,7 +1739,8 @@ fn run_heartbeat(
             }
         }
         let stale = reg.stale_tasks(Duration::from_secs(30 * 60));
-        let stale_names: Vec<String> = stale.iter()
+        let stale_names: Vec<String> = stale
+            .iter()
             .map(|(_, t)| format!("{}: {}", t.task_id, t.name))
             .collect();
         (running, completed, failed, stale_names)
@@ -1690,8 +1789,11 @@ fn run_heartbeat(
 
     for (chat_id, failed_task) in &failed_restartable {
         let new_session = format!("restart:{}:{}", failed_task.name, Utc::now().timestamp());
-        eprintln!("[heartbeat] restarting failed task '{}' (attempt {})",
-            failed_task.name, failed_task.retry_count + 1);
+        eprintln!(
+            "[heartbeat] restarting failed task '{}' (attempt {})",
+            failed_task.name,
+            failed_task.retry_count + 1
+        );
 
         // Remove the failed task from registry
         {
@@ -1703,58 +1805,101 @@ fn run_heartbeat(
 
         let restart_prompt = format!(
             "RESTARTING (attempt {}): This task previously failed. Original prompt:\n\n{}",
-            failed_task.retry_count + 1, failed_task.full_prompt
+            failed_task.retry_count + 1,
+            failed_task.full_prompt
         );
-        match run_agent_for_bridge(agent_config, &restart_prompt, new_session.clone(), None, None, None) {
+        match run_agent_for_bridge(
+            agent_config,
+            &restart_prompt,
+            new_session.clone(),
+            None,
+            None,
+            None,
+        ) {
             Ok(output) => {
-                tg_notify(tg, &format!("Restarted '{}' (attempt {}) — {}",
-                    failed_task.name, failed_task.retry_count + 1,
-                    truncate_text(output.final_text.as_deref().unwrap_or("done"), 200)));
+                tg_notify(
+                    tg,
+                    &format!(
+                        "Restarted '{}' (attempt {}) — {}",
+                        failed_task.name,
+                        failed_task.retry_count + 1,
+                        truncate_text(output.final_text.as_deref().unwrap_or("done"), 200)
+                    ),
+                );
             }
             Err(e) => {
-                eprintln!("[heartbeat] restart of '{}' failed again: {e}", failed_task.name);
+                eprintln!(
+                    "[heartbeat] restart of '{}' failed again: {e}",
+                    failed_task.name
+                );
                 let mut reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
-                reg.register(*chat_id, BackgroundTask {
-                    task_id: format!("retry-{}", failed_task.task_id),
-                    name: failed_task.name.clone(),
-                    prompt_preview: failed_task.prompt_preview.clone(),
-                    full_prompt: failed_task.full_prompt.clone(),
-                    retry_count: failed_task.retry_count + 1,
-                    status: BackgroundTaskStatus::Failed(e),
-                    started_at_epoch: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs()).unwrap_or(0),
-                    completed_at_epoch: None,
-                    step_count: 0,
-                    max_steps: failed_task.max_steps,
-                    result_text: None,
-                    session: new_session,
-                });
+                reg.register(
+                    *chat_id,
+                    BackgroundTask {
+                        task_id: format!("retry-{}", failed_task.task_id),
+                        name: failed_task.name.clone(),
+                        prompt_preview: failed_task.prompt_preview.clone(),
+                        full_prompt: failed_task.full_prompt.clone(),
+                        retry_count: failed_task.retry_count + 1,
+                        status: BackgroundTaskStatus::Failed(e),
+                        started_at_epoch: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                        completed_at_epoch: None,
+                        step_count: 0,
+                        max_steps: failed_task.max_steps,
+                        result_text: None,
+                        session: new_session,
+                    },
+                );
             }
         }
     }
 
     // Only write heartbeat if there's something to report
-    if running == 0 && completed == 0 && failed == 0 && active_sessions == 0 && stale_sessions == 0
+    if running == 0
+        && completed == 0
+        && failed == 0
+        && active_sessions == 0
+        && stale_sessions == 0
         && failed_restartable.is_empty()
     {
         return Ok(());
     }
 
     let mut entry = format!("## Heartbeat [{timestamp}]\n");
-    entry.push_str(&format!("- Active subagents: {} running, {} completed, {} failed\n", running, completed, failed));
-    entry.push_str(&format!("- Sessions: {} active, {} stale\n", active_sessions, stale_sessions));
+    entry.push_str(&format!(
+        "- Active subagents: {} running, {} completed, {} failed\n",
+        running, completed, failed
+    ));
+    entry.push_str(&format!(
+        "- Sessions: {} active, {} stale\n",
+        active_sessions, stale_sessions
+    ));
     if !stale_names.is_empty() {
-        entry.push_str(&format!("- Stale tasks (>30m): [{}]\n", stale_names.join(", ")));
+        entry.push_str(&format!(
+            "- Stale tasks (>30m): [{}]\n",
+            stale_names.join(", ")
+        ));
     }
     if !failed_restartable.is_empty() {
-        let names: Vec<String> = failed_restartable.iter().map(|(_, t)| t.name.clone()).collect();
+        let names: Vec<String> = failed_restartable
+            .iter()
+            .map(|(_, t)| t.name.clone())
+            .collect();
         entry.push_str(&format!("- Auto-restarted: [{}]\n", names.join(", ")));
     }
 
     append_to_daily_note(workspace, &entry)?;
-    eprintln!("[trigger-thread] heartbeat logged: {}R {}C {}F, {}S active, {} restarted",
-        running, completed, failed, active_sessions, failed_restartable.len());
+    eprintln!(
+        "[trigger-thread] heartbeat logged: {}R {}C {}F, {}S active, {} restarted",
+        running,
+        completed,
+        failed,
+        active_sessions,
+        failed_restartable.len()
+    );
     Ok(())
 }
 
@@ -1796,7 +1941,10 @@ Update project_list entries: mark completed items, advance current_step on activ
         Ok(output) => {
             eprintln!("[trigger-thread] nightly consolidation completed");
             if let Some(ref text) = output.final_text {
-                tg_notify(tg, &format!("Nightly review:\n{}", truncate_text(text, 1500)));
+                tg_notify(
+                    tg,
+                    &format!("Nightly review:\n{}", truncate_text(text, 1500)),
+                );
             }
         }
         Err(e) => eprintln!("[trigger-thread] nightly consolidation failed: {e}"),
@@ -1819,7 +1967,9 @@ fn run_morning_kickoff(
     };
 
     // Read yesterday's daily note for open threads
-    let yesterday = (Utc::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+    let yesterday = (Utc::now() - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
     let yesterday_path = workspace.join("memory").join(format!("{yesterday}.md"));
     let yesterday_note = if yesterday_path.exists() {
         fs::read_to_string(&yesterday_path).unwrap_or_default()
@@ -1853,7 +2003,10 @@ fn run_morning_kickoff(
         Ok(output) => {
             eprintln!("[trigger-thread] morning kickoff completed");
             if let Some(ref text) = output.final_text {
-                tg_notify(tg, &format!("Morning kickoff:\n{}", truncate_text(text, 1500)));
+                tg_notify(
+                    tg,
+                    &format!("Morning kickoff:\n{}", truncate_text(text, 1500)),
+                );
             }
         }
         Err(e) => eprintln!("[trigger-thread] morning kickoff failed: {e}"),
@@ -1871,7 +2024,9 @@ fn run_idle_check(
     // Don't start idle work if subagents are already running
     {
         let reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
-        let running: usize = reg.tasks.values()
+        let running: usize = reg
+            .tasks
+            .values()
             .flat_map(|t| t.iter())
             .filter(|t| t.status == BackgroundTaskStatus::Running)
             .count();
@@ -1887,15 +2042,15 @@ fn run_idle_check(
     }
     let data = fs::read_to_string(&projects_path).unwrap_or_else(|_| "[]".to_string());
     let projects: Vec<crate::ActiveProject> = serde_json::from_str(&data).unwrap_or_default();
-    let active_projects: Vec<&crate::ActiveProject> = projects.iter()
-        .filter(|p| p.status == "active")
-        .collect();
+    let active_projects: Vec<&crate::ActiveProject> =
+        projects.iter().filter(|p| p.status == "active").collect();
     if active_projects.is_empty() {
         return Ok(false);
     }
 
     // Build a focused prompt
-    let project_names: Vec<String> = active_projects.iter()
+    let project_names: Vec<String> = active_projects
+        .iter()
         .map(|p| format!("- {} (step: {})", p.name, p.current_step))
         .collect();
 
@@ -1915,13 +2070,19 @@ fn run_idle_check(
     );
 
     let session = format!("idle:{}", Utc::now().format("%Y-%m-%dT%H:%M"));
-    eprintln!("[trigger-thread] starting idle work check ({} active projects)", active_projects.len());
+    eprintln!(
+        "[trigger-thread] starting idle work check ({} active projects)",
+        active_projects.len()
+    );
     match run_agent_for_bridge(agent_config, &prompt, session, None, None, None) {
         Ok(output) => {
             eprintln!("[trigger-thread] idle work completed");
             if let Some(ref text) = output.final_text {
                 if text.len() > 50 {
-                    tg_notify(tg, &format!("Autonomous work:\n{}", truncate_text(text, 1500)));
+                    tg_notify(
+                        tg,
+                        &format!("Autonomous work:\n{}", truncate_text(text, 1500)),
+                    );
                 }
             }
         }
@@ -1947,7 +2108,8 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     if text.len() <= max_chars {
         text.to_string()
     } else {
-        let end = text.char_indices()
+        let end = text
+            .char_indices()
             .take_while(|&(i, _)| i < max_chars)
             .last()
             .map(|(i, c)| i + c.len_utf8())
@@ -1987,7 +2149,10 @@ deploying code, managing payments, posting content, monitoring services.";
     match run_agent_for_bridge(agent_config, prompt, session, None, None, None) {
         Ok(output) => {
             if let Some(ref text) = output.final_text {
-                tg_notify(tg, &format!("Self-improvement review:\n{}", truncate_text(text, 1500)));
+                tg_notify(
+                    tg,
+                    &format!("Self-improvement review:\n{}", truncate_text(text, 1500)),
+                );
             }
         }
         Err(e) => eprintln!("[trigger-thread] self-improvement failed: {e}"),
@@ -2082,7 +2247,9 @@ pub(crate) fn run_trigger_thread(
                 if !db_ok {
                     if let Some(err) = db_persistent.triggers_list().err() {
                         let msg = err.to_string().to_ascii_lowercase();
-                        if msg.contains("malformed") || msg.contains("disk i/o error") || msg.contains("locking protocol")
+                        if msg.contains("malformed")
+                            || msg.contains("disk i/o error")
+                            || msg.contains("locking protocol")
                         {
                             attempt += 1;
                             if attempt >= MAX_TRIGGER_DB_RETRIES {
@@ -2104,7 +2271,8 @@ pub(crate) fn run_trigger_thread(
                         Err(e) => {
                             attempt += 1;
                             let backoff_ms = std::cmp::min(
-                                500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))),
+                                500u64
+                                    .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))),
                                 30_000,
                             );
                             if attempt <= 2 || attempt.is_power_of_two() {
@@ -2142,7 +2310,10 @@ pub(crate) fn run_trigger_thread(
                         let cron_expr = match CronExpr::parse(&cron_str) {
                             Ok(expr) => expr,
                             Err(e) => {
-                                eprintln!("[trigger-thread] trigger '{}' bad cron: {e}", trigger.id);
+                                eprintln!(
+                                    "[trigger-thread] trigger '{}' bad cron: {e}",
+                                    trigger.id
+                                );
                                 continue;
                             }
                         };
@@ -2155,32 +2326,57 @@ pub(crate) fn run_trigger_thread(
                             chrono::Weekday::Fri => 5,
                             chrono::Weekday::Sat => 6,
                         };
-                        if cron_expr.matches(now.minute(), now.hour(), now.day(), now.month(), dow) {
-                            let current_minute = format!("{}-{:02}-{:02}T{:02}:{:02}",
-                                now.year(), now.month(), now.day(), now.hour(), now.minute());
+                        if cron_expr.matches(now.minute(), now.hour(), now.day(), now.month(), dow)
+                        {
+                            let current_minute = format!(
+                                "{}-{:02}-{:02}T{:02}:{:02}",
+                                now.year(),
+                                now.month(),
+                                now.day(),
+                                now.hour(),
+                                now.minute()
+                            );
                             if trigger.last_fired.as_deref() == Some(&current_minute) {
                                 continue;
                             }
                             trigger.last_fired = Some(current_minute);
                             updated = true;
                             let mut prompt = trigger.prompt.clone().unwrap_or_else(|| {
-                                format!("Cron trigger '{}' fired.", trigger.name.as_deref().unwrap_or(&trigger.id))
+                                format!(
+                                    "Cron trigger '{}' fired.",
+                                    trigger.name.as_deref().unwrap_or(&trigger.id)
+                                )
                             });
                             if let Some(ref ws) = workspace {
                                 prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
                             }
                             let session = format!("trigger:cron:{}", trigger.id);
-                            match run_agent_for_bridge(&agent_config, &prompt, session, None, None, None) {
+                            match run_agent_for_bridge(
+                                &agent_config,
+                                &prompt,
+                                session,
+                                None,
+                                None,
+                                None,
+                            ) {
                                 Ok(output) => {
                                     if let Some(ref text) = output.final_text {
                                         if text.len() > 50 {
-                                            tg_notify(&tg, &format!("Trigger '{}':\n{}",
-                                                trigger.name.as_deref().unwrap_or(&trigger.id),
-                                                truncate_text(text, 1000)));
+                                            tg_notify(
+                                                &tg,
+                                                &format!(
+                                                    "Trigger '{}':\n{}",
+                                                    trigger.name.as_deref().unwrap_or(&trigger.id),
+                                                    truncate_text(text, 1000)
+                                                ),
+                                            );
                                         }
                                     }
                                 }
-                                Err(e) => eprintln!("[trigger-thread] trigger '{}' agent failed: {e}", trigger.id),
+                                Err(e) => eprintln!(
+                                    "[trigger-thread] trigger '{}' agent failed: {e}",
+                                    trigger.id
+                                ),
                             }
                         }
                     }
@@ -2232,7 +2428,14 @@ pub(crate) fn run_trigger_thread(
                                     prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
                                 }
                                 let session = format!("trigger:email:{}", trigger.id);
-                                let _ = run_agent_for_bridge(&agent_config, &prompt, session, None, None, None);
+                                let _ = run_agent_for_bridge(
+                                    &agent_config,
+                                    &prompt,
+                                    session,
+                                    None,
+                                    None,
+                                    None,
+                                );
                             }
                         }
                     }
@@ -2241,7 +2444,11 @@ pub(crate) fn run_trigger_thread(
                             Some(u) if !u.trim().is_empty() => u.clone(),
                             _ => continue,
                         };
-                        let method = trigger.webhook_method.as_deref().unwrap_or("GET").to_uppercase();
+                        let method = trigger
+                            .webhook_method
+                            .as_deref()
+                            .unwrap_or("GET")
+                            .to_uppercase();
                         let agent = ureq::AgentBuilder::new()
                             .timeout_connect(Duration::from_secs(30))
                             .timeout_read(Duration::from_secs(30))
@@ -2253,7 +2460,10 @@ pub(crate) fn run_trigger_thread(
                         let payload = match resp {
                             Ok(resp) => resp.into_string().unwrap_or_default(),
                             Err(e) => {
-                                eprintln!("[trigger-thread] trigger '{}' webhook error: {e}", trigger.id);
+                                eprintln!(
+                                    "[trigger-thread] trigger '{}' webhook error: {e}",
+                                    trigger.id
+                                );
                                 continue;
                             }
                         };
@@ -2270,20 +2480,32 @@ pub(crate) fn run_trigger_thread(
                         trigger.last_fired = Some(now.to_rfc3339());
                         updated = true;
                         let mut prompt = trigger.prompt.clone().unwrap_or_else(|| {
-                            format!("Webhook trigger '{}' detected a change.", trigger.name.as_deref().unwrap_or(&trigger.id))
+                            format!(
+                                "Webhook trigger '{}' detected a change.",
+                                trigger.name.as_deref().unwrap_or(&trigger.id)
+                            )
                         });
-                        let preview_end = payload.char_indices()
+                        let preview_end = payload
+                            .char_indices()
                             .take_while(|&(i, _)| i < 500)
                             .last()
                             .map(|(i, c)| i + c.len_utf8())
                             .unwrap_or(0);
-                        prompt.push_str(&format!("\n\nWebhook URL: {url}\nResponse preview: {}", &payload[..preview_end]));
+                        prompt.push_str(&format!(
+                            "\n\nWebhook URL: {url}\nResponse preview: {}",
+                            &payload[..preview_end]
+                        ));
                         if let Some(ref ws) = workspace {
                             prompt.push_str(&format!("\nWorkspace: {}", ws.display()));
                         }
                         let session = format!("trigger:webhook:{}", trigger.id);
-                        if let Err(e) = run_agent_for_bridge(&agent_config, &prompt, session, None, None, None) {
-                            eprintln!("[trigger-thread] trigger '{}' agent failed: {e}", trigger.id);
+                        if let Err(e) =
+                            run_agent_for_bridge(&agent_config, &prompt, session, None, None, None)
+                        {
+                            eprintln!(
+                                "[trigger-thread] trigger '{}' agent failed: {e}",
+                                trigger.id
+                            );
                         }
                     }
                     _ => {}
@@ -2302,7 +2524,9 @@ pub(crate) fn run_trigger_thread(
         // 2. Heartbeat every 5 minutes (with auto-restart of failed tasks)
         if last_heartbeat.elapsed() > Duration::from_secs(300) {
             if let Some(ref ws) = workspace {
-                if let Err(e) = run_heartbeat(&bg_registry, &session_registry, ws, &agent_config, &tg) {
+                if let Err(e) =
+                    run_heartbeat(&bg_registry, &session_registry, ws, &agent_config, &tg)
+                {
                     eprintln!("[trigger-thread] heartbeat error: {e}");
                 }
             }
@@ -2321,7 +2545,10 @@ pub(crate) fn run_trigger_thread(
         {
             let now_tz = Utc::now().with_timezone(&tz);
             let today_tz = now_tz.date_naive();
-            if now_tz.hour() == morning_hour && now_tz.minute() == 0 && last_morning != Some(today_tz) {
+            if now_tz.hour() == morning_hour
+                && now_tz.minute() == 0
+                && last_morning != Some(today_tz)
+            {
                 if let Some(ref ws) = workspace {
                     last_morning = Some(today_tz);
                     if let Err(e) = run_morning_kickoff(&agent_config, ws, &tg) {

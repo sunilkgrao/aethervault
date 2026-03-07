@@ -1,24 +1,25 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
-use std::sync::{mpsc, Arc};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use reqwest::blocking::{multipart, Client};
+use reqwest::blocking::{Client, multipart};
 use serde_json;
-use tungstenite::{connect, Message};
+use tungstenite::{Message, connect};
 
 use crate::{
-    load_session_turns, run_agent_with_prompt, save_session_turns, try_handle_approval_chat,
-    AgentRunOutput, BridgeAgentConfig, SessionTurn,
+    AgentRunOutput, BridgeAgentConfig, SessionTurn, load_session_turns, run_agent_with_prompt,
+    save_session_turns, try_handle_approval_chat,
 };
 
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 120_000;
 const SLACK_API_BASE: &str = "https://slack.com/api";
 fn voicebox_api_url() -> String {
-    std::env::var("VOICEBOX_API_URL").unwrap_or_else(|_| "http://localhost:8000/generate".to_string())
+    std::env::var("VOICEBOX_API_URL")
+        .unwrap_or_else(|_| "http://localhost:8000/generate".to_string())
 }
 const MAX_QUEUED_PER_SESSION: usize = 5;
 const MAX_FILE_BYTES: u64 = 25_000_000;
@@ -116,7 +117,12 @@ fn slack_api_post_json(
 fn fetch_slack_bot_user_id(http_agent: &ureq::Agent, bot_token: &str) -> Option<String> {
     slack_api_post_json(http_agent, bot_token, "auth.test", &serde_json::json!({}))
         .ok()
-        .and_then(|payload| payload.get("user_id").and_then(|v| v.as_str()).map(ToString::to_string))
+        .and_then(|payload| {
+            payload
+                .get("user_id")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+        })
 }
 
 fn open_slack_socket_url(http_agent: &ureq::Agent, app_token: &str) -> Result<String, String> {
@@ -148,15 +154,13 @@ fn normalize_slack_payload(raw: &serde_json::Value) -> Option<serde_json::Value>
 }
 
 fn is_slack_dm_channel(channel_id: &str, channel_type: Option<&str>) -> bool {
-    channel_type == Some("im")
-        || channel_type == Some("mpim")
-        || channel_id.starts_with('D')
+    channel_type == Some("im") || channel_type == Some("mpim") || channel_id.starts_with('D')
 }
 
 fn bot_mention_present(text: &str, bot_user_id: &Option<String>) -> bool {
-    bot_user_id
-        .as_ref()
-        .is_some_and(|bot_id| text.contains(&format!("<@{bot_id}>")) || text.contains(&format!("<@{bot_id}|")))
+    bot_user_id.as_ref().is_some_and(|bot_id| {
+        text.contains(&format!("<@{bot_id}>")) || text.contains(&format!("<@{bot_id}|"))
+    })
 }
 
 fn strip_bot_mentions(text: &str, bot_user_id: &Option<String>) -> String {
@@ -270,7 +274,10 @@ fn summarize_text_file(bytes: &[u8], max_chars: usize) -> Option<String> {
     let char_count = trimmed.chars().count();
     let preview: String = trimmed.chars().take(max_chars).collect();
     if char_count > max_chars {
-        Some(format!("{preview}\n... (truncated, {} total chars)", char_count))
+        Some(format!(
+            "{preview}\n... (truncated, {} total chars)",
+            char_count
+        ))
     } else {
         Some(preview)
     }
@@ -308,7 +315,8 @@ fn extract_slack_file_context(
             continue;
         }
 
-        let Some((bytes, remote_mime)) = slack_download_file_bytes(http_agent, bot_token, file_url) else {
+        let Some((bytes, remote_mime)) = slack_download_file_bytes(http_agent, bot_token, file_url)
+        else {
             notes.push(format!("[Slack file: {name} ({mime}) download failed]"));
             continue;
         };
@@ -322,16 +330,21 @@ fn extract_slack_file_context(
 
         if is_text_file(&mime, &name) || is_text_file(&remote_mime, &name) {
             if let Some(preview) = summarize_text_file(&bytes, 16_000) {
-                notes.push(format!("[Slack text file: {name}]\n```")
-                    .chars()
-                    .chain(preview.chars())
-                    .chain("\n```".chars())
-                    .collect());
+                notes.push(
+                    format!("[Slack text file: {name}]\n```")
+                        .chars()
+                        .chain(preview.chars())
+                        .chain("\n```".chars())
+                        .collect(),
+                );
                 continue;
             }
         }
 
-        notes.push(format!("[Slack file: {name} ({mime}), {} bytes]", bytes.len()));
+        notes.push(format!(
+            "[Slack file: {name} ({mime}), {} bytes]",
+            bytes.len()
+        ));
     }
 
     notes
@@ -415,9 +428,7 @@ fn parse_events_api_payload(
     }
 }
 
-fn parse_slash_command_payload(
-    payload: &serde_json::Value,
-) -> Option<SlackIncomingEvent> {
+fn parse_slash_command_payload(payload: &serde_json::Value) -> Option<SlackIncomingEvent> {
     let command = payload.get("command").and_then(|v| v.as_str())?.trim();
     let channel_id = payload
         .get("channel_id")
@@ -430,10 +441,7 @@ fn parse_slash_command_payload(
         .unwrap_or("unknown")
         .to_string();
 
-    let arg_text = payload
-        .get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let arg_text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
     let mut text = String::new();
     if !command.is_empty() {
@@ -586,7 +594,10 @@ fn parse_voice_directive(output: &str) -> (Option<VoiceDirective>, Option<String
     (Some(directive), remainder)
 }
 
-fn generate_voice_audio(http_agent: &ureq::Agent, directive: &VoiceDirective) -> Result<Vec<u8>, String> {
+fn generate_voice_audio(
+    http_agent: &ureq::Agent,
+    directive: &VoiceDirective,
+) -> Result<Vec<u8>, String> {
     let payload = serde_json::json!({
         "text": directive.text,
         "profile_id": directive.profile_id,
@@ -731,9 +742,10 @@ fn spawn_slack_run(
 
         let result = match result {
             Ok(agent_result) => agent_result,
-            Err(panic_info) => {
-                Err(format!("Agent crashed: {}", super::panic_to_string(panic_info)))
-            }
+            Err(panic_info) => Err(format!(
+                "Agent crashed: {}",
+                super::panic_to_string(panic_info)
+            )),
         };
 
         let _ = completion_tx.send(SlackCompletionEvent {
@@ -767,7 +779,9 @@ fn handle_slack_completion(
             if let Some(end) = after.find(']') {
                 let checkpoint_path = &after[..end];
                 if let Ok(checkpoint_json) = std::fs::read_to_string(checkpoint_path) {
-                    if let Ok(checkpoint) = serde_json::from_str::<crate::ContinuationCheckpoint>(&checkpoint_json) {
+                    if let Ok(checkpoint) =
+                        serde_json::from_str::<crate::ContinuationCheckpoint>(&checkpoint_json)
+                    {
                         if checkpoint.chain_depth < MAX_CHAIN_DEPTH {
                             let continuation_prompt = format!(
                                 "[Continuation from previous session — chain depth {}/{}]\n\n\
@@ -775,7 +789,8 @@ fn handle_slack_completion(
                                  ## Summary of work so far\n{}\n\n\
                                  ## Remaining work\n{}\n\n\
                                  Continue from where you left off. Do NOT repeat completed work.",
-                                checkpoint.chain_depth, MAX_CHAIN_DEPTH,
+                                checkpoint.chain_depth,
+                                MAX_CHAIN_DEPTH,
                                 checkpoint.goal,
                                 checkpoint.summary,
                                 checkpoint.remaining_work,
@@ -786,19 +801,25 @@ fn handle_slack_completion(
                                 checkpoint.chain_depth, MAX_CHAIN_DEPTH
                             );
                             let _ = send_slack_message(
-                                http_agent, bot_token, &completion.channel_id,
-                                completion.thread_ts.as_deref(), &status_msg,
+                                http_agent,
+                                bot_token,
+                                &completion.channel_id,
+                                completion.thread_ts.as_deref(),
+                                &status_msg,
                             );
                             eprintln!(
                                 "[auto-continuation] slack: chaining session (depth {}/{}): {}",
-                                checkpoint.chain_depth, MAX_CHAIN_DEPTH,
+                                checkpoint.chain_depth,
+                                MAX_CHAIN_DEPTH,
                                 checkpoint.goal.chars().take(80).collect::<String>()
                             );
 
                             // Re-insert active run state so completion handler works for the chained run
                             active_runs.insert(
                                 completion.session_key.clone(),
-                                SlackRunState { queued_messages: Vec::new() },
+                                SlackRunState {
+                                    queued_messages: Vec::new(),
+                                },
                             );
 
                             spawn_slack_run(
@@ -811,7 +832,10 @@ fn handle_slack_completion(
                             );
                             return; // Don't fall through to normal completion handling
                         } else {
-                            eprintln!("[auto-continuation] slack: max chain depth {} reached, stopping", MAX_CHAIN_DEPTH);
+                            eprintln!(
+                                "[auto-continuation] slack: max chain depth {} reached, stopping",
+                                MAX_CHAIN_DEPTH
+                            );
                         }
                     }
                 }
@@ -825,9 +849,13 @@ fn handle_slack_completion(
     if let Some(voice) = directive {
         if let Some(text) = trailing {
             if !text.trim().is_empty() {
-                if let Err(err) =
-                    send_slack_message(http_agent, bot_token, &completion.channel_id, completion.thread_ts.as_deref(), &text)
-                {
+                if let Err(err) = send_slack_message(
+                    http_agent,
+                    bot_token,
+                    &completion.channel_id,
+                    completion.thread_ts.as_deref(),
+                    &text,
+                ) {
                     eprintln!("Slack send error: {err}");
                 }
             }
@@ -940,7 +968,8 @@ fn handle_incoming_message(
 
     if let Some(state) = active_runs.get_mut(&incoming.session_key) {
         if state.queued_messages.len() < MAX_QUEUED_PER_SESSION {
-            state.queued_messages
+            state
+                .queued_messages
                 .push((incoming.text, incoming.thread_ts));
         }
         return;
@@ -965,7 +994,9 @@ fn handle_incoming_message(
 
 fn spawn_socket_listener(ws_url: String, tx: mpsc::Sender<SocketFrame>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut socket: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>> = match connect(&ws_url) {
+        let mut socket: tungstenite::WebSocket<
+            tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+        > = match connect(&ws_url) {
             Ok((socket, _)) => socket,
             Err(err) => {
                 let _ = tx.send(SocketFrame::Disconnected(format!("connect error: {err}")));
@@ -1060,7 +1091,13 @@ fn spawn_socket_listener(ws_url: String, tx: mpsc::Sender<SocketFrame>) -> threa
                         let _ = socket.send(Message::Text(ack.to_string().into()));
                     }
 
-                    if tx.send(SocketFrame::Event { envelope_id, payload }).is_err() {
+                    if tx
+                        .send(SocketFrame::Event {
+                            envelope_id,
+                            payload,
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1073,10 +1110,7 @@ fn spawn_socket_listener(ws_url: String, tx: mpsc::Sender<SocketFrame>) -> threa
                         .map(|frame| frame.reason)
                         .map(|reason| reason.to_string())
                         .unwrap_or_else(|| "socket closed".to_string());
-                    let _ = tx.send(SocketFrame::Disconnected(format!(
-                        "close: {}",
-                        reason
-                    )));
+                    let _ = tx.send(SocketFrame::Disconnected(format!("close: {}", reason)));
                     break;
                 }
                 _ => {}
@@ -1156,7 +1190,10 @@ pub(crate) fn run_slack_bridge(
             }
 
             match socket_rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(SocketFrame::Event { payload, envelope_id }) => {
+                Ok(SocketFrame::Event {
+                    payload,
+                    envelope_id,
+                }) => {
                     let event_id = payload
                         .get("event_id")
                         .and_then(|v| v.as_str())

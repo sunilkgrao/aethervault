@@ -45,11 +45,7 @@ pub(crate) fn token_jaccard(a: &str, b: &str) -> f32 {
     }
 
     if set_a.len() < 2 || set_b.len() < 2 {
-        return if a.eq_ignore_ascii_case(b) {
-            1.0
-        } else {
-            0.0
-        };
+        return if a.eq_ignore_ascii_case(b) { 1.0 } else { 0.0 };
     }
 
     let intersection = set_a.intersection(&set_b).count();
@@ -75,15 +71,11 @@ pub(crate) fn consolidate(
     let checksum_bytes = checksum.as_bytes().as_slice();
 
     if let Ok(existing_id) = db.find_active_frame_by_checksum(checksum_bytes) {
-        return ConsolidationDecision::Noop {
-            existing_id,
-        };
+        return ConsolidationDecision::Noop { existing_id };
     }
 
     // Step 2: FTS5 candidate retrieval using first ~200 chars of search text
-    let text = search_text.unwrap_or_else(|| {
-        std::str::from_utf8(bytes).unwrap_or("")
-    });
+    let text = search_text.unwrap_or_else(|| std::str::from_utf8(bytes).unwrap_or(""));
     if text.trim().is_empty() {
         return ConsolidationDecision::Add;
     }
@@ -171,10 +163,8 @@ pub(crate) fn put_with_consolidation(
 
             // Add audit trail in extra_metadata
             let mut opts = options;
-            opts.extra_metadata.insert(
-                "supersedes_id".into(),
-                supersede_id.to_string(),
-            );
+            opts.extra_metadata
+                .insert("supersedes_id".into(), supersede_id.to_string());
 
             let frame_id = db.put_bytes_with_options(bytes, opts)?;
             Ok(ConsolidationResult {
@@ -262,8 +252,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let db = MemoryDb::open_or_create(&path)?;
 
-        let decision =
-            consolidate(&db, b"brand new content here", Some("brand new content here"), None);
+        let decision = consolidate(
+            &db,
+            b"brand new content here",
+            Some("brand new content here"),
+            None,
+        );
         assert_eq!(decision, ConsolidationDecision::Add);
 
         std::fs::remove_file(&path).ok();
@@ -276,7 +270,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let db = MemoryDb::open_or_create(&path)?;
 
-        let content = b"Sunil prefers dark roast coffee in the morning and green tea in the afternoon";
+        let content =
+            b"Sunil prefers dark roast coffee in the morning and green tea in the afternoon";
         let mut opts = PutOptions::default();
         opts.uri = Some("aethervault://memory/test/1".to_string());
         opts.search_text = Some(String::from_utf8_lossy(content).to_string());
@@ -381,18 +376,19 @@ mod tests {
         opts2.uri = Some("aethervault://memory/observation/101".to_string());
         opts2.search_text = Some("the quick brown fox jumps over the lazy dog".to_string());
         opts2.track = Some("aethervault.observation".to_string());
-        let result2 = put_with_consolidation(
-            &db,
-            b"the quick brown fox jumps over the lazy dog",
-            opts2,
-        )?;
-        assert!(matches!(result2.decision, ConsolidationDecision::Noop { .. }));
+        let result2 =
+            put_with_consolidation(&db, b"the quick brown fox jumps over the lazy dog", opts2)?;
+        assert!(matches!(
+            result2.decision,
+            ConsolidationDecision::Noop { .. }
+        ));
         assert!(result2.frame_id.is_none());
 
         // Totally different content: ADD
         let mut opts3 = PutOptions::default();
         opts3.uri = Some("aethervault://memory/observation/102".to_string());
-        opts3.search_text = Some("quantum physics explains particle behavior at subatomic scales".to_string());
+        opts3.search_text =
+            Some("quantum physics explains particle behavior at subatomic scales".to_string());
         opts3.track = Some("aethervault.observation".to_string());
         let result3 = put_with_consolidation(
             &db,

@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "aethervault")]
@@ -594,9 +594,7 @@ pub(crate) enum Command {
     },
 
     /// Capsule statistics and breakdown by collection, age, size, and duplicates.
-    Stats {
-        mv2: PathBuf,
-    },
+    Stats { mv2: PathBuf },
 
     /// Migrate hot-memories.jsonl into the capsule (Mem0-style consolidation).
     MigrateHotMemories {

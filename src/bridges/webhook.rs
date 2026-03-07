@@ -3,11 +3,11 @@ use std::io::Read;
 use serde_json;
 use tiny_http::{Method, Response, Server};
 
-use std::io;
 use std::env;
+use std::io;
 
-use crate::{blake3_hash, try_handle_approval_chat, BridgeAgentConfig};
 use crate::bridges::run_agent_for_bridge;
+use crate::{BridgeAgentConfig, blake3_hash, try_handle_approval_chat};
 
 const WEBHOOK_MAX_BODY_BYTES_ENV: &str = "AETHERVAULT_WEBHOOK_MAX_BODY_BYTES";
 const DEFAULT_WEBHOOK_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -43,7 +43,9 @@ fn read_request_body(request: &mut tiny_http::Request) -> Result<String, String>
     Ok(body)
 }
 
-pub(crate) fn parse_json_body(request: &mut tiny_http::Request) -> Result<serde_json::Value, String> {
+pub(crate) fn parse_json_body(
+    request: &mut tiny_http::Request,
+) -> Result<serde_json::Value, String> {
     let body = read_request_body(request)?;
 
     if body.trim().is_empty() {
@@ -76,15 +78,14 @@ pub(crate) fn run_webhook_bridge(
             Ok(payload) => payload,
             Err(err) => {
                 if err == "payload too large" {
-                    let response = Response::from_string("payload too large")
-                        .with_status_code(413);
+                    let response = Response::from_string("payload too large").with_status_code(413);
                     let _ = request.respond(response);
                     continue;
                 }
 
                 eprintln!("{name} bridge malformed JSON payload: {err}");
-                let response = Response::from_string("bad request: malformed JSON body")
-                    .with_status_code(400);
+                let response =
+                    Response::from_string("bad request: malformed JSON body").with_status_code(400);
                 let _ = request.respond(response);
                 continue;
             }
@@ -231,4 +232,3 @@ pub(crate) fn extract_imessage_event(payload: &serde_json::Value) -> Option<(Str
 pub(crate) fn reply_none(_: &BridgeAgentConfig, _: &str) -> Option<String> {
     None
 }
-

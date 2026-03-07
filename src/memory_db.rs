@@ -11,12 +11,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use crate::TriggerEntry;
@@ -381,7 +381,7 @@ impl MemoryDb {
         // trigger thread, and observation consolidation all share this DB.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = 60000;"
+             PRAGMA busy_timeout = 60000;",
         )?;
 
         // Lightweight open check: verify we can read from the DB.
@@ -390,11 +390,16 @@ impl MemoryDb {
         // unnecessary recovery that replaces the DB with a stale backup.
         // Full integrity_check should only run on explicit user request.
         let read_ok = conn
-            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .is_ok();
 
         if !read_ok {
-            eprintln!("[capsule] Cannot read DB at {:?}, attempting recovery...", path);
+            eprintln!(
+                "[capsule] Cannot read DB at {:?}, attempting recovery...",
+                path
+            );
             return Self::recover_and_open(path);
         }
 
@@ -432,7 +437,9 @@ impl MemoryDb {
             db.apply_pragmas()?;
             db.init_schema()?;
             if let Err(e) = db.seed_trigger_id_counter_from_db() {
-                eprintln!("[capsule] WARNING: seed_trigger_id_counter_from_db failed (non-fatal): {e}");
+                eprintln!(
+                    "[capsule] WARNING: seed_trigger_id_counter_from_db failed (non-fatal): {e}"
+                );
             }
             return Ok(db);
         }
@@ -444,20 +451,25 @@ impl MemoryDb {
         if marker.exists() {
             if let Ok(meta) = std::fs::metadata(&marker) {
                 if let Ok(modified) = meta.modified() {
-                    if modified.elapsed().unwrap_or_default() < std::time::Duration::from_secs(600) {
+                    if modified.elapsed().unwrap_or_default() < std::time::Duration::from_secs(600)
+                    {
                         eprintln!(
                             "[capsule-recovery] BLOCKED: recovery already attempted in last 10 minutes. \
                              Refusing to cascade. Will open DB as-is or fail."
                         );
                         // Try opening the existing DB without recovery
                         let conn = Connection::open(path)?;
-                        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 60000;")?;
+                        conn.execute_batch(
+                            "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 60000;",
+                        )?;
                         let db = Self { conn };
                         db.apply_pragmas()?;
                         db.init_schema()?;
                         if let Err(e) = db.seed_trigger_id_counter_from_db() {
-                eprintln!("[capsule] WARNING: seed_trigger_id_counter_from_db failed (non-fatal): {e}");
-            }
+                            eprintln!(
+                                "[capsule] WARNING: seed_trigger_id_counter_from_db failed (non-fatal): {e}"
+                            );
+                        }
                         return Ok(db);
                     }
                 }
@@ -472,7 +484,10 @@ impl MemoryDb {
             .ok()
             .and_then(|c| {
                 c.execute_batch("PRAGMA busy_timeout = 60000;").ok()?;
-                c.query_row("SELECT count(*) FROM frames", [], |row| row.get::<_, i64>(0)).ok()
+                c.query_row("SELECT count(*) FROM frames", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .ok()
             })
             .unwrap_or(0);
 
@@ -498,8 +513,10 @@ impl MemoryDb {
                     db.apply_pragmas()?;
                     db.init_schema()?;
                     if let Err(e) = db.seed_trigger_id_counter_from_db() {
-                eprintln!("[capsule] WARNING: seed_trigger_id_counter_from_db failed (non-fatal): {e}");
-            }
+                        eprintln!(
+                            "[capsule] WARNING: seed_trigger_id_counter_from_db failed (non-fatal): {e}"
+                        );
+                    }
                     return Ok(db);
                 }
                 Ok(None) => {}
@@ -556,26 +573,32 @@ impl MemoryDb {
                     Ok(entry) => entry,
                     Err(_) => continue,
                 };
-            let entry_file_name = entry.file_name();
-            let file_name = match entry_file_name.to_str() {
-                Some(name) => name,
-                None => continue,
-            };
+                let entry_file_name = entry.file_name();
+                let file_name = match entry_file_name.to_str() {
+                    Some(name) => name,
+                    None => continue,
+                };
 
-            if !file_name.starts_with(&search_prefix) {
-                continue;
-            }
+                if !file_name.starts_with(&search_prefix) {
+                    continue;
+                }
 
-            let entry_path = entry.path();
-            if entry_path.is_file() {
-                wildcard_backups.push(entry_path);
+                let entry_path = entry.path();
+                if entry_path.is_file() {
+                    wildcard_backups.push(entry_path);
+                }
             }
-        }
         }
 
         wildcard_backups.sort_by(|a, b| {
-            let a_name = a.file_name().and_then(|name| name.to_str()).unwrap_or_default();
-            let b_name = b.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            let a_name = a
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let b_name = b
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
             b_name.cmp(a_name)
         });
         candidates.extend(wildcard_backups);
@@ -588,64 +611,80 @@ impl MemoryDb {
         backup_path: &Path,
         min_frame_count: i64,
     ) -> Result<Option<Connection>, String> {
-        let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Connection, String> {
-            // ── Pre-flight: check backup has enough data before overwriting ──
-            // Open the backup in-place (read-only) to count frames BEFORE copying.
-            let backup_conn = Connection::open_with_flags(
-                backup_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            ).map_err(|err| {
-                format!("cannot open backup {:?} for pre-flight check: {}", backup_path, err)
-            })?;
-            let backup_frames: i64 = backup_conn
-                .query_row("SELECT count(*) FROM frames", [], |row| row.get(0))
-                .unwrap_or(0);
-            drop(backup_conn);
-
-            if min_frame_count > 0 && backup_frames < min_frame_count / 2 {
-                return Err(format!(
-                    "backup {:?} has only {} frames vs {} in current DB — refusing to restore \
-                     (would lose >50% of data)",
-                    backup_path, backup_frames, min_frame_count
-                ));
-            }
-
-            std::fs::copy(backup_path, path).map_err(|err| {
-                format!(
-                    "failed to copy backup file {:?} to {:?}: {}",
-                    backup_path, path, err
+        let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<Connection, String> {
+                // ── Pre-flight: check backup has enough data before overwriting ──
+                // Open the backup in-place (read-only) to count frames BEFORE copying.
+                let backup_conn = Connection::open_with_flags(
+                    backup_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )
-            })?;
+                .map_err(|err| {
+                    format!(
+                        "cannot open backup {:?} for pre-flight check: {}",
+                        backup_path, err
+                    )
+                })?;
+                let backup_frames: i64 = backup_conn
+                    .query_row("SELECT count(*) FROM frames", [], |row| row.get(0))
+                    .unwrap_or(0);
+                drop(backup_conn);
 
-            let conn = Connection::open(path).map_err(|err| {
-                format!("failed to open recovered copy {:?} from {:?}: {}", path, backup_path, err)
-            })?;
+                if min_frame_count > 0 && backup_frames < min_frame_count / 2 {
+                    return Err(format!(
+                        "backup {:?} has only {} frames vs {} in current DB — refusing to restore \
+                     (would lose >50% of data)",
+                        backup_path, backup_frames, min_frame_count
+                    ));
+                }
 
-            // Lightweight read check instead of PRAGMA integrity_check.
-            // integrity_check can produce false negatives in WAL mode and is
-            // extremely slow on large DBs.  A sqlite_master read + frame count
-            // verifies the DB is structurally openable.
-            conn.execute_batch("PRAGMA busy_timeout = 60000;").map_err(|err| {
-                format!("failed to set busy_timeout after restore from {:?}: {}", backup_path, err)
-            })?;
-            let read_ok = conn
-                .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
-                .is_ok();
+                std::fs::copy(backup_path, path).map_err(|err| {
+                    format!(
+                        "failed to copy backup file {:?} to {:?}: {}",
+                        backup_path, path, err
+                    )
+                })?;
 
-            if !read_ok {
-                return Err(format!(
-                    "cannot read sqlite_master for {:?} after restore from {:?}",
-                    path, backup_path
-                ));
-            }
+                let conn = Connection::open(path).map_err(|err| {
+                    format!(
+                        "failed to open recovered copy {:?} from {:?}: {}",
+                        path, backup_path, err
+                    )
+                })?;
 
-            eprintln!(
-                "[capsule-recovery] backup {:?} has {} frames (current: {}), read check OK",
-                backup_path, backup_frames, min_frame_count
-            );
+                // Lightweight read check instead of PRAGMA integrity_check.
+                // integrity_check can produce false negatives in WAL mode and is
+                // extremely slow on large DBs.  A sqlite_master read + frame count
+                // verifies the DB is structurally openable.
+                conn.execute_batch("PRAGMA busy_timeout = 60000;")
+                    .map_err(|err| {
+                        format!(
+                            "failed to set busy_timeout after restore from {:?}: {}",
+                            backup_path, err
+                        )
+                    })?;
+                let read_ok = conn
+                    .query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .is_ok();
 
-            Ok(conn)
-        }));
+                if !read_ok {
+                    return Err(format!(
+                        "cannot read sqlite_master for {:?} after restore from {:?}",
+                        path, backup_path
+                    ));
+                }
+
+                eprintln!(
+                    "[capsule-recovery] backup {:?} has {} frames (current: {}), read check OK",
+                    backup_path, backup_frames, min_frame_count
+                );
+
+                Ok(conn)
+            },
+        ));
 
         match recovered {
             Ok(Ok(conn)) => Ok(Some(conn)),
@@ -683,13 +722,15 @@ impl MemoryDb {
         // Running CREATE VIRTUAL TABLE / CREATE TRIGGER on every open causes
         // FTS5 metadata corruption when multiple connections are active
         // (e.g. trigger-thread persistent conn + agent session).
-        let tables_exist = self.conn
+        let tables_exist = self
+            .conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='frames'",
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .unwrap_or(0) > 0;
+            .unwrap_or(0)
+            > 0;
 
         if !tables_exist {
             self.conn.execute_batch(SCHEMA_SQL)?;
@@ -755,9 +796,11 @@ impl MemoryDb {
 
     pub(crate) fn frame_canonical_payload(&self, id: FrameId) -> Result<Vec<u8>, String> {
         self.conn
-            .query_row("SELECT payload FROM frames WHERE id = ?", params![id as i64], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
+            .query_row(
+                "SELECT payload FROM frames WHERE id = ?",
+                params![id as i64],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
             .map_err(|e| format!("frame_payload({id}): {e}"))
     }
 
@@ -852,10 +895,7 @@ impl MemoryDb {
     }
 
     /// Find an active frame with a matching blake3 checksum (cross-track: identical bytes are never stored twice).
-    pub(crate) fn find_active_frame_by_checksum(
-        &self,
-        checksum: &[u8],
-    ) -> Result<FrameId, String> {
+    pub(crate) fn find_active_frame_by_checksum(&self, checksum: &[u8]) -> Result<FrameId, String> {
         self.conn
             .query_row(
                 "SELECT id FROM frames WHERE checksum = ?1 AND status = 'active' LIMIT 1",
@@ -909,8 +949,7 @@ impl MemoryDb {
                 vec![],
             ),
         };
-        let bind_refs: Vec<&dyn rusqlite::types::ToSql> =
-            bind.iter().map(|b| b.as_ref()).collect();
+        let bind_refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
         let mut stmt = match self.conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -1006,7 +1045,10 @@ impl MemoryDb {
         let bind_refs: Vec<&dyn rusqlite::types::ToSql> =
             bind_values.iter().map(|b| b.as_ref()).collect();
 
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| format!("search prepare: {e}"))?;
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| format!("search prepare: {e}"))?;
 
         let now = Utc::now().timestamp() as f64;
         let half_life: f64 = 604800.0; // 7 days in seconds
@@ -1031,8 +1073,7 @@ impl MemoryDb {
             match row_result {
                 Ok((id, uri, title, snippet, bm25_score, timestamp)) => {
                     let age_seconds = (now - timestamp as f64).max(0.0);
-                    let recency_boost =
-                        1.0 + 0.3 * (-0.693 * age_seconds / half_life).exp();
+                    let recency_boost = 1.0 + 0.3 * (-0.693 * age_seconds / half_life).exp();
                     let weighted_score = bm25_score.abs() * recency_boost;
 
                     hits.push(SearchHit {
@@ -1084,8 +1125,7 @@ impl MemoryDb {
             "SELECT id, uri, title, track, search_text, timestamp
              FROM frames WHERE track = ?1 AND status = 'active'",
         );
-        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(track.clone())];
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(track.clone())];
 
         if let Some(ref scope) = request.scope {
             bind_values.push(Box::new(format!("{scope}%")));
@@ -1340,10 +1380,7 @@ impl MemoryDb {
     // ── Frame enumeration (for list/diff/merge operations) ───────────
 
     /// Iterate all active frames with their latest version per URI.
-    pub(crate) fn collect_latest_frames(
-        &self,
-        include_inactive: bool,
-    ) -> HashMap<String, Frame> {
+    pub(crate) fn collect_latest_frames(&self, include_inactive: bool) -> HashMap<String, Frame> {
         let sql = if include_inactive {
             "SELECT id, uri, title, kind, track, status, timestamp, checksum,
                     search_text, role, parent_id, tags, labels, extra_metadata, doc_metadata
@@ -1445,8 +1482,8 @@ impl MemoryDb {
             .chars()
             .map(|c| match c {
                 '"' | '*' | '(' | ')' | ':' | '^' | '{' | '}' | '[' | ']' | '!' | '+' | '-'
-                | '~' | '\\' | '.' | '@' | '#' | ',' | ';' | '/' | '&' | '|' | '?'
-                | '`' | '\'' | '=' | '<' | '>' | '%' | '$' => ' ',
+                | '~' | '\\' | '.' | '@' | '#' | ',' | ';' | '/' | '&' | '|' | '?' | '`' | '\''
+                | '=' | '<' | '>' | '%' | '$' => ' ',
                 _ => c,
             })
             .collect();
@@ -1468,12 +1505,9 @@ impl MemoryDb {
 
     /// Migrate all data from an existing MV2 vault file into this SQLite database.
     /// Reads active frames, config, and feedback from the vault.
-    pub(crate) fn migrate_from_vault(
-        &self,
-        vault_path: &Path,
-    ) -> Result<MigrationReport, String> {
-        use aether_core::types::FrameStatus as VaultFrameStatus;
+    pub(crate) fn migrate_from_vault(&self, vault_path: &Path) -> Result<MigrationReport, String> {
         use aether_core::Vault;
+        use aether_core::types::FrameStatus as VaultFrameStatus;
 
         let mut vault =
             Vault::open_read_only(vault_path).map_err(|e| format!("open vault: {e}"))?;
@@ -1513,12 +1547,10 @@ impl MemoryDb {
             };
 
             let text_content = std::str::from_utf8(&payload).ok().map(|s| s.to_string());
-            let tags_json =
-                serde_json::to_string(&frame.tags).unwrap_or_else(|_| "[]".into());
-            let labels_json =
-                serde_json::to_string(&frame.labels).unwrap_or_else(|_| "[]".into());
-            let extra_json = serde_json::to_string(&frame.extra_metadata)
-                .unwrap_or_else(|_| "{}".into());
+            let tags_json = serde_json::to_string(&frame.tags).unwrap_or_else(|_| "[]".into());
+            let labels_json = serde_json::to_string(&frame.labels).unwrap_or_else(|_| "[]".into());
+            let extra_json =
+                serde_json::to_string(&frame.extra_metadata).unwrap_or_else(|_| "{}".into());
             let role_str = format!("{:?}", frame.role).to_ascii_lowercase();
 
             if let Err(e) = self.conn.execute(
@@ -1564,10 +1596,7 @@ impl MemoryDb {
                 .map_err(|e| format!("config extract: {e}"))?;
             let rows = stmt
                 .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                    ))
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })
                 .map_err(|e| format!("config query: {e}"))?;
             rows.filter_map(|r| r.ok()).collect()
@@ -1603,14 +1632,9 @@ impl MemoryDb {
                 .map_err(|e| format!("feedback query: {e}"))?;
             for row in rows {
                 if let Ok(payload) = row {
-                    if let Ok(event) =
-                        serde_json::from_slice::<serde_json::Value>(&payload)
-                    {
+                    if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&payload) {
                         let uri = event.get("uri").and_then(|v| v.as_str()).unwrap_or("");
-                        let score = event
-                            .get("score")
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0);
+                        let score = event.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                         let note = event.get("note").and_then(|v| v.as_str());
                         let session = event.get("session").and_then(|v| v.as_str());
                         let ts = event.get("ts_utc").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -1651,7 +1675,7 @@ impl MemoryDb {
         jsonl_path: &Path,
         dry_run: bool,
     ) -> Result<HotMemoryMigrationReport, String> {
-        use crate::consolidation::{consolidate, put_with_consolidation, ConsolidationDecision};
+        use crate::consolidation::{ConsolidationDecision, consolidate, put_with_consolidation};
 
         let content = std::fs::read_to_string(jsonl_path)
             .map_err(|e| format!("read {}: {e}", jsonl_path.display()))?;
@@ -1699,7 +1723,9 @@ impl MemoryDb {
                     match parsed.get("memory").and_then(|v| v.as_str()) {
                         Some(m) if !m.trim().is_empty() => m.to_string(),
                         _ => {
-                            report.errors.push(format!("line {line_num}: no fact/memory field"));
+                            report
+                                .errors
+                                .push(format!("line {line_num}: no fact/memory field"));
                             continue;
                         }
                     }
@@ -1924,12 +1950,14 @@ mod tests {
         assert_ne!(first, second);
         assert_ne!(second, third);
         let parse_num = |id: &str| -> u64 {
-            let raw = id.rsplit('_').next().ok_or_else(|| {
-                "trigger id should include counter suffix"
-            }).unwrap_or_else(|err| {
-                eprintln!("{err}");
-                "0"
-            });
+            let raw = id
+                .rsplit('_')
+                .next()
+                .ok_or_else(|| "trigger id should include counter suffix")
+                .unwrap_or_else(|err| {
+                    eprintln!("{err}");
+                    "0"
+                });
             raw.parse::<u64>().unwrap_or_else(|err| {
                 eprintln!("failed to parse trigger id counter suffix '{id}': {err}");
                 0
@@ -2123,15 +2151,9 @@ mod tests {
             MemoryDb::sanitize_fts_query("this AND that"),
             "this OR that"
         );
-        assert_eq!(
-            MemoryDb::sanitize_fts_query("NEAR something"),
-            "something"
-        );
+        assert_eq!(MemoryDb::sanitize_fts_query("NEAR something"), "something");
         // OR is also stripped (it's the join separator)
-        assert_eq!(
-            MemoryDb::sanitize_fts_query("OR fallback"),
-            "fallback"
-        );
+        assert_eq!(MemoryDb::sanitize_fts_query("OR fallback"), "fallback");
         assert_eq!(
             MemoryDb::sanitize_fts_query("this OR that"),
             "this OR that" // "OR" stripped, "this" + "that" re-joined with OR
@@ -2251,11 +2273,11 @@ mod tests {
         let db = MemoryDb::open_or_create(&path).unwrap();
 
         // Verify the importance column exists by inserting and querying
-        let result: Result<Option<f64>, _> = db.conn().query_row(
-            "SELECT importance FROM frames LIMIT 1",
-            [],
-            |row| row.get(0),
-        );
+        let result: Result<Option<f64>, _> =
+            db.conn()
+                .query_row("SELECT importance FROM frames LIMIT 1", [], |row| {
+                    row.get(0)
+                });
         // Table is empty but query should succeed (column exists)
         assert!(
             result.is_ok() || result.is_err(), // No rows is OK; column-missing would error on prepare

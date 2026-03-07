@@ -884,7 +884,9 @@ pub(crate) fn load_subagents_from_config(config: &CapsuleConfig) -> Vec<Subagent
         .collect()
 }
 
-pub(crate) fn tool_catalog_map(catalog: &[serde_json::Value]) -> HashMap<String, serde_json::Value> {
+pub(crate) fn tool_catalog_map(
+    catalog: &[serde_json::Value],
+) -> HashMap<String, serde_json::Value> {
     let mut map = HashMap::new();
     for tool in catalog {
         if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {

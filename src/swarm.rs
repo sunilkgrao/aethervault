@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -75,8 +75,9 @@ pub(crate) fn open_swarm_db(workspace: &Path) -> Result<Connection, String> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA busy_timeout = 60000;
-         PRAGMA synchronous = NORMAL;"
-    ).map_err(|e| format!("swarm db pragmas: {e}"))?;
+         PRAGMA synchronous = NORMAL;",
+    )
+    .map_err(|e| format!("swarm db pragmas: {e}"))?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS swarm_tasks (
             id TEXT PRIMARY KEY,
@@ -194,19 +195,40 @@ pub(crate) fn swarm_update_task(
     // Build dynamic params using rusqlite's boxed trait objects
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     param_values.push(Box::new(now));
-    if let Some(v) = status { param_values.push(Box::new(v.to_string())); }
-    if let Some(v) = branch { param_values.push(Box::new(v.to_string())); }
-    if let Some(v) = worktree_path { param_values.push(Box::new(v.to_string())); }
-    if let Some(v) = pr_number { param_values.push(Box::new(v)); }
-    if let Some(v) = pr_url { param_values.push(Box::new(v.to_string())); }
-    if let Some(v) = ci_status { param_values.push(Box::new(v.to_string())); }
-    if let Some(v) = review_status { param_values.push(Box::new(v.to_string())); }
-    if let Some(v) = error_context { param_values.push(Box::new(v.to_string())); }
-    if let Some(v) = agent_backend { param_values.push(Box::new(v.to_string())); }
-    if let Some(v) = retry_count { param_values.push(Box::new(v as i64)); }
+    if let Some(v) = status {
+        param_values.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = branch {
+        param_values.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = worktree_path {
+        param_values.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = pr_number {
+        param_values.push(Box::new(v));
+    }
+    if let Some(v) = pr_url {
+        param_values.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = ci_status {
+        param_values.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = review_status {
+        param_values.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = error_context {
+        param_values.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = agent_backend {
+        param_values.push(Box::new(v.to_string()));
+    }
+    if let Some(v) = retry_count {
+        param_values.push(Box::new(v as i64));
+    }
     param_values.push(Box::new(id.to_string()));
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|b| b.as_ref()).collect();
     conn.execute(&sql, params_ref.as_slice())
         .map_err(|e| format!("update swarm task: {e}"))?;
 
@@ -330,7 +352,13 @@ pub(crate) fn create_worktree(repo_path: &Path, branch_name: &str) -> Result<Pat
     }
 
     let output = Command::new("git")
-        .args(["worktree", "add", &wt_path.to_string_lossy(), "-b", branch_name])
+        .args([
+            "worktree",
+            "add",
+            &wt_path.to_string_lossy(),
+            "-b",
+            branch_name,
+        ])
         .current_dir(repo_path)
         .output()
         .map_err(|e| format!("git worktree add: {e}"))?;
@@ -358,10 +386,7 @@ pub(crate) fn create_worktree(repo_path: &Path, branch_name: &str) -> Result<Pat
                     eprintln!("[swarm] worktree already checked out, reusing");
                     return Ok(wt_path);
                 }
-                return Err(format!(
-                    "git worktree add failed: {}",
-                    stderr2
-                ));
+                return Err(format!("git worktree add failed: {}", stderr2));
             }
         } else {
             return Err(format!("git worktree add failed: {stderr}"));
@@ -425,7 +450,15 @@ pub(crate) fn swarm_check_open_tasks(conn: &Connection) -> String {
 
         // Check CI status via gh
         let ci_output = Command::new("gh")
-            .args(["pr", "checks", &pr_num.to_string(), "--json", "state", "-q", ".[].state"])
+            .args([
+                "pr",
+                "checks",
+                &pr_num.to_string(),
+                "--json",
+                "state",
+                "-q",
+                ".[].state",
+            ])
             .output();
 
         if let Ok(output) = ci_output {
@@ -437,7 +470,11 @@ pub(crate) fn swarm_check_open_tasks(conn: &Connection) -> String {
                     .filter(|l| !l.is_empty())
                     .collect();
 
-                let ci_status = if states.iter().all(|s| *s == "SUCCESS" || *s == "NEUTRAL" || *s == "SKIPPED") && !states.is_empty() {
+                let ci_status = if states
+                    .iter()
+                    .all(|s| *s == "SUCCESS" || *s == "NEUTRAL" || *s == "SKIPPED")
+                    && !states.is_empty()
+                {
                     "passing"
                 } else if states.iter().any(|s| *s == "FAILURE" || *s == "ERROR") {
                     "failing"
@@ -452,11 +489,18 @@ pub(crate) fn swarm_check_open_tasks(conn: &Connection) -> String {
                 };
 
                 let _ = swarm_update_task(
-                    conn, &task.id,
+                    conn,
+                    &task.id,
                     new_status,
-                    None, None, None, None,
+                    None,
+                    None,
+                    None,
+                    None,
                     Some(ci_status),
-                    None, None, None, None,
+                    None,
+                    None,
+                    None,
+                    None,
                 );
                 updates.push(format!("{} (PR #{}): CI {}", task.name, pr_num, ci_status));
             }
@@ -464,7 +508,15 @@ pub(crate) fn swarm_check_open_tasks(conn: &Connection) -> String {
 
         // Check review status via gh
         let review_output = Command::new("gh")
-            .args(["pr", "view", &pr_num.to_string(), "--json", "reviewDecision", "-q", ".reviewDecision"])
+            .args([
+                "pr",
+                "view",
+                &pr_num.to_string(),
+                "--json",
+                "reviewDecision",
+                "-q",
+                ".reviewDecision",
+            ])
             .output();
 
         if let Ok(output) = review_output {
@@ -485,14 +537,24 @@ pub(crate) fn swarm_check_open_tasks(conn: &Connection) -> String {
                 };
 
                 let _ = swarm_update_task(
-                    conn, &task.id,
+                    conn,
+                    &task.id,
                     new_status,
-                    None, None, None, None, None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                     Some(review_status),
-                    None, None, None,
+                    None,
+                    None,
+                    None,
                 );
                 if !decision.is_empty() {
-                    updates.push(format!("{} (PR #{}): review {}", task.name, pr_num, review_status));
+                    updates.push(format!(
+                        "{} (PR #{}): review {}",
+                        task.name, pr_num, review_status
+                    ));
                 }
             }
         }

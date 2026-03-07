@@ -87,7 +87,8 @@ pub(crate) fn save_config_to_file(
     }
 
     let mut root = match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents).unwrap_or_else(|_| serde_json::json!({})),
+        Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents)
+            .unwrap_or_else(|_| serde_json::json!({})),
         Err(_) => serde_json::json!({}),
     };
 
@@ -116,4 +117,3 @@ impl FileConfig {
         }
     }
 }
-

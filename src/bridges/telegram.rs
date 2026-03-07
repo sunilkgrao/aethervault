@@ -1,27 +1,28 @@
 use std::collections::HashMap;
+use std::fs;
 #[allow(unused_imports)]
 use std::io::Read;
-use std::fs;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+use regex::Regex;
 use serde::Deserialize;
 use serde_json;
 use url::Url;
 
+use base64::Engine;
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use base64::Engine;
 
 use crate::{
-    AgentProgress, BridgeAgentConfig, CompletionEvent, ActiveRun,
-    BackgroundTaskRegistry, SessionRegistry, StreamPhase,
-    SessionTurn, load_session_turns, save_session_turns,
-    run_agent_with_prompt, try_handle_approval_chat,
+    ActiveRun, AgentProgress, BackgroundTaskRegistry, BridgeAgentConfig, CompletionEvent,
+    SessionRegistry, SessionTurn, StreamPhase, load_session_turns, run_agent_with_prompt,
+    save_session_turns, try_handle_approval_chat,
 };
 
 const NO_TIMEOUT_MS: u64 = u64::MAX;
+const NON_STREAM_PROGRESS_HEARTBEAT_SECS: u64 = 120;
 
 fn parse_telegram_token(base_url: &str) -> Option<String> {
     let parsed = Url::parse(base_url).ok()?;
@@ -41,6 +42,125 @@ fn parse_telegram_token(base_url: &str) -> Option<String> {
             }
         }
     }
+    None
+}
+
+fn progress_redaction_patterns() -> &'static [Regex] {
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        vec![
+            Regex::new(r"\bsk-ant-[A-Za-z0-9_-]{16,}\b").unwrap(),
+            Regex::new(r"\bsk-[A-Za-z0-9_-]{16,}\b").unwrap(),
+            Regex::new(r"\bxai-[A-Za-z0-9_-]{16,}\b").unwrap(),
+            Regex::new(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b").unwrap(),
+            Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b").unwrap(),
+            Regex::new(r"\bAIza[0-9A-Za-z\\-_]{20,}\b").unwrap(),
+        ]
+    })
+}
+
+fn sanitize_progress_text(text: &str) -> String {
+    let mut sanitized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for pattern in progress_redaction_patterns() {
+        sanitized = pattern
+            .replace_all(&sanitized, "[redacted-secret]")
+            .into_owned();
+    }
+    sanitized
+}
+
+fn humanize_progress_phase(phase: &str) -> String {
+    match phase.strip_prefix("tool:") {
+        Some("self_upgrade") => "deploying update".to_string(),
+        Some("exec") => "running commands".to_string(),
+        Some(tool) => format!("running {tool}"),
+        None => match phase {
+            "starting" => "starting".to_string(),
+            "done" => "done".to_string(),
+            other => other.to_string(),
+        },
+    }
+}
+
+fn build_non_stream_progress_message(guard: &AgentProgress) -> Option<(String, String)> {
+    let elapsed = guard.started_at.elapsed().as_secs();
+    let tools: Vec<String> = {
+        let mut sorted: Vec<_> = guard
+            .tools_used
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(k, v)| format!("{k} ({v}x)"))
+            .collect()
+    };
+    let step = guard.step;
+    let phase = humanize_progress_phase(&guard.phase);
+    let preview = guard
+        .text_preview
+        .as_deref()
+        .map(sanitize_progress_text)
+        .filter(|text| !text.is_empty());
+
+    if guard.phase.contains("self_upgrade")
+        || tools.iter().any(|tool| tool.starts_with("self_upgrade"))
+    {
+        let signature = format!(
+            "deploy|step:{step}|preview:{}",
+            preview.clone().unwrap_or_default()
+        );
+        return Some((
+            signature,
+            format!(
+                "Deploying the update and waiting for the service to come back...\n({elapsed}s)"
+            ),
+        ));
+    }
+
+    if tools.is_empty() && step == 0 {
+        let preview_text = preview?;
+        let truncated: String = preview_text.chars().take(200).collect();
+        let signature = format!("thinking:{truncated}");
+        return Some((signature, format!("\u{1F4AD} {truncated}\n({elapsed}s)")));
+    }
+
+    if let Some(preview_text) = preview {
+        let truncated: String = preview_text.chars().take(80).collect();
+        let ellipsis = if preview_text.chars().count() > 80 {
+            "..."
+        } else {
+            ""
+        };
+        let signature = format!(
+            "step:{step}|phase:{phase}|tools:{}|preview:{truncated}",
+            tools.join(", ")
+        );
+        if tools.is_empty() {
+            return Some((signature, format!("{truncated}{ellipsis} ({elapsed}s)")));
+        }
+        return Some((
+            signature,
+            format!(
+                "{truncated}{ellipsis}\n[step {step} | {phase} | {} | {elapsed}s]",
+                tools.join(", ")
+            ),
+        ));
+    }
+
+    if !tools.is_empty() {
+        let signature = format!("step:{step}|phase:{phase}|tools:{}", tools.join(", "));
+        return Some((
+            signature,
+            format!(
+                "[step {step} | {phase} | {} | {elapsed}s]",
+                tools.join(", ")
+            ),
+        ));
+    }
+
     None
 }
 
@@ -201,26 +321,48 @@ pub(crate) struct TelegramChat {
     pub(crate) id: i64,
 }
 
-pub(crate) fn telegram_download_file_bytes(agent: &ureq::Agent, base_url: &str, file_id: &str) -> Result<(Vec<u8>, String), String> {
+pub(crate) fn telegram_download_file_bytes(
+    agent: &ureq::Agent,
+    base_url: &str,
+    file_id: &str,
+) -> Result<(Vec<u8>, String), String> {
     let url = format!("{base_url}/getFile");
     let payload = serde_json::json!({"file_id": file_id});
     eprintln!("[telegram/download] Resolving Telegram file_id={file_id}");
-    let resp = agent.post(&url)
+    let resp = agent
+        .post(&url)
         .set("content-type", "application/json")
         .send_json(payload)
         .map_err(|e| format!("getFile API failed for file_id={file_id}: {e}"))?;
     if resp.status() != 200 {
-        eprintln!("[telegram/download] getFile returned HTTP {} for file_id={file_id}", resp.status());
+        eprintln!(
+            "[telegram/download] getFile returned HTTP {} for file_id={file_id}",
+            resp.status()
+        );
     }
-    let data: serde_json::Value = resp.into_json()
+    let data: serde_json::Value = resp
+        .into_json()
         .map_err(|e| format!("getFile response parse failed for file_id={file_id}: {e}"))?;
     if !data.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return Err(format!("getFile returned ok=false for file_id={file_id}: {}",
-            serde_json::to_string(&data).unwrap_or_default().chars().take(300).collect::<String>()));
+        return Err(format!(
+            "getFile returned ok=false for file_id={file_id}: {}",
+            serde_json::to_string(&data)
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect::<String>()
+        ));
     }
-    let file_path = data["result"]["file_path"].as_str()
-        .ok_or_else(|| format!("getFile missing file_path for file_id={file_id}: {}",
-            serde_json::to_string(&data).unwrap_or_default().chars().take(300).collect::<String>()))?;
+    let file_path = data["result"]["file_path"].as_str().ok_or_else(|| {
+        format!(
+            "getFile missing file_path for file_id={file_id}: {}",
+            serde_json::to_string(&data)
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect::<String>()
+        )
+    })?;
     let decoded_file_path = urlencoding::decode(file_path)
         .map_err(|e| format!("URL decode failed for file_path={file_path}: {e}"))?
         .into_owned();
@@ -229,26 +371,43 @@ pub(crate) fn telegram_download_file_bytes(agent: &ureq::Agent, base_url: &str, 
     let api_base = std::env::var("TELEGRAM_API_BASE")
         .unwrap_or_else(|_| "https://api.telegram.org".to_string());
     let download_url = format!("{api_base}/file/bot{token_part}/{decoded_file_path}");
-    let dl_resp = agent.get(&download_url).call()
+    let dl_resp = agent
+        .get(&download_url)
+        .call()
         .map_err(|e| format!("file download failed for file_id={file_id} path={file_path}: {e}"))?;
     if dl_resp.status() != 200 {
-        eprintln!("[telegram/download] File download returned HTTP {} for file_id={file_id}", dl_resp.status());
+        eprintln!(
+            "[telegram/download] File download returned HTTP {} for file_id={file_id}",
+            dl_resp.status()
+        );
     }
-    let content_type = dl_resp.header("content-type")
-        .unwrap_or("application/octet-stream").to_string();
+    let content_type = dl_resp
+        .header("content-type")
+        .unwrap_or("application/octet-stream")
+        .to_string();
     let mut bytes = Vec::new();
-    dl_resp.into_reader().take(20_000_000).read_to_end(&mut bytes)
+    dl_resp
+        .into_reader()
+        .take(20_000_000)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("file read failed for file_id={file_id}: {e}"))?;
     if bytes.is_empty() {
         return Err(format!("downloaded file is 0 bytes for file_id={file_id}"));
     }
-    eprintln!("[telegram/download] file_id={file_id} downloaded {} bytes (ct={})", bytes.len(), content_type);
+    eprintln!(
+        "[telegram/download] file_id={file_id} downloaded {} bytes (ct={})",
+        bytes.len(),
+        content_type
+    );
     Ok((bytes, content_type))
 }
 
-pub(crate) fn transcribe_audio_deepgram(audio_bytes: &[u8], mime_type: &str) -> Result<String, String> {
-    let api_key = std::env::var("DEEPGRAM_API_KEY")
-        .map_err(|_| "DEEPGRAM_API_KEY not set".to_string())?;
+pub(crate) fn transcribe_audio_deepgram(
+    audio_bytes: &[u8],
+    mime_type: &str,
+) -> Result<String, String> {
+    let api_key =
+        std::env::var("DEEPGRAM_API_KEY").map_err(|_| "DEEPGRAM_API_KEY not set".to_string())?;
     if api_key.trim().is_empty() {
         return Err("DEEPGRAM_API_KEY is empty".to_string());
     }
@@ -256,7 +415,11 @@ pub(crate) fn transcribe_audio_deepgram(audio_bytes: &[u8], mime_type: &str) -> 
         .timeout_read(Duration::from_secs(120))
         .timeout_connect(Duration::from_secs(30))
         .build();
-    eprintln!("[deepgram] Transcribing audio bytes={} mime={}", audio_bytes.len(), mime_type);
+    eprintln!(
+        "[deepgram] Transcribing audio bytes={} mime={}",
+        audio_bytes.len(),
+        mime_type
+    );
 
     let mut last_err = String::new();
     for attempt in 0..3u32 {
@@ -265,29 +428,50 @@ pub(crate) fn transcribe_audio_deepgram(audio_bytes: &[u8], mime_type: &str) -> 
             eprintln!("[deepgram] retry {attempt}/2 after: {last_err}");
             thread::sleep(backoff);
         }
-        match agent.post("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true")
+        match agent
+            .post("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true")
             .set("Authorization", &format!("Token {api_key}"))
             .set("Content-Type", mime_type)
             .send_bytes(audio_bytes)
         {
             Ok(resp) => {
-                let body = resp.into_string()
+                let body = resp
+                    .into_string()
                     .map_err(|e| format!("Deepgram response read: {e}"))?;
-                let data: serde_json::Value = serde_json::from_str(&body)
-                    .map_err(|e| format!("Deepgram response parse: {e} body={}", body.chars().take(300).collect::<String>()))?;
+                let data: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                    format!(
+                        "Deepgram response parse: {e} body={}",
+                        body.chars().take(300).collect::<String>()
+                    )
+                })?;
                 let transcript = data["results"]["channels"][0]["alternatives"][0]["transcript"]
                     .as_str()
-                    .ok_or_else(|| format!("Deepgram missing transcript field: {}",
-                        serde_json::to_string(&data).unwrap_or_default().chars().take(300).collect::<String>()))?;
+                    .ok_or_else(|| {
+                        format!(
+                            "Deepgram missing transcript field: {}",
+                            serde_json::to_string(&data)
+                                .unwrap_or_default()
+                                .chars()
+                                .take(300)
+                                .collect::<String>()
+                        )
+                    })?;
                 if transcript.trim().is_empty() {
-                    return Err("Deepgram returned empty transcript (silent or too short)".to_string());
+                    return Err(
+                        "Deepgram returned empty transcript (silent or too short)".to_string()
+                    );
                 }
                 return Ok(transcript.to_string());
             }
             Err(ureq::Error::Status(code, resp)) => {
                 let body = resp.into_string().unwrap_or_default();
-                last_err = format!("HTTP {code}: {}", body.chars().take(200).collect::<String>());
-                if code >= 500 || code == 429 { continue; }
+                last_err = format!(
+                    "HTTP {code}: {}",
+                    body.chars().take(200).collect::<String>()
+                );
+                if code >= 500 || code == 429 {
+                    continue;
+                }
                 return Err(format!("Deepgram error: {last_err}"));
             }
             Err(e) => {
@@ -300,11 +484,21 @@ pub(crate) fn transcribe_audio_deepgram(audio_bytes: &[u8], mime_type: &str) -> 
 }
 
 pub(crate) fn guess_image_media_type(ct: &str, file_path: &str) -> String {
-    if ct.starts_with("image/") { return ct.to_string(); }
-    if file_path.ends_with(".jpg") || file_path.ends_with(".jpeg") { return "image/jpeg".to_string(); }
-    if file_path.ends_with(".png") { return "image/png".to_string(); }
-    if file_path.ends_with(".webp") { return "image/webp".to_string(); }
-    if file_path.ends_with(".gif") { return "image/gif".to_string(); }
+    if ct.starts_with("image/") {
+        return ct.to_string();
+    }
+    if file_path.ends_with(".jpg") || file_path.ends_with(".jpeg") {
+        return "image/jpeg".to_string();
+    }
+    if file_path.ends_with(".png") {
+        return "image/png".to_string();
+    }
+    if file_path.ends_with(".webp") {
+        return "image/webp".to_string();
+    }
+    if file_path.ends_with(".gif") {
+        return "image/gif".to_string();
+    }
     "image/jpeg".to_string()
 }
 
@@ -315,22 +509,36 @@ fn normalize_mime_for_deepgram(raw_mime: &str) -> String {
         .unwrap_or(raw_mime)
         .trim()
         .to_lowercase();
-    if base.is_empty() { "audio/ogg".to_string() } else { base }
+    if base.is_empty() {
+        "audio/ogg".to_string()
+    } else {
+        base
+    }
 }
 
 /// Extract content from a Telegram update. Returns (chat_id, message_id, text).
 /// For photos, the text will contain an [AV_IMAGE:base64:media_type:DATA] marker.
 /// For voice/audio, the transcription is prepended to any caption/text.
-pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Agent, base_url: &str) -> Option<(i64, Option<i64>, String)> {
+pub(crate) fn extract_telegram_content(
+    update: &TelegramUpdate,
+    agent: &ureq::Agent,
+    base_url: &str,
+) -> Option<(i64, Option<i64>, String)> {
     // Handle callback queries (inline keyboard presses)
     if let Some(cb) = &update.callback_query {
         if let Some(msg) = cb.message.as_ref() {
             if let Some(data) = &cb.data {
-                let user_name = cb.from.as_ref()
+                let user_name = cb
+                    .from
+                    .as_ref()
                     .and_then(|u| u.first_name.clone())
                     .unwrap_or_else(|| "User".to_string());
                 let msg_id = msg.message_id;
-                return Some((msg.chat.id, msg_id, format!("[Callback button pressed by {user_name}]: {data}")));
+                return Some((
+                    msg.chat.id,
+                    msg_id,
+                    format!("[Callback button pressed by {user_name}]: {data}"),
+                ));
             }
         }
         return None;
@@ -343,16 +551,23 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
         .or(update.channel_post.as_ref())?;
     let chat_id = msg.chat.id;
     let msg_id = msg.message_id;
-    let base_text = msg.text.clone()
+    let base_text = msg
+        .text
+        .clone()
         .or_else(|| msg.caption.clone())
         .unwrap_or_default();
-    let user_name = msg.from.as_ref()
+    let user_name = msg
+        .from
+        .as_ref()
         .and_then(|u| u.first_name.clone())
         .unwrap_or_else(|| "User".to_string());
 
     // Handle forwarded messages
     if let Some(fwd) = &msg.forward_from {
-        let fwd_name = fwd.first_name.clone().unwrap_or_else(|| "someone".to_string());
+        let fwd_name = fwd
+            .first_name
+            .clone()
+            .unwrap_or_else(|| "someone".to_string());
         let fwd_text = if base_text.trim().is_empty() {
             format!("[Forwarded message from {fwd_name} \u{2014} no text content]")
         } else {
@@ -367,7 +582,10 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
 
     // Handle stickers
     if let Some(sticker) = &msg.sticker {
-        let emoji = sticker.emoji.clone().unwrap_or_else(|| "unknown".to_string());
+        let emoji = sticker
+            .emoji
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         let set_name = sticker.set_name.clone().unwrap_or_default();
         let sticker_text = format!("[{user_name} sent a sticker: {emoji} from set '{set_name}']");
         return Some((chat_id, msg_id, sticker_text));
@@ -375,7 +593,10 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
 
     // Handle contacts
     if let Some(contact) = &msg.contact {
-        let name = contact.first_name.clone().unwrap_or_else(|| "Unknown".to_string());
+        let name = contact
+            .first_name
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string());
         let last = contact.last_name.clone().unwrap_or_default();
         let phone = &contact.phone_number;
         let contact_text = format!("[{user_name} shared a contact: {name} {last}, phone: {phone}]");
@@ -424,9 +645,15 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
     // Handle voice messages
     if let Some(voice) = &msg.voice {
         let duration_s = voice.duration.unwrap_or(0);
-        let raw_mime = voice.mime_type.clone().unwrap_or_else(|| "audio/ogg".to_string());
+        let raw_mime = voice
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| "audio/ogg".to_string());
         let mime = normalize_mime_for_deepgram(&raw_mime);
-        eprintln!("[voice] received: file_id={} duration={duration_s}s mime={mime}", voice.file_id);
+        eprintln!(
+            "[voice] received: file_id={} duration={duration_s}s mime={mime}",
+            voice.file_id
+        );
 
         match telegram_download_file_bytes(agent, base_url, &voice.file_id) {
             Ok((bytes, _ct)) => {
@@ -434,8 +661,10 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
                 eprintln!("[voice] downloaded {size_kb}KB");
 
                 // Persist audio before transcription attempt
-                let ts = SystemTime::now().duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis()).unwrap_or(0);
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
                 let tmp_path = format!("/tmp/voice_{ts}.ogg");
                 if let Err(e) = fs::write(&tmp_path, &bytes) {
                     eprintln!("[voice] WARNING: persist failed: {e}");
@@ -448,23 +677,31 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
                         let text = if base_text.trim().is_empty() {
                             format!("[Voice message transcription]: {transcript}")
                         } else {
-                            format!("[Voice message transcription]: {transcript}\n\nUser also wrote: {base_text}")
+                            format!(
+                                "[Voice message transcription]: {transcript}\n\nUser also wrote: {base_text}"
+                            )
                         };
                         return Some((chat_id, msg_id, text));
                     }
                     Err(e) => {
                         eprintln!("[voice] transcription FAILED: {e} (saved: {tmp_path})");
-                        return Some((chat_id, msg_id, format!(
-                            "[User sent a {duration_s}s voice message but transcription failed: {e}]"
-                        )));
+                        return Some((
+                            chat_id,
+                            msg_id,
+                            format!(
+                                "[User sent a {duration_s}s voice message but transcription failed: {e}]"
+                            ),
+                        ));
                     }
                 }
             }
             Err(e) => {
                 eprintln!("[voice] download FAILED: {e}");
-                return Some((chat_id, msg_id, format!(
-                    "[User sent a {duration_s}s voice message but download failed: {e}]"
-                )));
+                return Some((
+                    chat_id,
+                    msg_id,
+                    format!("[User sent a {duration_s}s voice message but download failed: {e}]"),
+                ));
             }
         }
     }
@@ -472,10 +709,20 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
     // Handle audio files
     if let Some(audio) = &msg.audio {
         let duration_s = audio.duration.unwrap_or(0);
-        let raw_mime = audio.mime_type.clone().unwrap_or_else(|| "audio/mpeg".to_string());
+        let raw_mime = audio
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| "audio/mpeg".to_string());
         let mime = normalize_mime_for_deepgram(&raw_mime);
-        let title_note = audio.title.as_deref().map(|t| format!(" (title: {t})")).unwrap_or_default();
-        eprintln!("[audio] received: file_id={} duration={duration_s}s mime={mime}{title_note}", audio.file_id);
+        let title_note = audio
+            .title
+            .as_deref()
+            .map(|t| format!(" (title: {t})"))
+            .unwrap_or_default();
+        eprintln!(
+            "[audio] received: file_id={} duration={duration_s}s mime={mime}{title_note}",
+            audio.file_id
+        );
 
         match telegram_download_file_bytes(agent, base_url, &audio.file_id) {
             Ok((bytes, _ct)) => {
@@ -483,13 +730,21 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
                 eprintln!("[audio] downloaded {size_kb}KB");
 
                 // Persist audio before transcription attempt
-                let ts = SystemTime::now().duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis()).unwrap_or(0);
-                let ext = if mime == "audio/mpeg" { "mp3" }
-                    else if mime == "audio/ogg" { "ogg" }
-                    else if mime == "audio/mp4" { "m4a" }
-                    else if let Some(suffix) = mime.strip_prefix("audio/") { suffix }
-                    else { "bin" };
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let ext = if mime == "audio/mpeg" {
+                    "mp3"
+                } else if mime == "audio/ogg" {
+                    "ogg"
+                } else if mime == "audio/mp4" {
+                    "m4a"
+                } else if let Some(suffix) = mime.strip_prefix("audio/") {
+                    suffix
+                } else {
+                    "bin"
+                };
                 let tmp_path = format!("/tmp/audio_{ts}.{ext}");
                 if let Err(e) = fs::write(&tmp_path, &bytes) {
                     eprintln!("[audio] WARNING: persist failed: {e}");
@@ -504,17 +759,23 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
                     }
                     Err(e) => {
                         eprintln!("[audio] transcription FAILED: {e} (saved: {tmp_path})");
-                        return Some((chat_id, msg_id, format!(
-                            "[User sent a {duration_s}s audio file{title_note} but transcription failed: {e}]"
-                        )));
+                        return Some((
+                            chat_id,
+                            msg_id,
+                            format!(
+                                "[User sent a {duration_s}s audio file{title_note} but transcription failed: {e}]"
+                            ),
+                        ));
                     }
                 }
             }
             Err(e) => {
                 eprintln!("[audio] download FAILED: {e}");
-                return Some((chat_id, msg_id, format!(
-                    "[User sent an audio file{title_note} but download failed: {e}]"
-                )));
+                return Some((
+                    chat_id,
+                    msg_id,
+                    format!("[User sent an audio file{title_note} but download failed: {e}]"),
+                ));
             }
         }
     }
@@ -522,15 +783,20 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
     // Handle video notes (circular video messages) — transcribe like voice
     if let Some(vn) = &msg.video_note {
         let duration_s = vn.duration.unwrap_or(0);
-        eprintln!("[video_note] received: file_id={} duration={duration_s}s", vn.file_id);
+        eprintln!(
+            "[video_note] received: file_id={} duration={duration_s}s",
+            vn.file_id
+        );
 
         match telegram_download_file_bytes(agent, base_url, &vn.file_id) {
             Ok((bytes, _ct)) => {
                 let size_kb = bytes.len() / 1024;
                 eprintln!("[video_note] downloaded {size_kb}KB");
 
-                let ts = SystemTime::now().duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis()).unwrap_or(0);
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
                 let tmp_path = format!("/tmp/videonote_{ts}.mp4");
                 if let Err(e) = fs::write(&tmp_path, &bytes) {
                     eprintln!("[video_note] WARNING: persist failed: {e}");
@@ -543,51 +809,72 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
                         let text = if base_text.trim().is_empty() {
                             format!("[Video note transcription]: {transcript}")
                         } else {
-                            format!("[Video note transcription]: {transcript}\n\nUser also wrote: {base_text}")
+                            format!(
+                                "[Video note transcription]: {transcript}\n\nUser also wrote: {base_text}"
+                            )
                         };
                         return Some((chat_id, msg_id, text));
                     }
                     Err(e) => {
                         eprintln!("[video_note] transcription FAILED: {e} (saved: {tmp_path})");
-                        return Some((chat_id, msg_id, format!(
-                            "[User sent a {duration_s}s video note but transcription failed: {e}]"
-                        )));
+                        return Some((
+                            chat_id,
+                            msg_id,
+                            format!(
+                                "[User sent a {duration_s}s video note but transcription failed: {e}]"
+                            ),
+                        ));
                     }
                 }
             }
             Err(e) => {
                 eprintln!("[video_note] download FAILED: {e}");
-                return Some((chat_id, msg_id, format!(
-                    "[User sent a {duration_s}s video note but download failed: {e}]"
-                )));
+                return Some((
+                    chat_id,
+                    msg_id,
+                    format!("[User sent a {duration_s}s video note but download failed: {e}]"),
+                ));
             }
         }
     }
 
     // Handle documents (text-based ones)
     if let Some(doc) = &msg.document {
-        let fname = doc.file_name.clone().unwrap_or_else(|| "unknown".to_string());
+        let fname = doc
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         let mime = doc.mime_type.clone().unwrap_or_default();
         let is_text = mime.starts_with("text/")
             || mime == "application/json"
             || mime == "application/xml"
-            || fname.ends_with(".txt") || fname.ends_with(".md")
-            || fname.ends_with(".json") || fname.ends_with(".csv")
-            || fname.ends_with(".py") || fname.ends_with(".rs")
-            || fname.ends_with(".js") || fname.ends_with(".ts")
-            || fname.ends_with(".sh") || fname.ends_with(".yaml")
-            || fname.ends_with(".yml") || fname.ends_with(".toml");
+            || fname.ends_with(".txt")
+            || fname.ends_with(".md")
+            || fname.ends_with(".json")
+            || fname.ends_with(".csv")
+            || fname.ends_with(".py")
+            || fname.ends_with(".rs")
+            || fname.ends_with(".js")
+            || fname.ends_with(".ts")
+            || fname.ends_with(".sh")
+            || fname.ends_with(".yaml")
+            || fname.ends_with(".yml")
+            || fname.ends_with(".toml");
         if is_text {
             match telegram_download_file_bytes(agent, base_url, &doc.file_id) {
                 Ok((bytes, _ct)) => {
                     if let Ok(text_content) = String::from_utf8(bytes) {
                         let truncated = if text_content.len() > 50000 {
                             let safe: String = text_content.chars().take(50000).collect();
-                            format!("{safe}\n... (truncated, {} total chars)", text_content.chars().count())
+                            format!(
+                                "{safe}\n... (truncated, {} total chars)",
+                                text_content.chars().count()
+                            )
                         } else {
                             text_content
                         };
-                        let text = format!("[Document: {fname}]\n```\n{truncated}\n```\n\n{base_text}");
+                        let text =
+                            format!("[Document: {fname}]\n```\n{truncated}\n```\n\n{base_text}");
                         return Some((chat_id, msg_id, text));
                     }
                 }
@@ -598,7 +885,9 @@ pub(crate) fn extract_telegram_content(update: &TelegramUpdate, agent: &ureq::Ag
         }
         // Non-text document or download failed
         let text = if base_text.trim().is_empty() {
-            format!("[User sent a document: {fname} ({mime}). This file type is not supported for direct reading.]")
+            format!(
+                "[User sent a document: {fname} ({mime}). This file type is not supported for direct reading.]"
+            )
         } else {
             format!("[User sent a document: {fname} ({mime})]\n{base_text}")
         };
@@ -618,18 +907,25 @@ pub(crate) fn telegram_send_typing(agent: &ureq::Agent, base_url: &str, chat_id:
         "chat_id": chat_id,
         "action": "typing"
     });
-    let _ = agent.post(&url)
+    let _ = agent
+        .post(&url)
         .set("content-type", "application/json")
         .send_json(payload);
 }
 
-pub(crate) fn telegram_answer_callback(agent: &ureq::Agent, base_url: &str, callback_id: &str, text: Option<&str>) {
+pub(crate) fn telegram_answer_callback(
+    agent: &ureq::Agent,
+    base_url: &str,
+    callback_id: &str,
+    text: Option<&str>,
+) {
     let url = format!("{base_url}/answerCallbackQuery");
     let mut payload = serde_json::json!({"callback_query_id": callback_id});
     if let Some(t) = text {
         payload["text"] = serde_json::json!(t);
     }
-    let _ = agent.post(&url)
+    let _ = agent
+        .post(&url)
         .set("content-type", "application/json")
         .send_json(payload);
 }
@@ -671,7 +967,7 @@ pub(crate) fn telegram_send_message_ext(
             .set("content-type", "application/json")
             .send_json(payload);
         match response {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(_) => {
                 // Markdown failed, retry as plain text
                 let mut plain_payload = serde_json::json!({
@@ -713,7 +1009,8 @@ fn telegram_edit_message(
         "message_id": message_id,
         "text": truncated,
     });
-    match agent.post(&url)
+    match agent
+        .post(&url)
         .set("content-type", "application/json")
         .send_json(payload)
     {
@@ -744,7 +1041,8 @@ fn telegram_send_message_returning_id(
         "chat_id": chat_id,
         "text": truncated,
     });
-    match agent.post(&url)
+    match agent
+        .post(&url)
         .set("content-type", "application/json")
         .send_json(payload)
     {
@@ -849,13 +1147,14 @@ pub(crate) fn spawn_agent_run(
                 reply_to_id,
                 result: agent_result,
             },
-            Err(panic_info) => {
-                CompletionEvent {
-                    chat_id,
-                    reply_to_id,
-                    result: Err(format!("Agent crashed: {}", super::panic_to_string(panic_info))),
-                }
-            }
+            Err(panic_info) => CompletionEvent {
+                chat_id,
+                reply_to_id,
+                result: Err(format!(
+                    "Agent crashed: {}",
+                    super::panic_to_string(panic_info)
+                )),
+            },
         };
         let _ = worker_tx.send(event);
     });
@@ -867,6 +1166,9 @@ pub(crate) fn spawn_agent_run(
     thread::spawn(move || {
         let mut tick_count: usize = 0;
         let mut last_stream_rev: u64 = 0;
+        let mut progress_message_id: Option<i64> = None;
+        let mut last_progress_signature: Option<String> = None;
+        let mut last_progress_sent_at: Option<std::time::Instant> = None;
         // Track the previous phase to detect thinking→responding transitions
         let mut prev_stream_phase = StreamPhase::Idle;
         loop {
@@ -879,9 +1181,16 @@ pub(crate) fn spawn_agent_run(
             } else {
                 let is_streaming = {
                     let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
-                    matches!(guard.stream_phase, StreamPhase::Thinking | StreamPhase::Responding)
+                    matches!(
+                        guard.stream_phase,
+                        StreamPhase::Thinking | StreamPhase::Responding
+                    )
                 };
-                let sleep_dur = if is_streaming { Duration::from_secs(1) } else { Duration::from_secs(4) };
+                let sleep_dur = if is_streaming {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_secs(4)
+                };
                 thread::sleep(sleep_dur);
             }
 
@@ -899,8 +1208,16 @@ pub(crate) fn spawn_agent_run(
 
             // Read stream state + general state in one lock
             let (
-                done, should_checkpoint, first_ack_needed, should_progress, timed_out,
-                stream_phase, stream_rev, stream_thinking, stream_response, stream_msg_id,
+                done,
+                should_checkpoint,
+                first_ack_needed,
+                should_progress,
+                timed_out,
+                stream_phase,
+                stream_rev,
+                stream_thinking,
+                stream_response,
+                stream_msg_id,
             ) = {
                 let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
                 let done = guard.phase == "done";
@@ -908,14 +1225,23 @@ pub(crate) fn spawn_agent_run(
                 let at_checkpoint = guard.step >= effective_max * 3 / 4
                     && !guard.checkpoint_sent
                     && effective_max > 4;
-                let needs_first_ack = !guard.first_ack_sent
-                    && tick_count >= 1
-                    && !done;
+                let needs_first_ack = !guard.first_ack_sent && tick_count >= 1 && !done;
                 // In streaming mode, suppress the old progress messages — streaming handles display
-                let in_stream = matches!(guard.stream_phase, StreamPhase::Thinking | StreamPhase::Responding);
-                let progress_interval = if guard.started_at.elapsed().as_secs() < 120 { 5 } else { 15 };
+                let in_stream = matches!(
+                    guard.stream_phase,
+                    StreamPhase::Thinking | StreamPhase::Responding
+                );
+                let progress_interval = if guard.started_at.elapsed().as_secs() < 120 {
+                    5
+                } else {
+                    15
+                };
                 // Convert tick_count to equivalent 4s ticks for throttle comparison
-                let equiv_ticks = if in_stream { tick_count / 4 } else { tick_count };
+                let equiv_ticks = if in_stream {
+                    tick_count / 4
+                } else {
+                    tick_count
+                };
                 let needs_progress = guard.first_ack_sent
                     && equiv_ticks % progress_interval == 0
                     && !done
@@ -923,9 +1249,15 @@ pub(crate) fn spawn_agent_run(
                 let elapsed_secs = guard.started_at.elapsed().as_secs();
                 let timed_out = elapsed_secs > 480 && !done;
                 (
-                    done, at_checkpoint, needs_first_ack, needs_progress, timed_out,
-                    guard.stream_phase.clone(), guard.stream_revision,
-                    guard.stream_thinking.clone(), guard.stream_response.clone(),
+                    done,
+                    at_checkpoint,
+                    needs_first_ack,
+                    needs_progress,
+                    timed_out,
+                    guard.stream_phase.clone(),
+                    guard.stream_revision,
+                    guard.stream_thinking.clone(),
+                    guard.stream_response.clone(),
                     guard.stream_message_id,
                 )
             };
@@ -943,8 +1275,12 @@ pub(crate) fn spawn_agent_run(
                 let mins = elapsed / 60;
                 eprintln!("[progress-reporter] SESSION TIMEOUT after {mins}m — notifying user");
                 let _ = telegram_send_message(
-                    &prog_agent, &prog_url, chat_id,
-                    &format!("This is taking unusually long ({mins}m). The session may be stuck. I'll keep trying, but you can send a new message to start fresh."),
+                    &prog_agent,
+                    &prog_url,
+                    chat_id,
+                    &format!(
+                        "This is taking unusually long ({mins}m). The session may be stuck. I'll keep trying, but you can send a new message to start fresh."
+                    ),
                 );
                 break;
             }
@@ -954,12 +1290,22 @@ pub(crate) fn spawn_agent_run(
                 StreamPhase::Thinking | StreamPhase::Responding => {
                     // On transition from Thinking to Responding: finalize thinking message,
                     // clear stream_message_id so response gets a new message
-                    if prev_stream_phase == StreamPhase::Thinking && stream_phase == StreamPhase::Responding {
+                    if prev_stream_phase == StreamPhase::Thinking
+                        && stream_phase == StreamPhase::Responding
+                    {
                         // Edit thinking message one last time with full content
-                        if let (Some(msg_id), Some(thinking)) = (stream_msg_id, stream_thinking.as_ref()) {
+                        if let (Some(msg_id), Some(thinking)) =
+                            (stream_msg_id, stream_thinking.as_ref())
+                        {
                             let final_text: String = thinking.chars().take(4000).collect();
                             let display = format!("\u{1F4AD} Thinking:\n{final_text}");
-                            telegram_edit_message(&prog_agent, &prog_url, chat_id, msg_id, &display);
+                            telegram_edit_message(
+                                &prog_agent,
+                                &prog_url,
+                                chat_id,
+                                msg_id,
+                                &display,
+                            );
                         }
                         // Clear message_id so responding phase creates a new message
                         if let Ok(mut guard) = prog_ref.lock() {
@@ -996,11 +1342,20 @@ pub(crate) fn spawn_agent_run(
 
                         match stream_msg_id {
                             Some(msg_id) => {
-                                telegram_edit_message(&prog_agent, &prog_url, chat_id, msg_id, &display_text);
+                                telegram_edit_message(
+                                    &prog_agent,
+                                    &prog_url,
+                                    chat_id,
+                                    msg_id,
+                                    &display_text,
+                                );
                             }
                             None => {
                                 if let Some(new_id) = telegram_send_message_returning_id(
-                                    &prog_agent, &prog_url, chat_id, &display_text,
+                                    &prog_agent,
+                                    &prog_url,
+                                    chat_id,
+                                    &display_text,
                                 ) {
                                     if let Ok(mut guard) = prog_ref.lock() {
                                         guard.stream_message_id = Some(new_id);
@@ -1026,48 +1381,57 @@ pub(crate) fn spawn_agent_run(
                 }
             }
             if should_progress {
-                let progress_msg = {
+                let progress_update = {
                     let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
-                    let elapsed = guard.started_at.elapsed().as_secs();
-                    let tools: Vec<String> = {
-                        let mut sorted: Vec<_> = guard.tools_used.iter()
-                            .map(|(k, v)| (k.clone(), *v))
-                            .collect();
-                        sorted.sort_by(|a, b| b.1.cmp(&a.1));
-                        sorted.into_iter().take(3)
-                            .map(|(k, v)| format!("{k} ({v}x)"))
-                            .collect()
-                    };
-                    let phase = &guard.phase;
-                    let step = guard.step;
-                    let preview = guard.text_preview.clone();
-                    if tools.is_empty() && step == 0 {
-                        if let Some(ref preview_text) = preview {
-                            // Show actual thinking content, not a canned message
-                            let truncated: String = preview_text.chars().take(200).collect();
-                            format!("\u{1F4AD} {truncated}\n({elapsed}s)")
-                        } else {
-                            // No thinking content yet — skip this tick
-                            continue;
-                        }
-                    } else if let Some(ref preview_text) = preview {
-                        let truncated: String = preview_text.chars().take(80).collect();
-                        if tools.is_empty() {
-                            format!("{truncated}... ({elapsed}s)")
-                        } else {
-                            format!("{truncated}...\n[step {step} | {phase} | {} | {elapsed}s]",
-                                tools.join(", "))
-                        }
-                    } else if !tools.is_empty() {
-                        format!("[step {step} | {phase} | {} | {elapsed}s]",
-                            tools.join(", "))
-                    } else {
-                        // No content yet — skip this tick entirely
-                        continue;
-                    }
+                    build_non_stream_progress_message(&guard)
                 };
+                let Some((signature, progress_msg)) = progress_update else {
+                    continue;
+                };
+
+                let is_duplicate = last_progress_signature
+                    .as_ref()
+                    .map(|prior| prior == &signature)
+                    .unwrap_or(false);
+                let heartbeat_due = last_progress_sent_at
+                    .map(|sent_at| {
+                        sent_at.elapsed().as_secs() >= NON_STREAM_PROGRESS_HEARTBEAT_SECS
+                    })
+                    .unwrap_or(true);
+                if is_duplicate && !heartbeat_due {
+                    continue;
+                }
+
                 eprintln!("[progress-reporter] sending progress: {progress_msg}");
-                let _ = telegram_send_message(&prog_agent, &prog_url, chat_id, &progress_msg);
+                match progress_message_id {
+                    Some(message_id) => {
+                        telegram_edit_message(
+                            &prog_agent,
+                            &prog_url,
+                            chat_id,
+                            message_id,
+                            &progress_msg,
+                        );
+                    }
+                    None => {
+                        progress_message_id = telegram_send_message_returning_id(
+                            &prog_agent,
+                            &prog_url,
+                            chat_id,
+                            &progress_msg,
+                        );
+                        if progress_message_id.is_none() {
+                            let _ = telegram_send_message(
+                                &prog_agent,
+                                &prog_url,
+                                chat_id,
+                                &progress_msg,
+                            );
+                        }
+                    }
+                }
+                last_progress_signature = Some(signature);
+                last_progress_sent_at = Some(std::time::Instant::now());
             }
             if should_checkpoint {
                 let (step, max, tools, preview, elapsed) = {
@@ -1075,16 +1439,25 @@ pub(crate) fn spawn_agent_run(
                     guard.checkpoint_sent = true;
                     let elapsed = guard.started_at.elapsed().as_secs();
                     let tools: Vec<String> = {
-                        let mut sorted: Vec<_> = guard.tools_used.iter()
+                        let mut sorted: Vec<_> = guard
+                            .tools_used
+                            .iter()
                             .map(|(k, v)| (k.clone(), *v))
                             .collect();
                         sorted.sort_by(|a, b| b.1.cmp(&a.1));
-                        sorted.into_iter().take(5)
+                        sorted
+                            .into_iter()
+                            .take(5)
                             .map(|(k, v)| format!("{k} ({v}x)"))
                             .collect()
                     };
-                    (guard.step, guard.extended_max_steps.unwrap_or(guard.max_steps),
-                     tools, guard.text_preview.clone(), elapsed)
+                    (
+                        guard.step,
+                        guard.extended_max_steps.unwrap_or(guard.max_steps),
+                        tools,
+                        guard.text_preview.clone(),
+                        elapsed,
+                    )
                 };
                 let tools_str = if tools.is_empty() {
                     "none yet".to_string()
@@ -1132,9 +1505,7 @@ pub(crate) fn handle_telegram_completion(
             }
             text
         }
-        Err(err) => {
-            err.chars().take(500).collect::<String>()
-        }
+        Err(err) => err.chars().take(500).collect::<String>(),
     };
 
     // ── Auto-continuation: if agent ran out of steps, chain to a new session ──
@@ -1146,7 +1517,9 @@ pub(crate) fn handle_telegram_completion(
                 let checkpoint_path = &after[..end];
                 // Read checkpoint and build continuation prompt
                 if let Ok(checkpoint_json) = std::fs::read_to_string(checkpoint_path) {
-                    if let Ok(checkpoint) = serde_json::from_str::<crate::ContinuationCheckpoint>(&checkpoint_json) {
+                    if let Ok(checkpoint) =
+                        serde_json::from_str::<crate::ContinuationCheckpoint>(&checkpoint_json)
+                    {
                         if checkpoint.chain_depth < MAX_CHAIN_DEPTH {
                             let continuation_prompt = format!(
                                 "[Continuation from previous session — chain depth {}/{}]\n\n\
@@ -1154,7 +1527,8 @@ pub(crate) fn handle_telegram_completion(
                                  ## Summary of work so far\n{}\n\n\
                                  ## Remaining work\n{}\n\n\
                                  Continue from where you left off. Do NOT repeat completed work.",
-                                checkpoint.chain_depth, MAX_CHAIN_DEPTH,
+                                checkpoint.chain_depth,
+                                MAX_CHAIN_DEPTH,
                                 checkpoint.goal,
                                 checkpoint.summary,
                                 checkpoint.remaining_work,
@@ -1163,13 +1537,22 @@ pub(crate) fn handle_telegram_completion(
                             // Send a brief status to the user (not the raw continuation marker)
                             let status_msg = format!(
                                 "Continuing — session {}/{}\nGoal: {}",
-                                checkpoint.chain_depth, MAX_CHAIN_DEPTH,
+                                checkpoint.chain_depth,
+                                MAX_CHAIN_DEPTH,
                                 checkpoint.goal.chars().take(120).collect::<String>(),
                             );
-                            let _ = telegram_send_message_ext(http_agent, base_url, chat_id, &status_msg, reply_to_id);
+                            let _ = telegram_send_message_ext(
+                                http_agent,
+                                base_url,
+                                chat_id,
+                                &status_msg,
+                                reply_to_id,
+                            );
                             eprintln!(
                                 "[auto-continuation] chaining session (depth {}/{}): {}",
-                                checkpoint.chain_depth, MAX_CHAIN_DEPTH, checkpoint.goal.chars().take(80).collect::<String>()
+                                checkpoint.chain_depth,
+                                MAX_CHAIN_DEPTH,
+                                checkpoint.goal.chars().take(80).collect::<String>()
                             );
 
                             // Build session with chain depth marker
@@ -1192,14 +1575,20 @@ pub(crate) fn handle_telegram_completion(
                             if let Some(run) = active_runs.get_mut(&chat_id) {
                                 run.progress = progress;
                             } else {
-                                active_runs.insert(chat_id, ActiveRun {
-                                    progress,
-                                    queued_messages: Vec::new(),
-                                });
+                                active_runs.insert(
+                                    chat_id,
+                                    ActiveRun {
+                                        progress,
+                                        queued_messages: Vec::new(),
+                                    },
+                                );
                             }
                             return; // Don't fall through to normal completion handling
                         } else {
-                            eprintln!("[auto-continuation] max chain depth {} reached, stopping", MAX_CHAIN_DEPTH);
+                            eprintln!(
+                                "[auto-continuation] max chain depth {} reached, stopping",
+                                MAX_CHAIN_DEPTH
+                            );
                         }
                     }
                 }
@@ -1225,7 +1614,8 @@ pub(crate) fn handle_telegram_completion(
         save_session_turns(&session_id, &turns, 20);
     }
 
-    if let Err(err) = telegram_send_message_ext(http_agent, base_url, chat_id, &output, reply_to_id) {
+    if let Err(err) = telegram_send_message_ext(http_agent, base_url, chat_id, &output, reply_to_id)
+    {
         eprintln!("Telegram send failed: {err}");
     }
 
@@ -1239,7 +1629,8 @@ pub(crate) fn handle_telegram_completion(
                 run.queued_messages[0].0.clone()
             } else {
                 // Multiple messages -- combine them so the agent sees the full context
-                run.queued_messages.iter()
+                run.queued_messages
+                    .iter()
                     .map(|(text, _)| text.as_str())
                     .collect::<Vec<_>>()
                     .join("\n\n")
@@ -1312,8 +1703,8 @@ pub(crate) fn run_telegram_bridge(
         let trigger_sessions = Arc::clone(&session_registry);
         let trigger_mv2 = agent_config.db_path.clone();
         let trigger_token = Some(token.clone());
-        let trigger_chat_id = crate::env_optional("AETHERVAULT_TELEGRAM_CHAT_ID")
-            .and_then(|s| s.parse::<i64>().ok());
+        let trigger_chat_id =
+            crate::env_optional("AETHERVAULT_TELEGRAM_CHAT_ID").and_then(|s| s.parse::<i64>().ok());
         thread::spawn(move || {
             if let Err(e) = crate::services::run_trigger_thread(
                 &trigger_mv2,
@@ -1415,10 +1806,13 @@ pub(crate) fn run_telegram_bridge(
                         &base_url,
                         Some(bg_registry.clone()),
                     );
-                    active_runs.insert(chat_id, ActiveRun {
-                        progress,
-                        queued_messages: Vec::new(),
-                    });
+                    active_runs.insert(
+                        chat_id,
+                        ActiveRun {
+                            progress,
+                            queued_messages: Vec::new(),
+                        },
+                    );
                 }
             }
         }
@@ -1436,7 +1830,12 @@ pub(crate) fn run_telegram_bridge(
                     reg.scorecard(chat_id)
                 };
                 if !scorecard.is_empty() {
-                    let _ = telegram_send_message(&http_agent, &base_url, chat_id, &format!("Background tasks:\n{scorecard}"));
+                    let _ = telegram_send_message(
+                        &http_agent,
+                        &base_url,
+                        chat_id,
+                        &format!("Background tasks:\n{scorecard}"),
+                    );
                 }
             }
         }
@@ -1497,7 +1896,9 @@ pub(crate) fn run_telegram_bridge(
                 telegram_answer_callback(&http_agent, &base_url, &cb.id, None);
             }
 
-            let Some((chat_id, reply_to_id, user_text)) = extract_telegram_content(&entry, &http_agent, &base_url) else {
+            let Some((chat_id, reply_to_id, user_text)) =
+                extract_telegram_content(&entry, &http_agent, &base_url)
+            else {
                 continue;
             };
             if let Some(output) = try_handle_approval_chat(&agent_config.db_path, &user_text) {
@@ -1517,7 +1918,11 @@ pub(crate) fn run_telegram_bridge(
                     guard.checkpoint_sent && guard.checkpoint_response.is_none()
                 };
                 if is_checkpoint_response {
-                    if lower.contains("continue") || lower.contains("keep going") || lower.contains("yes") || lower.contains("extend") {
+                    if lower.contains("continue")
+                        || lower.contains("keep going")
+                        || lower.contains("yes")
+                        || lower.contains("extend")
+                    {
                         let mut guard = run.progress.lock().unwrap_or_else(|e| e.into_inner());
                         let current_max = guard.extended_max_steps.unwrap_or(guard.max_steps);
                         guard.extended_max_steps = Some(current_max + guard.max_steps);
@@ -1530,11 +1935,19 @@ pub(crate) fn run_telegram_bridge(
                             let truncated: String = preview.chars().take(100).collect();
                             let new_max = guard.extended_max_steps.unwrap_or(guard.max_steps);
                             drop(guard);
-                            let _ = telegram_send_message(&http_agent, &base_url, chat_id,
-                                &format!("Extended to {new_max} steps.\n{truncated}"));
+                            let _ = telegram_send_message(
+                                &http_agent,
+                                &base_url,
+                                chat_id,
+                                &format!("Extended to {new_max} steps.\n{truncated}"),
+                            );
                         }
                         continue;
-                    } else if lower.contains("wrap") || lower.contains("stop") || lower.contains("finish") || lower.contains("no") {
+                    } else if lower.contains("wrap")
+                        || lower.contains("stop")
+                        || lower.contains("finish")
+                        || lower.contains("no")
+                    {
                         let mut guard = run.progress.lock().unwrap_or_else(|e| e.into_inner());
                         guard.checkpoint_response = Some(false);
                         drop(guard);
@@ -1564,7 +1977,12 @@ pub(crate) fn run_telegram_bridge(
                         let reg = bg_registry.lock().unwrap_or_else(|e| e.into_inner());
                         reg.scorecard(chat_id)
                     };
-                    let _ = telegram_send_message(&http_agent, &base_url, chat_id, &format!("Background tasks:\n{scorecard}"));
+                    let _ = telegram_send_message(
+                        &http_agent,
+                        &base_url,
+                        chat_id,
+                        &format!("Background tasks:\n{scorecard}"),
+                    );
                     continue;
                 }
             }
@@ -1600,10 +2018,68 @@ pub(crate) fn run_telegram_bridge(
                 Some(bg_registry.clone()),
             );
 
-            active_runs.insert(chat_id, ActiveRun {
-                progress,
-                queued_messages: Vec::new(),
-            });
+            active_runs.insert(
+                chat_id,
+                ActiveRun {
+                    progress,
+                    queued_messages: Vec::new(),
+                },
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_non_stream_progress_message, sanitize_progress_text};
+    use crate::AgentProgress;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn sample_progress() -> AgentProgress {
+        AgentProgress {
+            step: 6,
+            max_steps: 12,
+            phase: "tool:self_upgrade".to_string(),
+            text_preview: Some(
+                "Grok key confirmed: `xai-KJzvgaSGpIkRyaHb12345678901234567890`".to_string(),
+            ),
+            started_at: Instant::now() - Duration::from_secs(90),
+            tools_used: HashMap::from([("self_upgrade".to_string(), 1)]),
+            checkpoint_sent: false,
+            checkpoint_response: None,
+            extended_max_steps: None,
+            interim_messages: Vec::new(),
+            first_ack_sent: true,
+            opus_steps: 0,
+            delegated_steps: 0,
+            steering_messages: Vec::new(),
+            bg_registry: None,
+            chat_id: None,
+            last_output: Some(Arc::new(Mutex::new(None))),
+            session_registry: None,
+            stream_thinking: None,
+            stream_response: None,
+            stream_phase: crate::StreamPhase::Idle,
+            stream_message_id: None,
+            stream_revision: 0,
+        }
+    }
+
+    #[test]
+    fn sanitize_progress_text_redacts_known_secret_prefixes() {
+        let sanitized = sanitize_progress_text("token xai-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890");
+        assert!(sanitized.contains("[redacted-secret]"));
+        assert!(!sanitized.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"));
+    }
+
+    #[test]
+    fn self_upgrade_progress_uses_generic_message() {
+        let progress = sample_progress();
+        let (_, message) = build_non_stream_progress_message(&progress).expect("progress message");
+        assert!(message.contains("Deploying the update"));
+        assert!(!message.contains("xai-"));
+        assert!(!message.contains("self_upgrade"));
     }
 }

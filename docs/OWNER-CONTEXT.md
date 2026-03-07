@@ -139,7 +139,7 @@ Active process with Circle Surrogacy. Deeply personal and important. Be supporti
 |----------|---------|-------|
 | DigitalOcean | Cloud infrastructure | Droplet hosting for AetherVault |
 | Anthropic | Primary AI (Claude) | Opus 4.6 + Sonnet failover |
-| OpenAI | Codex sub-agent | GPT-5.3 for coding tasks |
+| OpenAI | Codex sub-agent | GPT-5.4 with xhigh reasoning for coding tasks |
 | xAI (Grok) | Twitter/web search | Real-time social + web data |
 | Groq | Voice transcription | Whisper STT, primary audio |
 | Deepgram | Backup transcription | Nova-2, secondary audio |

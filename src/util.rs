@@ -56,12 +56,15 @@ pub(crate) fn blake3_hash(bytes: &[u8]) -> Hash {
     blake3::hash(bytes)
 }
 
-pub(crate) fn open_or_create_db(path: &Path) -> Result<crate::memory_db::MemoryDb, Box<dyn std::error::Error>> {
+pub(crate) fn open_or_create_db(
+    path: &Path,
+) -> Result<crate::memory_db::MemoryDb, Box<dyn std::error::Error>> {
     if path.is_dir() {
         return Err(format!(
             "Path '{}' is a directory, expected a file path for database",
             path.display()
-        ).into());
+        )
+        .into());
     }
     use crate::memory_db::MemoryDb;
 
@@ -77,7 +80,9 @@ pub(crate) fn open_or_create_db(path: &Path) -> Result<crate::memory_db::MemoryD
 
     // ── MV2 vault detected — auto-migrate to SQLite WAL ──────────────
     eprintln!("[migrate] Detected MV2 vault at {}", path.display());
-    let file_size_mb = std::fs::metadata(path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+    let file_size_mb = std::fs::metadata(path)
+        .map(|m| m.len() / (1024 * 1024))
+        .unwrap_or(0);
     eprintln!("[migrate] File size: {file_size_mb} MB — migrating to SQLite WAL...");
 
     // Step 1: Rename original MV2 to a backup path (preserves it intact).
@@ -86,10 +91,10 @@ pub(crate) fn open_or_create_db(path: &Path) -> Result<crate::memory_db::MemoryD
         return Err(format!(
             "backup path already exists (previous failed migration?): {}",
             backup.display()
-        ).into());
+        )
+        .into());
     }
-    std::fs::rename(path, &backup)
-        .map_err(|e| format!("rename MV2 → backup: {e}"))?;
+    std::fs::rename(path, &backup).map_err(|e| format!("rename MV2 → backup: {e}"))?;
     eprintln!("[migrate] Backed up MV2 to {}", backup.display());
 
     // Step 2: Create fresh SQLite database at the original path.
@@ -121,7 +126,9 @@ pub(crate) fn open_or_create_db(path: &Path) -> Result<crate::memory_db::MemoryD
                     eprintln!("[migrate]   ... and {} more", report.errors.len() - 20);
                 }
             }
-            let new_size_mb = std::fs::metadata(path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+            let new_size_mb = std::fs::metadata(path)
+                .map(|m| m.len() / (1024 * 1024))
+                .unwrap_or(0);
             eprintln!("[migrate] SQLite size: {new_size_mb} MB (was {file_size_mb} MB MV2)");
             eprintln!("[migrate] Original MV2 preserved at: {}", backup.display());
             Ok(db)
@@ -395,13 +402,17 @@ pub(crate) fn build_external_command(program: &str, args: &[String]) -> ProcessC
 pub(crate) fn kill_process_tree(child: &mut std::process::Child) {
     let pid = child.id() as i32;
     // SIGTERM the group first (graceful)
-    unsafe { libc::kill(-pid, libc::SIGTERM); }
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+    }
     // Give 2 seconds for graceful shutdown
     std::thread::sleep(std::time::Duration::from_secs(2));
     // SIGKILL if still running
     match child.try_wait() {
         Ok(Some(_)) => {}
-        _ => { unsafe { libc::killpg(pid, libc::SIGKILL); } }
+        _ => unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        },
     }
     let _ = child.wait();
 }

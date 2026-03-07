@@ -5,7 +5,7 @@
 //!
 //! Run: cargo run --example skill_proof
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 
 fn create_db() -> Connection {
@@ -102,19 +102,74 @@ fn search_old(conn: &Connection, query: &str, limit: usize) -> Vec<String> {
              ORDER BY success_rate DESC LIMIT ?2",
         )
         .unwrap();
-    stmt.query_map(params![pattern, limit as i64], |row| row.get::<_, String>(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+    stmt.query_map(params![pattern, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })
+    .unwrap()
+    .filter_map(|r| r.ok())
+    .collect()
 }
 
 fn match_old(conn: &Connection, prompt: &str) -> Vec<String> {
     let stop: HashSet<&str> = [
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "have", "has", "had", "do",
-        "does", "did", "will", "would", "could", "should", "can", "may", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "it", "this", "that", "and", "or", "but", "not", "you",
-        "your", "i", "my", "me", "we", "our", "they", "their", "he", "she", "need", "want",
-        "something", "help", "please", "how", "get", "make", "just", "like",
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "can",
+        "may",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "it",
+        "this",
+        "that",
+        "and",
+        "or",
+        "but",
+        "not",
+        "you",
+        "your",
+        "i",
+        "my",
+        "me",
+        "we",
+        "our",
+        "they",
+        "their",
+        "he",
+        "she",
+        "need",
+        "want",
+        "something",
+        "help",
+        "please",
+        "how",
+        "get",
+        "make",
+        "just",
+        "like",
     ]
     .iter()
     .cloned()
@@ -128,7 +183,9 @@ fn match_old(conn: &Connection, prompt: &str) -> Vec<String> {
     let mut results = Vec::new();
     for word in &words {
         let cleaned: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
-        if cleaned.len() < 3 { continue; }
+        if cleaned.len() < 3 {
+            continue;
+        }
         for name in search_old(conn, &cleaned, 10) {
             if seen.insert(name.clone()) {
                 results.push(name);
@@ -150,22 +207,24 @@ fn search_new(conn: &Connection, query: &str, limit: usize) -> Vec<String> {
              ORDER BY success_rate DESC LIMIT ?2",
         )
         .unwrap();
-    stmt.query_map(params![pattern, limit as i64], |row| row.get::<_, String>(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+    stmt.query_map(params![pattern, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })
+    .unwrap()
+    .filter_map(|r| r.ok())
+    .collect()
 }
 
 fn stem(word: &str) -> String {
     let w = word.to_lowercase();
     for suffix in &[
-        "ation", "tion", "ment", "ness", "able", "ible",
-        "ying", "ous", "ive", "ful", "ess",
-        "ing", "ied", "ies",
-        "ed", "ly", "er", "es", "al",
+        "ation", "tion", "ment", "ness", "able", "ible", "ying", "ous", "ive", "ful", "ess", "ing",
+        "ied", "ies", "ed", "ly", "er", "es", "al",
     ] {
         if let Some(s) = w.strip_suffix(suffix) {
-            if s.len() >= 3 { return s.to_string(); }
+            if s.len() >= 3 {
+                return s.to_string();
+            }
         }
     }
     if w.ends_with('s') && !w.ends_with("ss") && w.len() > 3 {
@@ -190,9 +249,18 @@ fn expand_synonyms(word: &str) -> Vec<String> {
         ("checkout", &["stripe", "payment", "billing", "commerce"]),
         ("billing", &["stripe", "payment", "checkout", "commerce"]),
         ("commerce", &["stripe", "payment", "checkout", "billing"]),
-        ("sell", &["commerce", "stripe", "payment", "revenue", "money"]),
-        ("money", &["revenue", "stripe", "payment", "commerce", "sell"]),
-        ("revenue", &["money", "stripe", "payment", "commerce", "sell"]),
+        (
+            "sell",
+            &["commerce", "stripe", "payment", "revenue", "money"],
+        ),
+        (
+            "money",
+            &["revenue", "stripe", "payment", "commerce", "sell"],
+        ),
+        (
+            "revenue",
+            &["money", "stripe", "payment", "commerce", "sell"],
+        ),
         ("tweet", &["twitter", "post", "social"]),
         ("twitter", &["tweet", "post", "social", "x"]),
         ("post", &["tweet", "publish", "share"]),
@@ -214,11 +282,64 @@ fn expand_synonyms(word: &str) -> Vec<String> {
 
 fn match_new(conn: &Connection, prompt: &str) -> Vec<String> {
     let stop: HashSet<&str> = [
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "have", "has", "had", "do",
-        "does", "did", "will", "would", "could", "should", "can", "may", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "it", "this", "that", "and", "or", "but", "not", "you",
-        "your", "i", "my", "me", "we", "our", "they", "their", "he", "she", "need", "want",
-        "something", "help", "please", "how", "get", "make", "just", "like",
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "can",
+        "may",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "it",
+        "this",
+        "that",
+        "and",
+        "or",
+        "but",
+        "not",
+        "you",
+        "your",
+        "i",
+        "my",
+        "me",
+        "we",
+        "our",
+        "they",
+        "their",
+        "he",
+        "she",
+        "need",
+        "want",
+        "something",
+        "help",
+        "please",
+        "how",
+        "get",
+        "make",
+        "just",
+        "like",
     ]
     .iter()
     .cloned()
@@ -231,7 +352,9 @@ fn match_new(conn: &Connection, prompt: &str) -> Vec<String> {
     let mut all: HashMap<String, usize> = HashMap::new();
     for word in &words {
         let cleaned: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
-        if cleaned.len() < 3 { continue; }
+        if cleaned.len() < 3 {
+            continue;
+        }
         let stemmed = stem(&cleaned);
         let mut terms: HashSet<String> = HashSet::new();
         for base in [cleaned.to_lowercase(), stemmed] {
@@ -262,24 +385,24 @@ fn main() {
         "I want to sell something and make money",
         "review and merge this pr",
         // --- Stemming tests ---
-        "deploying the app",               // "deploying" → stem "deploy"
-        "check my payments",               // "payments" → stem "payment"
-        "how are my sales doing",           // "sales" → context match
-        "I tweeted something wrong",        // "tweeted" → stem "tweet"
+        "deploying the app",         // "deploying" → stem "deploy"
+        "check my payments",         // "payments" → stem "payment"
+        "how are my sales doing",    // "sales" → context match
+        "I tweeted something wrong", // "tweeted" → stem "tweet"
         // --- Steps/contexts tests ---
-        "run npx vercel",                   // "vercel" only in steps
-        "set up commerce for my app",       // "commerce" only in contexts
-        "what's my stripe balance",         // "stripe" in name + contexts
+        "run npx vercel",             // "vercel" only in steps
+        "set up commerce for my app", // "commerce" only in contexts
+        "what's my stripe balance",   // "stripe" in name + contexts
         // --- Real vague Telegram messages ---
-        "put my website online",            // no direct keyword match
-        "I need a payment link",            // "payment" → synonyms
-        "post something on twitter",        // direct + synonym
-        "push code and open a pull request",// "pull" → github synonym
-        "how much money did we make",       // "money" → synonym chain
-        "build and deploy a website",       // multi-intent
+        "put my website online",             // no direct keyword match
+        "I need a payment link",             // "payment" → synonyms
+        "post something on twitter",         // direct + synonym
+        "push code and open a pull request", // "pull" → github synonym
+        "how much money did we make",        // "money" → synonym chain
+        "build and deploy a website",        // multi-intent
         "check what people are saying about us on twitter", // vague social
-        "I want to start selling online",   // "selling" → stem "sell" → synonyms
-        "get the site hosted somewhere",    // "hosted" → stem "host" → synonym "deploy"
+        "I want to start selling online",    // "selling" → stem "sell" → synonyms
+        "get the site hosted somewhere",     // "hosted" → stem "host" → synonym "deploy"
     ];
 
     println!("╔══════════════════════════════════════════════════════════════════════╗");
@@ -297,8 +420,12 @@ fn main() {
         let old = match_old(&conn, msg);
         let new = match_new(&conn, msg);
 
-        if old.is_empty() { old_misses += 1; }
-        if new.is_empty() { new_misses += 1; }
+        if old.is_empty() {
+            old_misses += 1;
+        }
+        if new.is_empty() {
+            new_misses += 1;
+        }
         old_hits += old.len();
         new_hits += new.len();
 
@@ -351,7 +478,11 @@ fn main() {
     } else {
         println!("  Match improvement:   ∞");
     }
-    println!("  Miss reduction:      {} → {} ({} fewer dead ends)",
-        old_misses, new_misses, old_misses.saturating_sub(new_misses));
+    println!(
+        "  Miss reduction:      {} → {} ({} fewer dead ends)",
+        old_misses,
+        new_misses,
+        old_misses.saturating_sub(new_misses)
+    );
     println!("════════════════════════════════════════════════════════════════════════");
 }

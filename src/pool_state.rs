@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::{env_optional, AgentHookRequest, AgentMessage};
+use crate::{AgentHookRequest, AgentMessage, env_optional};
 
 // ---------------------------------------------------------------------------
 // Auth profiles config (deserialized from config/auth-profiles.json)
@@ -157,10 +157,10 @@ fn global_pool() -> Arc<Mutex<PoolState>> {
 
         // Try to load auth-profiles.json from AETHERVAULT_HOME
         let home = env_optional("AETHERVAULT_HOME")
-            .unwrap_or_else(|| {
-                dirs_home().unwrap_or_else(|| "/root/.aethervault".to_string())
-            });
-        let config_path = PathBuf::from(&home).join("config").join("auth-profiles.json");
+            .unwrap_or_else(|| dirs_home().unwrap_or_else(|| "/root/.aethervault".to_string()));
+        let config_path = PathBuf::from(&home)
+            .join("config")
+            .join("auth-profiles.json");
         if config_path.exists() {
             match std::fs::read_to_string(&config_path) {
                 Ok(raw) => match serde_json::from_str::<AuthProfilesConfig>(&raw) {
@@ -174,7 +174,10 @@ fn global_pool() -> Arc<Mutex<PoolState>> {
                         );
                     }
                     Err(e) => {
-                        eprintln!("[pool_state] Failed to parse {}: {e}", config_path.display());
+                        eprintln!(
+                            "[pool_state] Failed to parse {}: {e}",
+                            config_path.display()
+                        );
                     }
                 },
                 Err(e) => {
@@ -188,7 +191,9 @@ fn global_pool() -> Arc<Mutex<PoolState>> {
 }
 
 fn dirs_home() -> Option<String> {
-    std::env::var("HOME").ok().map(|h| format!("{h}/.aethervault"))
+    std::env::var("HOME")
+        .ok()
+        .map(|h| format!("{h}/.aethervault"))
 }
 
 // ---------------------------------------------------------------------------
@@ -301,21 +306,15 @@ pub(crate) fn run_codex_native(prompt: &str, read_only: bool) -> Result<AgentMes
 }
 
 fn run_codex_once(prompt: &str, account: &str, read_only: bool) -> Result<AgentMessage, String> {
-    let profile = pool_get_profile(account)
-        .ok_or_else(|| format!("No profile for account: {account}"))?;
+    let profile =
+        pool_get_profile(account).ok_or_else(|| format!("No profile for account: {account}"))?;
 
     let config_dir = profile
         .codex_config_dir
         .as_deref()
         .unwrap_or("/root/.codex");
-    let model = profile
-        .model
-        .as_deref()
-        .unwrap_or("gpt-5.3-codex-spark");
-    let reasoning = profile
-        .reasoning_effort
-        .as_deref()
-        .unwrap_or("xhigh");
+    let model = profile.model.as_deref().unwrap_or("gpt-5.4");
+    let reasoning = profile.reasoning_effort.as_deref().unwrap_or("xhigh");
 
     let effective_prompt = if read_only {
         format!(
@@ -336,7 +335,13 @@ fn run_codex_once(prompt: &str, account: &str, read_only: bool) -> Result<AgentM
     } else {
         args.push("--dangerously-bypass-approvals-and-sandbox");
     }
-    args.extend(["--json", "--skip-git-repo-check", "-c", &reasoning_cfg, &effective_prompt]);
+    args.extend([
+        "--json",
+        "--skip-git-repo-check",
+        "-c",
+        &reasoning_cfg,
+        &effective_prompt,
+    ]);
     cmd.args(&args);
     // Codex CLI reads config from $HOME/.codex/ — set HOME to the parent
     // of the config dir so each account gets its own auth.
@@ -426,17 +431,17 @@ fn run_codex_once(prompt: &str, account: &str, read_only: bool) -> Result<AgentM
 // Native Claude Code CLI backend
 // ---------------------------------------------------------------------------
 
-pub(crate) fn run_claude_code_native(prompt: &str, read_only: bool) -> Result<AgentMessage, String> {
-    let account = pool_pick_best_account("claude-code")
-        .ok_or("All Claude Code accounts are rate-limited")?;
+pub(crate) fn run_claude_code_native(
+    prompt: &str,
+    read_only: bool,
+) -> Result<AgentMessage, String> {
+    let account =
+        pool_pick_best_account("claude-code").ok_or("All Claude Code accounts are rate-limited")?;
 
-    let profile = pool_get_profile(&account)
-        .ok_or_else(|| format!("No profile for account: {account}"))?;
+    let profile =
+        pool_get_profile(&account).ok_or_else(|| format!("No profile for account: {account}"))?;
 
-    let model = profile
-        .model
-        .as_deref()
-        .unwrap_or("claude-sonnet-4-6");
+    let model = profile.model.as_deref().unwrap_or("claude-sonnet-4-6");
 
     let effective_prompt = if read_only {
         format!(
@@ -450,7 +455,14 @@ pub(crate) fn run_claude_code_native(prompt: &str, read_only: bool) -> Result<Ag
 
     eprintln!("[claude-code] Running with account={account}, model={model}, read_only={read_only}");
 
-    let mut args = vec!["-p", &effective_prompt, "--output-format", "json", "--model", model];
+    let mut args = vec![
+        "-p",
+        &effective_prompt,
+        "--output-format",
+        "json",
+        "--model",
+        model,
+    ];
     if read_only {
         args.extend(["--allowedTools", "Read,Grep,Glob,WebSearch,WebFetch"]);
     }
@@ -542,11 +554,10 @@ pub(crate) fn run_claude_code_native(prompt: &str, read_only: bool) -> Result<Ag
 }
 
 pub(crate) fn run_groq_native(prompt: &str, read_only: bool) -> Result<AgentMessage, String> {
-    let account = pool_pick_best_account("groq")
-        .ok_or("All Groq accounts are rate-limited")?;
+    let account = pool_pick_best_account("groq").ok_or("All Groq accounts are rate-limited")?;
 
-    let profile = pool_get_profile(&account)
-        .ok_or_else(|| format!("No profile for account: {account}"))?;
+    let profile =
+        pool_get_profile(&account).ok_or_else(|| format!("No profile for account: {account}"))?;
 
     let key = profile
         .extra
@@ -613,8 +624,12 @@ pub(crate) fn run_groq_native(prompt: &str, read_only: bool) -> Result<AgentMess
         return Err(format!("Groq API error {status}: {body}"));
     }
 
-    let parsed = serde_json::from_str::<serde_json::Value>(&body)
-        .map_err(|e| format!("Groq returned non-JSON response: {e} — body: {}", &body[..body.len().min(200)]))?;
+    let parsed = serde_json::from_str::<serde_json::Value>(&body).map_err(|e| {
+        format!(
+            "Groq returned non-JSON response: {e} — body: {}",
+            &body[..body.len().min(200)]
+        )
+    })?;
 
     let content = parsed
         .get("choices")
@@ -623,7 +638,12 @@ pub(crate) fn run_groq_native(prompt: &str, read_only: bool) -> Result<AgentMess
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("Groq response missing choices[0].message.content — body: {}", &body[..body.len().min(200)]))?;
+        .ok_or_else(|| {
+            format!(
+                "Groq response missing choices[0].message.content — body: {}",
+                &body[..body.len().min(200)]
+            )
+        })?;
 
     pool_mark_success(&account);
 
@@ -639,11 +659,10 @@ pub(crate) fn run_groq_native(prompt: &str, read_only: bool) -> Result<AgentMess
 }
 
 pub(crate) fn run_xai_native(prompt: &str, read_only: bool) -> Result<AgentMessage, String> {
-    let account = pool_pick_best_account("xai-grok")
-        .ok_or("All xAI accounts are rate-limited")?;
+    let account = pool_pick_best_account("xai-grok").ok_or("All xAI accounts are rate-limited")?;
 
-    let profile = pool_get_profile(&account)
-        .ok_or_else(|| format!("No profile for account: {account}"))?;
+    let profile =
+        pool_get_profile(&account).ok_or_else(|| format!("No profile for account: {account}"))?;
 
     let key = profile
         .extra
@@ -659,10 +678,7 @@ pub(crate) fn run_xai_native(prompt: &str, read_only: bool) -> Result<AgentMessa
         .or_else(|| env_optional("XAI_API_KEY"))
         .ok_or("Missing XAI API key")?;
 
-    let model = profile
-        .model
-        .as_deref()
-        .unwrap_or("grok-3-mini");
+    let model = profile.model.as_deref().unwrap_or("grok-3-mini");
 
     let effective_prompt = if read_only {
         format!(
@@ -751,7 +767,10 @@ pub(crate) fn run_xai_native(prompt: &str, read_only: bool) -> Result<AgentMessa
 /// Backend priority for pool routing
 const POOL_BACKEND_ORDER: &[&str] = &["codex", "claude-code", "groq", "xai-grok"];
 
-pub(crate) fn run_pool_routed(request: &AgentHookRequest, read_only: bool) -> Result<AgentMessage, String> {
+pub(crate) fn run_pool_routed(
+    request: &AgentHookRequest,
+    read_only: bool,
+) -> Result<AgentMessage, String> {
     let prompt = extract_prompt_from_request(request);
     if prompt.is_empty() {
         return Err("No user prompt found in messages".into());
@@ -812,11 +831,13 @@ pub(crate) fn should_hook_be_read_only(request: &AgentHookRequest) -> bool {
     if request.tools.is_empty() {
         return true;
     }
-    let has_exec = request.tools.iter().any(|t| {
-        t.get("name").and_then(|n| n.as_str()) == Some("exec")
-    });
-    let has_fs_write = request.tools.iter().any(|t| {
-        t.get("name").and_then(|n| n.as_str()) == Some("fs_write")
-    });
+    let has_exec = request
+        .tools
+        .iter()
+        .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("exec"));
+    let has_fs_write = request
+        .tools
+        .iter()
+        .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("fs_write"));
     !has_exec && !has_fs_write
 }

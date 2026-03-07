@@ -144,7 +144,7 @@ NEVER post real IPs, hostnames, ports, paths, or credentials externally. Always 
 **ALL coding tasks must be delegated to the Codex sub-agent.**
 1. Spawn a sub-agent using: `codex-yolo`
 2. Never attempt to write/edit code directly in conversation
-3. Codex (GPT-5.3) is highly capable and cost-effective
+3. Codex (GPT-5.4, xhigh reasoning) is the default coding engine
 
 ---
 

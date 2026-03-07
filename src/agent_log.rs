@@ -1,8 +1,8 @@
+use crate::AgentLogEntry;
+use chrono::Utc;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use chrono::Utc;
-use crate::AgentLogEntry;
 
 pub(crate) fn log_dir_path(workspace: &Path) -> PathBuf {
     workspace.join("logs")
@@ -16,20 +16,13 @@ pub(crate) fn append_log_jsonl(
     let date_str = Utc::now().format("%Y-%m-%d");
     let filename = format!("agent-{}.jsonl", date_str);
     let path = log_dir.join(filename);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     let json = serde_json::to_string(entry)?;
     writeln!(file, "{}", json)?;
     Ok(())
 }
 
-pub(crate) fn load_session_logs(
-    log_dir: &Path,
-    session: &str,
-    limit: usize,
-) -> Vec<AgentLogEntry> {
+pub(crate) fn load_session_logs(log_dir: &Path, session: &str, limit: usize) -> Vec<AgentLogEntry> {
     let mut files: Vec<PathBuf> = match fs::read_dir(log_dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())

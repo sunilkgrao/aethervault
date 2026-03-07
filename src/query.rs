@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-use crate::memory_db::{
-    Frame, MemoryDb, SearchHit, SearchRequest, TemporalFilter,
-};
+use crate::memory_db::{Frame, MemoryDb, SearchHit, SearchRequest, TemporalFilter};
 use chrono::Utc;
 use serde_json;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -42,7 +40,10 @@ pub(crate) fn frame_to_summary(frame: &Frame) -> Option<FrameSummary> {
     })
 }
 
-pub(crate) fn collect_latest_frames(db: &MemoryDb, include_inactive: bool) -> HashMap<String, FrameSummary> {
+pub(crate) fn collect_latest_frames(
+    db: &MemoryDb,
+    include_inactive: bool,
+) -> HashMap<String, FrameSummary> {
     let frames = db.collect_latest_frames(include_inactive);
     let mut out = HashMap::new();
     for (uri, frame) in frames {
@@ -67,7 +68,12 @@ pub(crate) fn has_strong_signal(hits: &[SearchHit]) -> bool {
     }
 }
 
-pub(crate) fn build_ranked_list(lane: LaneKind, query: &str, is_base: bool, hits: &[SearchHit]) -> RankedList {
+pub(crate) fn build_ranked_list(
+    lane: LaneKind,
+    query: &str,
+    is_base: bool,
+    hits: &[SearchHit],
+) -> RankedList {
     let items = hits
         .iter()
         .enumerate()
@@ -484,10 +490,16 @@ pub(crate) fn execute_query(
     // --- Qdrant external vector lane ---
     if !args.no_vector {
         if let Some(qdrant_url) = env_optional("QDRANT_URL") {
-            let collection = env_optional("QDRANT_COLLECTION").unwrap_or_else(|| "aethervault".to_string());
+            let collection =
+                env_optional("QDRANT_COLLECTION").unwrap_or_else(|| "aethervault".to_string());
             match qdrant_search_text(&qdrant_url, &collection, &args.raw_query, lane_limit) {
                 Ok(hits) if !hits.is_empty() => {
-                    lists.push(build_ranked_list(LaneKind::Vec, &args.raw_query, false, &hits));
+                    lists.push(build_ranked_list(
+                        LaneKind::Vec,
+                        &args.raw_query,
+                        false,
+                        &hits,
+                    ));
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -748,10 +760,7 @@ pub(crate) fn append_agent_log(
     Ok(uri)
 }
 
-pub(crate) fn append_feedback(
-    db: &MemoryDb,
-    event: &FeedbackEvent,
-) -> Result<String, String> {
+pub(crate) fn append_feedback(db: &MemoryDb, event: &FeedbackEvent) -> Result<String, String> {
     let ts = Utc::now().timestamp();
     let bytes = serde_json::to_vec(event).map_err(|e| format!("serialize feedback: {e}"))?;
     let hash = blake3_hash(&bytes);
@@ -909,9 +918,9 @@ pub(crate) fn scan_subagent_fabrication(text: &str, recent_tool_names: &[String]
         "according to the subagent",
     ];
     let has_claim = subagent_claims.iter().any(|m| lower.contains(m));
-    let had_subagent_tool = recent_tool_names.iter().any(|n|
-        n.contains("subagent") || n.contains("session") || n == "bg_status"
-    );
+    let had_subagent_tool = recent_tool_names
+        .iter()
+        .any(|n| n.contains("subagent") || n.contains("session") || n == "bg_status");
     // Fabrication = claiming subagent results without having called a subagent tool
     has_claim && !had_subagent_tool
 }
@@ -936,9 +945,9 @@ pub(crate) fn critic_should_fire(
     }
 
     let interval = if violation_count >= 10 {
-        1   // Every step after 10 violations
+        1 // Every step after 10 violations
     } else if violation_count >= 6 {
-        2   // Every other step after 6 violations
+        2 // Every other step after 6 violations
     } else {
         base_interval
     };
@@ -988,7 +997,10 @@ pub(crate) fn critic_should_fire(
     *last_critic_step = step;
 
     if tool_calls.len() >= 3 {
-        eprintln!("[critic] triggered: periodic + large tool batch ({})", tool_calls.len());
+        eprintln!(
+            "[critic] triggered: periodic + large tool batch ({})",
+            tool_calls.len()
+        );
     } else {
         eprintln!("[critic] triggered: periodic (step {})", step);
     }
@@ -997,7 +1009,9 @@ pub(crate) fn critic_should_fire(
 }
 
 pub(crate) fn tool_autonomy_for(tool_name: &str) -> ToolAutonomyLevel {
-    if let Ok(level_str) = std::env::var(format!("TOOL_AUTONOMY_{}", tool_name.to_ascii_uppercase())) {
+    if let Ok(level_str) =
+        std::env::var(format!("TOOL_AUTONOMY_{}", tool_name.to_ascii_uppercase()))
+    {
         match level_str.as_str() {
             "autonomous" => return ToolAutonomyLevel::Autonomous,
             "suggest_only" => return ToolAutonomyLevel::SuggestOnly,
@@ -1023,7 +1037,9 @@ mod tests {
         let (cycle_len, repeats) = match result {
             Some(value) => value,
             None => {
-                eprintln!("[query] detect_cycle unexpectedly returned None in detect_cycle_single_repeat");
+                eprintln!(
+                    "[query] detect_cycle unexpectedly returned None in detect_cycle_single_repeat"
+                );
                 (0, 0)
             }
         };
@@ -1051,7 +1067,9 @@ mod tests {
         let (cycle_len, _) = match result {
             Some(value) => value,
             None => {
-                eprintln!("[query] detect_cycle unexpectedly returned None in detect_cycle_two_step_pattern");
+                eprintln!(
+                    "[query] detect_cycle unexpectedly returned None in detect_cycle_two_step_pattern"
+                );
                 (0, 0)
             }
         };

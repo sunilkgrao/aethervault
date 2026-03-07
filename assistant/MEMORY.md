@@ -148,7 +148,7 @@ DOCKER: NOT WORKING on this WSL2 kernel (missing iptables + bridge modules). Don
 KVM: NOT AVAILABLE in WSL2. Android emulator uses software emulation only.
 AV CONTENT AGENT DEPLOYED & WORKING (2026-02-15). Full end-to-end content generation pipeline:
 
-ARCHITECTURE: raoDesktop Content Pipeline (port 8100) → AV Content Agent (port 8200 on AV droplet) → Codex CLI (gpt-5.3-codex-spark) → generated content returned
+ARCHITECTURE: raoDesktop Content Pipeline (port 8100) → AV Content Agent (port 8200 on AV droplet) → Codex CLI (gpt-5.4, xhigh reasoning) → generated content returned
 
 FILES:
 - AV droplet: /opt/av-content-agent/server.py (FastAPI on port 8200, systemd: av-content-agent.service)
@@ -380,7 +380,7 @@ codex-cli-invocation, raodesktop-ssh-access, macos-vm-management, browser-automa
    - Access: ssh -p 2222 sunil@localhost → ollama API at 127.0.0.1:11434
    - 24GB VRAM fits qwen3:32b (Q4 ~20GB) or qwen3:14b with huge context
 
-2. **CODEX CLI (FREE, powerful)** — gpt-5.3-codex-spark via `codex exec --dangerously-bypass-approvals-and-sandbox`
+2. **CODEX CLI (FREE, powerful)** — `gpt-5.4` via `codex exec --dangerously-bypass-approvals-and-sandbox -c 'model_reasoning_effort="xhigh"'`
    - Use for: Research tasks, code analysis, complex reasoning, multi-step planning, content generation
    - Can spin up internal swarms for parallelism
    - Fire-and-forget pattern: nohup codex exec ... &

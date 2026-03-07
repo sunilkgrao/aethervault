@@ -5,13 +5,12 @@ use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 
-
 use std::thread;
 use std::time::Instant;
 
 use super::{
-    build_external_command, dedup_keep_order, CapsuleConfig, CommandSpec, ConfigEntry,
-    ExpansionHookInput, ExpansionHookOutput, HookSpec, RerankHookInput, RerankHookOutput,
+    CapsuleConfig, CommandSpec, ConfigEntry, ExpansionHookInput, ExpansionHookOutput, HookSpec,
+    RerankHookInput, RerankHookOutput, build_external_command, dedup_keep_order,
 };
 
 use crate::memory_db::MemoryDb;
@@ -29,11 +28,7 @@ pub(crate) fn load_capsule_config(db: &MemoryDb) -> Option<CapsuleConfig> {
     serde_json::from_slice(&bytes).ok()
 }
 
-pub(crate) fn save_config_entry(
-    db: &MemoryDb,
-    key: &str,
-    bytes: &[u8],
-) -> Result<(), String> {
+pub(crate) fn save_config_entry(db: &MemoryDb, key: &str, bytes: &[u8]) -> Result<(), String> {
     db.config_set(key, bytes)
 }
 
@@ -172,18 +167,19 @@ pub(crate) fn run_hook_command(
         }
     };
 
-    let collect =
-        |handle: &mut Option<thread::JoinHandle<(Vec<u8>, bool)>>| -> (Vec<u8>, bool) {
-            handle
-                .take()
-                .and_then(|join| join.join().ok())
-                .unwrap_or_else(|| (Vec::new(), false))
-        };
+    let collect = |handle: &mut Option<thread::JoinHandle<(Vec<u8>, bool)>>| -> (Vec<u8>, bool) {
+        handle
+            .take()
+            .and_then(|join| join.join().ok())
+            .unwrap_or_else(|| (Vec::new(), false))
+    };
     let (stdout, stdout_truncated) = collect(&mut stdout_handle);
     let (stderr, stderr_truncated) = collect(&mut stderr_handle);
 
     if timed_out {
-        return Err(format!("hook '{kind}' timed out after {effective_timeout_ms}ms"));
+        return Err(format!(
+            "hook '{kind}' timed out after {effective_timeout_ms}ms"
+        ));
     }
 
     let status = status?;
@@ -250,7 +246,10 @@ pub(crate) fn run_expansion_hook(
     Ok(output)
 }
 
-pub(crate) fn run_rerank_hook(hook: &HookSpec, input: &RerankHookInput) -> Result<RerankHookOutput, String> {
+pub(crate) fn run_rerank_hook(
+    hook: &HookSpec,
+    input: &RerankHookInput,
+) -> Result<RerankHookOutput, String> {
     let cmd = command_spec_to_vec(&hook.command);
     let timeout = hook.timeout_ms.unwrap_or(NO_DEADLINE_TIMEOUT_MS);
     let value = serde_json::to_value(input).map_err(|e| format!("hook input: {e}"))?;

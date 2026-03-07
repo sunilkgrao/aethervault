@@ -1,15 +1,13 @@
-use std::io::Read;
 use std::collections::HashMap;
-use std::io;
 use std::env;
+use std::io;
+use std::io::Read;
 
 use tiny_http::{Header, Method, Response, Server};
 use url::form_urlencoded;
 
-use crate::{
-    try_handle_approval_chat, BridgeAgentConfig,
-};
 use crate::bridges::run_agent_for_bridge;
+use crate::{BridgeAgentConfig, try_handle_approval_chat};
 
 const WEBHOOK_MAX_BODY_BYTES_ENV: &str = "AETHERVAULT_WEBHOOK_MAX_BODY_BYTES";
 const DEFAULT_WEBHOOK_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -81,14 +79,13 @@ pub(crate) fn run_whatsapp_bridge(
             Ok(body) => body,
             Err(err) => {
                 if err == "payload too large" {
-                    let response = Response::from_string("payload too large")
-                        .with_status_code(413);
+                    let response = Response::from_string("payload too large").with_status_code(413);
                     let _ = request.respond(response);
                     continue;
                 }
 
-                let response = Response::from_string(format!("bad request: {err}"))
-                    .with_status_code(400);
+                let response =
+                    Response::from_string(format!("bad request: {err}")).with_status_code(400);
                 let _ = request.respond(response);
                 continue;
             }

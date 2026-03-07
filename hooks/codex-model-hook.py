@@ -185,7 +185,7 @@ def _run_codex_once(prompt, account):
     """Run Codex CLI once with a specific account. Returns (output, rate_limited)."""
     profile = pool_state.get_account_profile(account)
     config_dir = profile.get("codex_config_dir", "/root/.codex")
-    model = profile.get("model", "gpt-5.3-codex-spark")
+    model = profile.get("model", "gpt-5.4")
     reasoning = profile.get("reasoning_effort", "xhigh")
 
     logs_dir = os.path.join(AETHERVAULT_HOME, "logs")

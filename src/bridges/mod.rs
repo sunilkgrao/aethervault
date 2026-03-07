@@ -1,27 +1,24 @@
-pub(crate) mod telegram;
 pub(crate) mod slack;
-pub(crate) mod whatsapp;
+pub(crate) mod telegram;
 pub(crate) mod webhook;
+pub(crate) mod whatsapp;
 
 pub(crate) use telegram::*;
 
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-
-use crate::{
-    env_optional, run_agent_with_prompt,
-    AgentProgress, AgentRunOutput, BridgeAgentConfig, BridgeCommand,
-    load_capsule_config, open_or_create_db, resolve_workspace,
-    append_to_daily_note,
-};
-use self::telegram::run_telegram_bridge;
-use self::whatsapp::run_whatsapp_bridge;
 use self::slack::run_slack_bridge;
+use self::telegram::run_telegram_bridge;
 use self::webhook::{
     extract_discord_event, extract_imessage_event, extract_matrix_event, extract_signal_event,
     extract_teams_event, reply_none, run_webhook_bridge,
+};
+use self::whatsapp::run_whatsapp_bridge;
+use crate::{
+    AgentProgress, AgentRunOutput, BridgeAgentConfig, BridgeCommand, append_to_daily_note,
+    env_optional, load_capsule_config, open_or_create_db, resolve_workspace, run_agent_with_prompt,
 };
 
 pub(crate) fn resolve_mv2_path(cli_mv2: Option<PathBuf>) -> PathBuf {
@@ -178,9 +175,7 @@ pub(crate) fn run_agent_for_bridge(
             .map_err(|e| e.to_string())
         })) {
             Ok(result) => result,
-            Err(panic_info) => {
-                Err(format!("Agent crashed: {}", panic_to_string(panic_info)))
-            }
+            Err(panic_info) => Err(format!("Agent crashed: {}", panic_to_string(panic_info))),
         };
         let _ = tx.send(result);
     });
@@ -188,17 +183,28 @@ pub(crate) fn run_agent_for_bridge(
     // No timeout — let the agent run as long as it needs.
     // The agent is bounded by max_steps, not wall-clock time.
     // Long-running tasks (dev work, swarms, batch processing) can take hours.
-    let output = rx.recv().map_err(|err| format!("Agent channel error: {err}"))??;
+    let output = rx
+        .recv()
+        .map_err(|err| format!("Agent channel error: {err}"))??;
 
     // Auto-summary: append meaningful completions to the daily note
     if let Some(ref text) = output.final_text {
         if text.len() > 50 {
             let summary = if text.len() > 300 {
-                format!("{}...", &text[..text.char_indices().take_while(|&(i, _)| i < 300).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(300)])
+                format!(
+                    "{}...",
+                    &text[..text
+                        .char_indices()
+                        .take_while(|&(i, _)| i < 300)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(300)]
+                )
             } else {
                 text.clone()
             };
-            let entry = format!("## Agent Completion [{}]\n{}\n",
+            let entry = format!(
+                "## Agent Completion [{}]\n{}\n",
                 chrono::Utc::now().format("%H:%M UTC"),
                 summary
             );
@@ -213,7 +219,15 @@ pub(crate) fn run_agent_for_bridge(
                     // If agent used multiple steps, note as a skill extraction candidate
                     if output.step_count > 3 {
                         let prompt_preview = if prompt.len() > 200 {
-                            format!("{}...", &prompt[..prompt.char_indices().take_while(|&(i, _)| i < 200).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(200)])
+                            format!(
+                                "{}...",
+                                &prompt[..prompt
+                                    .char_indices()
+                                    .take_while(|&(i, _)| i < 200)
+                                    .last()
+                                    .map(|(i, c)| i + c.len_utf8())
+                                    .unwrap_or(200)]
+                            )
                         } else {
                             prompt.to_string()
                         };
@@ -327,12 +341,7 @@ pub(crate) fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::erro
                 log,
                 log_commit_interval,
             )?;
-            run_slack_bridge(
-                config,
-                bot_token,
-                app_token,
-                signing_secret,
-            )
+            run_slack_bridge(config, bot_token, app_token, signing_secret)
         }
         BridgeCommand::Discord {
             mv2,

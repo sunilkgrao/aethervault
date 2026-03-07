@@ -7,10 +7,11 @@ use std::time::Duration;
 use serde_json;
 
 use crate::{
-    command_spec_to_vec, env_bool, env_f64, env_optional, env_required, env_u64, env_usize,
-    extract_prompt_from_request, jitter_ratio, parse_retry_after, run_hook_command,
-    run_claude_code_native, run_codex_native, run_pool_routed, should_hook_be_read_only,
-    AgentHookRequest, AgentHookResponse, AgentMessage, AgentToolCall, ClaudeStreamEvent, CommandSpec, HookSpec,
+    AgentHookRequest, AgentHookResponse, AgentMessage, AgentToolCall, ClaudeStreamEvent,
+    CommandSpec, HookSpec, command_spec_to_vec, env_bool, env_f64, env_optional, env_required,
+    env_u64, env_usize, extract_prompt_from_request, jitter_ratio, parse_retry_after,
+    run_claude_code_native, run_codex_native, run_hook_command, run_pool_routed,
+    should_hook_be_read_only,
 };
 
 const CRITIC_SYSTEM_PROMPT: &str = "\
@@ -87,9 +88,7 @@ fn validate_image_base64(media_type: &str, b64_data: &str) -> Result<(), String>
                 "image/jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
                 "image/gif" => bytes.starts_with(b"GIF8"),
                 "image/webp" => {
-                    bytes.len() >= 12
-                        && &bytes[0..4] == b"RIFF"
-                        && &bytes[8..12] == b"WEBP"
+                    bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
                 }
                 _ => false,
             };
@@ -119,9 +118,7 @@ fn repair_request_for_400(messages: &mut Vec<serde_json::Value>, error_body: &st
             if let Some(content) = msg.get_mut("content") {
                 if let Some(arr) = content.as_array_mut() {
                     let before = arr.len();
-                    arr.retain(|block| {
-                        block.get("type").and_then(|t| t.as_str()) != Some("image")
-                    });
+                    arr.retain(|block| block.get("type").and_then(|t| t.as_str()) != Some("image"));
                     if arr.len() < before {
                         stripped = true;
                         // Add a text block noting images were removed
@@ -166,50 +163,120 @@ pub(crate) fn extract_critic_json(text: &str) -> Option<serde_json::Value> {
         if let Some(cap) = verdict_re.captures(clean) {
             let grounded = cap.get(1).is_some_and(|m| m.as_str() == "pass");
             eprintln!("[critic] verdict extracted via regex fallback (grounded={grounded})");
-            return Some(serde_json::json!({"grounded": grounded, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""}));
+            return Some(
+                serde_json::json!({"grounded": grounded, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""}),
+            );
         }
     }
 
     // Regex fallback: extract grounded boolean from natural language
     let lower = clean.to_ascii_lowercase();
-    let grounded_val = if lower.contains("\"grounded\": true") || lower.contains("\"grounded\":true") {
-        Some(true)
-    } else if lower.contains("\"grounded\": false") || lower.contains("\"grounded\":false") {
-        Some(false)
-    } else if lower.contains("is grounded") || lower.contains("appears grounded") {
-        Some(true)
-    } else if lower.contains("not grounded") {
-        Some(false)
-    } else {
-        None
-    };
+    let grounded_val =
+        if lower.contains("\"grounded\": true") || lower.contains("\"grounded\":true") {
+            Some(true)
+        } else if lower.contains("\"grounded\": false") || lower.contains("\"grounded\":false") {
+            Some(false)
+        } else if lower.contains("is grounded") || lower.contains("appears grounded") {
+            Some(true)
+        } else if lower.contains("not grounded") {
+            Some(false)
+        } else {
+            None
+        };
     if let Some(g) = grounded_val {
         eprintln!("[critic] verdict extracted via regex fallback (grounded={g})");
-        return Some(serde_json::json!({"grounded": g, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""}));
+        return Some(
+            serde_json::json!({"grounded": g, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""}),
+        );
     }
-    let parse_score = |line: &str| line.split_once(':').and_then(|(_, raw)| raw.split('/').next()).and_then(|v| v.trim().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse::<f64>().ok());
-    let (mut score, mut issues, mut suggestions, mut summary, mut section) = (None, Vec::<String>::new(), Vec::<String>::new(), String::new(), 0u8);
+    let parse_score = |line: &str| {
+        line.split_once(':')
+            .and_then(|(_, raw)| raw.split('/').next())
+            .and_then(|v| {
+                v.trim()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect::<String>()
+                    .parse::<f64>()
+                    .ok()
+            })
+    };
+    let (mut score, mut issues, mut suggestions, mut summary, mut section) = (
+        None,
+        Vec::<String>::new(),
+        Vec::<String>::new(),
+        String::new(),
+        0u8,
+    );
     for raw in clean.lines() {
         let line = raw.trim();
-        if line.is_empty() { section = 0; continue; }
+        if line.is_empty() {
+            section = 0;
+            continue;
+        }
         let ll = line.to_ascii_lowercase();
-        if ll.starts_with("score") || ll.starts_with("rating") { score = score.or_else(|| parse_score(line)); section = 0; continue; }
-        if ll.starts_with("issues:") || ll.starts_with("problems:") { if let Some((_,rest))=line.split_once(':').filter(|(_,rest)| !rest.trim().is_empty()) {issues.push(rest.trim().to_string());}; section=1; continue; }
-        if ll.starts_with("suggestions:") || ll.starts_with("recommendations:") { if let Some((_,rest))=line.split_once(':').filter(|(_,rest)| !rest.trim().is_empty()) {suggestions.push(rest.trim().to_string());}; section=2; continue; }
-        if ll.starts_with("summary:") || ll.starts_with("overall:") { summary = line.split_once(':').map(|(_, rest)| rest.trim().to_string()).unwrap_or_default(); section = 3; continue; }
+        if ll.starts_with("score") || ll.starts_with("rating") {
+            score = score.or_else(|| parse_score(line));
+            section = 0;
+            continue;
+        }
+        if ll.starts_with("issues:") || ll.starts_with("problems:") {
+            if let Some((_, rest)) = line
+                .split_once(':')
+                .filter(|(_, rest)| !rest.trim().is_empty())
+            {
+                issues.push(rest.trim().to_string());
+            };
+            section = 1;
+            continue;
+        }
+        if ll.starts_with("suggestions:") || ll.starts_with("recommendations:") {
+            if let Some((_, rest)) = line
+                .split_once(':')
+                .filter(|(_, rest)| !rest.trim().is_empty())
+            {
+                suggestions.push(rest.trim().to_string());
+            };
+            section = 2;
+            continue;
+        }
+        if ll.starts_with("summary:") || ll.starts_with("overall:") {
+            summary = line
+                .split_once(':')
+                .map(|(_, rest)| rest.trim().to_string())
+                .unwrap_or_default();
+            section = 3;
+            continue;
+        }
         let item = line.trim_start_matches(&['-', '*', '+', '•'][..]).trim();
-        if section == 1 && !item.is_empty() { issues.push(item.to_string()); continue; }
-        if section == 2 && !item.is_empty() { suggestions.push(item.to_string()); continue; }
+        if section == 1 && !item.is_empty() {
+            issues.push(item.to_string());
+            continue;
+        }
+        if section == 2 && !item.is_empty() {
+            suggestions.push(item.to_string());
+            continue;
+        }
         if section == 3 && !item.is_empty() {
-            if !summary.is_empty() { summary.push(' '); }
+            if !summary.is_empty() {
+                summary.push(' ');
+            }
             summary.push_str(item);
-        } else { section = 0; }
+        } else {
+            section = 0;
+        }
     }
     if score.is_none() && issues.is_empty() && suggestions.is_empty() && summary.is_empty() {
-        eprintln!("[critic] verdict parse error: could not extract JSON from response; defaulting to pass; raw response: {:?}", text);
-        Some(serde_json::json!({"grounded": true, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""}))
+        eprintln!(
+            "[critic] verdict parse error: could not extract JSON from response; defaulting to pass"
+        );
+        Some(
+            serde_json::json!({"grounded": true, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""}),
+        )
     } else {
-        Some(serde_json::json!({"grounded": true, "issues": issues, "agent_claim": "", "evidence_shows": "", "correction": "", "score": score, "suggestions": suggestions, "summary": summary}))
+        Some(
+            serde_json::json!({"grounded": true, "issues": issues, "agent_claim": "", "evidence_shows": "", "correction": "", "score": score, "suggestions": suggestions, "summary": summary}),
+        )
     }
 }
 
@@ -268,7 +335,9 @@ pub(crate) fn to_anthropic_messages(messages: &[AgentMessage]) -> Vec<serde_json
                                         }));
                                     }
                                     Err(reason) => {
-                                        eprintln!("[to_anthropic_messages] image validation failed: {reason}");
+                                        eprintln!(
+                                            "[to_anthropic_messages] image validation failed: {reason}"
+                                        );
                                         blocks.push(serde_json::json!({
                                             "type": "text",
                                             "text": format!("[Image could not be included: {reason}]")
@@ -518,13 +587,12 @@ pub(crate) fn call_claude_with_model(
     //   "off" or unset — no thinking.
     // ANTHROPIC_THINKING_EFFORT controls depth: "max", "high" (default), "medium", "low".
     //   "max" is Opus 4.6 only — highest quality, no constraints on thinking depth.
-    let thinking_mode = env_optional("ANTHROPIC_THINKING")
-        .unwrap_or_default();
+    let thinking_mode = env_optional("ANTHROPIC_THINKING").unwrap_or_default();
     // Disable thinking when using a model override (e.g. Sonnet for compaction) —
     // adaptive thinking is Opus-only and will cause 400 errors on other models.
     let thinking_enabled = thinking_mode == "adaptive" && model_override.is_none();
-    let thinking_effort = env_optional("ANTHROPIC_THINKING_EFFORT")
-        .unwrap_or_else(|| "high".to_string());
+    let thinking_effort =
+        env_optional("ANTHROPIC_THINKING_EFFORT").unwrap_or_else(|| "high".to_string());
 
     let effective_max_tokens = if thinking_enabled {
         // With thinking, max_tokens must cover thinking + response
@@ -550,15 +618,19 @@ pub(crate) fn call_claude_with_model(
 
     if !system_blocks.is_empty() {
         if let Some(cache) = cache_control.clone() {
-            let blocks: Vec<serde_json::Value> = system_blocks.iter().enumerate().map(|(i, text)| {
-                let mut block = serde_json::json!({"type": "text", "text": text});
-                if i == 0 {
-                    if let Some(obj) = block.as_object_mut() {
-                        obj.insert("cache_control".to_string(), cache.clone());
+            let blocks: Vec<serde_json::Value> = system_blocks
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let mut block = serde_json::json!({"type": "text", "text": text});
+                    if i == 0 {
+                        if let Some(obj) = block.as_object_mut() {
+                            obj.insert("cache_control".to_string(), cache.clone());
+                        }
                     }
-                }
-                block
-            }).collect();
+                    block
+                })
+                .collect();
             payload["system"] = serde_json::json!(blocks);
         } else {
             payload["system"] = serde_json::json!(system_blocks.join("\n\n"));
@@ -623,7 +695,10 @@ pub(crate) fn call_claude_with_model(
                     thread::sleep(Duration::from_secs_f64(delay));
                     continue;
                 }
-                eprintln!("[call_claude] primary API failed after {} retries: {code} {text}", max_retries);
+                eprintln!(
+                    "[call_claude] primary API failed after {} retries: {code} {text}",
+                    max_retries
+                );
                 break; // fall through to fallback/Vertex
             }
             Err(ureq::Error::Transport(err)) => {
@@ -634,7 +709,10 @@ pub(crate) fn call_claude_with_model(
                     thread::sleep(Duration::from_secs_f64(delay));
                     continue;
                 }
-                eprintln!("[call_claude] primary API transport error after {} retries: {err}", max_retries);
+                eprintln!(
+                    "[call_claude] primary API transport error after {} retries: {err}",
+                    max_retries
+                );
                 break; // fall through to fallback/Vertex
             }
         }
@@ -651,7 +729,9 @@ pub(crate) fn call_claude_with_model(
                 .unwrap_or_default();
 
             if repair_request_for_400(&mut repaired_messages, error_text) {
-                eprintln!("[call_claude] repaired request (stripped images), retrying primary once");
+                eprintln!(
+                    "[call_claude] repaired request (stripped images), retrying primary once"
+                );
                 let mut repaired_payload = payload.clone();
                 repaired_payload["messages"] = serde_json::json!(repaired_messages);
 
@@ -688,7 +768,8 @@ pub(crate) fn call_claude_with_model(
     if body.is_none() {
         let vertex_url = env_optional("VERTEX_FALLBACK_URL")
             .unwrap_or_else(|| "http://localhost:11436/v1/messages".to_string());
-        let vertex_enabled = env_optional("VERTEX_FALLBACK").unwrap_or_else(|| "1".to_string()) == "1";
+        let vertex_enabled =
+            env_optional("VERTEX_FALLBACK").unwrap_or_else(|| "1".to_string()) == "1";
         if vertex_enabled {
             eprintln!("Anthropic direct failed, falling back to Vertex proxy at {vertex_url}");
             payload["model"] = serde_json::json!(model);
@@ -782,7 +863,8 @@ pub(crate) fn call_claude_with_model(
         }
     }
 
-    let body = body.ok_or("All API endpoints failed (Anthropic direct + Vertex + Sonnet fallback)")?;
+    let body =
+        body.ok_or("All API endpoints failed (Anthropic direct + Vertex + Sonnet fallback)")?;
     let payload: serde_json::Value = serde_json::from_str(&body)?;
     parse_claude_response(&payload)
 }
@@ -825,11 +907,10 @@ pub(crate) fn call_critic(
         return None;
     }
 
-    let api_key = env_optional("CRITIC_API_KEY")
-        .or_else(|| env_optional("ANTHROPIC_API_KEY"))?;
-    let model = env_optional("CRITIC_MODEL")
-        .unwrap_or_else(|| env_optional("SONNET_MODEL")
-            .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string()));
+    let api_key = env_optional("CRITIC_API_KEY").or_else(|| env_optional("ANTHROPIC_API_KEY"))?;
+    let model = env_optional("CRITIC_MODEL").unwrap_or_else(|| {
+        env_optional("SONNET_MODEL").unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string())
+    });
     let base_url = env_optional("ANTHROPIC_BASE_URL")
         .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".to_string());
     let timeout_ms: u64 = env_optional("CRITIC_TIMEOUT")
@@ -841,14 +922,10 @@ pub(crate) fn call_critic(
     let context_turns: usize = env_optional("CRITIC_CONTEXT_TURNS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(12);
-    let version = env_optional("ANTHROPIC_VERSION")
-        .unwrap_or_else(|| "2023-06-01".to_string());
+    let version = env_optional("ANTHROPIC_VERSION").unwrap_or_else(|| "2023-06-01".to_string());
 
     // Collect recent non-system messages
-    let recent: Vec<&AgentMessage> = messages
-        .iter()
-        .filter(|m| m.role != "system")
-        .collect();
+    let recent: Vec<&AgentMessage> = messages.iter().filter(|m| m.role != "system").collect();
     let recent_slice = if recent.len() > context_turns {
         &recent[recent.len() - context_turns..]
     } else {
@@ -957,7 +1034,9 @@ pub(crate) fn call_critic(
     let verdict = match extract_critic_json(text) {
         Some(v) => v,
         None => {
-            eprintln!("[critic] verdict parse error: could not extract JSON from response; defaulting to pass; raw response: {:?}", text);
+            eprintln!(
+                "[critic] verdict parse error: could not extract JSON from response; defaulting to pass"
+            );
             serde_json::json!({"grounded": true, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""})
         }
     };
@@ -1012,7 +1091,10 @@ pub(crate) fn call_critic(
         .map(|s| s.to_string())
 }
 
-pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Result<AgentMessage, String> {
+pub(crate) fn call_agent_hook(
+    hook: &HookSpec,
+    request: &AgentHookRequest,
+) -> Result<AgentMessage, String> {
     let hook_cmd = match &hook.command {
         CommandSpec::String(cmd) => cmd.trim().to_ascii_lowercase(),
         CommandSpec::Array(items) => items
@@ -1026,8 +1108,10 @@ pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Re
     if is_builtin_claude || is_builtin_sonnet {
         // For builtin:sonnet, override model to Sonnet via env or hardcoded default
         let model_override = if is_builtin_sonnet {
-            Some(std::env::var("SONNET_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string()))
+            Some(
+                std::env::var("SONNET_MODEL")
+                    .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string()),
+            )
         } else {
             None
         };
@@ -1039,8 +1123,13 @@ pub(crate) fn call_agent_hook(hook: &HookSpec, request: &AgentHookRequest) -> Re
             Ok(resp) => return Ok(resp.message),
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("transport") || err_str.contains("timed out") || err_str.contains("Network") {
-                    eprintln!("[call_agent_hook] first attempt failed ({err_str}), retrying in 3s...");
+                if err_str.contains("transport")
+                    || err_str.contains("timed out")
+                    || err_str.contains("Network")
+                {
+                    eprintln!(
+                        "[call_agent_hook] first attempt failed ({err_str}), retrying in 3s..."
+                    );
                     thread::sleep(Duration::from_secs(3));
                     return call_claude_with_model(request, model_override.as_deref())
                         .map(|resp| resp.message)
@@ -1178,8 +1267,8 @@ pub(crate) fn call_claude_streaming(
 
     let thinking_mode = env_optional("ANTHROPIC_THINKING").unwrap_or_default();
     let thinking_enabled = thinking_mode == "adaptive";
-    let thinking_effort = env_optional("ANTHROPIC_THINKING_EFFORT")
-        .unwrap_or_else(|| "high".to_string());
+    let thinking_effort =
+        env_optional("ANTHROPIC_THINKING_EFFORT").unwrap_or_else(|| "high".to_string());
 
     let effective_max_tokens = if thinking_enabled {
         max_tokens.max(16384)
@@ -1201,15 +1290,19 @@ pub(crate) fn call_claude_streaming(
 
     if !system_blocks.is_empty() {
         if let Some(cache) = cache_control.clone() {
-            let blocks: Vec<serde_json::Value> = system_blocks.iter().enumerate().map(|(i, text)| {
-                let mut block = serde_json::json!({"type": "text", "text": text});
-                if i == 0 {
-                    if let Some(obj) = block.as_object_mut() {
-                        obj.insert("cache_control".to_string(), cache.clone());
+            let blocks: Vec<serde_json::Value> = system_blocks
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let mut block = serde_json::json!({"type": "text", "text": text});
+                    if i == 0 {
+                        if let Some(obj) = block.as_object_mut() {
+                            obj.insert("cache_control".to_string(), cache.clone());
+                        }
                     }
-                }
-                block
-            }).collect();
+                    block
+                })
+                .collect();
             payload["system"] = serde_json::json!(blocks);
         } else {
             payload["system"] = serde_json::json!(system_blocks.join("\n\n"));
@@ -1240,7 +1333,9 @@ pub(crate) fn call_claude_streaming(
         req = req.set("anthropic-beta", &beta_values.join(","));
     }
 
-    let response = req.send_json(payload).map_err(|e| format!("streaming request failed: {e}"))?;
+    let response = req
+        .send_json(payload)
+        .map_err(|e| format!("streaming request failed: {e}"))?;
 
     let reader = response.into_reader();
     let (tx, rx) = mpsc::channel();
@@ -1307,9 +1402,20 @@ fn parse_sse_event(event_type: &str, data: &str) -> Option<ClaudeStreamEvent> {
             let index = json.get("index")?.as_u64()? as usize;
             let block = json.get("content_block")?;
             let block_type = block.get("type")?.as_str()?.to_string();
-            let tool_id = block.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let tool_name = block.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
-            Some(ClaudeStreamEvent::BlockStart { index, block_type, tool_id, tool_name })
+            let tool_id = block
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let tool_name = block
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            Some(ClaudeStreamEvent::BlockStart {
+                index,
+                block_type,
+                tool_id,
+                tool_name,
+            })
         }
         "content_block_delta" => {
             let index = json.get("index")?.as_u64()? as usize;
@@ -1317,13 +1423,18 @@ fn parse_sse_event(event_type: &str, data: &str) -> Option<ClaudeStreamEvent> {
             let delta_type = delta.get("type")?.as_str()?.to_string();
             // Text can come from "text" (text blocks), "thinking" (thinking blocks),
             // or "partial_json" (tool_use input deltas)
-            let text = delta.get("text")
+            let text = delta
+                .get("text")
                 .or_else(|| delta.get("thinking"))
                 .or_else(|| delta.get("partial_json"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(ClaudeStreamEvent::BlockDelta { index, delta_type, text })
+            Some(ClaudeStreamEvent::BlockDelta {
+                index,
+                delta_type,
+                text,
+            })
         }
         "content_block_stop" => {
             let index = json.get("index")?.as_u64()? as usize;
@@ -1331,12 +1442,16 @@ fn parse_sse_event(event_type: &str, data: &str) -> Option<ClaudeStreamEvent> {
         }
         "message_delta" => {
             let delta = json.get("delta")?;
-            let stop_reason = delta.get("stop_reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let stop_reason = delta
+                .get("stop_reason")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             Some(ClaudeStreamEvent::MessageDelta { stop_reason })
         }
         "message_stop" => Some(ClaudeStreamEvent::MessageStop),
         "error" => {
-            let err = json.get("error")
+            let err = json
+                .get("error")
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown stream error")

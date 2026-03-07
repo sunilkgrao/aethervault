@@ -168,7 +168,7 @@ Account: personal (sunilkgrao@gmail.com via IMAP/SMTP app password). Config: `/r
 | Agent | Model | Purpose |
 |-------|-------|---------|
 | **researcher** | Claude Opus | Deep research and analysis |
-| **codex** | OpenAI GPT-5.3 | Code generation and debugging |
+| **codex** | OpenAI GPT-5.4 | Code generation and debugging |
 | **critic** | Claude Opus | Critical review and quality assurance |
 
 - Invoke via `subagent_invoke` tool. Can run in parallel.

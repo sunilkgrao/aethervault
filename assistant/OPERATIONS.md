@@ -9,7 +9,7 @@ The binary handles all subagent routing natively in Rust (`src/pool_state.rs`).
 No Python subprocess needed for backend selection.
 
 ### Backends (priority order):
-1. **Codex CLI** — `codex exec -m gpt-5.3-codex-spark --json --skip-git-repo-check`
+1. **Codex CLI** — `codex exec -m gpt-5.4 --json --skip-git-repo-check -c 'model_reasoning_effort="xhigh"'`
 2. **Claude Code CLI** — `claude -p "prompt" --output-format json`
 
 ### Accounts:
@@ -36,7 +36,7 @@ No Python subprocess needed for backend selection.
 
 ### Rules:
 - Codex is ALWAYS invoked via CLI, NEVER via API
-- Model: ALWAYS gpt-5.3-codex-spark
+- Model: ALWAYS `gpt-5.4` with `model_reasoning_effort="xhigh"`
 - The binary handles rate limit detection and failover automatically
 - Do NOT manually run `codex auth login` — accounts are pre-authenticated
 - Do NOT tell the user to re-authenticate — the pool handles it

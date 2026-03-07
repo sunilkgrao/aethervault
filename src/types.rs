@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::memory_db::TemporalFilter;
 use serde::{Deserialize, Serialize};
@@ -380,10 +380,23 @@ pub(crate) struct AgentHookResponse {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ClaudeStreamEvent {
-    BlockStart { index: usize, block_type: String, tool_id: Option<String>, tool_name: Option<String> },
-    BlockDelta { index: usize, delta_type: String, text: String },
-    BlockStop { index: usize },
-    MessageDelta { stop_reason: Option<String> },
+    BlockStart {
+        index: usize,
+        block_type: String,
+        tool_id: Option<String>,
+        tool_name: Option<String>,
+    },
+    BlockDelta {
+        index: usize,
+        delta_type: String,
+        text: String,
+    },
+    BlockStop {
+        index: usize,
+    },
+    MessageDelta {
+        stop_reason: Option<String>,
+    },
     MessageStop,
     Error(String),
 }
@@ -397,7 +410,9 @@ pub(crate) enum StreamPhase {
 }
 
 impl Default for StreamPhase {
-    fn default() -> Self { StreamPhase::Idle }
+    fn default() -> Self {
+        StreamPhase::Idle
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -554,12 +569,9 @@ impl BackgroundTaskRegistry {
                 if current >= self.max_concurrent as u64 {
                     return false;
                 }
-                self.active_count.compare_exchange(
-                    current,
-                    current + 1,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                ).is_ok()
+                self.active_count
+                    .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
             }
         }
     }
@@ -578,7 +590,12 @@ impl BackgroundTaskRegistry {
         self.tasks.entry(chat_id).or_default().push(task);
     }
 
-    pub(crate) fn update_status(&mut self, task_id: &str, status: BackgroundTaskStatus, result_text: Option<String>) {
+    pub(crate) fn update_status(
+        &mut self,
+        task_id: &str,
+        status: BackgroundTaskStatus,
+        result_text: Option<String>,
+    ) {
         for tasks in self.tasks.values_mut() {
             if let Some(task) = tasks.iter_mut().find(|t| t.task_id == task_id) {
                 task.status = status;
@@ -599,7 +616,10 @@ impl BackgroundTaskRegistry {
         self.tasks
             .get(&chat_id)
             .map(|tasks| {
-                tasks.iter().filter(|t| t.status == BackgroundTaskStatus::Running).collect()
+                tasks
+                    .iter()
+                    .filter(|t| t.status == BackgroundTaskStatus::Running)
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -611,7 +631,10 @@ impl BackgroundTaskRegistry {
         };
         let mut completed = Vec::new();
         tasks.retain(|t| {
-            if matches!(t.status, BackgroundTaskStatus::Completed | BackgroundTaskStatus::Failed(_)) {
+            if matches!(
+                t.status,
+                BackgroundTaskStatus::Completed | BackgroundTaskStatus::Failed(_)
+            ) {
                 completed.push(t.clone());
                 false
             } else {
@@ -635,13 +658,20 @@ impl BackgroundTaskRegistry {
             let (icon, status_str, elapsed) = match &t.status {
                 BackgroundTaskStatus::Running => {
                     let elapsed = now.saturating_sub(t.started_at_epoch);
-                    let icon = if elapsed < 600 { "\u{1F7E2}" } else { "\u{1F7E1}" }; // green/yellow circle
+                    let icon = if elapsed < 600 {
+                        "\u{1F7E2}"
+                    } else {
+                        "\u{1F7E1}"
+                    }; // green/yellow circle
                     let mins = elapsed / 60;
                     let secs = elapsed % 60;
                     (icon, "running".to_string(), format!("{mins}m {secs}s"))
                 }
                 BackgroundTaskStatus::Completed => {
-                    let elapsed = t.completed_at_epoch.unwrap_or(now).saturating_sub(t.started_at_epoch);
+                    let elapsed = t
+                        .completed_at_epoch
+                        .unwrap_or(now)
+                        .saturating_sub(t.started_at_epoch);
                     let mins = elapsed / 60;
                     let secs = elapsed % 60;
                     ("\u{2705}", "done".to_string(), format!("{mins}m {secs}s"))
@@ -661,7 +691,10 @@ impl BackgroundTaskRegistry {
         lines.join("\n")
     }
 
-    pub(crate) fn stale_tasks(&self, threshold: std::time::Duration) -> Vec<(i64, &BackgroundTask)> {
+    pub(crate) fn stale_tasks(
+        &self,
+        threshold: std::time::Duration,
+    ) -> Vec<(i64, &BackgroundTask)> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -685,7 +718,12 @@ impl BackgroundTaskRegistry {
         self.tasks
             .iter()
             .filter_map(|(&chat_id, tasks)| {
-                if tasks.iter().any(|t| matches!(t.status, BackgroundTaskStatus::Completed | BackgroundTaskStatus::Failed(_))) {
+                if tasks.iter().any(|t| {
+                    matches!(
+                        t.status,
+                        BackgroundTaskStatus::Completed | BackgroundTaskStatus::Failed(_)
+                    )
+                }) {
                     Some(chat_id)
                 } else {
                     None
@@ -698,7 +736,10 @@ impl BackgroundTaskRegistry {
         self.tasks
             .iter()
             .filter_map(|(&chat_id, tasks)| {
-                if tasks.iter().any(|t| t.status == BackgroundTaskStatus::Running) {
+                if tasks
+                    .iter()
+                    .any(|t| t.status == BackgroundTaskStatus::Running)
+                {
                     Some(chat_id)
                 } else {
                     None
@@ -752,7 +793,12 @@ impl SessionRegistry {
         self.sessions.get_mut(session_id)
     }
 
-    pub(crate) fn update_completed(&mut self, session_id: &str, status: BackgroundTaskStatus, result_text: Option<String>) {
+    pub(crate) fn update_completed(
+        &mut self,
+        session_id: &str,
+        status: BackgroundTaskStatus,
+        result_text: Option<String>,
+    ) {
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.status = status;
             session.result_text = result_text;
@@ -772,7 +818,9 @@ impl SessionRegistry {
             let elapsed = now.saturating_sub(s.started_at_epoch);
             let mins = elapsed / 60;
             let secs = elapsed % 60;
-            let (step, max) = s.progress.lock()
+            let (step, max) = s
+                .progress
+                .lock()
                 .map(|p| (p.step, p.max_steps))
                 .unwrap_or((0, 0));
             let status_str = match &s.status {
@@ -889,7 +937,7 @@ pub(crate) struct BridgeAgentConfig {
     pub(crate) tool_filter: Option<Vec<String>>,
 }
 
-    #[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct SubagentSpec {
     pub(crate) name: String,
     /// Human-readable description used for auto-routing.
@@ -962,12 +1010,16 @@ impl SessionTaint {
 pub(crate) enum FailureKind {
     Transient,
     Permanent,
-    ApiMisuse,  // Wrong request shape, fixable by reading docs
+    ApiMisuse, // Wrong request shape, fixable by reading docs
     Semantic,
 }
 
 /// Classify a tool failure based on error message and HTTP status codes.
-pub(crate) fn classify_failure(tool_name: &str, error_msg: &str, details: &serde_json::Value) -> FailureKind {
+pub(crate) fn classify_failure(
+    tool_name: &str,
+    error_msg: &str,
+    details: &serde_json::Value,
+) -> FailureKind {
     let msg = error_msg.to_lowercase();
     let status = details.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
 
@@ -984,30 +1036,48 @@ pub(crate) fn classify_failure(tool_name: &str, error_msg: &str, details: &serde
     }
 
     // Message-based classification
-    if msg.contains("timeout") || msg.contains("timed out") || msg.contains("connection reset")
-        || msg.contains("broken pipe") || msg.contains("rate limit")
-        || msg.contains("too many requests") || msg.contains("temporarily unavailable")
-        || msg.contains("service unavailable") || msg.contains("try again")
+    if msg.contains("timeout")
+        || msg.contains("timed out")
+        || msg.contains("connection reset")
+        || msg.contains("broken pipe")
+        || msg.contains("rate limit")
+        || msg.contains("too many requests")
+        || msg.contains("temporarily unavailable")
+        || msg.contains("service unavailable")
+        || msg.contains("try again")
     {
         return FailureKind::Transient;
     }
     // API misuse patterns (wrong request shape, fixable by reading docs)
-    if msg.contains("validation error") || msg.contains("unknown field")
-        || msg.contains("required field") || msg.contains("unexpected argument")
-        || msg.contains("missing parameter") || msg.contains("invalid argument")
-        || msg.contains("graphql_validation_failed") || msg.contains("schema validation")
-        || msg.contains("schema error") || msg.contains("json schema")
-        || msg.contains("did you mean") || msg.contains("no query string")
-        || msg.contains("unknown mutation") || msg.contains("unknown query")
-        || msg.contains("does not have field") || msg.contains("wrong type")
+    if msg.contains("validation error")
+        || msg.contains("unknown field")
+        || msg.contains("required field")
+        || msg.contains("unexpected argument")
+        || msg.contains("missing parameter")
+        || msg.contains("invalid argument")
+        || msg.contains("graphql_validation_failed")
+        || msg.contains("schema validation")
+        || msg.contains("schema error")
+        || msg.contains("json schema")
+        || msg.contains("did you mean")
+        || msg.contains("no query string")
+        || msg.contains("unknown mutation")
+        || msg.contains("unknown query")
+        || msg.contains("does not have field")
+        || msg.contains("wrong type")
         || msg.contains("expected type")
     {
         return FailureKind::ApiMisuse;
     }
 
-    if msg.contains("unauthorized") || msg.contains("forbidden") || msg.contains("not found")
-        || msg.contains("invalid") || msg.contains("denied") || msg.contains("no such")
-        || msg.contains("does not exist") || msg.contains("permission")
+    if msg.contains("unauthorized")
+        || msg.contains("forbidden")
+        || msg.contains("not found")
+        || msg.contains("invalid")
+        || msg.contains("denied")
+        || msg.contains("no such")
+        || msg.contains("does not exist")
+        || msg.contains("permission")
     {
         return FailureKind::Permanent;
     }
@@ -1065,9 +1135,9 @@ pub(crate) struct TriggerEntry {
 pub(crate) struct CronExpr {
     pub(crate) minute: CronField,
     pub(crate) hour: CronField,
-    pub(crate) dom: CronField,     // day of month
+    pub(crate) dom: CronField, // day of month
     pub(crate) month: CronField,
-    pub(crate) dow: CronField,     // day of week (0=Sun, 1=Mon, ..., 6=Sat)
+    pub(crate) dow: CronField, // day of week (0=Sun, 1=Mon, ..., 6=Sat)
 }
 
 pub(crate) enum CronField {
@@ -1097,24 +1167,36 @@ impl CronExpr {
         let mut values = Vec::new();
         for part in field.split(',') {
             if let Some((start_s, end_s)) = part.split_once('-') {
-                let start: u32 = start_s.parse().map_err(|_| format!("cron: bad value '{start_s}'"))?;
-                let end: u32 = end_s.parse().map_err(|_| format!("cron: bad value '{end_s}'"))?;
+                let start: u32 = start_s
+                    .parse()
+                    .map_err(|_| format!("cron: bad value '{start_s}'"))?;
+                let end: u32 = end_s
+                    .parse()
+                    .map_err(|_| format!("cron: bad value '{end_s}'"))?;
                 if start < min || end > max || start > end {
-                    return Err(format!("cron: range {start}-{end} out of bounds [{min}-{max}]"));
+                    return Err(format!(
+                        "cron: range {start}-{end} out of bounds [{min}-{max}]"
+                    ));
                 }
                 for v in start..=end {
                     values.push(v);
                 }
             } else if let Some(step_s) = part.strip_prefix("*/") {
-                let step: u32 = step_s.parse().map_err(|_| format!("cron: bad step '{step_s}'"))?;
-                if step == 0 { return Err("cron: step cannot be 0".into()); }
+                let step: u32 = step_s
+                    .parse()
+                    .map_err(|_| format!("cron: bad step '{step_s}'"))?;
+                if step == 0 {
+                    return Err("cron: step cannot be 0".into());
+                }
                 let mut v = min;
                 while v <= max {
                     values.push(v);
                     v += step;
                 }
             } else {
-                let val: u32 = part.parse().map_err(|_| format!("cron: bad value '{part}'"))?;
+                let val: u32 = part
+                    .parse()
+                    .map_err(|_| format!("cron: bad value '{part}'"))?;
                 if val < min || val > max {
                     return Err(format!("cron: value {val} out of bounds [{min}-{max}]"));
                 }
@@ -1157,18 +1239,16 @@ pub(crate) fn session_file_path(session_id: &str) -> PathBuf {
 pub(crate) fn load_session_turns(session_id: &str, max_turns: usize) -> Vec<SessionTurn> {
     let path = session_file_path(session_id);
     match std::fs::read_to_string(&path) {
-        Ok(data) => {
-            match serde_json::from_str::<Vec<SessionTurn>>(&data) {
-                Ok(mut turns) => {
-                    let keep = max_turns * 2;
-                    if turns.len() > keep {
-                        turns.drain(..turns.len() - keep);
-                    }
-                    turns
+        Ok(data) => match serde_json::from_str::<Vec<SessionTurn>>(&data) {
+            Ok(mut turns) => {
+                let keep = max_turns * 2;
+                if turns.len() > keep {
+                    turns.drain(..turns.len() - keep);
                 }
-                Err(_) => Vec::new(),
+                turns
             }
-        }
+            Err(_) => Vec::new(),
+        },
         Err(_) => Vec::new(),
     }
 }
@@ -1192,7 +1272,6 @@ pub(crate) fn save_session_turns(session_id: &str, turns: &[SessionTurn], max_tu
     }
 }
 
-
 // === Capsule File Locking ===
 // The Vault itself manages shared (read) and exclusive (write) flock() on the .mv2
 // file directly. Readers can operate concurrently; writers upgrade to exclusive only
@@ -1202,7 +1281,11 @@ pub(crate) const TOOL_DETAILS_MAX_CHARS: usize = 4_000;
 pub(crate) const TOOL_OUTPUT_MAX_FOR_DETAILS: usize = 2_000;
 pub(crate) const DEFAULT_WORKSPACE_DIR: &str = "./assistant";
 
-pub(crate) fn format_tool_message_content(name: &str, output: &str, details: &serde_json::Value) -> String {
+pub(crate) fn format_tool_message_content(
+    name: &str,
+    output: &str,
+    details: &serde_json::Value,
+) -> String {
     if output.is_empty() {
         return String::new();
     }

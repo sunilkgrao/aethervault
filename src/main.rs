@@ -1,45 +1,45 @@
 // Module declarations
+mod agent;
+mod agent_log;
+mod bridges;
+mod claude;
 mod cli;
-mod types;
-mod tool_args;
-mod util;
 mod config;
+mod config_file;
+mod consolidation;
+mod mcp;
+mod memory_db;
+mod pool_state;
 mod query;
+mod services;
+mod skill_registry;
+mod swarm;
+mod tool_args;
 mod tool_defs;
 mod tool_exec;
-mod mcp;
-mod claude;
-mod agent;
-mod bridges;
-mod services;
-mod agent_log;
-mod config_file;
-mod memory_db;
-mod consolidation;
-mod skill_registry;
-mod pool_state;
-mod swarm;
+mod types;
+mod util;
 
 // Re-export all module items at crate root so cross-module references work.
 // Before this split, everything lived in main.rs and shared a single namespace.
 // These wildcard re-exports preserve that behavior.
+pub(crate) use agent::*;
+pub(crate) use agent_log::*;
+pub(crate) use bridges::*;
+pub(crate) use claude::*;
 pub(crate) use cli::*;
-pub(crate) use types::*;
-pub(crate) use tool_args::*;
-pub(crate) use util::*;
 pub(crate) use config::*;
+pub(crate) use config_file::*;
+pub(crate) use mcp::*;
+pub(crate) use pool_state::*;
 pub(crate) use query::*;
+pub(crate) use services::*;
+pub(crate) use skill_registry::*;
+pub(crate) use tool_args::*;
 pub(crate) use tool_defs::*;
 pub(crate) use tool_exec::*;
-pub(crate) use mcp::*;
-pub(crate) use claude::*;
-pub(crate) use agent::*;
-pub(crate) use bridges::*;
-pub(crate) use services::*;
-pub(crate) use agent_log::*;
-pub(crate) use config_file::*;
-pub(crate) use skill_registry::*;
-pub(crate) use pool_state::*;
+pub(crate) use types::*;
+pub(crate) use util::*;
 
 // External crate imports used directly in main()
 use std::collections::HashMap;
@@ -104,8 +104,7 @@ fn frame_collection_name(frame: &Frame) -> String {
     let Some(rest) = uri.strip_prefix("aethervault://") else {
         return "<non-aethervault-uri>".to_string();
     };
-    rest
-        .split('/')
+    rest.split('/')
         .next()
         .filter(|collection| !collection.is_empty())
         .map(normalize_collection)
@@ -190,7 +189,9 @@ fn copy_frame_to_archive(
     archive: &MemoryDb,
     frame: &Frame,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let payload = source.frame_canonical_payload(frame.id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    let payload = source
+        .frame_canonical_payload(frame.id)
+        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     let mut options = PutOptions::default();
     options.timestamp = Some(frame.timestamp);
     if let Some(track) = frame.track.as_deref() {
@@ -222,7 +223,9 @@ fn copy_frame_to_archive(
     }
     options.role = frame.role;
     options.parent_id = frame.parent_id;
-    let id = archive.put_bytes_with_options(&payload, options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    let id = archive
+        .put_bytes_with_options(&payload, options)
+        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
     Ok(id)
 }
 
@@ -333,7 +336,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .insert("size_bytes".into(), size_bytes);
                 }
 
-                db.put_bytes_with_options(&bytes, options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                db.put_bytes_with_options(&bytes, options)
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
                 if existing_checksum.is_some() {
                     updated += 1;
@@ -349,7 +353,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            db.commit().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            db.commit()
+                .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             println!("Done: scanned={scanned} ingest={ingested} update={updated} skip={skipped}");
             Ok(())
         }
@@ -399,8 +404,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let db = open_or_create_db(&mv2)?;
-            let frame_id = db.put_bytes_with_options(&payload, options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-            db.commit().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            let frame_id = db
+                .put_bytes_with_options(&payload, options)
+                .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            db.commit()
+                .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
             if json {
                 let response = serde_json::json!({
@@ -435,7 +443,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 as_of_ts: None,
             };
 
-            let response = db.search(request).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            let response = db
+                .search(request)
+                .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -544,8 +554,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 options.kind = Some("application/json".to_string());
                 options.track = Some("aethervault.query".to_string());
                 options.search_text = Some(response.plan.cleaned_query.clone());
-                db.put_bytes_with_options(&bytes, options).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-                db.commit().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                db.put_bytes_with_options(&bytes, options)
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                db.commit()
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
 
             if !response.warnings.is_empty() && !json {
@@ -706,7 +718,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ts_utc: Some(Utc::now().timestamp()),
             };
             let db = open_or_create_db(&mv2)?;
-            let _ = append_feedback(&db, &event).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            let _ =
+                append_feedback(&db, &event).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             println!("Feedback recorded.");
             Ok(())
         }
@@ -725,8 +738,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             #[cfg(feature = "vec")]
             {
-                let _ = (mv2, collection, limit, batch, force, model, embed_cache, embed_no_cache, dry_run, json);
-                eprintln!("Local embedding is not supported with SQLite backend. Use Qdrant for vector search.");
+                let _ = (
+                    mv2,
+                    collection,
+                    limit,
+                    batch,
+                    force,
+                    model,
+                    embed_cache,
+                    embed_no_cache,
+                    dry_run,
+                    json,
+                );
+                eprintln!(
+                    "Local embedding is not supported with SQLite backend. Use Qdrant for vector search."
+                );
                 std::process::exit(2);
             }
             #[cfg(not(feature = "vec"))]
@@ -755,14 +781,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let frame_id: u64 = rest.parse().map_err(|_| -> Box<dyn std::error::Error> {
                     "invalid frame id (expected #123)".into()
                 })?;
-                let frame = db.frame_by_id(frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                let frame = db
+                    .frame_by_id(frame_id)
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 (frame_id, frame)
             } else {
-                let frame = db.frame_by_uri(&id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                let frame = db
+                    .frame_by_uri(&id)
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 (frame.id, frame)
             };
 
-            let text = db.frame_text_by_id(frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            let text = db
+                .frame_text_by_id(frame_id)
+                .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
             if json {
                 let payload = GetResponse {
@@ -819,7 +851,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     serde_json::to_vec(&value)?
                 };
                 let db = open_or_create_db(&mv2)?;
-                save_config_entry(&db, &key, &payload).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                save_config_entry(&db, &key, &payload)
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 println!("Stored config {key}");
                 Ok(())
             }
@@ -949,7 +982,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_steps,
             log_commit_interval,
             json,
-            log, ..
+            log,
+            ..
         } => run_agent(
             mv2,
             prompt,
@@ -1072,19 +1106,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = (rebuild_time, rebuild_vec, dry_run, quiet);
             let db = open_or_create_db(&mv2)?;
             // Always purge superseded frames — they are dead weight
-            let purged = db.purge_superseded().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            let purged = db
+                .purge_superseded()
+                .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             if purged > 0 {
                 eprintln!("[doctor] purged {purged} superseded frames");
             }
             if rebuild_lex {
-                db.rebuild_fts().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                db.rebuild_fts()
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
             if vacuum {
-                db.vacuum().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                db.vacuum()
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
             let size = db.file_size(&mv2);
             if json {
-                println!("{}", serde_json::json!({"status": "ok", "size_bytes": size}));
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "ok", "size_bytes": size})
+                );
             } else {
                 println!("Doctor complete. Size: {} bytes", size);
             }
@@ -1099,11 +1140,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let _ = (dry_run, quiet);
             let db = open_or_create_db(&mv2)?;
-            db.rebuild_fts().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-            db.vacuum().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            db.rebuild_fts()
+                .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            db.vacuum()
+                .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             let size = db.file_size(&mv2);
             if json {
-                println!("{}", serde_json::json!({"status": "ok", "size_bytes": size}));
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "ok", "size_bytes": size})
+                );
             } else {
                 println!("Compact complete. Size: {} bytes", size);
             }
@@ -1118,11 +1164,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dry_run,
         } => {
             let source_path = mv2.display().to_string();
-            let target = target.unwrap_or_else(|| {
-                mv2.parent()
-                    .unwrap_or(Path::new("."))
-                    .join("archive.mv2")
-            });
+            let target = target
+                .unwrap_or_else(|| mv2.parent().unwrap_or(Path::new(".")).join("archive.mv2"));
             let cutoff = parse_date_to_ts(&before)
                 .ok_or_else(|| format!("invalid before date: {before}"))?;
 
@@ -1165,21 +1208,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_ref()
                     .ok_or_else(|| "target memory not initialized".to_string())?;
                 for frame_id in candidates {
-                let frame = source.frame_by_id(frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-                if frame.status != FrameStatus::Active
-                    || frame.timestamp >= cutoff
-                    || !frame_matches_collection(&frame, &collection)
-                {
-                    continue;
+                    let frame = source
+                        .frame_by_id(frame_id)
+                        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                    if frame.status != FrameStatus::Active
+                        || frame.timestamp >= cutoff
+                        || !frame_matches_collection(&frame, &collection)
+                    {
+                        continue;
+                    }
+                    copy_frame_to_archive(&source, target, &frame)?;
+                    source
+                        .delete_frame(frame_id)
+                        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                    archived += 1;
+                    deleted += 1;
                 }
-                copy_frame_to_archive(&source, target, &frame)?;
-                source.delete_frame(frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-                archived += 1;
-                deleted += 1;
-            }
-                target.commit()
+                target
+                    .commit()
                     .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-                source.vacuum().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                source
+                    .vacuum()
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
 
             let report = ArchiveSummary {
@@ -1241,23 +1291,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut duplicate_ids = Vec::new();
             for versions in by_uri_versions.values_mut() {
-                versions.sort_by(|left, right| {
-                    right
-                        .0
-                        .cmp(&left.0)
-                        .then_with(|| right.1.cmp(&left.1))
-                });
+                versions
+                    .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
                 if versions.len() > keep_versions {
-                    duplicate_ids.extend(versions.iter().skip(keep_versions).map(|(_, frame_id)| *frame_id));
+                    duplicate_ids.extend(
+                        versions
+                            .iter()
+                            .skip(keep_versions)
+                            .map(|(_, frame_id)| *frame_id),
+                    );
                 }
             }
 
             let deleted = duplicate_ids.len();
             if !dry_run {
                 for frame_id in &duplicate_ids {
-                    source.delete_frame(*frame_id).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                    source
+                        .delete_frame(*frame_id)
+                        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 }
-                source.vacuum().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                source
+                    .vacuum()
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
 
             let report = DedupSummary {
@@ -1312,13 +1367,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .or_insert(0) += 1;
 
                 let age_days = now.saturating_sub(frame.timestamp).div_euclid(86_400);
-                *by_age_days
-                    .entry(frame_age_bucket(age_days))
-                    .or_insert(0) += 1;
-                let payload_size = source.frame_canonical_payload(frame.id).map(|p| p.len() as u64).unwrap_or(0);
-                *by_size
-                    .entry(frame_size_bucket(payload_size))
-                    .or_insert(0) += 1;
+                *by_age_days.entry(frame_age_bucket(age_days)).or_insert(0) += 1;
+                let payload_size = source
+                    .frame_canonical_payload(frame.id)
+                    .map(|p| p.len() as u64)
+                    .unwrap_or(0);
+                *by_size.entry(frame_size_bucket(payload_size)).or_insert(0) += 1;
                 let uri_key = frame.uri.unwrap_or_else(|| "<no-uri>".to_string());
                 *uri_counts.entry(uri_key).or_insert(0) += 1;
             }
@@ -1351,7 +1405,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Stats for {}", report.source);
             println!("Active frames: {}", report.active_frames);
             println!("Total frames: {}", report.total_frames);
-            println!("Duplicate URIs: {} ({} duplicate frames)", report.duplicate_uris, report.duplicate_frames);
+            println!(
+                "Duplicate URIs: {} ({} duplicate frames)",
+                report.duplicate_uris, report.duplicate_frames
+            );
             println!("By collection:");
             for (collection, count) in &report.by_collection {
                 println!("  {collection}: {count}");
@@ -1382,10 +1439,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PathBuf::from(format!("{home}/.aethervault/data/hot-memories.jsonl"))
             });
             if !jsonl_path.exists() {
-                eprintln!(
-                    "JSONL file not found: {}",
-                    jsonl_path.display()
-                );
+                eprintln!("JSONL file not found: {}", jsonl_path.display());
                 std::process::exit(2);
             }
             let db = open_or_create_db(&mv2)?;
@@ -1409,7 +1463,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("  error: {err}");
             }
             if !dry_run {
-                db.commit().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                db.commit()
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
             Ok(())
         }
@@ -1424,9 +1479,15 @@ mod tests {
     fn test_extract_critic_json_fallback_paths() {
         let result = extract_critic_json(r#"{"verdict":"pass","reason":"looks good"}"#).unwrap();
         assert_eq!(result.get("verdict").and_then(|v| v.as_str()), Some("pass"));
-        assert_eq!(result.get("reason").and_then(|v| v.as_str()), Some("looks good"));
+        assert_eq!(
+            result.get("reason").and_then(|v| v.as_str()),
+            Some("looks good")
+        );
 
-        let result = extract_critic_json("Here's my analysis:\n{\"verdict\": \"fail\", \"reason\": \"...\"}").unwrap();
+        let result = extract_critic_json(
+            "Here's my analysis:\n{\"verdict\": \"fail\", \"reason\": \"...\"}",
+        )
+        .unwrap();
         assert_eq!(result.get("verdict").and_then(|v| v.as_str()), Some("fail"));
         assert_eq!(result.get("reason").and_then(|v| v.as_str()), Some("..."));
         let result = extract_critic_json("I think this looks fine").unwrap();

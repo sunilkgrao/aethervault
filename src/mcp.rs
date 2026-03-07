@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use rmcp::{
     model::{CallToolRequestParams, JsonObject, Tool},
-    service::{RunningService, RoleClient, ServiceExt},
+    service::{RoleClient, RunningService, ServiceExt},
     transport::TokioChildProcess,
 };
 use tokio::runtime::Builder;
@@ -111,9 +111,15 @@ impl McpRegistry {
         let mut defs = Vec::new();
         for handle in &self.servers {
             for tool in &handle.tools {
-                let original_name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let original_name = tool
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 let prefixed_name = format!("mcp__{}__{}", handle.name, original_name);
-                let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                let description = tool
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let input_schema = tool
                     .get("inputSchema")
                     .cloned()
@@ -130,7 +136,11 @@ impl McpRegistry {
     }
 
     /// Call a tool on the appropriate server
-    pub(crate) fn call_tool(&mut self, prefixed_name: &str, args: serde_json::Value) -> Result<super::ToolExecution, String> {
+    pub(crate) fn call_tool(
+        &mut self,
+        prefixed_name: &str,
+        args: serde_json::Value,
+    ) -> Result<super::ToolExecution, String> {
         let (server_idx, original_name) = self
             .route_map
             .get(prefixed_name)
@@ -191,7 +201,9 @@ impl McpRegistry {
         }
     }
 
-    fn tool_execution_from_rmcp_result(result: rmcp::model::CallToolResult) -> super::ToolExecution {
+    fn tool_execution_from_rmcp_result(
+        result: rmcp::model::CallToolResult,
+    ) -> super::ToolExecution {
         let text_parts: Vec<&str> = result
             .content
             .iter()
@@ -270,15 +282,14 @@ impl McpServerHandle {
         let transport = TokioChildProcess::new(command)
             .map_err(|e| format!("mcp '{}' spawn transport: {e}", cfg.name))?;
         let child_pid = transport.id();
-        let service = runtime
-            .block_on(async {
-                let service = ().serve(transport).await;
-                let service = match service {
-                    Ok(service) => service,
-                    Err(err) => return Err(format!("mcp '{}' serve_client: {err}", cfg.name)),
-                };
-                Ok::<RunningService<RoleClient, ()>, String>(service)
-            })?;
+        let service = runtime.block_on(async {
+            let service = ().serve(transport).await;
+            let service = match service {
+                Ok(service) => service,
+                Err(err) => return Err(format!("mcp '{}' serve_client: {err}", cfg.name)),
+            };
+            Ok::<RunningService<RoleClient, ()>, String>(service)
+        })?;
 
         let mut handle = McpServerHandle {
             config: cfg.clone(),
@@ -354,7 +365,9 @@ impl McpServerHandle {
             return Err(format!("mcp '{}' service unavailable", self.name));
         }
 
-        let remaining = deadline.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO);
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
         if remaining.is_zero() {
             return Err(format!(
                 "mcp '{}' timed out before calling '{}', request exceeded deadline",
@@ -375,14 +388,12 @@ impl McpServerHandle {
         let arguments = if args.is_null() {
             None
         } else {
-            Some(
-                serde_json::from_value::<JsonObject>(args).map_err(|_| {
-                    format!(
-                        "mcp '{}' invalid call arguments for '{name}' (expected object)",
-                        self.name
-                    )
-                })?,
-            )
+            Some(serde_json::from_value::<JsonObject>(args).map_err(|_| {
+                format!(
+                    "mcp '{}' invalid call arguments for '{name}' (expected object)",
+                    self.name
+                )
+            })?)
         };
 
         let req = CallToolRequestParams {
@@ -412,7 +423,7 @@ impl McpServerHandle {
         }
     }
 
-pub(crate) fn shutdown(&mut self) -> Result<(), String> {
+    pub(crate) fn shutdown(&mut self) -> Result<(), String> {
         let service = self.service.take();
         let mut shutdown_error: Option<String> = None;
 
@@ -450,7 +461,10 @@ pub(crate) fn shutdown(&mut self) -> Result<(), String> {
             if check == 0 {
                 true
             } else {
-                !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
+                !matches!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                )
             }
         };
         if !alive {
@@ -481,7 +495,9 @@ impl Drop for McpRegistry {
     }
 }
 
-pub(crate) fn read_mcp_message(reader: &mut BufReader<impl Read>) -> io::Result<Option<serde_json::Value>> {
+pub(crate) fn read_mcp_message(
+    reader: &mut BufReader<impl Read>,
+) -> io::Result<Option<serde_json::Value>> {
     let mut first_line = String::new();
     if reader.read_line(&mut first_line)? == 0 {
         return Ok(None);
@@ -533,7 +549,10 @@ pub(crate) fn read_mcp_message(reader: &mut BufReader<impl Read>) -> io::Result<
     }
 }
 
-pub(crate) fn write_mcp_response(writer: &mut impl Write, value: &serde_json::Value) -> io::Result<()> {
+pub(crate) fn write_mcp_response(
+    writer: &mut impl Write,
+    value: &serde_json::Value,
+) -> io::Result<()> {
     let payload = serde_json::to_vec(value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
     write!(writer, "Content-Length: {}\r\n\r\n", payload.len())?;
@@ -599,15 +618,7 @@ pub(crate) fn run_mcp_server(
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                match super::execute_tool(
-                    name,
-                    arguments,
-                    &mv2,
-                    &db,
-                    read_only,
-                    None,
-                    None,
-                ) {
+                match super::execute_tool(name, arguments, &mv2, &db, read_only, None, None) {
                     Ok(result) => serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": id,
