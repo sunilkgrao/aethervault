@@ -58,7 +58,8 @@ static CRITIC_CONSECUTIVE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 const CRITIC_MAX_CONSECUTIVE_FAILURES: usize = 8;
 
 fn model_supports_adaptive_thinking(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("opus")
+    let lower = model.to_ascii_lowercase();
+    lower.contains("opus") || lower.contains("sonnet-4")
 }
 
 fn prompt_is_trivial_for_thinking(prompt: &str) -> bool {
@@ -1180,7 +1181,10 @@ pub(crate) fn call_critic(
     let content = match parsed.get("content").and_then(|v| v.as_array()) {
         Some(v) => v,
         None => {
-            eprintln!("[critic] response parse failed: missing/invalid content array in critic response: {:?}", body);
+            eprintln!(
+                "[critic] response parse failed: missing/invalid content array in critic response: {:?}",
+                body
+            );
             CRITIC_CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -1192,7 +1196,10 @@ pub(crate) fn call_critic(
     {
         Some(v) => v,
         None => {
-            eprintln!("[critic] response parse failed: missing text block in critic response: {:?}", body);
+            eprintln!(
+                "[critic] response parse failed: missing text block in critic response: {:?}",
+                body
+            );
             CRITIC_CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             return None;
         }
