@@ -1,6 +1,6 @@
 # Deployment Guide
 
-This document covers local, Docker, and cloud deployments (including DigitalOcean droplet) with minimal setup.
+This document covers local, Docker, and generic cloud/server deployments with minimal setup.
 
 ## Local (native)
 
@@ -30,10 +30,10 @@ export ANTHROPIC_MODEL=claude-<model>
 docker compose up --build
 ```
 
-## DigitalOcean Droplet (Ubuntu, Docker)
+## Generic Linux host (Ubuntu, Docker)
 
-1. Create a droplet (Ubuntu LTS).
-2. SSH in and install Docker:
+1. Provision a Linux host.
+2. Install Docker:
 
 ```bash
 sudo apt-get update

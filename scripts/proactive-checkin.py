@@ -8,18 +8,18 @@ anything that needs attention before winding down: unaddressed emails,
 incomplete tasks, and a brief status nudge.
 
 Usage:
-    python3 /root/.aethervault/hooks/proactive-checkin.py
+    python3 scripts/proactive-checkin.py
 
-    # Or with the bash wrapper for cron:
-    bash /root/.aethervault/hooks/proactive-checkin.sh
+    # Or with the bash wrapper:
+    bash scripts/proactive-checkin.sh
 
-Environment variables (loaded from /root/.aethervault/.env):
+Environment variables (typically loaded from $AETHERVAULT_HOME/.env):
     TELEGRAM_BOT_TOKEN   - Telegram bot API token
     ANTHROPIC_API_KEY    - Anthropic API key for Claude
 
 Cron schedule (add via `crontab -e`):
     # Evening check-in: 8 PM daily
-    0 20 * * * /root/.aethervault/hooks/proactive-checkin.sh
+    0 20 * * * /path/to/repo/scripts/proactive-checkin.sh
 """
 
 import json
@@ -27,17 +27,18 @@ import os
 import subprocess
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from executive_state import read_state_focus_summary
+from notifier import send_telegram
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_API_URL = os.environ.get("CLAUDE_API_URL", "http://127.0.0.1:11436/v1/messages")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
@@ -103,7 +104,15 @@ def gather_todays_briefing() -> tuple:
 
 
 def gather_active_tasks() -> tuple:
-    """Query knowledge graph for active tasks/projects."""
+    """Load strategic state first, then fall back to the knowledge graph."""
+    try:
+        summary, ok = read_state_focus_summary(limit=8)
+        if ok:
+            log(f"Strategic state loaded ({len(summary)} chars)")
+            return summary, True
+    except Exception as e:
+        log(f"Strategic state load failed: {e}")
+
     try:
         result = subprocess.run(
             [
@@ -209,7 +218,7 @@ def generate_checkin(context: dict) -> str:
         sections.append(f"EMAIL INBOX (recent):\n{context['emails']}")
 
     if context.get("tasks"):
-        sections.append(f"ACTIVE TASKS:\n{context['tasks']}")
+        sections.append(f"STRATEGIC STATE:\n{context['tasks']}")
 
     if context.get("system_health"):
         sections.append(f"SYSTEM STATUS:\n{context['system_health']}")
@@ -234,7 +243,7 @@ Keep it SHORT — 100-200 words max. This is a quick nudge, not a report.
 
 Structure:
 1. Casual opener (one line — "Hey" energy, not formal)
-2. Quick hits — any emails that still need a response, or tasks that didn't get done
+2. Quick hits — any emails that still need a response, or open loops and waiting-fors that should not slip
 3. One-liner on system health if anything is notable
 4. Sign off — a chill closing, like "anything else before you call it?" vibe
 
@@ -298,7 +307,7 @@ def _fallback_checkin(context: dict) -> str:
         lines.extend(email_lines)
         lines.append("")
     if context.get("tasks"):
-        lines.append("*Active Tasks*")
+        lines.append("*Open Loops*")
         lines.append(context["tasks"])
         lines.append("")
     if context.get("system_health"):
@@ -306,78 +315,6 @@ def _fallback_checkin(context: dict) -> str:
         lines.append("")
     lines.append("Anything else you need?")
     return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Telegram
-# ---------------------------------------------------------------------------
-
-def send_telegram(message: str) -> bool:
-    """Send a message via Telegram Bot API."""
-    if not TELEGRAM_BOT_TOKEN:
-        log("TELEGRAM_BOT_TOKEN not set")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
-    payload = json.dumps({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        if result.get("ok"):
-            log("Telegram message sent")
-            return True
-        log(f"Telegram not-ok: {result}")
-        # Retry without Markdown
-        return _send_plain(message)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        log(f"Telegram error {e.code}: {body[:300]}")
-        return _send_plain(message)
-    except Exception as e:
-        log(f"Telegram send failed: {e}")
-        return False
-
-
-def _send_plain(message: str) -> bool:
-    """Retry without Markdown formatting."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = json.dumps({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        if result.get("ok"):
-            log("Sent as plain text fallback")
-            return True
-        return False
-    except Exception as e:
-        log(f"Plain send also failed: {e}")
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +374,7 @@ def main():
     if ok:
         context["tasks"] = tasks
     else:
-        context["unavailable"].append("tasks")
+        context["unavailable"].append("strategic state")
 
     log("Checking system health...")
     health, ok = check_system_health()
@@ -458,7 +395,7 @@ def main():
     # Send
     if TELEGRAM_BOT_TOKEN:
         log("Sending via Telegram...")
-        sent = send_telegram(checkin)
+        sent = send_telegram(checkin, log=log)
         if not sent:
             log("WARNING: Telegram send failed")
     else:

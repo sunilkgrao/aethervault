@@ -1,138 +1,79 @@
-# KairosVault architecture (v0)
+# AetherVault Architecture
 
 ## Thesis
 
-The capsule is the **only persistent artifact**.  
-All retrieval quality comes from a **hybrid pipeline** that can run fully on‑device, with optional hooks for external models.  
-The agent harness stays **minimal and explicit**: you control context, tools, and logging.
+The capsule is the durable substrate, but the product is not just a memory file. AetherVault is an agent runtime with one shared operating model for interactive chat, scheduled executive-assistant jobs, and delegated worker execution.
 
----
+## Core planes
 
-## Core objects
+### State plane
 
-### 1) Capsule (`.mv2`)
+- `.mv2` capsule: append-only content, logs, approvals, skills, reflections, and retrieval traces.
+- Workspace files: `SOUL.md`, `USER.md`, `MEMORY.md`, and `STATE.{md,json}`.
+- `STATE` is the live executive state for priorities, commitments, waiting-fors, drafts, follow-ups, and closures.
+- The knowledge graph enriches entities and relationships; it does not define task truth.
 
-A single file that contains:
-- append‑only frames (documents + metadata),
-- optional lexical index (BM25),
-- optional vector index (HNSW),
-- time index (chronological),
-- query / feedback frames for audit + self‑improvement.
+### Control plane
 
-### 2) Logical document identity
+The runtime decides:
 
-Stable URI scheme:
+- prompt assembly
+- memory retrieval
+- tool exposure
+- approval routing
+- worker delegation
+- failure recovery and reflection
 
-`aether://<collection>/<relative_path>`
+Delegation is elastic. The main loop can choose zero, one, or many workers based on task shape and policy.
 
-Each update appends a new frame with the same URI.
+### Execution plane
 
-Why append?
-- time‑travel queries (`asof`, `before`, `after`)
-- deterministic diffs
-- provenance for agents
+The binary is still large, but the internal seams are explicit:
 
-### 3) Collections + config
+- `agent_runtime.rs`: loop orchestration, prompt guidance, compaction, session continuity
+- `agent_logs.rs`: durable session logging and log export
+- `executive_state.rs`: durable executive-state model and rendering
+- `workspace_state.rs`: workspace bootstrap and capsule/workspace sync
+- `executive_tools.rs`: EA-focused tool handlers
+- `host_tools.rs`: host I/O, filesystem, browser, webhook, and local status tools
+- `policy.rs`: approval and filesystem guardrails
+- `bridge_runtime.rs`: chat connector adapters
+- `tool_registry.rs`: tool schema surface
 
-Collections are URI prefixes:
+## Retrieval model
 
-`aether://notes/...`, `aether://docs/...`
+Each query builds a plan:
 
-Portable config is stored inside the capsule:
+1. Parse inline constraints and scope.
+2. Expand when useful.
+3. Retrieve across lexical and optional vector lanes.
+4. Fuse and rerank.
+5. Return human text, JSON, file lists, or a context pack.
 
-`aethervault://config/index.json`
+This keeps the agent fast by loading context progressively instead of re-injecting whole files.
 
-This can include collection roots, human context, and hook commands.
+## Agent contract
 
----
+The runtime exposes:
 
-## Query pipeline (hybrid)
-
-Each query builds a **query plan**:
-
-1) **Parse query markup**
-   - inline constraints: `in:notes`, `before:2025-01-01`, `asof:2026-01-10`
-2) **Expansion (optional)**
-   - built‑in heuristic expansions **or** an expansion hook
-3) **Parallel retrieval**
-   - lexical BM25 lane
-   - optional vector lane
-4) **Fusion**
-   - Reciprocal Rank Fusion (RRF) + top‑rank bonus
-5) **Reranking (optional)**
-   - local reranker **or** hook‑based reranker
-6) **Position‑aware blending**
-   - protect high‑precision hits, boost recall
-7) **Outputs**
-   - human text, JSON, files list, or context pack
-
----
-
-## Agent harness surface
-
-KairosVault exposes five primitives:
-- **Context packs** (`context`): prompt‑ready JSON with citations.
-- **Agent logs** (`log`): append conversation turns for audit/replay.
-- **Feedback** (`feedback`): explicit relevance signals.
-- **MCP server** (`mcp`): stdio JSON‑RPC tool surface.
-- **Agent loop** (`agent`): hook‑based minimal assistant loop.
+- context packs
+- logs
+- feedback
+- MCP server compatibility
+- an agent loop with tools, approvals, and elastic worker orchestration
 
 Tool results are split into:
-- **output** (LLM‑facing text)
-- **details** (structured JSON for UI/workflows)
 
----
+- `output`: concise LLM-facing text
+- `details`: structured JSON for workflows and downstream automation
 
-## Merge + diff
+## EA contract
 
-**Diff** compares latest active frames by URI:
-- `only_left`, `only_right`, `changed`
+Interactive chat and scheduled jobs should agree on the same reality:
 
-**Merge** appends active frames into a new capsule:
-- dedup by `(uri, checksum, timestamp)`
-- preserves timestamps, metadata, and URIs
+- morning briefing reads `STATE` and supporting context
+- evening check-in reads `STATE` and unclosed loops
+- nightly consolidation updates `MEMORY`, `STATE`, and the knowledge graph
+- chat bridges use the same policies and state model as scheduled jobs
 
-Limitations:
-- frame status is not preserved (only active frames are merged)
-- extracted metadata that requires background enrichment may be re‑derived
-
----
-
-## Hook protocol (summary)
-
-**Expansion hook input**:
-```json
-{ "query": "...", "max_expansions": 2, "scope": "aether://notes/", "temporal": null }
-```
-
-**Expansion hook output**:
-```json
-{ "lex": ["..."], "vec": ["..."], "warnings": [] }
-```
-
-**Rerank hook input**:
-```json
-{ "query": "...", "candidates": [{ "key": "...", "uri": "...", "snippet": "..." }] }
-```
-
-**Rerank hook output**:
-```json
-{ "scores": { "key": 0.42 }, "snippets": { "key": "..." }, "warnings": [] }
-```
-
-**Agent hook input**:
-```json
-{ "messages": [...], "tools": [...], "session": "optional" }
-```
-
-**Agent hook output**:
-```json
-{ "message": { "role": "assistant", "content": "...", "tool_calls": [] } }
-```
-
----
-
-## Implementation shape
-
-**Rust core**: capsule read/write, ingestion, hybrid retrieval, hooks, diff/merge  
-**CLI + MCP**: deterministic outputs and tool surfaces for agent harnesses
+If a subsystem cannot speak that shared contract, it should be removed or rewritten.

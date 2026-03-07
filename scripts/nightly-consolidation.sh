@@ -6,7 +6,7 @@
 # Bash wrapper for nightly-consolidation.py. Designed to be called by cron.
 #
 # Cron entry (runs at 3 AM daily):
-#   0 3 * * * /root/.aethervault/hooks/nightly-consolidation.sh
+#   0 3 * * * /path/to/repo/scripts/nightly-consolidation.sh
 #
 # What it does:
 #   1. Sources the .env file for API keys

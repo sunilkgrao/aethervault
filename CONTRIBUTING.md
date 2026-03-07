@@ -20,11 +20,6 @@
    cp config/env.example ~/.aethervault/.env
    ```
 
-4. For the Django superclustered app (separate):
-   ```bash
-   pip install -r requirements.txt
-   ```
-
 ## Code Style
 
 - **Python**: Follow the patterns established in existing scripts. Use `os.environ.get()`

@@ -7,22 +7,20 @@ Gathers context from multiple sources (email, calendar, knowledge graph, weather
 yesterday's summary) and uses Claude to generate a personalized morning briefing.
 Sends the briefing via Telegram and saves it locally.
 
-Designed to run as a cron job on the AetherVault DigitalOcean droplet.
-
 Usage:
-    python3 /root/.aethervault/hooks/morning-briefing.py
+    python3 scripts/morning-briefing.py
 
-    # Or with the bash wrapper for cron:
-    bash /root/.aethervault/hooks/morning-briefing.sh
+    # Or with the bash wrapper:
+    bash scripts/morning-briefing.sh
 
-Environment variables (loaded from /root/.aethervault/.env):
+Environment variables (typically loaded from $AETHERVAULT_HOME/.env):
     TELEGRAM_BOT_TOKEN   - Telegram bot API token
     ANTHROPIC_API_KEY    - Anthropic API key for Claude
 
 Cron schedule (add via `crontab -e`):
     # Morning briefing: 8 AM weekdays, 9 AM weekends
-    0 8 * * 1-5 /root/.aethervault/hooks/morning-briefing.sh
-    0 9 * * 0,6 /root/.aethervault/hooks/morning-briefing.sh
+    0 8 * * 1-5 /path/to/repo/scripts/morning-briefing.sh
+    0 9 * * 0,6 /path/to/repo/scripts/morning-briefing.sh
 """
 
 import json
@@ -30,17 +28,18 @@ import os
 import subprocess
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from executive_state import read_state_focus_summary
+from notifier import send_telegram
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_API_URL = os.environ.get("CLAUDE_API_URL", "http://127.0.0.1:11436/v1/messages")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
@@ -114,7 +113,15 @@ def gather_emails() -> tuple:
 
 
 def gather_active_projects() -> tuple:
-    """Query the knowledge graph for active projects."""
+    """Load strategic state first, then fall back to the knowledge graph."""
+    try:
+        summary, ok = read_state_focus_summary(limit=8)
+        if ok:
+            log(f"Strategic state loaded ({len(summary)} chars)")
+            return summary, True
+    except Exception as e:
+        log(f"Strategic state load failed: {e}")
+
     try:
         result = subprocess.run(
             [
@@ -255,8 +262,8 @@ def generate_briefing(context: dict) -> str:
     if context.get("emails"):
         sections.append(f"RECENT EMAILS (last 5):\n{context['emails']}")
 
-    if context.get("projects"):
-        sections.append(f"ACTIVE PROJECTS:\n{context['projects']}")
+    if context.get("strategic_state"):
+        sections.append(f"STRATEGIC STATE:\n{context['strategic_state']}")
 
     if context.get("calendar"):
         sections.append(f"TODAY'S CALENDAR:\n{context['calendar']}")
@@ -291,9 +298,9 @@ Structure:
 1. A brief, warm greeting (one line, reference the weather if available)
 2. *Schedule* — today's calendar events (or "clear day" if none)
 3. *Inbox* — emails that need attention (skip routine ones)
-4. *Active Projects* — brief status on what's moving
-5. *From Yesterday* — anything carried over or noteworthy
-6. A closing line — something genuine and motivating, not a fortune cookie
+4. *Priorities* — the active loops, deadlines, and waiting-fors that matter most
+5. *From Yesterday* — anything carried over or still unresolved
+6. A closing line — grounded and useful, not a fortune cookie
 
 Here is today's context:
 
@@ -361,117 +368,15 @@ def _fallback_briefing(context: dict) -> str:
         lines.append("*Inbox*")
         lines.append(context["emails"])
         lines.append("")
-    if context.get("projects"):
-        lines.append("*Active Projects*")
-        lines.append(context["projects"])
+    if context.get("strategic_state"):
+        lines.append("*Priorities*")
+        lines.append(context["strategic_state"])
         lines.append("")
     if context.get("unavailable"):
         lines.append(f"_Data unavailable: {', '.join(context['unavailable'])}_")
         lines.append("")
     lines.append("_(Briefing generated without Claude — API was unavailable)_")
     return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Telegram — Send the briefing
-# ---------------------------------------------------------------------------
-
-def send_telegram(message: str) -> bool:
-    """Send a message via Telegram Bot API with Markdown formatting."""
-    if not TELEGRAM_BOT_TOKEN:
-        log("ERROR: TELEGRAM_BOT_TOKEN not set")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
-    # Telegram has a 4096 character limit per message
-    # If the briefing is too long, split it
-    chunks = _split_message(message, max_length=4000)
-
-    success = True
-    for i, chunk in enumerate(chunks):
-        payload = json.dumps({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": chunk,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True,
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-            if not result.get("ok"):
-                log(f"Telegram API returned not-ok: {result}")
-                # Retry without Markdown if parsing failed
-                success = _send_telegram_plain(chunk)
-            else:
-                log(f"Telegram message sent (chunk {i + 1}/{len(chunks)})")
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            log(f"Telegram API error {e.code}: {body[:300]}")
-            # Retry without Markdown parsing
-            success = _send_telegram_plain(chunk)
-        except Exception as e:
-            log(f"Telegram send failed: {e}")
-            success = False
-
-    return success
-
-
-def _send_telegram_plain(message: str) -> bool:
-    """Retry sending without Markdown if formatting causes issues."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = json.dumps({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        if result.get("ok"):
-            log("Telegram message sent (plain text fallback)")
-            return True
-        log(f"Telegram plain send also failed: {result}")
-        return False
-    except Exception as e:
-        log(f"Telegram plain send failed: {e}")
-        return False
-
-
-def _split_message(text: str, max_length: int = 4000) -> list:
-    """Split a message into chunks that fit within Telegram's character limit."""
-    if len(text) <= max_length:
-        return [text]
-
-    chunks = []
-    current = ""
-    for line in text.split("\n"):
-        if len(current) + len(line) + 1 > max_length:
-            if current:
-                chunks.append(current.strip())
-            current = line + "\n"
-        else:
-            current += line + "\n"
-    if current.strip():
-        chunks.append(current.strip())
-
-    return chunks if chunks else [text[:max_length]]
 
 
 # ---------------------------------------------------------------------------
@@ -528,12 +433,12 @@ def main():
     else:
         context["unavailable"].append("email")
 
-    log("Gathering active projects...")
-    projects, ok = gather_active_projects()
+    log("Gathering strategic state...")
+    strategic_state, ok = gather_active_projects()
     if ok:
-        context["projects"] = projects
+        context["strategic_state"] = strategic_state
     else:
-        context["unavailable"].append("knowledge graph")
+        context["unavailable"].append("strategic state")
 
     log("Gathering calendar...")
     calendar, ok = gather_calendar()
@@ -563,7 +468,7 @@ def main():
     # Send via Telegram
     if TELEGRAM_BOT_TOKEN:
         log("Sending via Telegram...")
-        sent = send_telegram(briefing)
+        sent = send_telegram(briefing, log=log)
         if not sent:
             log("WARNING: Telegram send failed — briefing saved locally")
     else:

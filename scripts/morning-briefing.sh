@@ -7,15 +7,15 @@
 # morning briefing Python script with proper logging.
 #
 # Usage:
-#     bash /root/.aethervault/hooks/morning-briefing.sh
+#     bash scripts/morning-briefing.sh
 #
 # Cron schedule (add via `crontab -e` — do NOT install automatically):
 #     # Morning briefing: 8 AM weekdays, 9 AM weekends (Eastern Time)
-#     0 8 * * 1-5 /root/.aethervault/hooks/morning-briefing.sh
-#     0 9 * * 0,6 /root/.aethervault/hooks/morning-briefing.sh
+#     0 8 * * 1-5 /path/to/repo/scripts/morning-briefing.sh
+#     0 9 * * 0,6 /path/to/repo/scripts/morning-briefing.sh
 #
 #     # Evening check-in: 8 PM daily
-#     0 20 * * * /root/.aethervault/hooks/proactive-checkin.sh
+#     0 20 * * * /path/to/repo/scripts/proactive-checkin.sh
 #
 # Log output goes to /var/log/aethervault/briefing.log
 # =============================================================================

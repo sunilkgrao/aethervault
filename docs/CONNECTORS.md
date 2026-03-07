@@ -146,9 +146,12 @@ export ANTHROPIC_MODEL=claude-<model>
 ## Subagents / multi-session orchestration
 
 Subagents are configured in the capsule (`agent.subagents`) and invoked via the `subagent_invoke` tool.
+The core agent can also create ad-hoc subagents on the fly by supplying a custom `system` prompt to `subagent_invoke` or `subagent_batch`, so delegation does not need to be limited to a fixed predefined set.
+Each invocation can inherit runtime policy from capsule config or override its own `max_steps`, context budget, logging, and memory usage when the task warrants it.
 
 ## Useful env vars
 
 - `ANTHROPIC_PROMPT_CACHE` / `ANTHROPIC_PROMPT_CACHE_TTL`
 - `ANTHROPIC_TOKEN_EFFICIENT` (token‑efficient tools beta)
 - `AETHERVAULT_COMMAND_WRAPPER` (optional command prefix for sandboxing external tools)
+- `AETHERVAULT_BRIDGE_TIMEOUT_SECS` (`0` disables the default 15-minute bridge timeout)

@@ -4,12 +4,12 @@ AetherVault Session Manager
 Spawn, list, check, and kill named background agent sessions.
 
 Usage (called by the agent via exec tool):
-    python3 /root/.aethervault/hooks/session-manager.py spawn --task "Build a doom clone" [--name cosmic-falcon-7] [--model claude] [--max-steps 32]
-    python3 /root/.aethervault/hooks/session-manager.py list
-    python3 /root/.aethervault/hooks/session-manager.py check <session-name>
-    python3 /root/.aethervault/hooks/session-manager.py check-all
-    python3 /root/.aethervault/hooks/session-manager.py kill <session-name>
-    python3 /root/.aethervault/hooks/session-manager.py kill-all
+    python3 scripts/session-manager.py spawn --task "Build a doom clone" [--name cosmic-falcon-7] [--model claude] [--max-steps 32]
+    python3 scripts/session-manager.py list
+    python3 scripts/session-manager.py check <session-name>
+    python3 scripts/session-manager.py check-all
+    python3 scripts/session-manager.py kill <session-name>
+    python3 scripts/session-manager.py kill-all
 """
 
 import argparse

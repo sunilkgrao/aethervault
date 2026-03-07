@@ -7,12 +7,12 @@ Auto-discovers hooks, cron jobs, services, and configs.
 The agent queries this before using any capability.
 
 Usage:
-    python3 /root/.aethervault/hooks/capabilities.py list [--format json|table]
-    python3 /root/.aethervault/hooks/capabilities.py check <name>
-    python3 /root/.aethervault/hooks/capabilities.py discover
-    python3 /root/.aethervault/hooks/capabilities.py enable <name>
-    python3 /root/.aethervault/hooks/capabilities.py disable <name> --reason "..."
-    python3 /root/.aethervault/hooks/capabilities.py status
+    python3 scripts/capabilities.py list [--format json|table]
+    python3 scripts/capabilities.py check <name>
+    python3 scripts/capabilities.py discover
+    python3 scripts/capabilities.py enable <name>
+    python3 scripts/capabilities.py disable <name> --reason "..."
+    python3 scripts/capabilities.py status
 """
 
 import argparse

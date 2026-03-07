@@ -154,7 +154,7 @@
           }
         }
       },
-      "workspace": "/root/aethervault-workspace",
+      "workspace": "/path/to/aethervault-workspace",
       "memorySearch": {
         "enabled": true,
         "sources": [

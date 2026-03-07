@@ -12,10 +12,10 @@
 #   capsule-manager.sh watchdog        — Cron-safe: check health, alert on issues, auto-compact
 #
 # Architecture:
-#   /root/.aethervault/memory.mv2           — Working capsule (agent reads/writes)
-#   /root/.aethervault/archive/             — Archived capsules (read-only, timestamped)
-#   /root/.aethervault/migration-data/      — Original migration source data (if available)
-#   /root/.aethervault/logs/                — Capsule manager logs
+#   ~/.aethervault/memory.mv2               — Working capsule (agent reads/writes)
+#   ~/.aethervault/archive/                 — Archived capsules (read-only, timestamped)
+#   ~/.aethervault/migration-data/          — Original migration source data (if available)
+#   ~/.aethervault/logs/                    — Capsule manager logs
 #
 # Capacity tiers (determined by WAL size in binary):
 #   Free  (WAL < 4 MiB):  200 MiB
@@ -46,6 +46,12 @@ MAX_ARCHIVES=10  # Keep at most this many archive capsules
 
 # Telegram alerting — read chat_id from config (not hardcoded)
 ENV_FILE="$AETHERVAULT_HOME/.env"
+if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+fi
+ENABLE_VERTEX_PROXY="${ENABLE_VERTEX_PROXY:-0}"
+ENABLE_MOONSHOT_PROXY="${ENABLE_MOONSHOT_PROXY:-0}"
 ALERT_CHAT_ID=""
 BRIEFING_CONFIG="$AETHERVAULT_HOME/config/briefing.json"
 if [ -f "$BRIEFING_CONFIG" ]; then
@@ -716,11 +722,11 @@ cmd_watchdog() {
         log_to_file "WATCHDOG: WARNING — disk at ${disk_pct}%"
     fi
 
-    # Check proxy processes
-    if ! pgrep -f "vertex_proxy.py" >/dev/null 2>&1; then
+    # Check optional proxy processes only when explicitly enabled
+    if [ "$ENABLE_VERTEX_PROXY" = "1" ] && ! pgrep -f "vertex_proxy.py" >/dev/null 2>&1; then
         log_to_file "WATCHDOG: WARNING — vertex_proxy.py not running"
     fi
-    if ! pgrep -f "moonshot_proxy.py" >/dev/null 2>&1; then
+    if [ "$ENABLE_MOONSHOT_PROXY" = "1" ] && ! pgrep -f "moonshot_proxy.py" >/dev/null 2>&1; then
         log_to_file "WATCHDOG: WARNING — moonshot_proxy.py not running"
     fi
 

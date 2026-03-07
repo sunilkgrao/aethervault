@@ -8,8 +8,9 @@ Runs as a cron job each night to:
 2. Summarize conversations using Claude API
 3. Extract new facts about the user
 4. Update MEMORY.md with new facts
-5. Update the knowledge graph with new entities/relations
-6. Write a daily summary to workspace/daily-summaries/
+5. Refresh executive state with open loops, waiting-fors, and follow-ups
+6. Update the knowledge graph with new entities/relations
+7. Write a daily summary to workspace/daily-summaries/
 
 Usage:
     # Run directly (requires ANTHROPIC_API_KEY in environment or .env):
@@ -25,11 +26,12 @@ Usage:
     python3 scripts/nightly-consolidation.py --date 2026-02-10
 
 Architecture:
-    Capsule:         /root/.aethervault/memory.mv2
-    Knowledge graph: /root/.aethervault/data/knowledge-graph.json
-    MEMORY.md:       /root/.aethervault/workspace/MEMORY.md
-    Daily summaries: /root/.aethervault/workspace/daily-summaries/
-    Agent logs:      queried via `aethervault query` against agent-log collection
+    Capsule:         $AETHERVAULT_HOME/memory.mv2
+    Knowledge graph: $AETHERVAULT_HOME/data/knowledge-graph.json
+    MEMORY.md:       $AETHERVAULT_HOME/workspace/MEMORY.md
+    STATE:           $AETHERVAULT_HOME/workspace/STATE.{json,md}
+    Daily summaries: $AETHERVAULT_HOME/workspace/daily-summaries/
+    Agent logs:      exported via `aethervault agent-logs --date YYYY-MM-DD`
 """
 
 import argparse
@@ -43,6 +45,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from executive_state import apply_state_updates, read_state_focus_summary
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -124,8 +128,8 @@ def query_agent_logs(target_date: str, limit: int = 100) -> str:
     """
     Query today's agent logs from the capsule.
 
-    Uses `aethervault query` to pull frames from the agent-log collection.
-    The target_date is used as the query string to match relevant frames.
+    Uses `aethervault agent-logs` to export structured log entries for
+    the requested UTC date.
     """
     if not os.path.isfile(AETHERVAULT_BIN):
         log_warn(f"aethervault binary not found at {AETHERVAULT_BIN}, trying PATH")
@@ -138,12 +142,12 @@ def query_agent_logs(target_date: str, limit: int = 100) -> str:
         return ""
 
     cmd = [
-        binary, "query", CAPSULE_PATH, target_date,
-        "--collection", "agent-log",
+        binary, "agent-logs", CAPSULE_PATH,
+        "--date", target_date,
         "--limit", str(limit),
     ]
 
-    log(f"Querying agent logs: {' '.join(cmd)}")
+    log(f"Exporting agent logs: {' '.join(cmd)}")
     try:
         result = subprocess.run(
             cmd,
@@ -152,7 +156,7 @@ def query_agent_logs(target_date: str, limit: int = 100) -> str:
             timeout=60,
         )
         if result.returncode != 0:
-            log_warn(f"aethervault query returned {result.returncode}: {result.stderr.strip()}")
+            log_warn(f"aethervault agent-logs returned {result.returncode}: {result.stderr.strip()}")
         output = result.stdout.strip()
         if not output:
             log_warn("No agent logs returned for today")
@@ -163,10 +167,10 @@ def query_agent_logs(target_date: str, limit: int = 100) -> str:
         log_error(f"aethervault binary not found: {binary}")
         return ""
     except subprocess.TimeoutExpired:
-        log_error("aethervault query timed out after 60s")
+        log_error("aethervault agent-logs timed out after 60s")
         return ""
     except Exception as e:
-        log_error(f"Failed to query agent logs: {e}")
+        log_error(f"Failed to export agent logs: {e}")
         return ""
 
 
@@ -290,6 +294,18 @@ Respond with ONLY valid JSON matching this schema (no markdown fences, no extra 
       "to": "entity2"
     }
   ],
+  "state_updates": [
+    {
+      "title": "open loop or commitment",
+      "kind": "priority|task|project|follow_up|waiting_on|meeting|draft|note",
+      "status": "active|pending|waiting|done|archived",
+      "next_action": "optional concrete next action",
+      "due": "optional YYYY-MM-DD date",
+      "waiting_on": "optional person or system blocking progress",
+      "note": "optional brief state note",
+      "source": "optional source marker"
+    }
+  ],
   "summary_paragraph": "A 2-4 sentence narrative summary of the day's interactions."
 }
 
@@ -299,6 +315,7 @@ Guidelines:
 - Mark confidence as "low" for anything inferred rather than directly stated
 - For entities, include people mentioned by name, projects discussed, tools used
 - For relations, capture how entities connect (e.g. "User works_on ProjectX")
+- For state_updates, capture only live commitments, unresolved loops, explicit follow-ups, waiting-fors, or items clearly completed/closed today
 - The user's name is """ + OWNER_NAME + """
 - If the logs are empty or contain no meaningful content, return minimal JSON with empty arrays
 """
@@ -311,9 +328,19 @@ def summarize_logs(api_key: str, logs: str, target_date: str) -> dict:
         log(f"Truncating logs from {len(logs)} to {MAX_LOG_TOKENS} chars")
         logs = logs[:MAX_LOG_TOKENS] + "\n\n[... truncated ...]"
 
+    current_state, has_state = read_state_focus_summary(limit=12)
+    state_block = ""
+    if has_state:
+        state_block = (
+            "Current strategic state snapshot:\n"
+            f"{current_state}\n\n"
+            "Use this to update or close existing loops rather than duplicating them.\n\n"
+        )
+
     user_msg = (
         f"Here are the agent conversation logs for {target_date}.\n"
         f"Analyze them and produce the structured JSON summary.\n\n"
+        f"{state_block}"
         f"--- BEGIN LOGS ---\n{logs}\n--- END LOGS ---"
     )
 
@@ -655,6 +682,7 @@ def write_daily_summary(summary_data: dict, logs_raw: str,
     new_facts = summary_data.get("new_facts", [])
     entities = summary_data.get("entities", [])
     relations = summary_data.get("relations", [])
+    state_updates = summary_data.get("state_updates", [])
     paragraph = summary_data.get("summary_paragraph", "No summary available.")
 
     lines = [
@@ -734,6 +762,23 @@ def write_daily_summary(summary_data: dict, logs_raw: str,
                          f"{r.get('to', '?')}")
         lines.append("")
 
+    if state_updates:
+        lines.append("## Strategic State Updates")
+        lines.append("")
+        for item in state_updates:
+            title = item.get("title", "")
+            kind = item.get("kind", "task")
+            status = item.get("status", "active")
+            bits = [f"**[{status}][{kind}]** {title}"]
+            if item.get("next_action"):
+                bits.append(f"next: {item['next_action']}")
+            if item.get("waiting_on"):
+                bits.append(f"waiting on: {item['waiting_on']}")
+            if item.get("due"):
+                bits.append(f"due: {item['due']}")
+            lines.append(f"- {' | '.join(bits)}")
+        lines.append("")
+
     lines.append("---")
     lines.append("*Generated by nightly-consolidation.py*")
 
@@ -805,7 +850,7 @@ def main():
         sys.exit(0)
 
     # Step 1: Query agent logs
-    log("Step 1/5: Querying agent logs from capsule...")
+    log("Step 1/6: Querying agent logs from capsule...")
     logs_raw = query_agent_logs(target_date, limit=args.log_limit)
     if not logs_raw:
         log_warn("No logs found for today. Writing empty summary and exiting.")
@@ -819,6 +864,7 @@ def main():
             "new_facts": [],
             "entities": [],
             "relations": [],
+            "state_updates": [],
             "summary_paragraph": f"No agent interactions recorded for {target_date}.",
         }
         write_daily_summary(empty_summary, "", target_date, dry_run=args.dry_run)
@@ -826,7 +872,7 @@ def main():
         sys.exit(0)
 
     # Step 2: Summarize with Claude
-    log("Step 2/5: Summarizing conversations with Claude...")
+    log("Step 2/6: Summarizing conversations with Claude...")
     summary_data = summarize_logs(api_key, logs_raw, target_date)
     if not summary_data:
         log_error("Failed to get summary from Claude. Writing raw log summary.")
@@ -840,6 +886,7 @@ def main():
             "new_facts": [],
             "entities": [],
             "relations": [],
+            "state_updates": [],
             "summary_paragraph": (
                 f"Nightly consolidation for {target_date} failed to contact Claude API. "
                 f"Raw logs were {len(logs_raw)} characters. Manual review recommended."
@@ -849,18 +896,28 @@ def main():
         sys.exit(1)
 
     # Step 3: Update MEMORY.md
-    log("Step 3/5: Updating MEMORY.md with new facts...")
+    log("Step 3/6: Updating MEMORY.md with new facts...")
     new_facts = summary_data.get("new_facts", [])
     update_memory_md(new_facts, target_date, dry_run=args.dry_run)
 
-    # Step 4: Update knowledge graph
-    log("Step 4/5: Updating knowledge graph...")
+    # Step 4: Refresh strategic state
+    log("Step 4/6: Refreshing strategic state...")
+    state_updates = summary_data.get("state_updates", [])
+    _, state_changes = apply_state_updates(
+        state_updates,
+        dry_run=args.dry_run,
+        source_note=f"{target_date}: nightly consolidation refreshed strategic state",
+    )
+    log(f"Strategic state updates applied: {state_changes}")
+
+    # Step 5: Update knowledge graph
+    log("Step 5/6: Updating knowledge graph...")
     entities = summary_data.get("entities", [])
     relations = summary_data.get("relations", [])
     update_knowledge_graph(entities, relations, target_date, dry_run=args.dry_run)
 
-    # Step 5: Write daily summary
-    log("Step 5/5: Writing daily summary...")
+    # Step 6: Write daily summary
+    log("Step 6/6: Writing daily summary...")
     write_daily_summary(summary_data, logs_raw, target_date, dry_run=args.dry_run)
 
     # Final stats
@@ -869,6 +926,7 @@ def main():
     log(f"  Tasks:     {len(summary_data.get('tasks_completed', []))} completed, "
         f"{len(summary_data.get('tasks_in_progress', []))} in progress")
     log(f"  Facts:     {len(new_facts)} extracted")
+    log(f"  State:     {len(state_updates)} candidate updates")
     log(f"  Entities:  {len(entities)}")
     log(f"  Relations: {len(relations)}")
     log("=== Done ===")

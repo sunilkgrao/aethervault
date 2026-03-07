@@ -4,15 +4,15 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/root/aethervault-workspace/embedding-service
-ExecStart=/usr/bin/node /root/aethervault-workspace/embedding-service/dist/server.js
+User=aethervault
+WorkingDirectory=/path/to/aethervault/services/embedding-service
+ExecStart=/usr/bin/node /path/to/aethervault/services/embedding-service/dist/server.js
 Restart=always
 RestartSec=10
 Environment="NODE_ENV=production"
 Environment="HOST=127.0.0.1"
 Environment="PORT=11435"
-Environment="MODEL_CACHE_DIR=/root/.cache/embedding-service/models"
+Environment="MODEL_CACHE_DIR=/home/aethervault/.cache/embedding-service/models"
 
 # Logging
 StandardOutput=journal

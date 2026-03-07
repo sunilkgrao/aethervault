@@ -24,7 +24,7 @@ curl -X POST http://localhost:11435/v1/embeddings \
 
 1. **Copy service file:**
 ```bash
-sudo cp /root/aethervault-workspace/embedding-service/embedding-service.service /etc/systemd/system/
+sudo cp /path/to/aethervault/services/embedding-service/embedding-service.service /etc/systemd/system/
 ```
 
 2. **Enable and start:**
@@ -49,7 +49,7 @@ sudo systemctl disable ollama-tunnel.service
 
 2. **Update AetherVault config:**
 
-Edit `/root/.aethervault/aethervault.json`:
+Edit `~/.aethervault/aethervault.json`:
 
 ```json
 {
@@ -118,7 +118,7 @@ sudo journalctl -u embedding-service -f
 sudo journalctl -u embedding-service -n 50
 
 # Try manual start
-cd /root/aethervault-workspace/embedding-service
+cd /path/to/aethervault/services/embedding-service
 npm start
 ```
 
@@ -130,7 +130,7 @@ npm start
 ### Model not downloading
 - Check disk space: `df -h`
 - Check cache dir: `ls -lh ~/.cache/embedding-service/models/`
-- Manual download: `cd /root/aethervault-workspace/embedding-service && npm start`
+- Manual download: `cd /path/to/aethervault/services/embedding-service && npm start`
 
 ## Next Steps
 

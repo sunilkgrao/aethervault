@@ -127,7 +127,7 @@
           }
         }
       },
-      "workspace": "/root/aethervault-workspace",
+      "workspace": "/path/to/aethervault-workspace",
       "memorySearch": {
         "enabled": true,
         "sources": [
@@ -145,7 +145,7 @@
         "fallback": "none",
         "model": "nomic-embed-text",
         "local": {
-          "modelCacheDir": "/root/.cache/aethervault-models"
+          "modelCacheDir": "~/.cache/aethervault-models"
         },
         "query": {
           "hybrid": {

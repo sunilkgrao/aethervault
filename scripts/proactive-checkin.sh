@@ -6,11 +6,11 @@
 # Loads environment variables and runs the proactive check-in script.
 #
 # Usage:
-#     bash /root/.aethervault/hooks/proactive-checkin.sh
+#     bash scripts/proactive-checkin.sh
 #
 # Cron schedule (add via `crontab -e` — do NOT install automatically):
 #     # Evening check-in: 8 PM daily
-#     0 20 * * * /root/.aethervault/hooks/proactive-checkin.sh
+#     0 20 * * * /path/to/repo/scripts/proactive-checkin.sh
 #
 # Log output goes to /var/log/aethervault/checkin.log
 # =============================================================================

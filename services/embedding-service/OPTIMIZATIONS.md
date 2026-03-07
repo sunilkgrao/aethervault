@@ -145,7 +145,7 @@ All via environment variables:
 ```bash
 # Model and cache
 EMBED_MODEL=hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf
-MODEL_CACHE_DIR=/root/.cache/embedding-service/models
+MODEL_CACHE_DIR=~/.cache/embedding-service/models
 
 # Server
 PORT=11435
