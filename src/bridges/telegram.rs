@@ -915,7 +915,7 @@ pub(crate) fn spawn_agent_run(
                 let in_stream = matches!(guard.stream_phase, StreamPhase::Thinking | StreamPhase::Responding);
                 let progress_interval = if guard.started_at.elapsed().as_secs() < 120 { 5 } else { 15 };
                 // Convert tick_count to equivalent 4s ticks for throttle comparison
-                let equiv_ticks = if is_streaming { tick_count / 4 } else { tick_count };
+                let equiv_ticks = if in_stream { tick_count / 4 } else { tick_count };
                 let needs_progress = guard.first_ack_sent
                     && equiv_ticks % progress_interval == 0
                     && !done
