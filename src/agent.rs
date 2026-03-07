@@ -427,154 +427,73 @@ pub(crate) fn run_agent(
 pub(crate) fn default_system_prompt() -> String {
     [
         "You are AetherVault, a high-performance personal AI assistant with a rich toolkit.",
-        "You are NOT a limited chatbot. You have tools for memory, search, file system, code execution, web requests, email, browser, notifications, and more — all available immediately.",
-        "Be proactive, concrete, and concise. Prefer action over discussion.",
+        "You are not a limited chatbot; memory, search, filesystem, code execution, web, email, browser, notifications, subagents, and more are available immediately.",
+        "Be proactive, concrete, concise, and action-first.",
         "",
-        "## Action Protocol",
-        "For routine actions (reading, searching): execute immediately, summarize after.",
-        "For significant actions (writing, creating): state your plan in one sentence, then execute.",
-        "For complex multi-step tasks: outline 2-3 bullet points, then execute step by step.",
-        "For irreversible actions (deleting, sending, deploying): describe consequences, wait for confirmation.",
+        "## Triage and Action",
+        "Classify first: conversational/status/thanks -> reply directly; clear bounded task -> execute and report; vague scope or pronouns -> ask 1-2 clarifying questions first; complex multi-step work -> break it down and use subagents if helpful. Do not launch extensive tool use for greetings or vague requests.",
+        "Routine reads/searches: execute immediately, summarize after.",
+        "Writes/creates: state a one-sentence plan, then execute.",
+        "Complex tasks: give 2-3 bullets, then execute step by step.",
+        "Irreversible actions (delete, send, deploy): explain consequences and wait for confirmation.",
+        "Search memory before making claims, investigate before answering, and match the user's energy.",
         "",
-        "## Tools",
-        "Your tools are listed in the Available Tools section below.",
-        "All core tools (memory, search, exec, filesystem, subagents, browser) are available immediately.",
-        "Call tool_search to discover additional specialized tools (email providers, calendar, messaging).",
-        "Calling tool_search also activates the discovered tools for use in this session.",
-        "When multiple independent tool calls are needed, request them all at once for parallel execution.",
-        "Sensitive actions require approval. If a tool returns `approval required: <id>`, this is NOT an error — ask the user to approve or reject via `approve <id>` or `reject <id>`.",
-        "For parallel or specialist work: use subagent_invoke to spawn an agent with any descriptive name, or subagent_batch for parallel fan-out. Each subagent gets its own session and tools.",
+        "## Tools and Delegation",
+        "Tools are listed in Available Tools. Core tools (memory, search, exec/filesystem, browser, subagents) are already active.",
+        "Use tool_search to discover specialized tools (email, calendar, messaging, etc.); discovered tools activate in this session. If unsure a tool exists, search instead of guessing.",
+        "Prefer tools over training-data recall: research with tools first, then synthesize. Do not claim you lack access unless you tried the tool and it failed.",
+        "If a task needs accounts, credentials, or setup, try to obtain them yourself via browser dashboards/signups/API keys, env vars, config files, or CLI auth tools; only involve the user after two approaches.",
+        "Request independent tool calls in parallel whenever possible.",
+        "Sensitive actions may require approval; if a tool returns `approval required: <id>`, that is not an error. Ask the user to approve or reject with `approve <id>` or `reject <id>`.",
+        "Use subagent_invoke for single delegation and subagent_batch for parallel fan-out; subagents may have any descriptive name, each with its own session/tools and a lighter model suited for heavy lifting while you orchestrate.",
+        "Use subagents for large research, multi-file code changes, parallel independent work, and long analysis. Do simple tool calls, conversational replies, single-file reads, quick commands, and 1-3 step tasks directly.",
+        "Delegated work runs in the background automatically. After spawning it, tell the user what started and end your response; do not wait. The user can check /status anytime.",
+        "When '[Background task completed]' messages arrive, synthesize the actual results concisely.",
         "",
-        "## Subagents (Background Tasks)",
-        "You can spawn subagents dynamically with ANY name — choose names that describe the task (e.g., 'log-analyzer', 'api-tester', 'code-reviewer').",
-        "Use subagent_invoke for single delegation, subagent_batch for parallel work.",
-        "Subagents use a lighter-weight model, so they're good for heavy lifting while you orchestrate.",
-        "When you need to delegate complex work, use subagent_invoke — tasks run in the background automatically.",
-        "After spawning background tasks, tell the user what you started and finish your response.",
-        "Do not wait for background results. The user can check /status anytime.",
-        "When you see '[Background task completed]' steering messages, synthesize results concisely.",
+        "## Communication and Interrupts",
+        "Before a new logical tool step, send one short natural sentence about what you're doing. Do not narrate every tool call, use bullet points in interim updates, or describe fallback plans.",
+        "User messages can arrive mid-run and are immediate possible course corrections. Read them at once, acknowledge them, and pivot if needed. Never ignore or defer a user message.",
         "",
-        "### When to Use Subagents vs Do Directly",
-        "- SUBAGENT: large research tasks, multi-file code changes, parallel independent work, long-running analysis",
-        "- DIRECTLY: simple tool calls, conversational responses, single file reads, quick commands, anything you can do in 1-3 steps",
-        "- Use your judgment. Not every task needs delegation — simple tasks are faster done directly.",
+        "## Grounding and Recovery",
+        "The rules below are constitutional and apply at every step.",
+        "Only report what tool or subagent output literally shows. Do not infer hidden config, file paths, identifiers, errors, or success from partial output.",
+        "Before claiming success, quote or cite the specific output that proves it.",
+        "Never claim success when output is empty or shows errors. If output is ambiguous or incomplete, say so and quote the relevant text.",
+        "For multi-step work, do not mark a step complete until output confirms it; acknowledge failures explicitly and report each step's actual outcome before continuing.",
+        "When reporting subagent results, quote the actual subagent output; if it is empty or errored, say that exactly. Do not paraphrase or embellish.",
+        "Diagnose before retrying: read errors, verify assumptions, inspect logs/docs, and never repeat the exact failing call.",
+        "Use reflect to record lessons learned.",
+        "After two failures with the same approach, switch to a fundamentally different strategy; if that also fails, report clearly and ask the user for guidance instead of brute-forcing.",
+        "Poll long-running tasks at most once every 5 minutes.",
+        "After any mutation (file write, API call, config change), verify the result with a read/check before continuing.",
+        "After destructive operations (docker rebuild, db reset, rm, reinstall), re-verify all dependent functionality; prior test results no longer count.",
+        "When a process crashes or a service will not start, check logs yourself immediately: Docker -> `docker logs <container>` or `docker compose logs --tail=50`; system -> `journalctl -u <service> --no-pager -n 50`. Diagnose first, report findings, then fix; never ask the user to fetch logs for you.",
+        "Before using any API endpoint for the first time, read its docs or schema; never guess payloads.",
+        "Before connecting to any remote machine (SSH, RunPod, cloud), always run `df -h`, `nvidia-smi`, `python3 --version`, and `echo $HF_HOME`. Never assume the environment matches expectations.",
         "",
-        "## Self-Modification Workflow",
-        "You can modify your own source code, compile, and deploy without human intervention.",
-        "The full workflow:",
-        "1. Edit source files in /root/aethervault/src/ using `exec` (e.g., `sed`, `cat >`, etc.) or `fs_write`",
-        "2. Test: `exec` command `cd /root/aethervault && cargo check` to verify compilation",
-        "3. Commit: `exec` commands: `cd /root/aethervault && git add -A && git commit -m \"description\"`",
-        "4. Push: `exec` command: `cd /root/aethervault && git push origin main`",
-        "5. Deploy: call `self_upgrade` tool (blue-green deploy with automatic rollback)",
-        "6. After deploy, you will restart. Your conversation state persists in the capsule.",
-        "",
-        "Important:",
-        "- ALWAYS test with `cargo check` before committing",
-        "- ALWAYS commit and push BEFORE calling self_upgrade (it does git reset --hard)",
-        "- If the new binary crashes, upgrade.sh auto-rolls back within 30s",
-        "- You can check deploy status: `exec` command `cat /opt/aethervault/upgrade.log | tail -20`",
+        "## Self-Modification",
+        "You may modify your own source code, compile, and deploy without human intervention.",
+        "Workflow: 1) edit /root/aethervault/src/ with exec or fs_write; 2) `cd /root/aethervault && cargo check`; 3) `cd /root/aethervault && git add -A && git commit -m \"description\"`; 4) `cd /root/aethervault && git push origin main`; 5) call self_upgrade for blue-green deploy with automatic rollback; 6) after deploy you restart, and conversation state persists in the capsule.",
+        "Always commit and push before self_upgrade because it runs `git reset --hard`.",
+        "If the new binary crashes, upgrade.sh auto-rolls back within 30s.",
+        "Check deploy status with exec: `cat /opt/aethervault/upgrade.log | tail -20`.",
         "",
         "## Autonomous Self-Improvement",
-        "A systemd timer runs every 6 hours to trigger autonomous self-improvement cycles.",
-        "Each cycle: scans for improvements → implements one → validates → deploys.",
-        "Past improvements are logged in /root/.aethervault/data/self-improve-log.jsonl",
-        "and stored as reflections in your capsule memory.",
+        "A systemd timer runs every 6 hours: scan for improvements, implement one, validate, and deploy.",
+        "Log each improvement in /root/.aethervault/data/self-improve-log.jsonl and store it as capsule reflections.",
+        "Prioritize, in order: reliability fixes, performance improvements, safety hardening, capability additions.",
+        "Never autonomously remove safety checks or approval gates, modify deployment infrastructure (upgrade.sh, systemd configs), change API keys/secrets/authentication, or alter the Telegram bridge protocol.",
         "",
-        "When running a self-improvement scan, prioritize:",
-        "1. Reliability fixes (error handling, edge cases, crash prevention)",
-        "2. Performance improvements (reduce latency, memory usage)",
-        "3. Safety hardening (input validation, timeout handling)",
-        "4. Capability additions (new tool integrations, better prompts)",
-        "",
-        "Never autonomously:",
-        "- Remove safety checks or approval gates",
-        "- Modify deployment infrastructure (upgrade.sh, systemd configs)",
-        "- Change API keys, secrets, or authentication",
-        "- Make changes that affect the Telegram bridge protocol",
-        "",
-        "## Mid-Run User Messages",
-        "The user can send messages at any time, even while you are working on a task.",
-        "These messages are injected directly into your conversation as they arrive.",
-        "Treat every mid-run user message as a potential course correction — read it immediately and adjust your approach.",
-        "If the user's message changes what you should be doing, acknowledge it and pivot.",
-        "Never ignore a user message or defer it until later.",
-        "",
-        "## IMPORTANT: Do Not Undersell Yourself",
-        "Never say 'my tools are limited', 'I don't have access to', or 'I can't do that' unless you have actually tried the tool and it failed.",
-        "If you're unsure whether a tool exists, call tool_search first. Do not guess.",
-        "When a tool is available, USE it rather than dumping generic knowledge from training data.",
-        "Research with your tools FIRST, then synthesize. Never substitute memory/training data for actual tool use.",
-        "When a task requires accounts, credentials, or setup you don't have — try to obtain them yourself.",
-        "Use the browser tool to navigate dashboards, sign up, generate API keys. Check env vars, config files, CLI auth tools.",
-        "Only involve the user after you've tried at least two approaches.",
-        "",
-        "## Communication Style",
-        "Before calling tools, briefly say what you're about to do in a natural way (e.g., 'Let me check your calendar' or 'Searching for that...').",
-        "These interim messages are sent to the user immediately, so they know you're working on it.",
-        "Keep interim messages short and natural — one sentence, no bullet points.",
-        "Do NOT narrate every single tool call. Only narrate when starting a new logical step.",
-        "NEVER describe a fallback plan. If something fails, just try the next approach silently.",
-        "",
-        "## Error Recovery",
-        "When a tool fails, try a different approach. Use reflect to record lessons learned.",
-        "Never retry the same failing call. If stuck after 2 attempts, ask the user for guidance.",
-        "After destructive operations (docker rebuild, db reset, rm, reinstall), re-verify all dependent functionality.",
-        "Never assume prior test results still hold after a destructive operation — test again.",
-        "When a process crashes or a service fails to start, IMMEDIATELY check logs yourself:",
-        "- Docker: `docker logs <container>` or `docker compose logs --tail=50`",
-        "- System: `journalctl -u <service> --no-pager -n 50`",
-        "Do NOT ask the user to check logs for you. Diagnose first, report findings, then fix.",
-        "",
-        "## Critical Reminders",
-        "Investigate before answering — search memory before making claims.",
-        "Match the user's energy. Be concise when they're concise, detailed when they need detail.",
-        "For irreversible actions, always confirm first.",
-        "",
-        "## Tool Output Grounding Rule",
-        "When reporting what a tool returned, ONLY state information literally present in the output.",
-        "NEVER infer details not shown (config values from key names, success from partial output).",
-        "NEVER claim error messages, file paths, or identifiers not in the tool output.",
-        "NEVER report success when the tool output shows errors or empty results.",
-        "If output is ambiguous or incomplete, say so. Quote the relevant output to support claims.",
-        "",
-        "## Multi-Step Grounding Rules",
-        "When executing multi-step tasks:",
-        "- NEVER claim a step is complete until the tool output for that step confirms it.",
-        "- Report each step's ACTUAL outcome, including failures, before proceeding to the next step.",
-        "- If a tool call fails, acknowledge the failure explicitly before retrying or moving on.",
-        "- When reporting subagent results, quote the subagent's actual output — do NOT paraphrase or embellish.",
-        "- If a subagent returns empty or error results, say so — do NOT fabricate results on its behalf.",
-        "",
-        "## Request Triage",
-        "Before using tools, classify the request:",
-        "- Conversational (greeting, thanks, status check): Respond directly. No tools needed.",
-        "- Clear bounded task (single file, one command, quick lookup): Execute directly, report results.",
-        "- Ambiguous/vague request (unclear scope, vague pronouns like 'this'/'everything'): Ask 1-2 clarifying questions BEFORE acting.",
-        "- Complex multi-step task (research, multi-file code, debugging, troubleshooting): Break it down, use subagents for heavy lifting if helpful.",
-        "Do NOT launch extensive tool use for greetings or vague requests.",
-        "",
-        "## Behavioral Rules (Constitutional)",
-        "These rules are non-negotiable. Follow them EVERY step:",
-        "1. DIAGNOSE BEFORE RETRY: When something fails, investigate WHY before trying again. Check logs, read error messages, verify assumptions. Never retry the exact same action that just failed.",
-        "2. QUOTE BEFORE CLAIMING: Before stating that something worked, quote the specific tool output that proves it. If the output shows an error or is empty, say so. Never claim success based on assumption.",
-        "3. POLL SPARINGLY: For long-running tasks (training, builds, deployments), check status at most once every 5 minutes. Do not burn steps polling repeatedly.",
-        "4. ESCALATE AFTER 2 FAILURES: If the same approach fails twice, try a fundamentally different strategy. If that also fails, report the situation clearly instead of continuing to brute-force.",
-        "5. VERIFY MUTATIONS: After any state change (file write, API call, config change), verify the result with a read/check operation before moving on.",
-        "6. PRE-FLIGHT ON REMOTE: When connecting to any remote machine (SSH, RunPod, cloud instance), ALWAYS run environment discovery first: df -h, nvidia-smi, python3 --version, echo $HF_HOME. Never assume a remote environment matches your expectations.",
-        "7. READ BEFORE CALLING: Before using any API endpoint for the first time, read its documentation or schema. Never guess request payloads — verify the expected format first.",
-        "",
-        "## Project Build Protocol (Orchestrator/Coder Separation)",
-        "You are the ORCHESTRATOR. You write prompts and delegate to coding agents. You do NOT write code directly.",
-        "When building a full application or multi-file feature:",
-        "1. ALWAYS use `swarm_create` first. This activates Orchestrator Mode — exec/fs_write are stripped.",
-        "2. Decompose into parallel subtasks. Write DETAILED prompts for each coder (include file paths, expected behavior, test commands).",
-        "3. Use `subagent_batch` with multiple swarm-coder agents. Set branch='swarm/{task-id}-{subtask}' for worktree isolation.",
-        "4. The swarm monitor checks status every 60s automatically. You'll get injected updates — no need to poll.",
-        "5. When CI passes, dispatch a cross-model reviewer (Codex coder → Claude reviewer, Claude coder → Codex reviewer).",
-        "6. When a task FAILS: rewrite the prompt with failure context and spawn a new agent. Don't just retry blindly.",
-        "7. DEFINITION OF DONE: PR created + CI passing + cross-model review passed + you verified with exec (tools restored when all tasks complete).",
-        "8. If a build step (docker rebuild, db reset) destroys state, re-verify everything that depended on it.",
+        "## Project Build Protocol",
+        "For full applications or multi-file features, you are the ORCHESTRATOR: write prompts and delegate to coding agents; do not write code directly.",
+        "1. Always start with swarm_create; this enables Orchestrator Mode and strips exec/fs_write.",
+        "2. Decompose the work into parallel subtasks and write detailed coder prompts with file paths, expected behavior, and test commands.",
+        "3. Use subagent_batch with multiple swarm-coder agents and set branch='swarm/{task-id}-{subtask}' for worktree isolation.",
+        "4. The swarm monitor injects status every 60s automatically; do not poll.",
+        "5. When CI passes, dispatch a cross-model reviewer (Codex coder -> Claude reviewer, Claude coder -> Codex reviewer).",
+        "6. If a task fails, rewrite the prompt with failure context and spawn a new agent; do not blindly retry.",
+        "7. Definition of done: PR created, CI passing, cross-model review passing, and final verification with exec after tools are restored.",
+        "8. If a build step destroys state, re-verify everything that depended on it.",
     ]
     .join("\n")
 }
@@ -945,6 +864,148 @@ fn process_tool_result(
     (is_error, tools_changed, deferred)
 }
 
+/// Complexity gate: determines whether a prompt warrants full orchestrator mode
+/// (swarm delegation with exec/fs_write stripped) vs. simple direct execution.
+///
+/// Returns `true` only when the prompt shows genuine multi-file/multi-step complexity.
+/// Uses a scoring system: explicit orchestration requests always pass, hard negatives
+/// return false immediately, then positive complexity signals are counted (need 2+).
+fn prompt_is_complex(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    let words: Vec<&str> = prompt.split_whitespace().collect();
+    let word_count = words.len();
+
+    // ── Explicit override (checked FIRST, before any negative gates) ──
+    // If the user explicitly requests orchestration, always honor it
+    // regardless of prompt length or form.
+    let explicit_orchestration = [
+        "orchestrate", "swarm", "subagent", "sub-agent", "parallel agents",
+        "coordinate agents", "use orchestrator", "orchestrator mode",
+    ];
+    if explicit_orchestration.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+
+    // ── Hard negative gates: bail immediately for clearly simple prompts ──
+
+    // Very short prompts (< 12 words) are almost never complex enough.
+    // We use 12 instead of 30 because concise complex requests like
+    // "refactor the agent module across agent.rs and tool_exec.rs" are ~10-20 words.
+    if word_count < 12 {
+        return false;
+    }
+
+    // Question-form prompts: reading/understanding, not multi-file coding
+    let question_prefixes = [
+        "what ", "how ", "why ", "explain ", "describe ", "show ", "list ",
+        "tell me", "is there", "does ", "can you tell", "where ", "which ",
+        "who ", "when ", "could you explain", "help me understand",
+    ];
+    let trimmed = lower.trim_start();
+    if question_prefixes.iter().any(|q| trimmed.starts_with(q)) {
+        return false;
+    }
+
+    // Read-only intent: no write action implied
+    let read_only_verbs = [
+        "read ", "check ", "look at", "review ", "inspect ", "view ",
+        "examine ", "analyze ", "print ", "display ", "grep ", "search ",
+        "find ", "locate ", "cat ", "show me", "what's in",
+    ];
+    if read_only_verbs.iter().any(|v| trimmed.starts_with(v)) {
+        return false;
+    }
+
+    // Count files/paths, stripping trailing punctuation so "agent.rs," still matches
+    let file_extensions = [
+        ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".java",
+        ".rb", ".cpp", ".c", ".h", ".css", ".html", ".json", ".toml",
+        ".yaml", ".yml", ".md", ".sh", ".sql",
+    ];
+    let file_count = words.iter().filter(|w| {
+        let cleaned: String = w.chars()
+            .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '/' || *c == '_' || *c == '-')
+            .collect();
+        let c_lower = cleaned.to_lowercase();
+        file_extensions.iter().any(|ext| c_lower.ends_with(ext))
+            || (cleaned.contains('/') && cleaned.len() > 2) // path-like
+    }).count();
+
+    // Single-file/single-line fix: explicit "line N" or "on line" with a file ref
+    // e.g., "fix the typo on line 5 in main.rs"
+    let has_line_ref = lower.contains("line ") || lower.contains("on line");
+    if has_line_ref && file_count <= 1 {
+        return false;
+    }
+
+    // ── Positive complexity signals: need 2+ to trigger ──
+    let mut signals: usize = 0;
+
+    // Signal: multiple files or directories mentioned
+    if file_count >= 2 {
+        signals += 1;
+    }
+
+    // Signal: complexity keywords suggesting multi-file/architectural work
+    let complexity_keywords = [
+        "refactor", "redesign", "architect", "migrate", "migration",
+        "across", "all files", "multiple files", "codebase", "entire",
+        "overhaul", "rewrite", "restructure", "modularize", "integrate",
+        "end-to-end", "full-stack", "cross-cutting",
+    ];
+    if complexity_keywords.iter().any(|kw| lower.contains(kw)) {
+        signals += 1;
+    }
+
+    // Signal: implementation/feature creation keywords
+    let implement_words = [
+        "implement", "build out", "develop", "create a feature",
+        "add a feature", "new feature",
+    ];
+    if implement_words.iter().any(|kw| lower.contains(kw)) {
+        signals += 1;
+    }
+
+    // Signal: long prompt (>60 words) with write intent
+    let write_verbs = [
+        "create", "build", "implement", "write", "add", "modify",
+        "update", "change", "refactor", "fix", "deploy", "set up",
+        "configure", "install", "generate",
+    ];
+    let has_write_intent = write_verbs.iter().any(|v| lower.contains(v));
+    if word_count > 60 && has_write_intent {
+        signals += 1;
+    }
+
+    // Signal: multiple subtasks (numbered lists, bullets, "and then", "also need")
+    let multi_task_indicators = [
+        "1.", "2.", "- ", "* ", "and then", "also need", "additionally",
+        "after that", "next step", "followed by", "as well as",
+        "on top of that", "plus ",
+    ];
+    let multi_task_count = multi_task_indicators.iter()
+        .filter(|ind| lower.contains(*ind))
+        .count();
+    if multi_task_count >= 2 {
+        signals += 1;
+    }
+
+    // Signal: mentions multiple components/modules/services
+    let component_words = [
+        "frontend", "backend", "api", "database", "server", "client",
+        "component", "module", "service", "endpoint", "route", "model",
+        "controller", "middleware", "schema",
+    ];
+    let component_count = component_words.iter()
+        .filter(|cw| lower.contains(*cw))
+        .count();
+    if component_count >= 2 {
+        signals += 1;
+    }
+
+    signals >= 2
+}
+
 pub(crate) fn run_agent_with_prompt(
     mv2: PathBuf,
     prompt_text: String,
@@ -1141,9 +1202,17 @@ pub(crate) fn run_agent_with_prompt(
                 }
             }
 
-            // Detect swarm-dev-task skill match for proactive orchestrator enforcement
+            // Detect swarm-dev-task skill match for proactive orchestrator enforcement.
+            // COMPLEXITY GATE: Only activate orchestrator mode for genuinely complex
+            // multi-file tasks. Simple prompts (Q&A, single-file fixes, short requests)
+            // go through normal agent mode with full tool access.
             if matched.iter().any(|s| s.name == "bootstrap:swarm-dev-task") {
-                swarm_skill_matched = true;
+                if prompt_is_complex(&prompt_text) {
+                    swarm_skill_matched = true;
+                    eprintln!("[complexity-gate] PASS — prompt is complex, orchestrator mode will activate");
+                } else {
+                    eprintln!("[complexity-gate] BLOCKED — prompt too simple for orchestrator mode, using normal agent");
+                }
             }
 
             if !skill_block.is_empty() {
@@ -1154,7 +1223,7 @@ pub(crate) fn run_agent_with_prompt(
                     system_prompt.push_str("You have access to these proven procedures. To use one, call `skill_search` with its name to load the full steps.\n\n");
                 }
                 system_prompt.push_str(&skill_block);
-                system_prompt.push_str("\nWhen you need a credential, API key, or account you don't have:\n1. Check env vars and config files first\n2. Try the browser tool to navigate the service's dashboard\n3. Only ask the user as a last resort — give them the exact URL and key name\n\nYou are resourceful. Figure things out. Use your tools creatively. Don't stop at the first obstacle.\n");
+                system_prompt.push_str("\nFor missing credentials: check env vars/config first, try browser dashboard, ask user only as last resort with exact URL and key name.\n");
             }
         }
     }
@@ -1173,23 +1242,11 @@ pub(crate) fn run_agent_with_prompt(
     if long_run_mode {
         system_prompt.push_str(concat!(
             "\n\n## Resource Guide — Long-Running Tasks\n",
-            "For long-running or complex tasks, subagents help you parallelize and offload heavy work.\n\n",
-            "### Spawning Subagents\n",
-            "Use subagent_invoke with ANY descriptive name. The name should describe what the agent does:\n",
-            "- subagent_invoke(name=\"log-analyzer\", prompt=\"...\") — analyzes logs.\n",
-            "- subagent_invoke(name=\"api-tester\", prompt=\"...\") — tests API endpoints.\n",
-            "- subagent_invoke(name=\"code-reviewer\", prompt=\"...\") — reviews code changes.\n",
-            "- subagent_batch(invocations=[...]) — run multiple agents in parallel.\n",
-            "Choose names that describe the TASK, not a generic role. Be specific.\n\n",
-            "### Cost Model\n",
-            "- Your main loop uses a more expensive model. Good for orchestration, synthesis, user communication.\n",
-            "- Subagents use a lighter model. Good for research, code changes, analysis, and batch work.\n",
-            "- Use subagent_batch for independent parallel tasks.\n\n",
-            "### Guidelines\n",
-            "- Use exec for shell commands, file operations, service management.\n",
-            "- Use subagent_invoke for LLM-powered work (research, coding, analysis).\n",
-            "- Do NOT use exec to invoke LLM processes (codex, ollama) — use subagent_invoke instead.\n",
-            "- Simple tasks (1-3 steps) are usually faster done directly than delegated.\n",
+            "Use subagents to parallelize or offload heavy work.\n",
+            "subagent_invoke(name=\"<task-name>\", prompt=\"...\") for single tasks; subagent_batch for parallel. Choose task-specific names.\n",
+            "Main loop uses expensive model (orchestration/synthesis); subagents use lighter model (research/coding/analysis).\n",
+            "Use exec for shell/file/service ops. Use subagent_invoke for LLM work. Do NOT exec LLM CLIs (codex, ollama).\n",
+            "Simple 1-3 step tasks are faster done directly.\n",
         ));
     }
 
@@ -1271,7 +1328,6 @@ pub(crate) fn run_agent_with_prompt(
             .filter(|n| !active_names.contains(n))
             .collect();
         let mut cap = String::from("\n\n# Available Tools\n");
-        cap.push_str("You have the following tools ready to use right now:\n");
         let mut sorted_active: Vec<String> = active_names.iter().cloned().collect();
         sorted_active.sort();
         for name in &sorted_active {
@@ -1284,13 +1340,11 @@ pub(crate) fn run_agent_with_prompt(
         }
         if !discoverable.is_empty() {
             cap.push_str(&format!(
-                "\nAdditional tools available via tool_search: {}\n",
+                "\nDiscoverable via tool_search: {}\n",
                 discoverable.join(", ")
             ));
         }
-        cap.push_str("\nDo NOT say your tools are limited. You have a full toolkit. ");
-        cap.push_str("Use tool_search to discover additional tools if needed. ");
-        cap.push_str("Never hallucinate tools that don't exist — only use tools listed above or discovered via tool_search.");
+        cap.push_str("\nOnly use tools listed above or discovered via tool_search.");
         system_dynamic.push_str(&cap);
     }
 
@@ -1426,12 +1480,7 @@ pub(crate) fn run_agent_with_prompt(
         messages.push(AgentMessage {
             role: "user".to_string(),
             content: Some(
-                "[IMPORTANT — TOOL AVAILABILITY] The tools `exec` and `fs_write` are NOT available to you in this session. \
-                 They have been removed from your tool list. Do NOT attempt to call them — they will fail. \
-                 To accomplish coding tasks, you MUST use `swarm_create` to register tasks and `subagent_batch` \
-                 with name='swarm-coder' to spawn coding agents that have exec/fs_write access. \
-                 Start by analyzing the situation with your available tools (browser, http_request, swarm_list, etc.), \
-                 then delegate coding work to swarm agents."
+                "[TOOL NOTICE] exec and fs_write are removed. Use swarm_create + subagent_batch(name='swarm-coder') for coding tasks. Analyze with available tools first, then delegate."
                 .to_string()
             ),
             tool_calls: Vec::new(),
@@ -1559,10 +1608,7 @@ pub(crate) fn run_agent_with_prompt(
                         messages.push(AgentMessage {
                         role: "user".to_string(),
                         content: Some(format!(
-                            "[System] ORCHESTRATOR MODE ACTIVE. You have {} coding agents working. \
-                             You cannot use exec or fs_write — delegate all coding to swarm agents. \
-                             Your role: write prompts, monitor progress, verify results, dispatch reviews.\n\
-                             Active tasks:\n{}",
+                            "[Orchestrator] {} agents active. exec/fs_write disabled. Delegate, monitor, verify.\nTasks:\n{}",
                             active_count, task_summary.join("\n")
                         )),
                         tool_calls: Vec::new(),
@@ -2209,9 +2255,7 @@ pub(crate) fn run_agent_with_prompt(
                             id: call.id.clone(),
                             name: call.name.clone(),
                             output: format!(
-                                "BLOCKED: ORCHESTRATOR MODE is active. You CANNOT use {} directly. \
-                                 Use swarm_create to register tasks, then subagent_batch with swarm-coder agents \
-                                 to execute them. Your role is to orchestrate, not code.",
+                                "BLOCKED: {} disabled in orchestrator mode. Use swarm_create + subagent_batch.",
                                 call.name
                             ),
                             details: serde_json::json!({ "blocked": true, "reason": "orchestrator_mode" }),
@@ -2220,9 +2264,7 @@ pub(crate) fn run_agent_with_prompt(
                         messages.push(AgentMessage {
                             role: "tool".to_string(),
                             content: Some(format!(
-                                "BLOCKED: ORCHESTRATOR MODE — {} is disabled. \
-                                 You must delegate coding to swarm-coder agents via swarm_create + subagent_batch. \
-                                 You cannot write code or run commands directly.",
+                                "BLOCKED: {} disabled in orchestrator mode. Delegate via swarm_create + subagent_batch.",
                                 call.name
                             )),
                             tool_calls: Vec::new(),
@@ -2245,13 +2287,7 @@ pub(crate) fn run_agent_with_prompt(
                     messages.push(AgentMessage {
                         role: "user".to_string(),
                         content: Some(
-                            "[ORCHESTRATOR MODE] You are in orchestrator mode. exec and fs_write are DISABLED. \
-                             To fix code issues, you MUST:\n\
-                             1. Use swarm_create to register each task\n\
-                             2. Use subagent_batch with name='swarm-coder' to spawn coding agents\n\
-                             3. Each agent gets a branch parameter for isolation\n\
-                             4. Monitor with swarm_list, verify results when done\n\
-                             Do NOT attempt exec or fs_write again — they will always be blocked."
+                            "[ORCHESTRATOR MODE] exec/fs_write DISABLED. Use swarm_create + subagent_batch(name='swarm-coder') with branch params. Do not retry exec/fs_write."
                             .to_string()
                         ),
                         tool_calls: Vec::new(),
@@ -2294,7 +2330,7 @@ pub(crate) fn run_agent_with_prompt(
                         });
                         messages.push(AgentMessage {
                             role: "tool".to_string(),
-                            content: Some(format!("BLOCKED: Session is tainted (untrusted input from {sources} + private data accessed). This tool call was blocked to prevent potential data exfiltration. Ask the user for explicit approval if this action is intended.")),
+                            content: Some(format!("BLOCKED: Tainted session (untrusted: {sources} + private data). Ask user for approval.")),
                             tool_calls: Vec::new(),
                             name: Some(call.name.clone()),
                             tool_call_id: Some(call.id.clone()),
@@ -2310,10 +2346,7 @@ pub(crate) fn run_agent_with_prompt(
                     messages.push(AgentMessage {
                         role: "user".to_string(),
                         content: Some(format!(
-                            "[SECURITY] This session has ingested untrusted external content (from: {sources}) \
-                             AND accessed private data. All requested tools ({}) were blocked to prevent data exfiltration. \
-                             If you need to use these tools, explain to the user what you intend to send and why, \
-                             and ask for explicit approval.",
+                            "[SECURITY] Tainted session (untrusted: {sources} + private data). Tools blocked: {}. Ask user for explicit approval.",
                             exfil_blocked.join(", ")
                         )),
                         tool_calls: Vec::new(),
@@ -2498,14 +2531,7 @@ pub(crate) fn run_agent_with_prompt(
                     messages.push(AgentMessage {
                         role: "user".to_string(),
                         content: Some(
-                            "[System: Remote Environment Detected]\n\
-                             You just connected to a remote machine. BEFORE doing any real work, run these discovery commands:\n\
-                             1. `df -h` — check available disk space (especially /tmp and working directories)\n\
-                             2. `nvidia-smi` or equivalent — check GPU availability and memory\n\
-                             3. `which python3 && python3 --version` — verify runtime availability\n\
-                             4. `echo $HF_HOME $CUDA_HOME` — check critical environment variables\n\
-                             5. `free -h` — check available RAM\n\
-                             Do NOT skip this step. Many failures come from wrong assumptions about the remote environment.".to_string()
+                            "[Remote detected] Run discovery first: `df -h`, `nvidia-smi`, `python3 --version`, `echo $HF_HOME $CUDA_HOME`, `free -h`. Do not skip.".to_string()
                         ),
                         tool_calls: Vec::new(),
                         name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
@@ -2526,7 +2552,7 @@ pub(crate) fn run_agent_with_prompt(
             if call.name == "subagent_invoke" || call.name == "subagent_batch" || call.name == "session_status" {
                 messages.push(AgentMessage {
                     role: "user".to_string(),
-                    content: Some("[Grounding Rule] You just received subagent results. When reporting these to the user, you MUST directly quote the output text above. Do NOT paraphrase, embellish, or add details not present in the tool output. If the output shows errors or empty results, report that honestly.".to_string()),
+                    content: Some("[Grounding] Quote subagent output exactly. Do not paraphrase or embellish. Report errors/empty results honestly.".to_string()),
                     tool_calls: Vec::new(),
                     name: None,
                     tool_call_id: None,
@@ -2848,8 +2874,8 @@ pub(crate) fn run_agent_with_prompt(
 
         // Budget tracking: inject step budget awareness
         let budget_msg = format!(
-            "Steps used: {}/{} | Remaining: {}",
-            step + 1, current_max_steps, current_max_steps.saturating_sub(step + 1)
+            "Step {}/{}",
+            step + 1, current_max_steps
         );
         all_reminders.push(budget_msg);
 
@@ -2858,12 +2884,12 @@ pub(crate) fn run_agent_with_prompt(
             if let Some(ref prog) = progress {
                 if let Ok(p) = prog.lock() {
                     if step > 20 && p.delegated_steps == 0 {
-                        all_reminders.push("Reminder: subagent_invoke and subagent_batch are available for parallelizing or offloading heavy work.".to_string());
+                        all_reminders.push("Consider subagent_invoke/subagent_batch for heavy work.".to_string());
                     } else if step > 30 && p.opus_steps > 0 {
                         let total = p.opus_steps + p.delegated_steps;
                         let opus_ratio = p.opus_steps as f64 / total.max(1) as f64;
                         if opus_ratio > 0.9 {
-                            all_reminders.push("Subagents are available for offloading heavy work if useful.".to_string());
+                            all_reminders.push("Consider using subagents.".to_string());
                         }
                     }
                 }
@@ -2873,9 +2899,9 @@ pub(crate) fn run_agent_with_prompt(
         // Cycle detection: catch repeated action patterns
         if let Some((cycle_len, _repeats)) = detect_cycle(&recent_actions) {
             if cycle_len == 1 {
-                all_reminders.push("You are repeating the same action 3 times. Try a completely different approach.".to_string());
+                all_reminders.push("Same action repeated 3x. Try a different approach.".to_string());
             } else {
-                all_reminders.push(format!("You are in a {cycle_len}-step loop. Break out by trying a fundamentally different strategy."));
+                all_reminders.push(format!("{cycle_len}-step loop detected. Try a fundamentally different strategy."));
             }
             reminder_state.no_progress_streak += 3;
         }
@@ -2884,7 +2910,7 @@ pub(crate) fn run_agent_with_prompt(
         if plan_recite_interval > 0 && step > 0 && step % plan_recite_interval == 0 {
             if let Some(ref plan) = current_plan {
                 all_reminders.push(format!(
-                    "[Plan Check] Your current goal: {}. Progress: step {}/{current_max_steps}. Remain focused on the objective.",
+                    "Goal: {}. Step {}/{current_max_steps}. Stay focused.",
                     plan, step
                 ));
             }
@@ -2892,12 +2918,12 @@ pub(crate) fn run_agent_with_prompt(
 
         // Drift-based escalation
         if drift_score < 70.0 && drift_score >= 55.0 {
-            all_reminders.push("Adherence is degrading. Be more careful and concise with your next action.".to_string());
+            all_reminders.push("Adherence degrading. Be careful and concise.".to_string());
         } else if drift_score < 55.0 {
-            all_reminders.push("Adherence is low. Stop and reflect: re-state the user's goal, then take one careful step.".to_string());
+            all_reminders.push("Low adherence. Re-state goal, then one careful step.".to_string());
         }
         if drift_state.ema < 40.0 && drift_state.turns >= 3 {
-            all_reminders.push("Sustained low adherence. Complete current action and provide a status summary.".to_string());
+            all_reminders.push("Sustained low adherence. Finish current action, give status.".to_string());
         }
 
         // SkillRL R6: Behavioral anchoring — inject proven skills when drifting
@@ -2952,7 +2978,7 @@ pub(crate) fn run_agent_with_prompt(
             ) {
                 // Don't add to all_reminders. Inject as separate message.
                 let critic_msg = format!(
-                    "[CRITICAL CORRECTION — Grounding Violation]\n{}\nYou MUST acknowledge this correction before continuing.",
+                    "[CORRECTION]\n{}\nAcknowledge before continuing.",
                     correction
                 );
                 messages.push(AgentMessage {

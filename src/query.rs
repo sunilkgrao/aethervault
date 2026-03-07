@@ -655,32 +655,31 @@ pub(crate) fn collect_mid_loop_reminders(
 ) -> Vec<String> {
     let mut out = Vec::new();
     if token_est > 60_000 {
-        out.push("Context is growing. Switch to compact summaries and avoid verbose raw tool output.".to_string());
+        out.push("Context growing. Use compact summaries.".to_string());
     }
     if token_est > 80_000 {
-        out.push("Context is high. Keep tool calls minimal and summarize before next major step.".to_string());
+        out.push("Context high. Minimize tool calls, summarize first.".to_string());
     }
     if step > max_steps * 3 / 4 {
-        out.push("Approaching step budget. Finish current objective with the smallest safe completion path.".to_string());
+        out.push("Near step budget. Finish via smallest safe path.".to_string());
     }
     if reminder_state.last_tool_failed {
-        out.push("Previous tool call failed. Reflect on what went wrong, then try a different approach.".to_string());
+        out.push("Last tool failed. Diagnose, then try different approach.".to_string());
     }
     if reminder_state.same_tool_fail_streak >= 2 {
-        out.push("You are retrying the same failing pattern. Try a different tool or different scope.".to_string());
+        out.push("Same failure repeated. Switch tool or scope.".to_string());
     }
     if reminder_state.approval_required_count >= 2 {
-        out.push("Multiple approval-required calls. Combine or batch work, then ask for one concise approval.".to_string());
+        out.push("Multiple approvals pending. Batch and ask once.".to_string());
     }
     if reminder_state.sequential_read_ops >= 2 {
-        out.push("Independent read-only calls available; prefer batched parallel execution instead of sequential loops.".to_string());
+        out.push("Batch independent reads in parallel.".to_string());
     }
     if reminder_state.no_progress_streak >= 3 {
-        out.push("No observable progress for several turns. Re-state your hypothesis, then pick one high-confidence next step.".to_string());
+        out.push("No progress. Restate hypothesis, pick one high-confidence step.".to_string());
     }
     if reminder_state.remote_host_seen && !reminder_state.remote_env_verified {
-        out.push("You are working on a REMOTE machine but have not verified its environment. \
-                  Run df -h and nvidia-smi before proceeding.".to_string());
+        out.push("Remote env not verified. Run df -h and nvidia-smi first.".to_string());
     }
     out
 }
