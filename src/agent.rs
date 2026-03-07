@@ -942,6 +942,156 @@ fn process_tool_result(
     (is_error, tools_changed, deferred)
 }
 
+fn prompt_file_reference_count(prompt: &str) -> usize {
+    let file_extensions = [
+        ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".java", ".rb", ".cpp", ".c", ".h",
+        ".css", ".html", ".json", ".toml", ".yaml", ".yml", ".md", ".sh", ".sql",
+    ];
+    prompt
+        .split_whitespace()
+        .filter(|w| {
+            let cleaned: String = w
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '/' || *c == '_' || *c == '-')
+                .collect();
+            let c_lower = cleaned.to_lowercase();
+            file_extensions.iter().any(|ext| c_lower.ends_with(ext))
+                || (cleaned.contains('/') && cleaned.len() > 2)
+        })
+        .count()
+}
+
+fn prompt_has_engineering_intent(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    let explicit_orchestration = [
+        "orchestrate",
+        "swarm",
+        "subagent",
+        "sub-agent",
+        "parallel agents",
+        "coordinate agents",
+        "use orchestrator",
+        "orchestrator mode",
+    ];
+    if explicit_orchestration.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+
+    let file_refs = prompt_file_reference_count(prompt);
+    if file_refs > 0 {
+        return true;
+    }
+
+    let strong_terms = [
+        "codebase",
+        "repository",
+        "repo",
+        "package.json",
+        "cargo",
+        "npm",
+        "pnpm",
+        "yarn",
+        "stack trace",
+        "panic",
+        "pull request",
+        "unit test",
+        "integration test",
+        "test suite",
+        "compile",
+        "binary",
+        "function",
+        "class",
+        "module",
+        "endpoint",
+        "api",
+        "database",
+        "schema",
+        "migration",
+        "frontend",
+        "backend",
+        "cli",
+        "http server",
+        "bug",
+        "refactor",
+        "debug",
+        "implement",
+        "oauth",
+        "auth flow",
+        "docker",
+        "ci",
+    ];
+    let medium_terms = [
+        "build an app",
+        "build a project",
+        "application",
+        "feature",
+        "service",
+        "server",
+        "route",
+        "handler",
+        "workspace",
+        "tests",
+        "readme",
+        "public/",
+        "src/",
+        "git",
+        "commit",
+        "deploy",
+        "configure",
+        "install",
+    ];
+    let human_ops_terms = [
+        "flight",
+        "travel",
+        "hotel",
+        "airline",
+        "airport",
+        "parents",
+        "mom",
+        "dad",
+        "mother",
+        "father",
+        "inbox",
+        "email",
+        "calendar",
+        "meeting",
+        "rhaine",
+        "slack",
+        "visit",
+        "home",
+        "follow-up",
+        "follow up",
+        "proposal",
+        "itinerary",
+        "restaurant",
+        "reservation",
+        "gift",
+        "birthday",
+    ];
+
+    let strong_hits = strong_terms
+        .iter()
+        .filter(|term| lower.contains(**term))
+        .count();
+    let medium_hits = medium_terms
+        .iter()
+        .filter(|term| lower.contains(**term))
+        .count();
+    let human_hits = human_ops_terms
+        .iter()
+        .filter(|term| lower.contains(**term))
+        .count();
+
+    let engineering_score = strong_hits * 2 + medium_hits;
+    if engineering_score == 0 {
+        return false;
+    }
+    if human_hits >= engineering_score && strong_hits == 0 {
+        return false;
+    }
+    engineering_score >= 2
+}
+
 /// Complexity gate: determines whether a prompt warrants full orchestrator mode
 /// (swarm delegation with exec/fs_write stripped) vs. simple direct execution.
 ///
@@ -1029,22 +1179,7 @@ fn prompt_is_complex(prompt: &str) -> bool {
     }
 
     // Count files/paths, stripping trailing punctuation so "agent.rs," still matches
-    let file_extensions = [
-        ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".java", ".rb", ".cpp", ".c", ".h",
-        ".css", ".html", ".json", ".toml", ".yaml", ".yml", ".md", ".sh", ".sql",
-    ];
-    let file_count = words
-        .iter()
-        .filter(|w| {
-            let cleaned: String = w
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '/' || *c == '_' || *c == '-')
-                .collect();
-            let c_lower = cleaned.to_lowercase();
-            file_extensions.iter().any(|ext| c_lower.ends_with(ext))
-                || (cleaned.contains('/') && cleaned.len() > 2) // path-like
-        })
-        .count();
+    let file_count = prompt_file_reference_count(prompt);
 
     // Single-file/single-line fix: explicit "line N" or "on line" with a file ref
     // e.g., "fix the typo on line 5 in main.rs"
@@ -1375,6 +1510,7 @@ pub(crate) fn run_agent_with_prompt(
 
     let mut injected_skill_names: Vec<String> = Vec::new();
     let mut swarm_skill_matched = false;
+    let mut engineering_orchestration_intent = prompt_has_engineering_intent(&prompt_text);
     // --- SkillRL R1: Auto-inject top skills into stable prefix ---
     if !skip_trivial_prefetch {
         if let Some(workspace) = resolve_workspace(None, &agent_cfg) {
@@ -1404,6 +1540,7 @@ pub(crate) fn run_agent_with_prompt(
                     prompt_text.clone()
                 };
                 let matched = match_skills_for_prompt(&conn, &match_context, 5);
+                engineering_orchestration_intent = prompt_has_engineering_intent(&match_context);
                 // Also get top general skills by success rate
                 let general = list_skills(&conn, 3);
 
@@ -1412,6 +1549,9 @@ pub(crate) fn run_agent_with_prompt(
                 let mut inline_count = 0usize;
                 // Inline full steps for top 3 matched skills; one-liner for the rest
                 for s in matched.iter().chain(general.iter()) {
+                    if !engineering_orchestration_intent && s.name == "bootstrap:swarm-dev-task" {
+                        continue;
+                    }
                     if !seen.insert(s.name.clone()) {
                         continue;
                     }
@@ -1464,6 +1604,9 @@ pub(crate) fn run_agent_with_prompt(
                 }
                 // Track auto-injected skills for SkillRL R4 end-of-session recording
                 for s in matched.iter().chain(general.iter()) {
+                    if !engineering_orchestration_intent && s.name == "bootstrap:swarm-dev-task" {
+                        continue;
+                    }
                     if seen.contains(&s.name) {
                         injected_skill_names.push(s.name.clone());
                     }
@@ -1473,7 +1616,9 @@ pub(crate) fn run_agent_with_prompt(
                 // COMPLEXITY GATE: Only activate orchestrator mode for genuinely complex
                 // multi-file tasks. Simple prompts (Q&A, single-file fixes, short requests)
                 // go through normal agent mode with full tool access.
-                if matched.iter().any(|s| s.name == "bootstrap:swarm-dev-task") {
+                if engineering_orchestration_intent
+                    && matched.iter().any(|s| s.name == "bootstrap:swarm-dev-task")
+                {
                     if prompt_is_complex(&prompt_text) {
                         swarm_skill_matched = true;
                         eprintln!(
@@ -1939,13 +2084,16 @@ pub(crate) fn run_agent_with_prompt(
         .as_deref()
         .map(|s| s.starts_with("subagent:"))
         .unwrap_or(false);
-    let mut orchestrator_mode = swarm_skill_matched && !is_subagent_early && tool_filter.is_none();
+    let mut orchestrator_mode = engineering_orchestration_intent
+        && swarm_skill_matched
+        && !is_subagent_early
+        && tool_filter.is_none();
     if orchestrator_mode {
         eprintln!(
             "[harness] ORCHESTRATOR MODE (proactive): swarm-dev-task skill matched, tools already stripped"
         );
     }
-    if !is_subagent && tool_filter.is_none() {
+    if engineering_orchestration_intent && !is_subagent && tool_filter.is_none() {
         if let Some(ref ws) = workspace_env {
             if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
                 let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(100));
@@ -4047,4 +4195,30 @@ pub(crate) fn run_agent_with_prompt(
         final_text,
         step_count: step,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{prompt_has_engineering_intent, prompt_is_complex};
+
+    #[test]
+    fn engineering_intent_detects_multi_file_build_prompt() {
+        let prompt = r#"
+        Build a real application in /tmp/linus-battery-av-123.
+        Include package.json, src/, public/index.html, node:test coverage,
+        a CLI, HTTP endpoints, and run the test suite yourself.
+        "#;
+        assert!(prompt_has_engineering_intent(prompt));
+        assert!(prompt_is_complex(prompt));
+    }
+
+    #[test]
+    fn engineering_intent_rejects_flight_planning_prompt() {
+        let prompt = r#"
+        I need to find flights for my parents. Figure out who they are from memory
+        or my inbox if needed. Ask the smart questions you actually need, infer
+        whether the likely destination is my home, and only ask what remains ambiguous.
+        "#;
+        assert!(!prompt_has_engineering_intent(prompt));
+    }
 }

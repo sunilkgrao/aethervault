@@ -764,8 +764,15 @@ pub(crate) fn run_xai_native(prompt: &str, read_only: bool) -> Result<AgentMessa
 // Pool router: tries backends in priority order
 // ---------------------------------------------------------------------------
 
-/// Backend priority for pool routing
-const POOL_BACKEND_ORDER: &[&str] = &["codex", "claude-code", "groq", "xai-grok"];
+fn pool_backend_order() -> Vec<String> {
+    env_optional("AETHERVAULT_POOL_BACKEND_ORDER")
+        .unwrap_or_else(|| "claude-code,codex,groq,xai-grok".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect()
+}
 
 pub(crate) fn run_pool_routed(
     request: &AgentHookRequest,
@@ -778,15 +785,15 @@ pub(crate) fn run_pool_routed(
 
     let mut errors: Vec<String> = Vec::new();
 
-    for service in POOL_BACKEND_ORDER {
-        if !pool_has_available(service) {
+    for service in pool_backend_order() {
+        if !pool_has_available(&service) {
             errors.push(format!("{service}: all accounts rate-limited"));
             continue;
         }
 
-        let result = match *service {
-            "codex" => run_codex_native(&prompt, read_only),
+        let result = match service.as_str() {
             "claude-code" => run_claude_code_native(&prompt, read_only),
+            "codex" => run_codex_native(&prompt, read_only),
             "groq" => run_groq_native(&prompt, read_only),
             "xai-grok" => run_xai_native(&prompt, read_only),
             _ => {

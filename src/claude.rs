@@ -57,6 +57,178 @@ Browser violations:\n\
 static CRITIC_CONSECUTIVE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 const CRITIC_MAX_CONSECUTIVE_FAILURES: usize = 8;
 
+fn model_supports_adaptive_thinking(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("opus")
+}
+
+fn prompt_is_trivial_for_thinking(prompt: &str) -> bool {
+    let normalized = prompt
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let compact = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return true;
+    }
+    if matches!(
+        compact.as_str(),
+        "hi" | "hello"
+            | "hey"
+            | "thanks"
+            | "thank you"
+            | "ok"
+            | "okay"
+            | "sounds good"
+            | "cool"
+            | "done"
+            | "status"
+    ) {
+        return true;
+    }
+    compact.split_whitespace().count() <= 8
+        && ![
+            "plan",
+            "decide",
+            "compare",
+            "debug",
+            "refactor",
+            "flight",
+            "travel",
+            "email",
+            "calendar",
+            "meeting",
+            "approval",
+            "delegate",
+            "book",
+            "build",
+            "implement",
+        ]
+        .iter()
+        .any(|kw| compact.contains(kw))
+}
+
+fn prompt_is_operational_automation(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    [
+        "health check",
+        "heartbeat",
+        "cron trigger",
+        "verify all services",
+        "restart any that are down",
+        "log actions taken",
+        "service status",
+        "uptime check",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+}
+
+fn prompt_needs_deep_reasoning(prompt: &str) -> bool {
+    if prompt_is_trivial_for_thinking(prompt) || prompt_is_operational_automation(prompt) {
+        return false;
+    }
+
+    let lower = prompt.to_ascii_lowercase();
+    let word_count = lower.split_whitespace().count();
+    let structured_markers = [
+        "\n-",
+        "\n*",
+        "\n1.",
+        "\n2.",
+        "and then",
+        "after that",
+        "as well as",
+    ]
+    .iter()
+    .filter(|kw| lower.contains(**kw))
+    .count();
+    let reasoning_terms = [
+        "plan",
+        "proposal",
+        "compare",
+        "tradeoff",
+        "decide",
+        "infer",
+        "estimate",
+        "evaluate",
+        "prioritize",
+        "research",
+        "analyze",
+        "architecture",
+        "refactor",
+        "debug",
+        "root cause",
+        "design",
+        "approval",
+        "delegate",
+        "draft",
+        "email",
+        "calendar",
+        "meeting",
+        "flight",
+        "travel",
+        "itinerary",
+        "book",
+        "parents",
+        "home",
+        "visit",
+        "build a real application",
+        "package.json",
+        "unit test",
+        "integration test",
+        "endpoint",
+        "api",
+        "schema",
+        "migration",
+    ];
+    let hits = reasoning_terms
+        .iter()
+        .filter(|kw| lower.contains(**kw))
+        .count();
+    hits >= 2 || word_count > 80 || structured_markers >= 2
+}
+
+fn resolve_thinking_policy(
+    request: &AgentHookRequest,
+    model: &str,
+    model_override: Option<&str>,
+) -> (bool, String) {
+    let configured_effort =
+        env_optional("ANTHROPIC_THINKING_EFFORT").unwrap_or_else(|| "high".to_string());
+    if model_override.is_some() || !model_supports_adaptive_thinking(model) {
+        return (false, configured_effort);
+    }
+
+    let thinking_mode = env_optional("ANTHROPIC_THINKING")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(thinking_mode.as_str(), "off" | "false" | "0") {
+        return (false, configured_effort);
+    }
+    if thinking_mode == "adaptive" {
+        return (true, configured_effort);
+    }
+
+    let prompt = extract_prompt_from_request(request);
+    if prompt_needs_deep_reasoning(&prompt) {
+        let effort = if prompt.split_whitespace().count() > 120 {
+            configured_effort.clone()
+        } else {
+            "medium".to_string()
+        };
+        return (true, effort);
+    }
+
+    (false, configured_effort)
+}
+
 // ---------------------------------------------------------------------------
 // Image validation
 // ---------------------------------------------------------------------------
@@ -582,17 +754,13 @@ pub(crate) fn call_claude_with_model(
     } else {
         None
     };
-    // Extended thinking: ANTHROPIC_THINKING controls thinking mode.
-    //   "adaptive" (recommended for Opus 4.6) — Claude decides when/how much to think.
-    //   "off" or unset — no thinking.
-    // ANTHROPIC_THINKING_EFFORT controls depth: "max", "high" (default), "medium", "low".
-    //   "max" is Opus 4.6 only — highest quality, no constraints on thinking depth.
-    let thinking_mode = env_optional("ANTHROPIC_THINKING").unwrap_or_default();
-    // Disable thinking when using a model override (e.g. Sonnet for compaction) —
-    // adaptive thinking is Opus-only and will cause 400 errors on other models.
-    let thinking_enabled = thinking_mode == "adaptive" && model_override.is_none();
-    let thinking_effort =
-        env_optional("ANTHROPIC_THINKING_EFFORT").unwrap_or_else(|| "high".to_string());
+    // Extended thinking policy:
+    // - ANTHROPIC_THINKING=adaptive => always on for Opus models.
+    // - ANTHROPIC_THINKING=smart or unset on Opus => enable only for prompts that
+    //   look like real planning/research/engineering work, keep trivial turns fast.
+    // - ANTHROPIC_THINKING=off => always off.
+    let (thinking_enabled, thinking_effort) =
+        resolve_thinking_policy(request, model, model_override.as_deref());
 
     let effective_max_tokens = if thinking_enabled {
         // With thinking, max_tokens must cover thinking + response
@@ -1265,10 +1433,7 @@ pub(crate) fn call_claude_streaming(
         None
     };
 
-    let thinking_mode = env_optional("ANTHROPIC_THINKING").unwrap_or_default();
-    let thinking_enabled = thinking_mode == "adaptive";
-    let thinking_effort =
-        env_optional("ANTHROPIC_THINKING_EFFORT").unwrap_or_else(|| "high".to_string());
+    let (thinking_enabled, thinking_effort) = resolve_thinking_policy(request, model, None);
 
     let effective_max_tokens = if thinking_enabled {
         max_tokens.max(16384)
@@ -1480,4 +1645,22 @@ pub(crate) fn call_agent_hook_streaming(
         return Err("streaming only supported for builtin:claude".to_string());
     }
     call_claude_streaming(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{prompt_is_operational_automation, prompt_needs_deep_reasoning};
+
+    #[test]
+    fn deep_reasoning_turns_on_for_exec_assistant_planning() {
+        let prompt = "I need to find flights for my parents, infer the likely destination, ask the smart missing questions, compare options, and draft the next step for Rhaine.";
+        assert!(prompt_needs_deep_reasoning(prompt));
+    }
+
+    #[test]
+    fn deep_reasoning_stays_off_for_health_check_ops() {
+        let prompt = "Perform hourly infrastructure health check. Verify all services are healthy, restart any that are down, and log actions taken.";
+        assert!(prompt_is_operational_automation(prompt));
+        assert!(!prompt_needs_deep_reasoning(prompt));
+    }
 }
