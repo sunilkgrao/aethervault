@@ -206,7 +206,7 @@ pub(crate) fn extract_critic_json(text: &str) -> Option<serde_json::Value> {
         } else { section = 0; }
     }
     if score.is_none() && issues.is_empty() && suggestions.is_empty() && summary.is_empty() {
-        eprintln!("[critic] verdict parse error: could not extract JSON from response; defaulting to pass");
+        eprintln!("[critic] verdict parse error: could not extract JSON from response; defaulting to pass; raw response: {:?}", text);
         Some(serde_json::json!({"grounded": true, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""}))
     } else {
         Some(serde_json::json!({"grounded": true, "issues": issues, "agent_claim": "", "evidence_shows": "", "correction": "", "score": score, "suggestions": suggestions, "summary": summary}))
@@ -925,24 +925,39 @@ pub(crate) fn call_critic(
     let parsed: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[critic] JSON parse error: {e}");
+            eprintln!("[critic] JSON parse error: {e}; raw response: {:?}", body);
             CRITIC_CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             return None;
         }
     };
 
     // Extract text from the Anthropic response
-    let content = parsed.get("content")?.as_array()?;
-    let text = content
+    let content = match parsed.get("content").and_then(|v| v.as_array()) {
+        Some(v) => v,
+        None => {
+            eprintln!("[critic] response parse failed: missing/invalid content array in critic response: {:?}", body);
+            CRITIC_CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    let text = match content
         .iter()
         .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-        .and_then(|b| b.get("text").and_then(|t| t.as_str()))?;
+        .and_then(|b| b.get("text").and_then(|t| t.as_str()))
+    {
+        Some(v) => v,
+        None => {
+            eprintln!("[critic] response parse failed: missing text block in critic response: {:?}", body);
+            CRITIC_CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
 
     // Parse the critic's JSON verdict using lenient extractor
     let verdict = match extract_critic_json(text) {
         Some(v) => v,
         None => {
-            eprintln!("[critic] verdict parse error: could not extract JSON from response; defaulting to pass");
+            eprintln!("[critic] verdict parse error: could not extract JSON from response; defaulting to pass; raw response: {:?}", text);
             serde_json::json!({"grounded": true, "issues": [], "agent_claim": "", "evidence_shows": "", "correction": ""})
         }
     };
