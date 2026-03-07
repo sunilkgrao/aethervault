@@ -1330,6 +1330,9 @@ pub(crate) fn execute_tool(
                 before: parsed.before,
                 after: parsed.after,
                 feedback_weight: parsed.feedback_weight.unwrap_or(0.15),
+                fusion_mode: crate::FusionMode::Rrf,
+                bayesian_bm25_weight: 0.5,
+                bayesian_vec_weight: 0.5,
             };
             let response = execute_query(db, qargs).map_err(|e| e.to_string())?;
             let mut lines = Vec::new();
@@ -1376,6 +1379,9 @@ pub(crate) fn execute_tool(
                 before: parsed.before,
                 after: parsed.after,
                 feedback_weight: parsed.feedback_weight.unwrap_or(0.15),
+                fusion_mode: crate::FusionMode::Rrf,
+                bayesian_bm25_weight: 0.5,
+                bayesian_vec_weight: 0.5,
             };
             let pack = build_context_pack(
                 db,

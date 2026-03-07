@@ -131,6 +131,13 @@ pub(crate) struct ContextPack {
     pub(crate) context: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum FusionMode {
+    #[default]
+    Rrf,
+    BayesianLogOdds,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct QueryArgs {
@@ -161,6 +168,9 @@ pub(crate) struct QueryArgs {
     pub(crate) before: Option<String>,
     pub(crate) after: Option<String>,
     pub(crate) feedback_weight: f32,
+    pub(crate) fusion_mode: FusionMode,
+    pub(crate) bayesian_bm25_weight: f32,
+    pub(crate) bayesian_vec_weight: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

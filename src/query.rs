@@ -7,6 +7,27 @@ use serde_json;
 
 use super::*;
 
+fn sigmoid_f32(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+fn safe_prob_f32(p: f32) -> f32 {
+    p.clamp(1e-6, 1.0 - 1e-6)
+}
+
+fn logit_f32(p: f32) -> f32 {
+    let p = safe_prob_f32(p);
+    (p / (1.0 - p)).ln()
+}
+
+fn score_to_prob(score: f32, alpha: f32, beta: f32) -> f32 {
+    sigmoid_f32(alpha * (score - beta))
+}
+
+fn cosine_to_prob(cosine: f32) -> f32 {
+    safe_prob_f32((1.0 + cosine) / 2.0)
+}
+
 pub(crate) fn frame_to_summary(frame: &Frame) -> Option<FrameSummary> {
     let uri = frame.uri.clone()?;
     Some(FrameSummary {
@@ -121,6 +142,105 @@ pub(crate) fn rrf_fuse(lists: &[RankedList], k: f32) -> Vec<FusedCandidate> {
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
     fused
+}
+
+pub(crate) fn bayesian_log_odds_fuse(
+    lists: &[RankedList],
+    bm25_weight: f32,
+    vec_weight: f32,
+) -> Vec<FusedCandidate> {
+    #[derive(Clone)]
+    struct BayesAccumulator {
+        p_bm25: f32,
+        has_bm25: bool,
+        p_vec: f32,
+        has_vec: bool,
+        frame_id: u64,
+        uri: String,
+        title: Option<String>,
+        snippet: String,
+        best_rank: usize,
+        sources: Vec<String>,
+    }
+
+    let mut scores: HashMap<String, BayesAccumulator> = HashMap::new();
+
+    for list in lists {
+        for (i, cand) in list.items.iter().enumerate() {
+            let rank = i + 1;
+            let entry = scores.entry(cand.key.clone()).or_insert(BayesAccumulator {
+                p_bm25: 0.5,
+                has_bm25: false,
+                p_vec: 0.5,
+                has_vec: false,
+                frame_id: cand.frame_id,
+                uri: cand.uri.clone(),
+                title: cand.title.clone(),
+                snippet: cand.snippet.clone(),
+                best_rank: rank,
+                sources: Vec::new(),
+            });
+
+            if rank < entry.best_rank {
+                entry.best_rank = rank;
+                entry.snippet = cand.snippet.clone();
+                entry.title = cand.title.clone();
+                entry.frame_id = cand.frame_id;
+                entry.uri = cand.uri.clone();
+            }
+
+            if list.is_base {
+                // BM25 list — normalize rank-based score to prob
+                let raw = 1.0 / (1.0 + i as f32);
+                entry.p_bm25 = score_to_prob(raw, 4.0, 0.5);
+                entry.has_bm25 = true;
+            } else {
+                // Vector list — scores are cosine similarities
+                let raw = cand.score.unwrap_or(0.0);
+                entry.p_vec = if raw >= -1.0 && raw <= 1.0 {
+                    cosine_to_prob(raw)
+                } else {
+                    score_to_prob(raw, 1.0, 0.5)
+                };
+                entry.has_vec = true;
+            }
+
+            entry
+                .sources
+                .push(format!("{}:{}#{}", list.lane.as_str(), list.query, rank));
+        }
+    }
+
+    let mut candidates: Vec<FusedCandidate> = scores
+        .into_iter()
+        .map(|(id, stats)| {
+            let fused_logit = bm25_weight * logit_f32(if stats.has_bm25 {
+                stats.p_bm25
+            } else {
+                0.5
+            }) + vec_weight * logit_f32(if stats.has_vec { stats.p_vec } else { 0.5 });
+            let fused_score = sigmoid_f32(fused_logit);
+
+            FusedCandidate {
+                key: id,
+                frame_id: stats.frame_id,
+                uri: stats.uri,
+                title: stats.title,
+                snippet: stats.snippet,
+                best_rank: stats.best_rank,
+                rrf_score: fused_score,
+                rrf_bonus: 0.0,
+                sources: stats.sources,
+            }
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| {
+        b.rrf_score
+            .partial_cmp(&a.rrf_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates
 }
 
 pub(crate) fn chunk_text(text: &str, max_chars: usize, overlap: usize) -> Vec<(String, usize)> {
@@ -386,7 +506,14 @@ pub(crate) fn execute_query(
         });
     }
 
-    let fused = rrf_fuse(&lists, 60.0);
+    let fused = match args.fusion_mode {
+        FusionMode::Rrf => rrf_fuse(&lists, 60.0),
+        FusionMode::BayesianLogOdds => bayesian_log_odds_fuse(
+            &lists,
+            args.bayesian_bm25_weight,
+            args.bayesian_vec_weight,
+        ),
+    };
 
     let rerank_mode = if rerank_hook.is_some() {
         "hook"

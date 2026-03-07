@@ -567,6 +567,9 @@ pub fn run_agent_with_prompt(
             before: None,
             after: None,
             feedback_weight: 0.15,
+            fusion_mode: crate::FusionMode::Rrf,
+            bayesian_bm25_weight: 0.5,
+            bayesian_vec_weight: 0.5,
         };
         if let Ok(pack) = build_context_pack(
             mem_read.as_mut().unwrap(),

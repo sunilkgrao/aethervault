@@ -1,37 +1,36 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, LazyLock, Mutex, mpsc as std_mpsc};
 use std::thread;
-use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::memory_db::PutOptions;
 use crate::consolidation::put_with_consolidation;
+use crate::memory_db::PutOptions;
 use chrono::Utc;
 use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde_json;
 
-use crate::claude::{call_agent_hook, call_agent_hook_streaming, call_claude, call_claude_with_model, call_critic};
+use crate::claude::{
+    call_agent_hook, call_agent_hook_streaming, call_claude, call_claude_with_model, call_critic,
+};
 use crate::{
-    append_log_jsonl, base_tool_names, build_context_pack, build_kg_context,
-    collect_mid_loop_reminders, compute_drift_score, critic_should_fire, detect_cycle, env_optional,
-    execute_tool, find_kg_entities, log_dir_path,
-    config_file_path, format_tool_message_content, load_capsule_config, load_config_from_file,
-    load_kg_graph, load_session_turns, load_workspace_context, open_or_create_db, requires_approval,
-    resolve_hook_spec, resolve_workspace,
-    save_session_turns, tool_catalog_map, tool_definitions_json,
-    tools_from_active, AgentHookRequest, AgentLogEntry, AgentMessage,
-    AgentProgress, AgentRunOutput, AgentSession, AgentToolCall, AgentToolResult,
-    ClaudeStreamEvent, ContinuationCheckpoint,
-    CommandSpec, DriftState, HookSpec, McpRegistry, McpServerConfig, QueryArgs, ReminderState, SessionTurn,
-    StreamPhase, ToolExecution, BackgroundTaskRegistry, SessionRegistry,
-    SessionTaint, FailureKind, classify_failure, LearnedFailure, detect_invisible_unicode,
-    open_skill_db, list_skills, record_skill_use,
-    match_skills_for_prompt, bootstrap_skills,
-    prune_low_performing_skills, rebuild_fts5_index,
+    AgentHookRequest, AgentLogEntry, AgentMessage, AgentProgress, AgentRunOutput, AgentSession,
+    AgentToolCall, AgentToolResult, BackgroundTaskRegistry, ClaudeStreamEvent, CommandSpec,
+    ContinuationCheckpoint, DriftState, FailureKind, HookSpec, LearnedFailure, McpRegistry,
+    McpServerConfig, QueryArgs, ReminderState, SessionRegistry, SessionTaint, SessionTurn,
+    StreamPhase, ToolExecution, append_log_jsonl, base_tool_names, bootstrap_skills,
+    build_context_pack, build_kg_context, classify_failure, collect_mid_loop_reminders,
+    compute_drift_score, config_file_path, critic_should_fire, detect_cycle,
+    detect_invisible_unicode, env_optional, execute_tool, find_kg_entities,
+    format_tool_message_content, list_skills, load_capsule_config, load_config_from_file,
+    load_kg_graph, load_session_turns, load_workspace_context, log_dir_path,
+    match_skills_for_prompt, open_or_create_db, open_skill_db, prune_low_performing_skills,
+    rebuild_fts5_index, record_skill_use, requires_approval, resolve_hook_spec, resolve_workspace,
+    save_session_turns, tool_catalog_map, tool_definitions_json, tools_from_active,
 };
 
 /// Tracks blake3 hashes of observations already written this process lifetime.
@@ -63,9 +62,14 @@ fn observation_is_useful(text: &str) -> bool {
     // Filter strategy: drop obvious meta-phrases and status boilerplate,
     // while requiring a concrete signal (number, proper noun, or explicit marker) for everything else.
     let blocked_prefix = [
-        "the assistant", "the agent",
-        "i will now", "let me help", "here is", "here are",
-        "as an assistant", "as your assistant",
+        "the assistant",
+        "the agent",
+        "i will now",
+        "let me help",
+        "here is",
+        "here are",
+        "as an assistant",
+        "as your assistant",
     ];
 
     let has_prefix = |text: &str, phrase: &str| {
@@ -76,7 +80,10 @@ fn observation_is_useful(text: &str) -> bool {
                 .map_or(true, |next| !next.is_alphabetic())
     };
 
-    if blocked_prefix.iter().any(|phrase| has_prefix(&lower, phrase)) {
+    if blocked_prefix
+        .iter()
+        .any(|phrase| has_prefix(&lower, phrase))
+    {
         return false;
     }
     // Generic status check phrases that are typically non-actionable
@@ -95,10 +102,7 @@ fn observation_is_useful(text: &str) -> bool {
     let is_title_case_word = |token: &str| {
         let cleaned = token.trim_matches(|c: char| !c.is_alphanumeric());
         cleaned.len() > 1
-            && cleaned
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_uppercase())
+            && cleaned.chars().next().is_some_and(|c| c.is_uppercase())
             && !proper_noun_lookalikes.contains(&cleaned)
     };
 
@@ -106,9 +110,24 @@ fn observation_is_useful(text: &str) -> bool {
     let has_number = trimmed.chars().any(|c| c.is_ascii_digit());
     let has_proper_noun = trimmed.split_whitespace().any(is_title_case_word);
     let specificity_markers = [
-        "because", "prefers", "always", "never", "important",
-        "learned", "rule", "policy", "deadline", "budget", "password", "key",
-        "api", "token", "endpoint", "port", "version", "config",
+        "because",
+        "prefers",
+        "always",
+        "never",
+        "important",
+        "learned",
+        "rule",
+        "policy",
+        "deadline",
+        "budget",
+        "password",
+        "key",
+        "api",
+        "token",
+        "endpoint",
+        "port",
+        "version",
+        "config",
     ];
     let has_specificity = specificity_markers.iter().any(|m| lower.contains(m));
 
@@ -133,15 +152,23 @@ fn consume_stream(
     let mut block_tool_names: HashMap<usize, String> = HashMap::new();
 
     let timeout_secs: u64 = std::env::var("ANTHROPIC_TIMEOUT")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(180);
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180);
     let recv_timeout = StdDuration::from_secs(timeout_secs);
 
     loop {
-        let event = rx.recv_timeout(recv_timeout)
+        let event = rx
+            .recv_timeout(recv_timeout)
             .map_err(|_| format!("stream recv timeout ({}s)", timeout_secs))?;
 
         match event {
-            ClaudeStreamEvent::BlockStart { index, block_type, tool_id, tool_name } => {
+            ClaudeStreamEvent::BlockStart {
+                index,
+                block_type,
+                tool_id,
+                tool_name,
+            } => {
                 block_types.insert(index, block_type.clone());
                 block_texts.insert(index, String::new());
                 if let Some(id) = tool_id {
@@ -171,7 +198,11 @@ fn consume_stream(
                     _ => {} // tool_use, redacted_thinking — no streaming display
                 }
             }
-            ClaudeStreamEvent::BlockDelta { index, delta_type, text } => {
+            ClaudeStreamEvent::BlockDelta {
+                index,
+                delta_type,
+                text,
+            } => {
                 if let Some(buf) = block_texts.get_mut(&index) {
                     buf.push_str(&text);
                 }
@@ -187,7 +218,10 @@ fn consume_stream(
                             if let Some(ref t) = p.stream_thinking {
                                 let chars: Vec<char> = t.chars().collect();
                                 let snippet = if chars.len() > 100 {
-                                    format!("...{}", chars[chars.len()-97..].iter().collect::<String>())
+                                    format!(
+                                        "...{}",
+                                        chars[chars.len() - 97..].iter().collect::<String>()
+                                    )
                                 } else {
                                     t.clone()
                                 };
@@ -207,7 +241,11 @@ fn consume_stream(
                 }
             }
             ClaudeStreamEvent::BlockStop { index } => {
-                let btype = block_types.get(&index).map(|s| s.as_str()).unwrap_or("").to_string();
+                let btype = block_types
+                    .get(&index)
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let accumulated = block_texts.remove(&index).unwrap_or_default();
 
                 match btype.as_str() {
@@ -333,8 +371,7 @@ pub(crate) fn run_agent(
         )?;
 
         let continuation_marker_line = output.final_text.as_ref().and_then(|text| {
-            text
-                .lines()
+            text.lines()
                 .find(|line| line.starts_with(CONTINUATION_MARKER_PREFIX))
         });
         let needs_continuation = continuation_marker_line.is_some();
@@ -346,7 +383,9 @@ pub(crate) fn run_agent(
                 if let Some(end) = after.find(']') {
                     let checkpoint_path = &after[..end];
                     if let Ok(checkpoint_json) = fs::read_to_string(checkpoint_path) {
-                        if let Ok(checkpoint) = serde_json::from_str::<ContinuationCheckpoint>(&checkpoint_json) {
+                        if let Ok(checkpoint) =
+                            serde_json::from_str::<ContinuationCheckpoint>(&checkpoint_json)
+                        {
                             chain_depth = if checkpoint.chain_depth <= MAX_CHECKPOINT_CHAIN_DEPTH {
                                 checkpoint.chain_depth
                             } else {
@@ -358,7 +397,8 @@ pub(crate) fn run_agent(
                             };
                             eprintln!(
                                 "[auto-continuation] chaining session (depth {}/{}): {}",
-                                chain_depth, MAX_CHAIN_DEPTH,
+                                chain_depth,
+                                MAX_CHAIN_DEPTH,
                                 checkpoint.goal.chars().take(80).collect::<String>()
                             );
                             current_prompt = format!(
@@ -367,8 +407,11 @@ pub(crate) fn run_agent(
                                  ## Summary of work so far\n{}\n\n\
                                  ## Remaining work\n{}\n\n\
                                  Continue from where you left off. Do NOT repeat completed work.",
-                                chain_depth, MAX_CHAIN_DEPTH,
-                                checkpoint.goal, checkpoint.summary, checkpoint.remaining_work,
+                                chain_depth,
+                                MAX_CHAIN_DEPTH,
+                                checkpoint.goal,
+                                checkpoint.summary,
+                                checkpoint.remaining_work,
                             );
                             current_session = current_session.map(|s| {
                                 if s.contains(":chain:") {
@@ -500,17 +543,24 @@ pub(crate) fn default_system_prompt() -> String {
 
 /// Estimate token count for messages (rough: chars / 4).
 pub(crate) fn estimate_tokens(messages: &[AgentMessage]) -> usize {
-    messages.iter().map(|m| {
-        let content_chars = m.content.as_ref().map(|c| c.len()).unwrap_or(0);
-        let tool_call_chars: usize = m.tool_calls.iter().map(|tc| {
-            tc.name.len() + tc.id.len() + tc.args.to_string().len()
-        }).sum();
-        let thinking_chars: usize = m.thinking_blocks.iter().map(|tb| {
-            tb.to_string().len()
-        }).sum();
-        // ~4 chars per token, plus per-message overhead (~20 tokens for role/structure)
-        (content_chars + tool_call_chars + thinking_chars) / 4 + 20
-    }).sum()
+    messages
+        .iter()
+        .map(|m| {
+            let content_chars = m.content.as_ref().map(|c| c.len()).unwrap_or(0);
+            let tool_call_chars: usize = m
+                .tool_calls
+                .iter()
+                .map(|tc| tc.name.len() + tc.id.len() + tc.args.to_string().len())
+                .sum();
+            let thinking_chars: usize = m
+                .thinking_blocks
+                .iter()
+                .map(|tb| tb.to_string().len())
+                .sum();
+            // ~4 chars per token, plus per-message overhead (~20 tokens for role/structure)
+            (content_chars + tool_call_chars + thinking_chars) / 4 + 20
+        })
+        .sum()
 }
 
 pub(crate) fn compaction_budget_tokens() -> usize {
@@ -547,7 +597,8 @@ pub(crate) fn compact_messages(
     // Ensure we don't split in the middle of a tool_use→tool_result pair.
     // If `recent` would start with a "tool" role message, back up to include the
     // preceding assistant message with the corresponding tool_calls.
-    while summary_end > system_end && summary_end < messages.len()
+    while summary_end > system_end
+        && summary_end < messages.len()
         && messages[summary_end].role == "tool"
     {
         summary_end = summary_end.saturating_sub(1);
@@ -589,8 +640,8 @@ pub(crate) fn compact_messages(
     );
 
     // Use Sonnet directly for compaction — lightweight, no thinking, won't blow up on token limits
-    let sonnet_model = env_optional("SONNET_MODEL")
-        .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
+    let sonnet_model =
+        env_optional("SONNET_MODEL").unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
     let summary_request = AgentHookRequest {
         messages: vec![
             AgentMessage {
@@ -618,10 +669,14 @@ pub(crate) fn compact_messages(
 
     let summary_response = call_claude_with_model(&summary_request, Some(&sonnet_model))
         .map_err(|e| format!("compaction summarizer failed: {e}"))?;
-    let summary = summary_response.message.content.unwrap_or_else(|| "(compaction failed)".to_string());
+    let summary = summary_response
+        .message
+        .content
+        .unwrap_or_else(|| "(compaction failed)".to_string());
 
     // Extract the GOAL field from the structured summary
-    let extracted_goal = summary.lines()
+    let extracted_goal = summary
+        .lines()
         .find(|line| line.starts_with("GOAL:"))
         .map(|line| line.trim_start_matches("GOAL:").trim().to_string());
 
@@ -629,7 +684,9 @@ pub(crate) fn compact_messages(
     *messages = system_msgs;
     messages.push(AgentMessage {
         role: "user".to_string(),
-        content: Some(format!("[Context compacted. Summary of prior conversation:]\n{summary}")),
+        content: Some(format!(
+            "[Context compacted. Summary of prior conversation:]\n{summary}"
+        )),
         tool_calls: Vec::new(),
         name: None,
         tool_call_id: None,
@@ -638,7 +695,9 @@ pub(crate) fn compact_messages(
     });
     messages.push(AgentMessage {
         role: "assistant".to_string(),
-        content: Some("Understood. I have the context from the summary above. Continuing.".to_string()),
+        content: Some(
+            "Understood. I have the context from the summary above. Continuing.".to_string(),
+        ),
         tool_calls: Vec::new(),
         name: None,
         tool_call_id: None,
@@ -704,7 +763,11 @@ fn process_tool_result(
     });
     messages.push(AgentMessage {
         role: "tool".to_string(),
-        content: if tool_content.is_empty() { None } else { Some(tool_content) },
+        content: if tool_content.is_empty() {
+            None
+        } else {
+            Some(tool_content)
+        },
         tool_calls: Vec::new(),
         name: Some(call.name.clone()),
         tool_call_id: Some(call.id.clone()),
@@ -733,13 +796,19 @@ fn process_tool_result(
     // fs_read, and other tool outputs are not. Detect and warn the LLM when invisible
     // chars are found — this is strong evidence of prompt injection.
     if let Some(warning) = detect_invisible_unicode(&result.output) {
-        eprintln!("[security] invisible unicode detected in {} output", call.name);
+        eprintln!(
+            "[security] invisible unicode detected in {} output",
+            call.name
+        );
         session_taint.mark_untrusted(&format!("{} (invisible unicode)", call.name));
         deferred.push(AgentMessage {
             role: "user".to_string(),
             content: Some(warning),
             tool_calls: Vec::new(),
-            name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+            name: None,
+            tool_call_id: None,
+            is_error: None,
+            thinking_blocks: vec![],
         });
     }
 
@@ -759,11 +828,17 @@ fn process_tool_result(
                      2. Is this a missing dependency, wrong path, permission issue, or syntax error?\n\
                      3. On a REMOTE machine, have you verified: disk space (df -h), available tools (which <cmd>), environment vars?\n\
                      4. What is ONE specific thing you will change before retrying?",
-                    exit_code.map(|c| format!(" (exit code {c})")).unwrap_or_default()
+                    exit_code
+                        .map(|c| format!(" (exit code {c})"))
+                        .unwrap_or_default()
                 ))
             }
             "http_request" => {
-                let status = result.details.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
+                let status = result
+                    .details
+                    .get("status")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 Some(format!(
                     "[Root-Cause Analysis Required]\n\
                      HTTP request failed with status {status}.\n\
@@ -781,7 +856,10 @@ fn process_tool_result(
                 role: "user".to_string(),
                 content: Some(rca),
                 tool_calls: Vec::new(),
-                name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                name: None,
+                tool_call_id: None,
+                is_error: None,
+                thinking_blocks: vec![],
             });
         }
 
@@ -879,8 +957,14 @@ fn prompt_is_complex(prompt: &str) -> bool {
     // If the user explicitly requests orchestration, always honor it
     // regardless of prompt length or form.
     let explicit_orchestration = [
-        "orchestrate", "swarm", "subagent", "sub-agent", "parallel agents",
-        "coordinate agents", "use orchestrator", "orchestrator mode",
+        "orchestrate",
+        "swarm",
+        "subagent",
+        "sub-agent",
+        "parallel agents",
+        "coordinate agents",
+        "use orchestrator",
+        "orchestrator mode",
     ];
     if explicit_orchestration.iter().any(|kw| lower.contains(kw)) {
         return true;
@@ -897,9 +981,23 @@ fn prompt_is_complex(prompt: &str) -> bool {
 
     // Question-form prompts: reading/understanding, not multi-file coding
     let question_prefixes = [
-        "what ", "how ", "why ", "explain ", "describe ", "show ", "list ",
-        "tell me", "is there", "does ", "can you tell", "where ", "which ",
-        "who ", "when ", "could you explain", "help me understand",
+        "what ",
+        "how ",
+        "why ",
+        "explain ",
+        "describe ",
+        "show ",
+        "list ",
+        "tell me",
+        "is there",
+        "does ",
+        "can you tell",
+        "where ",
+        "which ",
+        "who ",
+        "when ",
+        "could you explain",
+        "help me understand",
     ];
     let trimmed = lower.trim_start();
     if question_prefixes.iter().any(|q| trimmed.starts_with(q)) {
@@ -908,9 +1006,23 @@ fn prompt_is_complex(prompt: &str) -> bool {
 
     // Read-only intent: no write action implied
     let read_only_verbs = [
-        "read ", "check ", "look at", "review ", "inspect ", "view ",
-        "examine ", "analyze ", "print ", "display ", "grep ", "search ",
-        "find ", "locate ", "cat ", "show me", "what's in",
+        "read ",
+        "check ",
+        "look at",
+        "review ",
+        "inspect ",
+        "view ",
+        "examine ",
+        "analyze ",
+        "print ",
+        "display ",
+        "grep ",
+        "search ",
+        "find ",
+        "locate ",
+        "cat ",
+        "show me",
+        "what's in",
     ];
     if read_only_verbs.iter().any(|v| trimmed.starts_with(v)) {
         return false;
@@ -918,18 +1030,21 @@ fn prompt_is_complex(prompt: &str) -> bool {
 
     // Count files/paths, stripping trailing punctuation so "agent.rs," still matches
     let file_extensions = [
-        ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".java",
-        ".rb", ".cpp", ".c", ".h", ".css", ".html", ".json", ".toml",
-        ".yaml", ".yml", ".md", ".sh", ".sql",
+        ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".java", ".rb", ".cpp", ".c", ".h",
+        ".css", ".html", ".json", ".toml", ".yaml", ".yml", ".md", ".sh", ".sql",
     ];
-    let file_count = words.iter().filter(|w| {
-        let cleaned: String = w.chars()
-            .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '/' || *c == '_' || *c == '-')
-            .collect();
-        let c_lower = cleaned.to_lowercase();
-        file_extensions.iter().any(|ext| c_lower.ends_with(ext))
-            || (cleaned.contains('/') && cleaned.len() > 2) // path-like
-    }).count();
+    let file_count = words
+        .iter()
+        .filter(|w| {
+            let cleaned: String = w
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '/' || *c == '_' || *c == '-')
+                .collect();
+            let c_lower = cleaned.to_lowercase();
+            file_extensions.iter().any(|ext| c_lower.ends_with(ext))
+                || (cleaned.contains('/') && cleaned.len() > 2) // path-like
+        })
+        .count();
 
     // Single-file/single-line fix: explicit "line N" or "on line" with a file ref
     // e.g., "fix the typo on line 5 in main.rs"
@@ -948,10 +1063,24 @@ fn prompt_is_complex(prompt: &str) -> bool {
 
     // Signal: complexity keywords suggesting multi-file/architectural work
     let complexity_keywords = [
-        "refactor", "redesign", "architect", "migrate", "migration",
-        "across", "all files", "multiple files", "codebase", "entire",
-        "overhaul", "rewrite", "restructure", "modularize", "integrate",
-        "end-to-end", "full-stack", "cross-cutting",
+        "refactor",
+        "redesign",
+        "architect",
+        "migrate",
+        "migration",
+        "across",
+        "all files",
+        "multiple files",
+        "codebase",
+        "entire",
+        "overhaul",
+        "rewrite",
+        "restructure",
+        "modularize",
+        "integrate",
+        "end-to-end",
+        "full-stack",
+        "cross-cutting",
     ];
     if complexity_keywords.iter().any(|kw| lower.contains(kw)) {
         signals += 1;
@@ -959,8 +1088,12 @@ fn prompt_is_complex(prompt: &str) -> bool {
 
     // Signal: implementation/feature creation keywords
     let implement_words = [
-        "implement", "build out", "develop", "create a feature",
-        "add a feature", "new feature",
+        "implement",
+        "build out",
+        "develop",
+        "create a feature",
+        "add a feature",
+        "new feature",
     ];
     if implement_words.iter().any(|kw| lower.contains(kw)) {
         signals += 1;
@@ -968,9 +1101,21 @@ fn prompt_is_complex(prompt: &str) -> bool {
 
     // Signal: long prompt (>60 words) with write intent
     let write_verbs = [
-        "create", "build", "implement", "write", "add", "modify",
-        "update", "change", "refactor", "fix", "deploy", "set up",
-        "configure", "install", "generate",
+        "create",
+        "build",
+        "implement",
+        "write",
+        "add",
+        "modify",
+        "update",
+        "change",
+        "refactor",
+        "fix",
+        "deploy",
+        "set up",
+        "configure",
+        "install",
+        "generate",
     ];
     let has_write_intent = write_verbs.iter().any(|v| lower.contains(v));
     if word_count > 60 && has_write_intent {
@@ -979,11 +1124,22 @@ fn prompt_is_complex(prompt: &str) -> bool {
 
     // Signal: multiple subtasks (numbered lists, bullets, "and then", "also need")
     let multi_task_indicators = [
-        "1.", "2.", "- ", "* ", "and then", "also need", "additionally",
-        "after that", "next step", "followed by", "as well as",
-        "on top of that", "plus ",
+        "1.",
+        "2.",
+        "- ",
+        "* ",
+        "and then",
+        "also need",
+        "additionally",
+        "after that",
+        "next step",
+        "followed by",
+        "as well as",
+        "on top of that",
+        "plus ",
     ];
-    let multi_task_count = multi_task_indicators.iter()
+    let multi_task_count = multi_task_indicators
+        .iter()
         .filter(|ind| lower.contains(*ind))
         .count();
     if multi_task_count >= 2 {
@@ -992,11 +1148,24 @@ fn prompt_is_complex(prompt: &str) -> bool {
 
     // Signal: mentions multiple components/modules/services
     let component_words = [
-        "frontend", "backend", "api", "database", "server", "client",
-        "component", "module", "service", "endpoint", "route", "model",
-        "controller", "middleware", "schema",
+        "frontend",
+        "backend",
+        "api",
+        "database",
+        "server",
+        "client",
+        "component",
+        "module",
+        "service",
+        "endpoint",
+        "route",
+        "model",
+        "controller",
+        "middleware",
+        "schema",
     ];
-    let component_count = component_words.iter()
+    let component_count = component_words
+        .iter()
         .filter(|cw| lower.contains(*cw))
         .count();
     if component_count >= 2 {
@@ -1004,6 +1173,87 @@ fn prompt_is_complex(prompt: &str) -> bool {
     }
 
     signals >= 2
+}
+
+fn prompt_is_trivial_chat(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let normalized = trimmed
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return true;
+    }
+
+    let exact_matches = [
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "ping",
+        "test",
+        "ok",
+        "okay",
+        "kk",
+        "thanks",
+        "thank you",
+        "thx",
+        "cool",
+        "great",
+        "nice",
+        "sure",
+        "yep",
+        "yes",
+        "no",
+        "continue",
+        "keep going",
+        "go on",
+    ];
+    if exact_matches.contains(&normalized.as_str()) {
+        return true;
+    }
+
+    let filler_words = [
+        "hi", "hello", "hey", "yo", "ok", "okay", "kk", "thanks", "thank", "you", "thx", "cool",
+        "great", "nice", "sure", "yep", "yes", "no", "continue", "keep", "going", "go", "on",
+        "please", "ping", "test",
+    ];
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    words.len() <= 3 && words.iter().all(|word| filler_words.contains(word))
+}
+
+fn build_memory_query_seed(prompt_text: &str, session_turns: &[SessionTurn]) -> String {
+    let mut parts = Vec::new();
+    for turn in session_turns.iter().rev().take(4).rev() {
+        let snippet = turn.content.trim();
+        if snippet.is_empty() {
+            continue;
+        }
+        let condensed = if snippet.len() > 240 {
+            format!("{}...", &snippet[..240])
+        } else {
+            snippet.to_string()
+        };
+        parts.push(format!("{}: {}", turn.role, condensed));
+    }
+    parts.push(format!("user: {}", prompt_text.trim()));
+    let joined = parts.join("\n");
+    if joined.len() > 1_200 {
+        joined[joined.len() - 1_200..].to_string()
+    } else {
+        joined
+    }
 }
 
 pub(crate) fn run_agent_with_prompt(
@@ -1025,6 +1275,7 @@ pub(crate) fn run_agent_with_prompt(
     if prompt_text.trim().is_empty() {
         return Err("agent prompt is empty".into());
     }
+    let prompt_setup_started = Instant::now();
 
     // One-time capsule size check at session start
     check_capsule_health(&mv2);
@@ -1057,13 +1308,22 @@ pub(crate) fn run_agent_with_prompt(
     )
     .ok_or("agent requires --model-hook or config.agent.model_hook or config.hooks.llm")?;
     let mut model_spec = base_model_spec.clone();
+    let session_turns = session
+        .as_ref()
+        .map(|sess_id| load_session_turns(sess_id, 20))
+        .unwrap_or_default();
+    let skip_trivial_prefetch = prompt_is_trivial_chat(&prompt_text);
+    let session_label = session.as_deref().unwrap_or("<none>");
 
     // Opus escalation: build a fallback HookSpec for when critic fires
     let opus_escalation_spec: Option<HookSpec> = {
         // Only useful if the base model isn't already Opus
         let base_cmd = match &base_model_spec.command {
             CommandSpec::String(s) => s.trim().to_ascii_lowercase(),
-            CommandSpec::Array(a) => a.first().map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default(),
+            CommandSpec::Array(a) => a
+                .first()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .unwrap_or_default(),
         };
         let is_already_opus = base_cmd == "builtin:claude" || base_cmd == "claude";
         if is_already_opus {
@@ -1116,114 +1376,126 @@ pub(crate) fn run_agent_with_prompt(
     let mut injected_skill_names: Vec<String> = Vec::new();
     let mut swarm_skill_matched = false;
     // --- SkillRL R1: Auto-inject top skills into stable prefix ---
-    if let Some(workspace) = resolve_workspace(None, &agent_cfg) {
-        let db_path = workspace.join("skills.sqlite");
-        if let Ok(conn) = open_skill_db(&db_path) {
-            // Bootstrap essential skills on first run
-            bootstrap_skills(&conn);
+    if !skip_trivial_prefetch {
+        if let Some(workspace) = resolve_workspace(None, &agent_cfg) {
+            let db_path = workspace.join("skills.sqlite");
+            if let Ok(conn) = open_skill_db(&db_path) {
+                // Bootstrap essential skills on first run
+                bootstrap_skills(&conn);
 
-            // Prune skills with <30% success rate after 5+ uses
-            let pruned = prune_low_performing_skills(&conn, 5, 0.3);
-            if pruned > 0 {
-                rebuild_fts5_index(&conn);
-            }
+                // Prune skills with <30% success rate after 5+ uses
+                let pruned = prune_low_performing_skills(&conn, 5, 0.3);
+                if pruned > 0 {
+                    rebuild_fts5_index(&conn);
+                }
 
-            // Match skills against session context (not just current message)
-            // so follow-up messages like "try again" still match earlier topics.
-            let match_context = if let Some(ref sess_id) = session {
-                let turns = load_session_turns(sess_id, 20);
-                let recent: String = turns.iter().rev().take(6)
-                    .map(|t| t.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("{} {}", recent, &prompt_text)
-            } else {
-                prompt_text.clone()
-            };
-            let matched = match_skills_for_prompt(&conn, &match_context, 5);
-            // Also get top general skills by success rate
-            let general = list_skills(&conn, 3);
+                // Match skills against session context (not just current message)
+                // so follow-up messages like "try again" still match earlier topics.
+                let match_context = if session.is_some() {
+                    let recent: String = session_turns
+                        .iter()
+                        .rev()
+                        .take(6)
+                        .map(|t| t.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("{} {}", recent, &prompt_text)
+                } else {
+                    prompt_text.clone()
+                };
+                let matched = match_skills_for_prompt(&conn, &match_context, 5);
+                // Also get top general skills by success rate
+                let general = list_skills(&conn, 3);
 
-            let mut seen: HashSet<String> = HashSet::new();
-            let mut skill_block = String::new();
-            let mut inline_count = 0usize;
-            // Inline full steps for top 3 matched skills; one-liner for the rest
-            for s in matched.iter().chain(general.iter()) {
-                if !seen.insert(s.name.clone()) { continue; }
-                let is_matched = matched.iter().any(|m| m.name == s.name);
-                if is_matched && inline_count < 3 && !s.steps.is_empty() {
-                    // Full inline expansion
-                    skill_block.push_str(&format!("### {}", s.name));
-                    if let Some(ref desc) = s.description {
-                        skill_block.push_str(&format!(" — {}", desc));
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut skill_block = String::new();
+                let mut inline_count = 0usize;
+                // Inline full steps for top 3 matched skills; one-liner for the rest
+                for s in matched.iter().chain(general.iter()) {
+                    if !seen.insert(s.name.clone()) {
+                        continue;
                     }
-                    if s.times_used > 0 {
-                        skill_block.push_str(&format!(" ({:.0}% success)", s.success_rate * 100.0));
-                    }
-                    skill_block.push('\n');
-                    if let Some(ref trigger) = s.trigger {
-                        skill_block.push_str(&format!("**When:** {}\n", trigger));
-                    }
-                    skill_block.push_str("**Steps:**\n");
-                    for (i, step) in s.steps.iter().enumerate() {
-                        skill_block.push_str(&format!("{}. {}\n", i + 1, step));
-                    }
-                    if !s.tools.is_empty() {
-                        skill_block.push_str(&format!("**Tools:** {}\n", s.tools.join(", ")));
-                    }
-                    if let Some(ref notes) = s.notes {
-                        if !notes.is_empty() {
-                            skill_block.push_str(&format!("**Notes:** {}\n", notes));
+                    let is_matched = matched.iter().any(|m| m.name == s.name);
+                    if is_matched && inline_count < 3 && !s.steps.is_empty() {
+                        // Full inline expansion
+                        skill_block.push_str(&format!("### {}", s.name));
+                        if let Some(ref desc) = s.description {
+                            skill_block.push_str(&format!(" — {}", desc));
                         }
+                        if s.times_used > 0 {
+                            skill_block
+                                .push_str(&format!(" ({:.0}% success)", s.success_rate * 100.0));
+                        }
+                        skill_block.push('\n');
+                        if let Some(ref trigger) = s.trigger {
+                            skill_block.push_str(&format!("**When:** {}\n", trigger));
+                        }
+                        skill_block.push_str("**Steps:**\n");
+                        for (i, step) in s.steps.iter().enumerate() {
+                            skill_block.push_str(&format!("{}. {}\n", i + 1, step));
+                        }
+                        if !s.tools.is_empty() {
+                            skill_block.push_str(&format!("**Tools:** {}\n", s.tools.join(", ")));
+                        }
+                        if let Some(ref notes) = s.notes {
+                            if !notes.is_empty() {
+                                skill_block.push_str(&format!("**Notes:** {}\n", notes));
+                            }
+                        }
+                        skill_block.push('\n');
+                        inline_count += 1;
+                    } else {
+                        // One-liner summary
+                        skill_block.push_str(&format!("- **{}**", s.name));
+                        if let Some(ref desc) = s.description {
+                            skill_block.push_str(&format!(": {}", desc));
+                        } else if let Some(ref trigger) = s.trigger {
+                            skill_block.push_str(&format!(" — {}", trigger));
+                        }
+                        if !s.contexts.is_empty() {
+                            skill_block.push_str(&format!(" [{}]", s.contexts.join(", ")));
+                        }
+                        if s.times_used > 0 {
+                            skill_block
+                                .push_str(&format!(" ({:.0}% success)", s.success_rate * 100.0));
+                        }
+                        skill_block.push('\n');
                     }
-                    skill_block.push('\n');
-                    inline_count += 1;
-                } else {
-                    // One-liner summary
-                    skill_block.push_str(&format!("- **{}**", s.name));
-                    if let Some(ref desc) = s.description {
-                        skill_block.push_str(&format!(": {}", desc));
-                    } else if let Some(ref trigger) = s.trigger {
-                        skill_block.push_str(&format!(" — {}", trigger));
-                    }
-                    if !s.contexts.is_empty() {
-                        skill_block.push_str(&format!(" [{}]", s.contexts.join(", ")));
-                    }
-                    if s.times_used > 0 {
-                        skill_block.push_str(&format!(" ({:.0}% success)", s.success_rate * 100.0));
-                    }
-                    skill_block.push('\n');
                 }
-            }
-            // Track auto-injected skills for SkillRL R4 end-of-session recording
-            for s in matched.iter().chain(general.iter()) {
-                if seen.contains(&s.name) {
-                    injected_skill_names.push(s.name.clone());
+                // Track auto-injected skills for SkillRL R4 end-of-session recording
+                for s in matched.iter().chain(general.iter()) {
+                    if seen.contains(&s.name) {
+                        injected_skill_names.push(s.name.clone());
+                    }
                 }
-            }
 
-            // Detect swarm-dev-task skill match for proactive orchestrator enforcement.
-            // COMPLEXITY GATE: Only activate orchestrator mode for genuinely complex
-            // multi-file tasks. Simple prompts (Q&A, single-file fixes, short requests)
-            // go through normal agent mode with full tool access.
-            if matched.iter().any(|s| s.name == "bootstrap:swarm-dev-task") {
-                if prompt_is_complex(&prompt_text) {
-                    swarm_skill_matched = true;
-                    eprintln!("[complexity-gate] PASS — prompt is complex, orchestrator mode will activate");
-                } else {
-                    eprintln!("[complexity-gate] BLOCKED — prompt too simple for orchestrator mode, using normal agent");
+                // Detect swarm-dev-task skill match for proactive orchestrator enforcement.
+                // COMPLEXITY GATE: Only activate orchestrator mode for genuinely complex
+                // multi-file tasks. Simple prompts (Q&A, single-file fixes, short requests)
+                // go through normal agent mode with full tool access.
+                if matched.iter().any(|s| s.name == "bootstrap:swarm-dev-task") {
+                    if prompt_is_complex(&prompt_text) {
+                        swarm_skill_matched = true;
+                        eprintln!(
+                            "[complexity-gate] PASS — prompt is complex, orchestrator mode will activate"
+                        );
+                    } else {
+                        eprintln!(
+                            "[complexity-gate] BLOCKED — prompt too simple for orchestrator mode, using normal agent"
+                        );
+                    }
                 }
-            }
 
-            if !skill_block.is_empty() {
-                system_prompt.push_str("\n\n# Available Procedures\n");
-                if inline_count > 0 {
-                    system_prompt.push_str("Follow the steps below directly when the procedure matches. For other procedures, call `skill_search` with its name to load full steps.\n\n");
-                } else {
-                    system_prompt.push_str("You have access to these proven procedures. To use one, call `skill_search` with its name to load the full steps.\n\n");
+                if !skill_block.is_empty() {
+                    system_prompt.push_str("\n\n# Available Procedures\n");
+                    if inline_count > 0 {
+                        system_prompt.push_str("Follow the steps below directly when the procedure matches. For other procedures, call `skill_search` with its name to load full steps.\n\n");
+                    } else {
+                        system_prompt.push_str("You have access to these proven procedures. To use one, call `skill_search` with its name to load the full steps.\n\n");
+                    }
+                    system_prompt.push_str(&skill_block);
+                    system_prompt.push_str("\nFor missing credentials: check env vars/config first, try browser dashboard, ask user only as last resort with exact URL and key name.\n");
                 }
-                system_prompt.push_str(&skill_block);
-                system_prompt.push_str("\nFor missing credentials: check env vars/config first, try browser dashboard, ask user only as last resort with exact URL and key name.\n");
             }
         }
     }
@@ -1237,7 +1509,9 @@ pub(crate) fn run_agent_with_prompt(
 
     // Resource-aware orchestration: inject compute delegation guide for long-running tasks
     let is_continuation = prompt_text.contains("[Continuation from previous session");
-    let long_run_mode = env_optional("AGENT_LONG_RUN").map(|v| v == "1").unwrap_or(false)
+    let long_run_mode = env_optional("AGENT_LONG_RUN")
+        .map(|v| v == "1")
+        .unwrap_or(false)
         || is_continuation;
     if long_run_mode {
         system_prompt.push_str(concat!(
@@ -1258,28 +1532,36 @@ pub(crate) fn run_agent_with_prompt(
 
     let mut context_pack = None;
     let effective_max_steps = agent_cfg.max_steps.unwrap_or(max_steps);
-    if !no_memory {
-        let query = context_query
-            .or(agent_cfg.context_query)
-            .unwrap_or_else(|| prompt_text.clone());
-            let qargs = QueryArgs {
-            raw_query: query,
-            collection: session.as_ref().map(|s| format!("agent-log/{s}")),
-            limit: agent_cfg.max_context_results.unwrap_or(context_results),
-            snippet_chars: 300,
-            no_expand: false,
-            max_expansions: 2,
+    let explicit_context_query = context_query.clone().or(agent_cfg.context_query.clone());
+    let auto_memory_prefetch = env_optional("AETHERVAULT_AUTO_MEMORY_PREFETCH")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let should_load_memory_context = !no_memory
+        && (explicit_context_query.is_some() || (auto_memory_prefetch && !skip_trivial_prefetch));
+    if should_load_memory_context {
+        let memory_context_started = Instant::now();
+        let qargs = QueryArgs {
+            raw_query: explicit_context_query
+                .unwrap_or_else(|| build_memory_query_seed(&prompt_text, &session_turns)),
+            collection: Some("memory".to_string()),
+            limit: agent_cfg
+                .max_context_results
+                .unwrap_or(context_results)
+                .clamp(1, 6),
+            snippet_chars: 220,
+            no_expand: true,
+            max_expansions: 1,
             expand_hook: None,
-            expand_hook_timeout_ms: u64::MAX,
-            no_vector: false,
-            rerank: "local".to_string(),
+            expand_hook_timeout_ms: 1_500,
+            no_vector: true,
+            rerank: "none".to_string(),
             rerank_hook: None,
-            rerank_hook_timeout_ms: u64::MAX,
+            rerank_hook_timeout_ms: 2_000,
             rerank_hook_full_text: false,
             embed_model: None,
             embed_cache: 4096,
             embed_no_cache: false,
-            rerank_docs: 40,
+            rerank_docs: 0,
             rerank_chunk_chars: 1200,
             rerank_chunk_overlap: 200,
             plan: false,
@@ -1287,51 +1569,105 @@ pub(crate) fn run_agent_with_prompt(
             before: None,
             after: None,
             feedback_weight: 0.15,
+            fusion_mode: crate::FusionMode::Rrf,
+            bayesian_bm25_weight: 0.5,
+            bayesian_vec_weight: 0.5,
         };
-        if let Ok(pack) = build_context_pack(
+        match build_context_pack(
             &db,
             qargs,
-            agent_cfg.max_context_bytes.unwrap_or(context_max_bytes),
+            agent_cfg
+                .max_context_bytes
+                .unwrap_or(context_max_bytes)
+                .min(6_000),
             false,
         ) {
-            if !pack.context.trim().is_empty() {
+            Ok(pack) if !pack.context.trim().is_empty() => {
+                eprintln!(
+                    "[latency] memory-context session={} citations={} bytes={} elapsed_ms={}",
+                    session_label,
+                    pack.citations.len(),
+                    pack.context.len(),
+                    memory_context_started.elapsed().as_millis()
+                );
                 system_dynamic.push_str("\n\n# Memory Context\n");
                 system_dynamic.push_str(&pack.context);
                 context_pack = Some(pack);
             }
+            Ok(_) => {
+                eprintln!(
+                    "[latency] memory-context session={} citations=0 bytes=0 elapsed_ms={}",
+                    session_label,
+                    memory_context_started.elapsed().as_millis()
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "[latency] memory-context session={} status=error elapsed_ms={} error={}",
+                    session_label,
+                    memory_context_started.elapsed().as_millis(),
+                    err
+                );
+            }
         }
+    } else if !no_memory {
+        let reason = if explicit_context_query.is_none() && !auto_memory_prefetch {
+            "auto-prefetch-disabled"
+        } else {
+            "trivial-prompt"
+        };
+        eprintln!(
+            "[latency] memory-context session={} skipped={}",
+            session_label, reason
+        );
     }
     // Knowledge Graph entity auto-injection
-    let kg_path = agent_workspace.as_ref()
+    let kg_path = agent_workspace
+        .as_ref()
         .map(|ws| ws.join("data/knowledge-graph.json"))
         .unwrap_or_else(|| PathBuf::from("/root/.aethervault/data/knowledge-graph.json"));
-    if kg_path.exists() {
+    if !skip_trivial_prefetch && kg_path.exists() {
         if let Some(kg) = load_kg_graph(&kg_path) {
             let matched = find_kg_entities(&prompt_text, &kg);
             if !matched.is_empty() {
                 let kg_context = build_kg_context(&matched, &kg);
                 if !kg_context.trim().is_empty() {
                     system_dynamic.push_str("\n\n# Knowledge Graph Context\n");
-                    system_dynamic.push_str("(Automatically matched entities from the knowledge graph)\n\n");
+                    system_dynamic
+                        .push_str("(Automatically matched entities from the knowledge graph)\n\n");
                     system_dynamic.push_str(&kg_context);
                 }
             }
         }
     }
+    eprintln!(
+        "[latency] prompt-assembly session={} trivial_prefetch={} auto_memory_prefetch={} session_turns={} elapsed_ms={}",
+        session_label,
+        skip_trivial_prefetch,
+        auto_memory_prefetch,
+        session_turns.len(),
+        prompt_setup_started.elapsed().as_millis()
+    );
 
     // Inject tool capability inventory so the agent knows what it can do
     {
         let all_tools = tool_definitions_json();
         let active_names = base_tool_names();
-        let discoverable: Vec<String> = all_tools.iter()
-            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+        let discoverable: Vec<String> = all_tools
+            .iter()
+            .filter_map(|t| {
+                t.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
             .filter(|n| !active_names.contains(n))
             .collect();
         let mut cap = String::from("\n\n# Available Tools\n");
         let mut sorted_active: Vec<String> = active_names.iter().cloned().collect();
         sorted_active.sort();
         for name in &sorted_active {
-            let desc = all_tools.iter()
+            let desc = all_tools
+                .iter()
                 .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
                 .and_then(|t| t.get("description").and_then(|d| d.as_str()))
                 .unwrap_or("");
@@ -1371,9 +1707,9 @@ pub(crate) fn run_agent_with_prompt(
     }
 
     // Insert session history as proper user/assistant messages (not in system prompt)
-    if let Some(ref sess_id) = session {
-        let session_turns = load_session_turns(sess_id, 10);
-        for turn in &session_turns {
+    if session.is_some() {
+        let keep_from = session_turns.len().saturating_sub(10);
+        for turn in &session_turns[keep_from..] {
             messages.push(AgentMessage {
                 role: turn.role.clone(),
                 content: Some(if turn.content.len() > 2000 {
@@ -1449,7 +1785,11 @@ pub(crate) fn run_agent_with_prompt(
                 .map(|name| allowed.contains(name))
                 .unwrap_or(false)
         });
-        eprintln!("[harness] tool_filter active: {} tools allowed (of {} in filter)", full_catalog.len(), allowed.len());
+        eprintln!(
+            "[harness] tool_filter active: {} tools allowed (of {} in filter)",
+            full_catalog.len(),
+            allowed.len()
+        );
     }
 
     let tool_map = tool_catalog_map(&full_catalog);
@@ -1470,11 +1810,16 @@ pub(crate) fn run_agent_with_prompt(
     // (not a subagent), strip exec/fs_write BEFORE the first LLM call.
     // This makes it structurally impossible for the orchestrator to code directly —
     // it MUST delegate to swarm-coder agents.
-    let is_subagent_early = session.as_deref().map(|s| s.starts_with("subagent:")).unwrap_or(false);
+    let is_subagent_early = session
+        .as_deref()
+        .map(|s| s.starts_with("subagent:"))
+        .unwrap_or(false);
     if swarm_skill_matched && !is_subagent_early && tool_filter.is_none() {
         active_tools.remove("exec");
         active_tools.remove("fs_write");
-        eprintln!("[harness] PROACTIVE ORCHESTRATOR: swarm-dev-task skill matched — exec/fs_write stripped before first response");
+        eprintln!(
+            "[harness] PROACTIVE ORCHESTRATOR: swarm-dev-task skill matched — exec/fs_write stripped before first response"
+        );
         // Inject explicit notice so the model never attempts exec/fs_write at step 0.
         // Without this, models hallucinate tool calls for tools not in their tool list.
         messages.push(AgentMessage {
@@ -1495,7 +1840,8 @@ pub(crate) fn run_agent_with_prompt(
     // Agent logs go to date-based JSONL files in workspace/logs/agent-YYYY-MM-DD.jsonl.
     // This avoids Tantivy index bloat and naturally partitions logs by day.
     // Resolve workspace from env var (already computed earlier) or agent config.
-    let log_dir = workspace_env.as_ref()
+    let log_dir = workspace_env
+        .as_ref()
         .cloned()
         .or_else(|| agent_cfg.workspace.as_ref().map(PathBuf::from))
         .map(|ws| log_dir_path(&ws))
@@ -1533,15 +1879,24 @@ pub(crate) fn run_agent_with_prompt(
             // Carry forward learned failures (cap at 20, FIFO)
             drift_state.learned_failures = persisted.learned_failures;
             if drift_state.learned_failures.len() > 20 {
-                drift_state.learned_failures = drift_state.learned_failures
+                drift_state.learned_failures = drift_state
+                    .learned_failures
                     .split_off(drift_state.learned_failures.len() - 20);
             }
             if !drift_state.learned_failures.is_empty() {
-                eprintln!("[drift] loaded {} learned failures from previous sessions",
-                    drift_state.learned_failures.len());
+                eprintln!(
+                    "[drift] loaded {} learned failures from previous sessions",
+                    drift_state.learned_failures.len()
+                );
             }
-            let prev_count = persisted.violations.get("critic_correction").copied().unwrap_or(0);
-            eprintln!("[drift] loaded {prev_count} persisted violations (reset to 0 for new session)");
+            let prev_count = persisted
+                .violations
+                .get("critic_correction")
+                .copied()
+                .unwrap_or(0);
+            eprintln!(
+                "[drift] loaded {prev_count} persisted violations (reset to 0 for new session)"
+            );
         }
     }
     let mut recent_actions: VecDeque<String> = VecDeque::with_capacity(30);
@@ -1565,47 +1920,58 @@ pub(crate) fn run_agent_with_prompt(
         .unwrap_or(8);
 
     // Extract background task registry from progress (if running via bridge)
-    let bg_registry_ref: Option<(i64, Arc<Mutex<BackgroundTaskRegistry>>)> = progress.as_ref().and_then(|p| {
-        let guard = p.lock().ok()?;
-        Some((guard.chat_id?, guard.bg_registry.clone()?))
-    });
+    let bg_registry_ref: Option<(i64, Arc<Mutex<BackgroundTaskRegistry>>)> =
+        progress.as_ref().and_then(|p| {
+            let guard = p.lock().ok()?;
+            Some((guard.chat_id?, guard.bg_registry.clone()?))
+        });
 
     // Extract session registry from progress (if running via bridge)
-    let session_registry_ref: Option<Arc<Mutex<SessionRegistry>>> = progress.as_ref().and_then(|p| {
-        p.lock().ok().and_then(|g| g.session_registry.clone())
-    });
+    let session_registry_ref: Option<Arc<Mutex<SessionRegistry>>> = progress
+        .as_ref()
+        .and_then(|p| p.lock().ok().and_then(|g| g.session_registry.clone()));
 
     // --- Orchestrator Mode ---
     // When the main agent (not a subagent) has active swarm tasks, enter orchestrator mode:
     // strip exec and fs_write so the orchestrator can only plan, delegate, and verify.
     // This enforces the OpenClaw pattern: orchestrator writes prompts, not code.
-    let is_subagent = session.as_deref().map(|s| s.starts_with("subagent:")).unwrap_or(false);
+    let is_subagent = session
+        .as_deref()
+        .map(|s| s.starts_with("subagent:"))
+        .unwrap_or(false);
     let mut orchestrator_mode = swarm_skill_matched && !is_subagent_early && tool_filter.is_none();
     if orchestrator_mode {
-        eprintln!("[harness] ORCHESTRATOR MODE (proactive): swarm-dev-task skill matched, tools already stripped");
+        eprintln!(
+            "[harness] ORCHESTRATOR MODE (proactive): swarm-dev-task skill matched, tools already stripped"
+        );
     }
-        if !is_subagent && tool_filter.is_none() {
-            if let Some(ref ws) = workspace_env {
-                if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
-                    let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(100));
-                    let queued = crate::swarm::swarm_list_tasks(&sdb, Some("queued"), Some(100));
-                    let pr_open = crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(100));
-                    let reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(100));
-                    let active_count = running.len() + queued.len() + pr_open.len() + reviewing.len();
-                    if active_count > 0 {
-                        orchestrator_mode = true;
-                        // Strip direct coding tools — orchestrator delegates, doesn't code
-                        active_tools.remove("exec");
-                        active_tools.remove("fs_write");
-                        tools = tools_from_active(&tool_map, &active_tools);
-                        eprintln!("[harness] ORCHESTRATOR MODE: {} active swarm tasks, exec/fs_write stripped", active_count);
-                        // Inject orchestrator mode notification
-                        let task_summary: Vec<String> = running.iter().chain(queued.iter())
-                            .chain(pr_open.iter())
-                            .chain(reviewing.iter())
-                            .map(|t| format!("  - {} ({}): {}", t.id, t.status.as_str(), t.name))
-                            .collect();
-                        messages.push(AgentMessage {
+    if !is_subagent && tool_filter.is_none() {
+        if let Some(ref ws) = workspace_env {
+            if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
+                let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(100));
+                let queued = crate::swarm::swarm_list_tasks(&sdb, Some("queued"), Some(100));
+                let pr_open = crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(100));
+                let reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(100));
+                let active_count = running.len() + queued.len() + pr_open.len() + reviewing.len();
+                if active_count > 0 {
+                    orchestrator_mode = true;
+                    // Strip direct coding tools — orchestrator delegates, doesn't code
+                    active_tools.remove("exec");
+                    active_tools.remove("fs_write");
+                    tools = tools_from_active(&tool_map, &active_tools);
+                    eprintln!(
+                        "[harness] ORCHESTRATOR MODE: {} active swarm tasks, exec/fs_write stripped",
+                        active_count
+                    );
+                    // Inject orchestrator mode notification
+                    let task_summary: Vec<String> = running
+                        .iter()
+                        .chain(queued.iter())
+                        .chain(pr_open.iter())
+                        .chain(reviewing.iter())
+                        .map(|t| format!("  - {} ({}): {}", t.id, t.status.as_str(), t.name))
+                        .collect();
+                    messages.push(AgentMessage {
                         role: "user".to_string(),
                         content: Some(format!(
                             "[Orchestrator] {} agents active. exec/fs_write disabled. Delegate, monitor, verify.\nTasks:\n{}",
@@ -1639,14 +2005,17 @@ pub(crate) fn run_agent_with_prompt(
     let mut orchestrator_blocked_count: usize = 0;
     // Circuit breaker: track tool+args failure counts. After 3 identical failures,
     // block the call and force the agent to try a different approach.
-    let mut tool_failure_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut tool_failure_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     // Failed attempts scratchpad: track what was tried and why it failed.
     // Injected periodically so the agent doesn't repeat the same mistakes.
     let mut failed_attempts: Vec<String> = Vec::new();
 
     // Inject learned failures from previous sessions as context
     if !drift_state.learned_failures.is_empty() {
-        let lessons: Vec<String> = drift_state.learned_failures.iter()
+        let lessons: Vec<String> = drift_state
+            .learned_failures
+            .iter()
             .map(|lf| format!("- {}: {} → {}", lf.tool, lf.pattern, lf.lesson))
             .collect();
         messages.push(AgentMessage {
@@ -1657,7 +2026,10 @@ pub(crate) fn run_agent_with_prompt(
                 lessons.join("\n")
             )),
             tool_calls: Vec::new(),
-            name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+            name: None,
+            tool_call_id: None,
+            is_error: None,
+            thinking_blocks: vec![],
         });
     }
 
@@ -1698,10 +2070,14 @@ pub(crate) fn run_agent_with_prompt(
                     content: Some(
                         "[SYSTEM: SESSION TIMEOUT] You have exceeded the maximum session time. \
                          Provide your best answer NOW with whatever information you have. \
-                         Do NOT make any more tool calls. Respond directly.".to_string()
+                         Do NOT make any more tool calls. Respond directly."
+                            .to_string(),
                     ),
                     tool_calls: Vec::new(),
-                    name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                    name: None,
+                    tool_call_id: None,
+                    is_error: None,
+                    thinking_blocks: vec![],
                 });
                 // Give the LLM one more turn to respond, then the step limit will end it
                 current_max_steps = step + 2;
@@ -1717,7 +2093,10 @@ pub(crate) fn run_agent_with_prompt(
                 if !steering.is_empty() {
                     let combined = steering.join("\n\n");
                     drop(p);
-                    eprintln!("[harness] injecting {} steering message(s) from user", steering.len());
+                    eprintln!(
+                        "[harness] injecting {} steering message(s) from user",
+                        steering.len()
+                    );
                     messages.push(AgentMessage {
                         role: "user".to_string(),
                         content: Some(combined),
@@ -1739,11 +2118,15 @@ pub(crate) fn run_agent_with_prompt(
             if let Some(ref ws) = workspace_env {
                 if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
                     let check_result = crate::swarm::swarm_check_open_tasks(&sdb);
-                    if !check_result.contains("No open PR tasks") && !check_result.contains("no status changes") {
+                    if !check_result.contains("No open PR tasks")
+                        && !check_result.contains("no status changes")
+                    {
                         eprintln!("[swarm-monitor] {}", check_result);
                         messages.push(AgentMessage {
                             role: "user".to_string(),
-                            content: Some(format!("[SWARM MONITOR — automatic, deterministic check]\n{check_result}")),
+                            content: Some(format!(
+                                "[SWARM MONITOR — automatic, deterministic check]\n{check_result}"
+                            )),
                             tool_calls: Vec::new(),
                             name: None,
                             tool_call_id: None,
@@ -1755,23 +2138,29 @@ pub(crate) fn run_agent_with_prompt(
                     let failed = crate::swarm::swarm_list_tasks(&sdb, Some("failed"), Some(50));
                     for task in &failed {
                         if task.retry_count < task.max_retries {
-                            let error_ctx = task.error_context.as_deref().unwrap_or("unknown error");
-                            let failure_kind = classify_failure("swarm_task", error_ctx, &serde_json::json!({}));
+                            let error_ctx =
+                                task.error_context.as_deref().unwrap_or("unknown error");
+                            let failure_kind =
+                                classify_failure("swarm_task", error_ctx, &serde_json::json!({}));
                             let strategy = match failure_kind {
-                                FailureKind::Transient =>
+                                FailureKind::Transient => {
                                     "STRATEGY: Transient error (timeout/rate-limit). Retry with same approach but add \
-                                     error handling or timeout extension in the prompt.",
-                                FailureKind::Permanent =>
+                                     error handling or timeout extension in the prompt."
+                                }
+                                FailureKind::Permanent => {
                                     "STRATEGY: Permanent error (auth/permission/not-found). Do NOT retry the same approach. \
                                      Investigate root cause first, then try a fundamentally different method. \
-                                     If the task is impossible, mark it done with an explanation.",
-                                FailureKind::ApiMisuse =>
+                                     If the task is impossible, mark it done with an explanation."
+                                }
+                                FailureKind::ApiMisuse => {
                                     "STRATEGY: API misuse (wrong request shape/schema). The request payload doesn't match the API spec. \
                                      Rewrite the prompt to include the EXACT API schema. Tell the agent to read the API docs first, \
-                                     then construct the request. Include the validation error so the agent knows what field is wrong.",
-                                FailureKind::Semantic =>
+                                     then construct the request. Include the validation error so the agent knows what field is wrong."
+                                }
+                                FailureKind::Semantic => {
                                     "STRATEGY: Logic/parsing error. Rewrite the prompt with more specific instructions. \
-                                     Include the exact error so the new agent avoids the same mistake.",
+                                     Include the exact error so the new agent avoids the same mistake."
+                                }
                             };
                             let retry_prompt = format!(
                                 "[SWARM MONITOR — RETRY NEEDED]\n\
@@ -1779,8 +2168,13 @@ pub(crate) fn run_agent_with_prompt(
                                  Error: {}\n\n\
                                  {}\n\n\
                                  Original prompt (first 500 chars): {}",
-                                task.name, task.id, task.retry_count + 1, task.max_retries,
-                                failure_kind, error_ctx, strategy,
+                                task.name,
+                                task.id,
+                                task.retry_count + 1,
+                                task.max_retries,
+                                failure_kind,
+                                error_ctx,
+                                strategy,
                                 task.prompt.chars().take(500).collect::<String>()
                             );
                             messages.push(AgentMessage {
@@ -1792,13 +2186,19 @@ pub(crate) fn run_agent_with_prompt(
                                 is_error: None,
                                 thinking_blocks: vec![],
                             });
-                            eprintln!("[swarm-monitor] injected retry for task {} (failure: {:?})", task.id, failure_kind);
+                            eprintln!(
+                                "[swarm-monitor] injected retry for task {} (failure: {:?})",
+                                task.id, failure_kind
+                            );
                         }
                     }
                     // Check for CI-passing tasks that need cross-model review
-                    let reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(50));
+                    let reviewing =
+                        crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(50));
                     for task in &reviewing {
-                        if task.review_status.as_deref() == Some("pending") || task.review_status.is_none() {
+                        if task.review_status.as_deref() == Some("pending")
+                            || task.review_status.is_none()
+                        {
                             if let Some(pr_num) = task.pr_number {
                                 let backend = task.agent_backend.as_deref().unwrap_or("unknown");
                                 let reviewer = if backend.contains("codex") {
@@ -1820,7 +2220,10 @@ pub(crate) fn run_agent_with_prompt(
                                     is_error: None,
                                     thinking_blocks: vec![],
                                 });
-                                eprintln!("[swarm-monitor] injected review dispatch for task {} (PR #{})", task.id, pr_num);
+                                eprintln!(
+                                    "[swarm-monitor] injected review dispatch for task {} (PR #{})",
+                                    task.id, pr_num
+                                );
                             }
                         }
                     }
@@ -1831,29 +2234,56 @@ pub(crate) fn run_agent_with_prompt(
                     if orchestrator_mode {
                         // Auto-fail stale "running" tasks (>2 hours with no update)
                         {
-                            let stale_running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(100));
+                            let stale_running =
+                                crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(100));
                             let now_utc = chrono::Utc::now();
                             for task in &stale_running {
-                                if let Ok(updated) = chrono::NaiveDateTime::parse_from_str(&task.updated_at, "%Y-%m-%dT%H:%M:%S%.fZ")
-                                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(&task.updated_at, "%Y-%m-%dT%H:%M:%SZ"))
-                                {
+                                if let Ok(updated) = chrono::NaiveDateTime::parse_from_str(
+                                    &task.updated_at,
+                                    "%Y-%m-%dT%H:%M:%S%.fZ",
+                                )
+                                .or_else(|_| {
+                                    chrono::NaiveDateTime::parse_from_str(
+                                        &task.updated_at,
+                                        "%Y-%m-%dT%H:%M:%SZ",
+                                    )
+                                }) {
                                     let age = now_utc.naive_utc() - updated;
                                     if age > chrono::Duration::hours(2) {
-                                        eprintln!("[harness] Auto-failing stale swarm task {} (running for {}h)", task.id, age.num_hours());
+                                        eprintln!(
+                                            "[harness] Auto-failing stale swarm task {} (running for {}h)",
+                                            task.id,
+                                            age.num_hours()
+                                        );
                                         let _ = crate::swarm::swarm_update_task(
-                                            &sdb, &task.id, Some("failed"),
-                                            None, None, None, None, None, None,
-                                            Some("auto-failed: stale, no update for 2+ hours"), None, None,
+                                            &sdb,
+                                            &task.id,
+                                            Some("failed"),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            Some("auto-failed: stale, no update for 2+ hours"),
+                                            None,
+                                            None,
                                         );
                                     }
                                 }
                             }
                         }
-                        let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(1));
+                        let running =
+                            crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(1));
                         let queued = crate::swarm::swarm_list_tasks(&sdb, Some("queued"), Some(1));
-                        let pr_open = crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(1));
-                        let reviewing = crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(1));
-                        let no_active = running.is_empty() && queued.is_empty() && pr_open.is_empty() && reviewing.is_empty();
+                        let pr_open =
+                            crate::swarm::swarm_list_tasks(&sdb, Some("pr_open"), Some(1));
+                        let reviewing =
+                            crate::swarm::swarm_list_tasks(&sdb, Some("reviewing"), Some(1));
+                        let no_active = running.is_empty()
+                            && queued.is_empty()
+                            && pr_open.is_empty()
+                            && reviewing.is_empty();
                         // Restore tools when no active tasks remain (including after stale auto-fail).
                         let can_restore = no_active;
                         if can_restore {
@@ -1865,7 +2295,9 @@ pub(crate) fn run_agent_with_prompt(
                                 }
                             }
                             tools = tools_from_active(&tool_map, &active_tools);
-                            eprintln!("[harness] ORCHESTRATOR MODE OFF: all swarm tasks complete, full tools restored");
+                            eprintln!(
+                                "[harness] ORCHESTRATOR MODE OFF: all swarm tasks complete, full tools restored"
+                            );
                             messages.push(AgentMessage {
                                 role: "user".to_string(),
                                 content: Some("[System] All swarm tasks complete. Full tool access restored. You can now verify results directly with exec, curl, docker logs, etc.".to_string()),
@@ -1894,7 +2326,9 @@ pub(crate) fn run_agent_with_prompt(
         let compact_at = compaction_budget_tokens();
         let compact_keep = keep_recent_turns().max(2);
         if token_estimate > compact_at {
-            eprintln!("[harness] context at ~{token_estimate} tokens (budget {compact_at}), compacting...");
+            eprintln!(
+                "[harness] context at ~{token_estimate} tokens (budget {compact_at}), compacting..."
+            );
             match compact_messages(&mut messages, &model_spec, compact_keep) {
                 Ok(Some(goal)) => {
                     current_plan = Some(goal);
@@ -1920,12 +2354,14 @@ pub(crate) fn run_agent_with_prompt(
             tools: tools.clone(),
             session: session.clone(),
         };
+        let hook_started = Instant::now();
 
         // Try streaming first when a progress handle is available (Telegram bridge).
         // This enables live thinking/response display. Falls back to blocking on any error.
-        let message = if let Some(prog) = progress.as_ref() {
+        let message = if progress.is_some() {
             match call_agent_hook_streaming(&model_spec, &request) {
                 Ok(rx) => {
+                    let prog = progress.as_ref().unwrap();
                     // Set phase to Thinking before consuming
                     if let Ok(mut p) = prog.lock() {
                         p.stream_phase = StreamPhase::Thinking;
@@ -1943,6 +2379,12 @@ pub(crate) fn run_agent_with_prompt(
                                 p.stream_response = None;
                                 p.stream_message_id = None;
                             }
+                            eprintln!(
+                                "[latency] model-hook session={} step={} mode=streaming elapsed_ms={}",
+                                session_label,
+                                step,
+                                hook_started.elapsed().as_millis()
+                            );
                             msg
                         }
                         Err(e) => {
@@ -1955,9 +2397,24 @@ pub(crate) fn run_agent_with_prompt(
                             }
                             // Fall back to blocking call
                             match call_agent_hook(&model_spec, &request) {
-                                Ok(msg) => { consecutive_hook_failures = 0; msg }
+                                Ok(msg) => {
+                                    consecutive_hook_failures = 0;
+                                    eprintln!(
+                                        "[latency] model-hook session={} step={} mode=blocking-fallback elapsed_ms={}",
+                                        session_label,
+                                        step,
+                                        hook_started.elapsed().as_millis()
+                                    );
+                                    msg
+                                }
                                 Err(e2) => {
                                     consecutive_hook_failures += 1;
+                                    eprintln!(
+                                        "[latency] model-hook session={} step={} mode=blocking-fallback status=error elapsed_ms={}",
+                                        session_label,
+                                        step,
+                                        hook_started.elapsed().as_millis()
+                                    );
                                     eprintln!(
                                         "[harness] hook failed ({consecutive_hook_failures}/{MAX_CONSECUTIVE_HOOK_FAILURES}): {e2}"
                                     );
@@ -1970,8 +2427,14 @@ pub(crate) fn run_agent_with_prompt(
                                     }
                                     AgentMessage {
                                         role: "assistant".to_string(),
-                                        content: Some(format!("(Model hook error on attempt {consecutive_hook_failures}: {e2}. Will retry on next step.)")),
-                                        tool_calls: Vec::new(), name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                                        content: Some(format!(
+                                            "(Model hook error on attempt {consecutive_hook_failures}: {e2}. Will retry on next step.)"
+                                        )),
+                                        tool_calls: Vec::new(),
+                                        name: None,
+                                        tool_call_id: None,
+                                        is_error: None,
+                                        thinking_blocks: vec![],
                                     }
                                 }
                             }
@@ -1981,9 +2444,24 @@ pub(crate) fn run_agent_with_prompt(
                 Err(_) => {
                     // Non-claude hook or streaming not supported — use blocking path
                     match call_agent_hook(&model_spec, &request) {
-                        Ok(msg) => { consecutive_hook_failures = 0; msg }
+                        Ok(msg) => {
+                            consecutive_hook_failures = 0;
+                            eprintln!(
+                                "[latency] model-hook session={} step={} mode=blocking elapsed_ms={}",
+                                session_label,
+                                step,
+                                hook_started.elapsed().as_millis()
+                            );
+                            msg
+                        }
                         Err(e) => {
                             consecutive_hook_failures += 1;
+                            eprintln!(
+                                "[latency] model-hook session={} step={} mode=blocking status=error elapsed_ms={}",
+                                session_label,
+                                step,
+                                hook_started.elapsed().as_millis()
+                            );
                             eprintln!(
                                 "[harness] hook failed ({consecutive_hook_failures}/{MAX_CONSECUTIVE_HOOK_FAILURES}): {e}"
                             );
@@ -1996,8 +2474,14 @@ pub(crate) fn run_agent_with_prompt(
                             }
                             AgentMessage {
                                 role: "assistant".to_string(),
-                                content: Some(format!("(Model hook error on attempt {consecutive_hook_failures}: {e}. Will retry on next step.)")),
-                                tool_calls: Vec::new(), name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
+                                content: Some(format!(
+                                    "(Model hook error on attempt {consecutive_hook_failures}: {e}. Will retry on next step.)"
+                                )),
+                                tool_calls: Vec::new(),
+                                name: None,
+                                tool_call_id: None,
+                                is_error: None,
+                                thinking_blocks: vec![],
                             }
                         }
                     }
@@ -2008,10 +2492,22 @@ pub(crate) fn run_agent_with_prompt(
             match call_agent_hook(&model_spec, &request) {
                 Ok(msg) => {
                     consecutive_hook_failures = 0;
+                    eprintln!(
+                        "[latency] model-hook session={} step={} mode=blocking elapsed_ms={}",
+                        session_label,
+                        step,
+                        hook_started.elapsed().as_millis()
+                    );
                     msg
                 }
                 Err(e) => {
                     consecutive_hook_failures += 1;
+                    eprintln!(
+                        "[latency] model-hook session={} step={} mode=blocking status=error elapsed_ms={}",
+                        session_label,
+                        step,
+                        hook_started.elapsed().as_millis()
+                    );
                     eprintln!(
                         "[harness] hook failed ({consecutive_hook_failures}/{MAX_CONSECUTIVE_HOOK_FAILURES}): {e}"
                     );
@@ -2044,7 +2540,9 @@ pub(crate) fn run_agent_with_prompt(
         if !message.thinking_blocks.is_empty() {
             if let Some(ref prog) = progress {
                 if let Ok(mut p) = prog.lock() {
-                    let thinking_text: String = message.thinking_blocks.iter()
+                    let thinking_text: String = message
+                        .thinking_blocks
+                        .iter()
                         .filter_map(|tb| tb.get("thinking").and_then(|t| t.as_str()))
                         .collect::<Vec<_>>()
                         .join(" ");
@@ -2052,7 +2550,10 @@ pub(crate) fn run_agent_with_prompt(
                         // Take the LAST 100 chars of thinking (most recent reasoning)
                         let chars: Vec<char> = thinking_text.chars().collect();
                         let snippet = if chars.len() > 100 {
-                            format!("...{}", chars[chars.len()-97..].iter().collect::<String>())
+                            format!(
+                                "...{}",
+                                chars[chars.len() - 97..].iter().collect::<String>()
+                            )
                         } else {
                             thinking_text
                         };
@@ -2093,14 +2594,17 @@ pub(crate) fn run_agent_with_prompt(
             // Observational memory: extract durable facts every N turns
             if turns_since_fact_extract >= fact_extract_interval && !no_memory {
                 turns_since_fact_extract = 0;
-                let snapshot: String = messages.iter()
+                let snapshot: String = messages
+                    .iter()
                     .filter(|m| m.role == "user" || m.role == "assistant")
                     .rev()
                     .take(8)
-                    .filter_map(|m| m.content.as_ref().map(|c| {
-                        let preview: String = c.chars().take(300).collect();
-                        format!("[{}] {}", m.role, preview)
-                    }))
+                    .filter_map(|m| {
+                        m.content.as_ref().map(|c| {
+                            let preview: String = c.chars().take(300).collect();
+                            format!("[{}] {}", m.role, preview)
+                        })
+                    })
                     .collect::<Vec<_>>()
                     .into_iter()
                     .rev()
@@ -2137,18 +2641,23 @@ pub(crate) fn run_agent_with_prompt(
                         if let Ok(response) = call_claude(&extract_request) {
                             if let Some(facts) = response.message.content {
                                 if !facts.trim().is_empty() && observation_is_useful(&facts) {
-                                // Dedup guard: skip if we already wrote identical observation this session
-                                let hash = blake3::hash(facts.as_bytes()).to_hex().to_string();
-                                {
-                                    let mut seen = OBSERVATION_DEDUP.lock().unwrap_or_else(|e| e.into_inner());
-                                    if seen.len() >= OBSERVATION_DEDUP_CAP {
-                                        seen.clear();
+                                    // Dedup guard: skip if we already wrote identical observation this session
+                                    let hash = blake3::hash(facts.as_bytes()).to_hex().to_string();
+                                    {
+                                        let mut seen = OBSERVATION_DEDUP
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        if seen.len() >= OBSERVATION_DEDUP_CAP {
+                                            seen.clear();
+                                        }
+                                        if !seen.insert(hash) {
+                                            eprintln!(
+                                                "[observation-dedup] skipped duplicate: {}...",
+                                                &facts.chars().take(60).collect::<String>()
+                                            );
+                                            return;
+                                        }
                                     }
-                                    if !seen.insert(hash) {
-                                        eprintln!("[observation-dedup] skipped duplicate: {}...", &facts.chars().take(60).collect::<String>());
-                                        return;
-                                    }
-                                }
                                     let uri = format!(
                                         "aethervault://memory/observation/{}",
                                         Utc::now().timestamp()
@@ -2159,17 +2668,27 @@ pub(crate) fn run_agent_with_prompt(
                                         opts.kind = Some("text/markdown".to_string());
                                         opts.track = Some("aethervault.observation".to_string());
                                         opts.search_text = Some(facts.clone());
-                                        match put_with_consolidation(&obs_db, facts.as_bytes(), opts) {
+                                        match put_with_consolidation(
+                                            &obs_db,
+                                            facts.as_bytes(),
+                                            opts,
+                                        ) {
                                             Ok(result) => {
                                                 let decision_str = format!("{:?}", result.decision);
                                                 if result.frame_id.is_none() {
-                                                    eprintln!("[observation-consolidation] NOOP: {decision_str}");
+                                                    eprintln!(
+                                                        "[observation-consolidation] NOOP: {decision_str}"
+                                                    );
                                                 } else {
-                                                    eprintln!("[observation-consolidation] {decision_str}");
+                                                    eprintln!(
+                                                        "[observation-consolidation] {decision_str}"
+                                                    );
                                                 }
                                             }
                                             Err(e) => {
-                                                eprintln!("[observation] consolidation failed: {e}");
+                                                eprintln!(
+                                                    "[observation] consolidation failed: {e}"
+                                                );
                                             }
                                         }
                                         if let Err(e) = obs_db.commit() {
@@ -2177,7 +2696,10 @@ pub(crate) fn run_agent_with_prompt(
                                         }
                                     }
                                 } else if !facts.trim().is_empty() {
-                                    eprintln!("[observation-gate] skipped: {}...", &facts.chars().take(60).collect::<String>());
+                                    eprintln!(
+                                        "[observation-gate] skipped: {}...",
+                                        &facts.chars().take(60).collect::<String>()
+                                    );
                                 }
                             }
                         }
@@ -2193,9 +2715,9 @@ pub(crate) fn run_agent_with_prompt(
             let claims_subagent_success = lower.contains("completed successfully")
                 || lower.contains("finished processing")
                 || lower.contains("results are ready");
-            let has_recent_status_check = tool_calls.iter().any(|c|
+            let has_recent_status_check = tool_calls.iter().any(|c| {
                 c.name == "session_status" || c.name.contains("subagent") || c.name == "bg_status"
-            );
+            });
             if claims_subagent_success && !has_recent_status_check {
                 messages.push(AgentMessage {
                     role: "user".to_string(),
@@ -2242,7 +2764,8 @@ pub(crate) fn run_agent_with_prompt(
         // Belt-and-suspenders: even if tools leak back into active_tools,
         // block them here with a clear error message directing the agent to use swarm tools.
         if orchestrator_mode && !is_subagent_early {
-            let orchestrator_blocked: Vec<String> = tool_calls.iter()
+            let orchestrator_blocked: Vec<String> = tool_calls
+                .iter()
                 .filter(|c| matches!(c.name.as_str(), "exec" | "fs_write"))
                 .map(|c| c.name.clone())
                 .collect();
@@ -2272,7 +2795,10 @@ pub(crate) fn run_agent_with_prompt(
                             is_error: Some(true),
                             thinking_blocks: vec![],
                         });
-                        eprintln!("[orchestrator] BLOCKED {} — agent tried to bypass orchestrator mode", call.name);
+                        eprintln!(
+                            "[orchestrator] BLOCKED {} — agent tried to bypass orchestrator mode",
+                            call.name
+                        );
                     } else {
                         has_non_blocked = true;
                     }
@@ -2305,13 +2831,27 @@ pub(crate) fn run_agent_with_prompt(
         // When both untrusted input AND private data are present, block
         // external communication tools to prevent data exfiltration.
         if session_taint.is_tainted() {
-            let exfil_blocked: Vec<String> = tool_calls.iter()
-                .filter(|c| matches!(c.name.as_str(),
-                    "exec" | "email_send" | "gmail_send" | "signal_send" | "imessage_send" | "notify"
-                ) || (c.name == "http_request" && {
-                    let method = c.args.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_ascii_uppercase();
-                    method != "GET"
-                }))
+            let exfil_blocked: Vec<String> = tool_calls
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.name.as_str(),
+                        "exec"
+                            | "email_send"
+                            | "gmail_send"
+                            | "signal_send"
+                            | "imessage_send"
+                            | "notify"
+                    ) || (c.name == "http_request" && {
+                        let method = c
+                            .args
+                            .get("method")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("GET")
+                            .to_ascii_uppercase();
+                        method != "GET"
+                    })
+                })
                 .map(|c| c.name.clone())
                 .collect();
             if !exfil_blocked.is_empty() {
@@ -2422,16 +2962,26 @@ pub(crate) fn run_agent_with_prompt(
                         is_error: Some(true),
                         thinking_blocks: vec![],
                     });
-                    eprintln!("[circuit-breaker] blocked {}:{} after {count} failures", call.name, &key[call.name.len()+1..std::cmp::min(key.len(), call.name.len()+9)]);
+                    eprintln!(
+                        "[circuit-breaker] blocked {}:{} after {count} failures",
+                        call.name,
+                        &key[call.name.len() + 1..std::cmp::min(key.len(), call.name.len() + 9)]
+                    );
 
                     // Extract a learned failure lesson when circuit breaker triggers
                     let pattern_detail = match call.name.as_str() {
-                        "exec" => call.args.get("command")
+                        "exec" => call
+                            .args
+                            .get("command")
                             .and_then(|v| v.as_str())
                             .map(|s| s.chars().take(120).collect::<String>())
                             .unwrap_or_else(|| call.args.to_string().chars().take(80).collect()),
                         "http_request" => {
-                            let method = call.args.get("method").and_then(|v| v.as_str()).unwrap_or("?");
+                            let method = call
+                                .args
+                                .get("method")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
                             let url = call.args.get("url").and_then(|v| v.as_str()).unwrap_or("?");
                             format!("{} {}", method, url.chars().take(100).collect::<String>())
                         }
@@ -2440,14 +2990,22 @@ pub(crate) fn run_agent_with_prompt(
                     let lesson = LearnedFailure {
                         tool: call.name.clone(),
                         pattern: pattern_detail,
-                        lesson: format!("Failed {} times and was blocked by circuit breaker. Try a fundamentally different approach or verify prerequisites.", count),
+                        lesson: format!(
+                            "Failed {} times and was blocked by circuit breaker. Try a fundamentally different approach or verify prerequisites.",
+                            count
+                        ),
                         created_at: chrono::Utc::now().to_rfc3339(),
                     };
-                    if !drift_state.learned_failures.iter().any(|lf| lf.tool == lesson.tool && lf.pattern == lesson.pattern) {
+                    if !drift_state
+                        .learned_failures
+                        .iter()
+                        .any(|lf| lf.tool == lesson.tool && lf.pattern == lesson.pattern)
+                    {
                         drift_state.learned_failures.push(lesson);
                     }
                 }
-                let broken_ids: std::collections::HashSet<String> = circuit_broken.iter().map(|(c, _)| c.id.clone()).collect();
+                let broken_ids: std::collections::HashSet<String> =
+                    circuit_broken.iter().map(|(c, _)| c.id.clone()).collect();
                 tool_calls.retain(|c| !broken_ids.contains(&c.id));
                 if tool_calls.is_empty() {
                     messages.push(AgentMessage {
@@ -2504,10 +3062,16 @@ pub(crate) fn run_agent_with_prompt(
 
             let result = truncate_tool_output(result, max_tool_output);
             let (is_error, tools_changed, deferred_msgs) = process_tool_result(
-                call, result,
-                &mut tool_results, &mut messages, &mut active_tools,
-                &mut retrieved_skills, &mut session_taint,
-                should_log, &session, &log_dir,
+                call,
+                result,
+                &mut tool_results,
+                &mut messages,
+                &mut active_tools,
+                &mut retrieved_skills,
+                &mut session_taint,
+                should_log,
+                &session,
+                &log_dir,
             );
             if tools_changed {
                 // Re-strip orchestrator-blocked tools if they leaked back via tool_search
@@ -2541,14 +3105,20 @@ pub(crate) fn run_agent_with_prompt(
             if call.name == "exec" && !is_error && reminder_state.remote_host_seen {
                 if let Some(last_result) = tool_results.last() {
                     let output_lower = last_result.output.to_lowercase();
-                    if output_lower.contains("filesystem") || output_lower.contains("nvidia-smi") || output_lower.contains("mem:") {
+                    if output_lower.contains("filesystem")
+                        || output_lower.contains("nvidia-smi")
+                        || output_lower.contains("mem:")
+                    {
                         reminder_state.remote_env_verified = true;
                     }
                 }
             }
 
             // Inject grounding requirement after subagent-related tool results
-            if call.name == "subagent_invoke" || call.name == "subagent_batch" || call.name == "session_status" {
+            if call.name == "subagent_invoke"
+                || call.name == "subagent_batch"
+                || call.name == "session_status"
+            {
                 messages.push(AgentMessage {
                     role: "user".to_string(),
                     content: Some("[Grounding] Quote subagent output exactly. Do not paraphrase or embellish. Report errors/empty results honestly.".to_string()),
@@ -2573,7 +3143,8 @@ pub(crate) fn run_agent_with_prompt(
                     *count += 1;
                     if *count == 1 {
                         // First failure — record in scratchpad
-                        let output_preview: String = tool_results.last()
+                        let output_preview: String = tool_results
+                            .last()
                             .map(|r| r.output.chars().take(200).collect())
                             .unwrap_or_default();
                         failed_attempts.push(format!(
@@ -2585,17 +3156,27 @@ pub(crate) fn run_agent_with_prompt(
                     }
                     // Extract learned failure on 2nd consecutive failure (before circuit breaker at 3)
                     if *count == 2 {
-                        let err_snippet: String = tool_results.last()
+                        let err_snippet: String = tool_results
+                            .last()
                             .map(|r| r.output.chars().take(150).collect())
                             .unwrap_or_default();
                         let pattern_detail = match call.name.as_str() {
-                            "exec" => call.args.get("command")
+                            "exec" => call
+                                .args
+                                .get("command")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.chars().take(120).collect::<String>())
-                                .unwrap_or_else(|| call.args.to_string().chars().take(80).collect()),
+                                .unwrap_or_else(|| {
+                                    call.args.to_string().chars().take(80).collect()
+                                }),
                             "http_request" => {
-                                let method = call.args.get("method").and_then(|v| v.as_str()).unwrap_or("?");
-                                let url = call.args.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+                                let method = call
+                                    .args
+                                    .get("method")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let url =
+                                    call.args.get("url").and_then(|v| v.as_str()).unwrap_or("?");
                                 format!("{} {}", method, url.chars().take(100).collect::<String>())
                             }
                             _ => call.args.to_string().chars().take(80).collect(),
@@ -2603,10 +3184,17 @@ pub(crate) fn run_agent_with_prompt(
                         let lesson = LearnedFailure {
                             tool: call.name.clone(),
                             pattern: pattern_detail,
-                            lesson: format!("Failed twice with: {}. Change approach or verify prerequisites.", err_snippet),
+                            lesson: format!(
+                                "Failed twice with: {}. Change approach or verify prerequisites.",
+                                err_snippet
+                            ),
                             created_at: chrono::Utc::now().to_rfc3339(),
                         };
-                        if !drift_state.learned_failures.iter().any(|lf| lf.tool == lesson.tool && lf.pattern == lesson.pattern) {
+                        if !drift_state
+                            .learned_failures
+                            .iter()
+                            .any(|lf| lf.tool == lesson.tool && lf.pattern == lesson.pattern)
+                        {
                             drift_state.learned_failures.push(lesson);
                         }
                     }
@@ -2632,7 +3220,15 @@ pub(crate) fn run_agent_with_prompt(
             if requires_approval(&call.name, &call.args) {
                 reminder_state.approval_required_count += 1;
             }
-            let read_only_tools = ["search", "query", "get", "list", "tool_search", "skill_search", "reflect"];
+            let read_only_tools = [
+                "search",
+                "query",
+                "get",
+                "list",
+                "tool_search",
+                "skill_search",
+                "reflect",
+            ];
             if read_only_tools.iter().any(|t| call.name.contains(t)) {
                 reminder_state.sequential_read_ops += 1;
             } else {
@@ -2640,8 +3236,8 @@ pub(crate) fn run_agent_with_prompt(
             }
         } else {
             // Multiple tool calls — execute in parallel (non-MCP), MCP calls sequentially
-            let (mcp_calls, regular_calls): (Vec<_>, Vec<_>) = tool_calls.iter()
-                .partition(|c| c.name.starts_with("mcp__"));
+            let (mcp_calls, regular_calls): (Vec<_>, Vec<_>) =
+                tool_calls.iter().partition(|c| c.name.starts_with("mcp__"));
 
             let mut results: Vec<(AgentToolCall, ToolExecution)> = Vec::new();
 
@@ -2650,49 +3246,65 @@ pub(crate) fn run_agent_with_prompt(
                 let mv2_ref = &mv2;
                 let bg_reg_ref = &bg_registry_ref;
                 let sess_reg_ref = &session_registry_ref;
-                let execute_regular_call = |call: &&AgentToolCall| -> (AgentToolCall, ToolExecution) {
-                    let call = *call;
-                    let result = catch_unwind(AssertUnwindSafe(|| {
-                        let local_db = open_or_create_db(mv2_ref).map_err(|e| e.to_string())?;
-                        execute_tool(&call.name, call.args.clone(), mv2_ref, &local_db, false, bg_reg_ref.clone(), sess_reg_ref.clone())
-                    }));
+                let execute_regular_call =
+                    |call: &&AgentToolCall| -> (AgentToolCall, ToolExecution) {
+                        let call = *call;
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            let local_db = open_or_create_db(mv2_ref).map_err(|e| e.to_string())?;
+                            execute_tool(
+                                &call.name,
+                                call.args.clone(),
+                                mv2_ref,
+                                &local_db,
+                                false,
+                                bg_reg_ref.clone(),
+                                sess_reg_ref.clone(),
+                            )
+                        }));
 
-                    let execution = match result {
-                        Ok(Ok(r)) => r,
-                        Ok(Err(err)) => ToolExecution {
-                            output: format!("Tool error: {err}"),
-                            details: serde_json::json!({ "error": err }),
-                            is_error: true,
-                        },
-                        Err(panic_info) => {
-                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                                s.to_string()
-                            } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                                s.clone()
-                            } else {
-                                "unknown panic".to_string()
-                            };
-                            ToolExecution {
-                                output: format!("Tool panicked: {msg}"),
-                                details: serde_json::json!({ "error": "panic", "message": msg }),
+                        let execution = match result {
+                            Ok(Ok(r)) => r,
+                            Ok(Err(err)) => ToolExecution {
+                                output: format!("Tool error: {err}"),
+                                details: serde_json::json!({ "error": err }),
                                 is_error: true,
+                            },
+                            Err(panic_info) => {
+                                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                ToolExecution {
+                                    output: format!("Tool panicked: {msg}"),
+                                    details: serde_json::json!({ "error": "panic", "message": msg }),
+                                    is_error: true,
+                                }
                             }
-                        }
+                        };
+
+                        (call.clone(), execution)
                     };
 
-                    (call.clone(), execution)
-                };
-
-                let parallel_results: Vec<(AgentToolCall, ToolExecution)> = ThreadPoolBuilder::new()
-                    .num_threads(
-                        std::thread::available_parallelism()
-                            .map(|v| v.get())
-                            .unwrap_or(4)
-                            .min(regular_calls.len())
-                    )
-                    .build()
-                    .map(|pool| pool.install(|| regular_calls.par_iter().map(execute_regular_call).collect()))
-                    .unwrap_or_else(|_| regular_calls.iter().map(execute_regular_call).collect());
+                let parallel_results: Vec<(AgentToolCall, ToolExecution)> =
+                    ThreadPoolBuilder::new()
+                        .num_threads(
+                            std::thread::available_parallelism()
+                                .map(|v| v.get())
+                                .unwrap_or(4)
+                                .min(regular_calls.len()),
+                        )
+                        .build()
+                        .map(|pool| {
+                            pool.install(|| {
+                                regular_calls.par_iter().map(execute_regular_call).collect()
+                            })
+                        })
+                        .unwrap_or_else(|_| {
+                            regular_calls.iter().map(execute_regular_call).collect()
+                        });
                 results.extend(parallel_results);
             }
 
@@ -2720,10 +3332,16 @@ pub(crate) fn run_agent_with_prompt(
             for (call, result) in results {
                 let result = truncate_tool_output(result, max_tool_output);
                 let (is_error, tools_changed, deferred_msgs) = process_tool_result(
-                    &call, result,
-                    &mut tool_results, &mut messages, &mut active_tools,
-                    &mut retrieved_skills, &mut session_taint,
-                    should_log, &session, &log_dir,
+                    &call,
+                    result,
+                    &mut tool_results,
+                    &mut messages,
+                    &mut active_tools,
+                    &mut retrieved_skills,
+                    &mut session_taint,
+                    should_log,
+                    &session,
+                    &log_dir,
                 );
                 // Collect deferred messages — pushed AFTER all tool results
                 all_deferred.extend(deferred_msgs);
@@ -2748,7 +3366,8 @@ pub(crate) fn run_agent_with_prompt(
                         let count = tool_failure_counts.entry(cb_key).or_insert(0);
                         *count += 1;
                         if *count == 1 {
-                            let output_preview: String = tool_results.last()
+                            let output_preview: String = tool_results
+                                .last()
                                 .map(|r| r.output.chars().take(200).collect())
                                 .unwrap_or_default();
                             failed_attempts.push(format!(
@@ -2760,28 +3379,52 @@ pub(crate) fn run_agent_with_prompt(
                         }
                         // Extract learned failure on 2nd consecutive failure (parallel path)
                         if *count == 2 {
-                            let err_snippet: String = tool_results.last()
+                            let err_snippet: String = tool_results
+                                .last()
                                 .map(|r| r.output.chars().take(150).collect())
                                 .unwrap_or_default();
                             let pattern_detail = match call.name.as_str() {
-                                "exec" => call.args.get("command")
+                                "exec" => call
+                                    .args
+                                    .get("command")
                                     .and_then(|v| v.as_str())
                                     .map(|s| s.chars().take(120).collect::<String>())
-                                    .unwrap_or_else(|| call.args.to_string().chars().take(80).collect()),
+                                    .unwrap_or_else(|| {
+                                        call.args.to_string().chars().take(80).collect()
+                                    }),
                                 "http_request" => {
-                                    let method = call.args.get("method").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let url = call.args.get("url").and_then(|v| v.as_str()).unwrap_or("?");
-                                    format!("{} {}", method, url.chars().take(100).collect::<String>())
+                                    let method = call
+                                        .args
+                                        .get("method")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?");
+                                    let url = call
+                                        .args
+                                        .get("url")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?");
+                                    format!(
+                                        "{} {}",
+                                        method,
+                                        url.chars().take(100).collect::<String>()
+                                    )
                                 }
                                 _ => call.args.to_string().chars().take(80).collect(),
                             };
                             let lesson = LearnedFailure {
                                 tool: call.name.clone(),
                                 pattern: pattern_detail,
-                                lesson: format!("Failed twice with: {}. Change approach or verify prerequisites.", err_snippet),
+                                lesson: format!(
+                                    "Failed twice with: {}. Change approach or verify prerequisites.",
+                                    err_snippet
+                                ),
                                 created_at: chrono::Utc::now().to_rfc3339(),
                             };
-                            if !drift_state.learned_failures.iter().any(|lf| lf.tool == lesson.tool && lf.pattern == lesson.pattern) {
+                            if !drift_state
+                                .learned_failures
+                                .iter()
+                                .any(|lf| lf.tool == lesson.tool && lf.pattern == lesson.pattern)
+                            {
                                 drift_state.learned_failures.push(lesson);
                             }
                         }
@@ -2835,7 +3478,10 @@ pub(crate) fn run_agent_with_prompt(
             if reminder_state.remote_host_seen && !reminder_state.remote_env_verified {
                 for tr in tool_results.iter().rev().take(tool_calls.len()) {
                     let output_lower = tr.output.to_lowercase();
-                    if output_lower.contains("filesystem") || output_lower.contains("nvidia-smi") || output_lower.contains("mem:") {
+                    if output_lower.contains("filesystem")
+                        || output_lower.contains("nvidia-smi")
+                        || output_lower.contains("mem:")
+                    {
                         reminder_state.remote_env_verified = true;
                         break;
                     }
@@ -2856,7 +3502,8 @@ pub(crate) fn run_agent_with_prompt(
 
         // Mid-loop system reminders (10 rules) + drift detection
         let token_est = estimate_tokens(&messages);
-        let reminders = collect_mid_loop_reminders(&reminder_state, step, current_max_steps, token_est);
+        let reminders =
+            collect_mid_loop_reminders(&reminder_state, step, current_max_steps, token_est);
 
         // Drift detection scoring
         drift_state.turns += 1;
@@ -2872,10 +3519,7 @@ pub(crate) fn run_agent_with_prompt(
         let mut all_reminders = reminders;
 
         // Budget tracking: inject step budget awareness
-        let budget_msg = format!(
-            "Step {}/{}",
-            step + 1, current_max_steps
-        );
+        let budget_msg = format!("Step {}/{}", step + 1, current_max_steps);
         all_reminders.push(budget_msg);
 
         // Resource-awareness: nudge delegation to free compute when in long-run mode
@@ -2883,7 +3527,9 @@ pub(crate) fn run_agent_with_prompt(
             if let Some(ref prog) = progress {
                 if let Ok(p) = prog.lock() {
                     if step > 20 && p.delegated_steps == 0 {
-                        all_reminders.push("Consider subagent_invoke/subagent_batch for heavy work.".to_string());
+                        all_reminders.push(
+                            "Consider subagent_invoke/subagent_batch for heavy work.".to_string(),
+                        );
                     } else if step > 30 && p.opus_steps > 0 {
                         let total = p.opus_steps + p.delegated_steps;
                         let opus_ratio = p.opus_steps as f64 / total.max(1) as f64;
@@ -2898,9 +3544,12 @@ pub(crate) fn run_agent_with_prompt(
         // Cycle detection: catch repeated action patterns
         if let Some((cycle_len, _repeats)) = detect_cycle(&recent_actions) {
             if cycle_len == 1 {
-                all_reminders.push("Same action repeated 3x. Try a different approach.".to_string());
+                all_reminders
+                    .push("Same action repeated 3x. Try a different approach.".to_string());
             } else {
-                all_reminders.push(format!("{cycle_len}-step loop detected. Try a fundamentally different strategy."));
+                all_reminders.push(format!(
+                    "{cycle_len}-step loop detected. Try a fundamentally different strategy."
+                ));
             }
             reminder_state.no_progress_streak += 3;
         }
@@ -2922,7 +3571,8 @@ pub(crate) fn run_agent_with_prompt(
             all_reminders.push("Low adherence. Re-state goal, then one careful step.".to_string());
         }
         if drift_state.ema < 40.0 && drift_state.turns >= 3 {
-            all_reminders.push("Sustained low adherence. Finish current action, give status.".to_string());
+            all_reminders
+                .push("Sustained low adherence. Finish current action, give status.".to_string());
         }
 
         // SkillRL R6: Behavioral anchoring — inject proven skills when drifting
@@ -2941,9 +3591,8 @@ pub(crate) fn run_agent_with_prompt(
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             if !anchor.is_empty() {
-                                all_reminders.push(format!(
-                                    "Re-anchor with proven strategies:\n{anchor}"
-                                ));
+                                all_reminders
+                                    .push(format!("Re-anchor with proven strategies:\n{anchor}"));
                             }
                         }
                     }
@@ -2967,14 +3616,22 @@ pub(crate) fn run_agent_with_prompt(
 
         // Covert critic: periodic reality grounding via Opus evaluation
         // Critic corrections are injected as a SEPARATE message from routine reminders
-        let current_violation_count = drift_state.violations.get("critic_correction").copied().unwrap_or(0);
-        if critic_should_fire(step, critic_interval, &mut last_critic_step, &reminder_state, &tool_calls, &messages, current_violation_count) {
-            if let Some(correction) = call_critic(
-                &prompt_text,
-                &messages,
-                step,
-                current_max_steps,
-            ) {
+        let current_violation_count = drift_state
+            .violations
+            .get("critic_correction")
+            .copied()
+            .unwrap_or(0);
+        if critic_should_fire(
+            step,
+            critic_interval,
+            &mut last_critic_step,
+            &reminder_state,
+            &tool_calls,
+            &messages,
+            current_violation_count,
+        ) {
+            if let Some(correction) = call_critic(&prompt_text, &messages, step, current_max_steps)
+            {
                 // Don't add to all_reminders. Inject as separate message.
                 let critic_msg = format!(
                     "[CORRECTION]\n{}\nAcknowledge before continuing.",
@@ -2990,7 +3647,9 @@ pub(crate) fn run_agent_with_prompt(
                     thinking_blocks: vec![],
                 });
                 // Track in drift state
-                drift_state.violations.entry("critic_correction".to_string())
+                drift_state
+                    .violations
+                    .entry("critic_correction".to_string())
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
                 // Persist violations to disk
@@ -3001,14 +3660,20 @@ pub(crate) fn run_agent_with_prompt(
                 // Model escalation: swap to Opus for next N steps when critic fires
                 if let Some(ref opus_spec) = opus_escalation_spec {
                     if opus_escalation_remaining == 0 {
-                        eprintln!("[harness] critic fired — escalating to Opus for {opus_escalation_steps} steps");
+                        eprintln!(
+                            "[harness] critic fired — escalating to Opus for {opus_escalation_steps} steps"
+                        );
                         model_spec = opus_spec.clone();
                         opus_escalation_remaining = opus_escalation_steps;
                     }
                 }
 
                 // Progressive escalation based on violation count
-                let violation_count = drift_state.violations.get("critic_correction").copied().unwrap_or(0);
+                let violation_count = drift_state
+                    .violations
+                    .get("critic_correction")
+                    .copied()
+                    .unwrap_or(0);
                 match violation_count {
                     0..=3 => { /* Standard correction — already injected above */ }
                     4..=7 => {
@@ -3032,9 +3697,13 @@ pub(crate) fn run_agent_with_prompt(
                         // when orchestrator mode is NOT active.
                         let skip_subagent_restriction = orchestrator_mode;
                         let l3_message = if skip_subagent_restriction {
-                            format!("[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says. For browser: call snapshot after EVERY action. Your subagent tools remain available — use them to delegate work, but ground ALL claims in tool output.")
+                            format!(
+                                "[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says. For browser: call snapshot after EVERY action. Your subagent tools remain available — use them to delegate work, but ground ALL claims in tool output."
+                            )
                         } else {
-                            format!("[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says. For browser: call snapshot after EVERY action. Subagent tools have been REVOKED.")
+                            format!(
+                                "[SEVERE WARNING] {violation_count} grounding violations this session. STOP making claims not supported by tool output. Before EVERY response, re-read the most recent tool output and ONLY report what it literally says. For browser: call snapshot after EVERY action. Subagent tools have been REVOKED."
+                            )
                         };
                         messages.push(AgentMessage {
                             role: "user".to_string(),
@@ -3048,23 +3717,31 @@ pub(crate) fn run_agent_with_prompt(
                         // Enforce: restrict subagent tools ONLY when not in orchestrator mode
                         if !subagent_tools_restricted && !skip_subagent_restriction {
                             subagent_tools_restricted = true;
-                            let subagent_tool_names = ["subagent_invoke", "subagent_batch", "session_start"];
+                            let subagent_tool_names =
+                                ["subagent_invoke", "subagent_batch", "session_start"];
                             for tool_name in &subagent_tool_names {
                                 active_tools.remove(*tool_name);
                             }
                             tools = tools_from_active(&tool_map, &active_tools);
                             eprintln!("[critic] LEVEL 3: subagent tools restricted");
                         } else if skip_subagent_restriction {
-                            eprintln!("[critic] LEVEL 3: subagent tools PRESERVED (orchestrator mode active)");
+                            eprintln!(
+                                "[critic] LEVEL 3: subagent tools PRESERVED (orchestrator mode active)"
+                            );
                         }
                         // Enforce: reduce remaining step budget by 1/4 (was 1/3)
                         let remaining = current_max_steps.saturating_sub(step);
                         current_max_steps = step + (remaining * 3 / 4).max(8);
-                        eprintln!("[critic] LEVEL 3 enforcement: step budget reduced to {current_max_steps} (was {})", step + remaining);
+                        eprintln!(
+                            "[critic] LEVEL 3 enforcement: step budget reduced to {current_max_steps} (was {})",
+                            step + remaining
+                        );
                     }
                     _ => {
                         // Level 4: Graceful wind-down (raised from 7+ to 12+)
-                        eprintln!("[critic] LEVEL 4 escalation: {violation_count} violations — winding down gracefully");
+                        eprintln!(
+                            "[critic] LEVEL 4 escalation: {violation_count} violations — winding down gracefully"
+                        );
                         messages.push(AgentMessage {
                             role: "user".to_string(),
                             content: Some(format!("[CRITICAL — GRACEFUL WIND-DOWN] {violation_count} grounding violations. You have 8 steps remaining. IMMEDIATELY:\n1. Write any partial results to disk (files the user requested).\n2. Summarize what you actually accomplished vs. what failed.\n3. Do NOT make new claims — only report verified facts from tool outputs.\nAfter these 8 steps, the session will end.")),
@@ -3076,7 +3753,9 @@ pub(crate) fn run_agent_with_prompt(
                         });
                         // Enforce: allow 8 steps for graceful output (was 6)
                         current_max_steps = step + 8;
-                        eprintln!("[critic] LEVEL 4 enforcement: graceful wind-down in 8 steps (step={step}, max={current_max_steps})");
+                        eprintln!(
+                            "[critic] LEVEL 4 enforcement: graceful wind-down in 8 steps (step={step}, max={current_max_steps})"
+                        );
                     }
                 }
             }
@@ -3086,13 +3765,15 @@ pub(crate) fn run_agent_with_prompt(
         if step > 0 && step % 10 == 0 {
             let mut checkpoint_msg = format!(
                 "[Checkpoint — Step {}] Summarize what you have accomplished so far and what you plan to do next. \
-                 If the user's request was vague, confirm you are on the right track.", step
+                 If the user's request was vague, confirm you are on the right track.",
+                step
             );
             // Inject failed attempts scratchpad so the agent doesn't repeat mistakes
             if !failed_attempts.is_empty() {
                 checkpoint_msg.push_str(&format!(
                     "\n\n[Failed Attempts — DO NOT RETRY these exact approaches]\n{}",
-                    failed_attempts.iter()
+                    failed_attempts
+                        .iter()
                         .enumerate()
                         .map(|(i, a)| format!("{}. {}", i + 1, a))
                         .collect::<Vec<_>>()
@@ -3103,7 +3784,9 @@ pub(crate) fn run_agent_with_prompt(
             if !drift_state.learned_failures.is_empty() {
                 checkpoint_msg.push_str(&format!(
                     "\n\n[Lessons Learned — avoid these patterns]\n{}",
-                    drift_state.learned_failures.iter()
+                    drift_state
+                        .learned_failures
+                        .iter()
                         .map(|lf| format!("- {}: {}", lf.tool, lf.lesson))
                         .collect::<Vec<_>>()
                         .join("\n")
@@ -3140,15 +3823,27 @@ pub(crate) fn run_agent_with_prompt(
     // Only fires when: (a) task completed successfully, (b) took 3+ steps,
     // (c) used substantive tools (not just search/query).
     if completed && step >= 3 {
-        let substantive_tools: HashSet<&str> = ["exec", "http_request", "browser", "fs_write", "skill_store"]
-            .iter().cloned().collect();
-        let used_substantive = tool_results.iter().any(|r| substantive_tools.contains(r.name.as_str()));
+        let substantive_tools: HashSet<&str> =
+            ["exec", "http_request", "browser", "fs_write", "skill_store"]
+                .iter()
+                .cloned()
+                .collect();
+        let used_substantive = tool_results
+            .iter()
+            .any(|r| substantive_tools.contains(r.name.as_str()));
         if used_substantive {
             // Build a compact summary of what was done for distillation
-            let action_summary: String = tool_results.iter()
+            let action_summary: String = tool_results
+                .iter()
                 .filter(|r| !r.is_error)
                 .take(10)
-                .map(|r| format!("- {}: {}", r.name, r.output.chars().take(100).collect::<String>()))
+                .map(|r| {
+                    format!(
+                        "- {}: {}",
+                        r.name,
+                        r.output.chars().take(100).collect::<String>()
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             if !action_summary.is_empty() {
@@ -3163,14 +3858,15 @@ pub(crate) fn run_agent_with_prompt(
                 );
                 // Use a lightweight LLM call for distillation (best effort)
                 let distill_request = crate::AgentHookRequest {
-                    messages: vec![
-                        AgentMessage {
-                            role: "user".to_string(),
-                            content: Some(distill_prompt),
-                            tool_calls: Vec::new(),
-                            name: None, tool_call_id: None, is_error: None, thinking_blocks: vec![],
-                        },
-                    ],
+                    messages: vec![AgentMessage {
+                        role: "user".to_string(),
+                        content: Some(distill_prompt),
+                        tool_calls: Vec::new(),
+                        name: None,
+                        tool_call_id: None,
+                        is_error: None,
+                        thinking_blocks: vec![],
+                    }],
                     tools: vec![],
                     session: session.clone(),
                 };
@@ -3187,11 +3883,21 @@ pub(crate) fn run_agent_with_prompt(
                                     if let Ok(conn) = open_skill_db(&db_path) {
                                         // Check for duplicates before storing
                                         if crate::find_similar_skill(&conn, desc, 0.85).is_none() {
-                                            let steps: Vec<String> = skill_json.get("steps")
+                                            let steps: Vec<String> = skill_json
+                                                .get("steps")
                                                 .and_then(|v| v.as_array())
-                                                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                                                .map(|arr| {
+                                                    arr.iter()
+                                                        .filter_map(|v| {
+                                                            v.as_str().map(String::from)
+                                                        })
+                                                        .collect()
+                                                })
                                                 .unwrap_or_default();
-                                            let notes = skill_json.get("notes").and_then(|v| v.as_str()).map(String::from);
+                                            let notes = skill_json
+                                                .get("notes")
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from);
                                             let skill = crate::SkillRecord {
                                                 name: name.to_string(),
                                                 description: Some(desc.to_string()),
@@ -3207,7 +3913,9 @@ pub(crate) fn run_agent_with_prompt(
                                                 contexts: vec![],
                                             };
                                             if crate::upsert_skill(&conn, &skill).is_ok() {
-                                                eprintln!("[skill-distill] learned new skill: {name}");
+                                                eprintln!(
+                                                    "[skill-distill] learned new skill: {name}"
+                                                );
                                             }
                                         }
                                     }
@@ -3232,24 +3940,36 @@ pub(crate) fn run_agent_with_prompt(
             .unwrap_or_else(|| prompt_text.chars().take(500).collect());
 
         // Build the summary from the compacted context
-        let summary = messages.iter()
-            .find(|m| m.role == "user" && m.content.as_ref().map(|c| c.contains("[Context compacted")).unwrap_or(false))
+        let summary = messages
+            .iter()
+            .find(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_ref()
+                        .map(|c| c.contains("[Context compacted"))
+                        .unwrap_or(false)
+            })
             .and_then(|m| m.content.clone())
             .unwrap_or_else(|| {
-                messages.iter().rev()
+                messages
+                    .iter()
+                    .rev()
                     .find(|m| m.role == "assistant")
                     .and_then(|m| m.content.as_ref())
                     .map(|c| c.chars().take(500).collect::<String>())
                     .unwrap_or_default()
             });
 
-        let remaining_work = messages.iter().rev()
+        let remaining_work = messages
+            .iter()
+            .rev()
             .find(|m| m.role == "assistant")
             .and_then(|m| m.content.as_ref())
             .map(|c| c.chars().take(300).collect::<String>())
             .unwrap_or_else(|| "Continue working toward the goal.".to_string());
 
-        let chain_depth = session.as_ref()
+        let chain_depth = session
+            .as_ref()
             .and_then(|s| s.rsplit(":chain:").next())
             .and_then(|d| d.parse::<usize>().ok())
             .unwrap_or(0);
@@ -3269,16 +3989,15 @@ pub(crate) fn run_agent_with_prompt(
         let _ = fs::create_dir_all(&checkpoint_dir);
         let checkpoint_path = checkpoint_dir.join(format!(
             "{}.json",
-            checkpoint.session.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+            checkpoint
+                .session
+                .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
         ));
         if let Ok(json) = serde_json::to_string_pretty(&checkpoint) {
             let _ = fs::write(&checkpoint_path, &json);
         }
 
-        let continuation_marker = format!(
-            "[CONTINUATION_NEEDED:{}]",
-            checkpoint_path.display()
-        );
+        let continuation_marker = format!("[CONTINUATION_NEEDED:{}]", checkpoint_path.display());
 
         // Clean up browser daemons before returning
         if let Some(ref sess_id) = session {

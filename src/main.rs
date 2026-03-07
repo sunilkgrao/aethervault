@@ -514,6 +514,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 before,
                 after,
                 feedback_weight,
+                fusion_mode: crate::FusionMode::Rrf,
+                bayesian_bm25_weight: 0.5,
+                bayesian_vec_weight: 0.5,
             };
 
             let response = execute_query(&db, args)?;
@@ -637,6 +640,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 before,
                 after,
                 feedback_weight,
+                fusion_mode: crate::FusionMode::Rrf,
+                bayesian_bm25_weight: 0.5,
+                bayesian_vec_weight: 0.5,
             };
 
             let pack = build_context_pack(&db, args, max_bytes, full)?;
