@@ -760,7 +760,7 @@ pub(crate) fn call_claude_with_model(
     //   look like real planning/research/engineering work, keep trivial turns fast.
     // - ANTHROPIC_THINKING=off => always off.
     let (thinking_enabled, thinking_effort) =
-        resolve_thinking_policy(request, model, model_override.as_deref());
+        resolve_thinking_policy(request, &model, model_override.as_deref());
 
     let effective_max_tokens = if thinking_enabled {
         // With thinking, max_tokens must cover thinking + response
@@ -1433,7 +1433,7 @@ pub(crate) fn call_claude_streaming(
         None
     };
 
-    let (thinking_enabled, thinking_effort) = resolve_thinking_policy(request, model, None);
+    let (thinking_enabled, thinking_effort) = resolve_thinking_policy(request, &model, None);
 
     let effective_max_tokens = if thinking_enabled {
         max_tokens.max(16384)
