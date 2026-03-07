@@ -133,7 +133,7 @@ fn consume_stream(
     let mut block_tool_names: HashMap<usize, String> = HashMap::new();
 
     let timeout_secs: u64 = std::env::var("ANTHROPIC_TIMEOUT")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(180);
     let recv_timeout = StdDuration::from_secs(timeout_secs);
 
     loop {

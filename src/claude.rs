@@ -1219,10 +1219,14 @@ pub(crate) fn call_claude_streaming(
         payload["tools"] = serde_json::json!(tools);
     }
 
+    // Streaming reads need a generous but finite timeout. Using 0 (infinite)
+    // caused API calls to hang forever when the server stalled mid-stream.
+    // We use the configured timeout (min 300s) so long-running responses can
+    // complete, but a genuinely stalled connection will eventually time out.
+    let stream_read_timeout = std::cmp::max(timeout, 300);
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(timeout))
-        // No read timeout — SSE streams need to stay open for minutes
-        .timeout_read(Duration::from_secs(0))
+        .timeout_read(Duration::from_secs(stream_read_timeout))
         .timeout_write(Duration::from_secs(timeout))
         .build();
 

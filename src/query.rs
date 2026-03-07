@@ -799,6 +799,12 @@ pub(crate) fn critic_should_fire(
     messages: &[AgentMessage],
     violation_count: usize,
 ) -> bool {
+    // Skip critic at step 0: the agent hasn't produced any output yet,
+    // so running the critic just wastes 5-15 seconds on a no-op check.
+    if step == 0 {
+        return false;
+    }
+
     if !env_bool("CRITIC_ENABLED", true) {
         return false;
     }

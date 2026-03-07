@@ -401,7 +401,11 @@ impl MemoryDb {
         let db = Self { conn };
         db.apply_pragmas()?;
         db.init_schema()?;
-        db.seed_trigger_id_counter_from_db()?;
+        // Non-fatal: if triggers table is corrupt, log and continue with counter=0.
+        // A corrupt triggers table must not block all DB operations.
+        if let Err(e) = db.seed_trigger_id_counter_from_db() {
+            eprintln!("[capsule] WARNING: seed_trigger_id_counter_from_db failed (non-fatal): {e}");
+        }
         // NOTE: Do NOT checkpoint here.  Manual wal_checkpoint(PASSIVE) on
         // every open races with concurrent connections and can corrupt the
         // WAL index (SHM).  Let SQLite's auto-checkpoint handle it.
@@ -427,7 +431,9 @@ impl MemoryDb {
             let db = Self { conn };
             db.apply_pragmas()?;
             db.init_schema()?;
-            db.seed_trigger_id_counter_from_db()?;
+            if let Err(e) = db.seed_trigger_id_counter_from_db() {
+                eprintln!("[capsule] WARNING: seed_trigger_id_counter_from_db failed (non-fatal): {e}");
+            }
             return Ok(db);
         }
         // Lock acquired — this thread owns recovery. Lock released on drop.
@@ -449,7 +455,9 @@ impl MemoryDb {
                         let db = Self { conn };
                         db.apply_pragmas()?;
                         db.init_schema()?;
-                        db.seed_trigger_id_counter_from_db()?;
+                        if let Err(e) = db.seed_trigger_id_counter_from_db() {
+                eprintln!("[capsule] WARNING: seed_trigger_id_counter_from_db failed (non-fatal): {e}");
+            }
                         return Ok(db);
                     }
                 }
@@ -489,7 +497,9 @@ impl MemoryDb {
                     let db = Self { conn };
                     db.apply_pragmas()?;
                     db.init_schema()?;
-                    db.seed_trigger_id_counter_from_db()?;
+                    if let Err(e) = db.seed_trigger_id_counter_from_db() {
+                eprintln!("[capsule] WARNING: seed_trigger_id_counter_from_db failed (non-fatal): {e}");
+            }
                     return Ok(db);
                 }
                 Ok(None) => {}
