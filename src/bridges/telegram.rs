@@ -870,14 +870,20 @@ pub(crate) fn spawn_agent_run(
         // Track the previous phase to detect thinking→responding transitions
         let mut prev_stream_phase = StreamPhase::Idle;
         loop {
-            // Sleep interval: 1s when streaming is active, 4s otherwise
-            let is_streaming = {
-                let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
-                matches!(guard.stream_phase, StreamPhase::Thinking | StreamPhase::Responding)
-            };
-            let sleep_dur = if is_streaming { Duration::from_secs(1) } else { Duration::from_secs(4) };
-            thread::sleep(sleep_dur);
             tick_count += 1;
+
+            // On first tick, only wait 500ms so streaming tokens appear fast.
+            // After that: 1s when streaming is active, 4s otherwise.
+            if tick_count == 1 {
+                thread::sleep(Duration::from_millis(500));
+            } else {
+                let is_streaming = {
+                    let guard = prog_ref.lock().unwrap_or_else(|e| e.into_inner());
+                    matches!(guard.stream_phase, StreamPhase::Thinking | StreamPhase::Responding)
+                };
+                let sleep_dur = if is_streaming { Duration::from_secs(1) } else { Duration::from_secs(4) };
+                thread::sleep(sleep_dur);
+            }
 
             // Drain and send any interim messages from the agent
             let pending: Vec<String> = {
