@@ -824,30 +824,59 @@ pub fn run_agent_with_prompt(
                     .map(|call| {
                         let mv2 = &mv2;
                         let workspace_override = workspace.clone();
-                        s.spawn(move || {
-                            let mut local_mem_read: Option<Vault> = None;
-                            let mut local_mem_write: Option<Vault> = None;
-                            let result = match execute_tool_with_handles(
-                                &call.name,
-                                call.args.clone(),
-                                mv2,
-                                read_only_tools,
-                                &workspace_override,
-                                &mut local_mem_read,
-                                &mut local_mem_write,
-                            ) {
-                                Ok(r) => r,
-                                Err(err) => ToolExecution {
-                                    output: format!("Tool error: {err}"),
-                                    details: serde_json::json!({ "error": err }),
-                                    is_error: true,
-                                },
-                            };
-                            (call, result)
-                        })
+                        (
+                            call,
+                            s.spawn(move || {
+                                let mut local_mem_read: Option<Vault> = None;
+                                let mut local_mem_write: Option<Vault> = None;
+                                match execute_tool_with_handles(
+                                    &call.name,
+                                    call.args.clone(),
+                                    mv2,
+                                    read_only_tools,
+                                    &workspace_override,
+                                    &mut local_mem_read,
+                                    &mut local_mem_write,
+                                ) {
+                                    Ok(r) => r,
+                                    Err(err) => ToolExecution {
+                                        output: format!("Tool error: {err}"),
+                                        details: serde_json::json!({ "error": err }),
+                                        is_error: true,
+                                    },
+                                }
+                            }),
+                        )
                     })
                     .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
+                let mut results = Vec::with_capacity(handles.len());
+                for (call, handle) in handles {
+                    match handle.join() {
+                        Ok(result) => results.push((call, result)),
+                        Err(panic_info) => {
+                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            eprintln!("[harness] parallel tool '{}' panicked: {msg}", call.name);
+                            results.push((
+                                call,
+                                ToolExecution {
+                                    output: format!("Tool panicked: {msg}"),
+                                    details: serde_json::json!({
+                                        "error": "panic",
+                                        "message": msg,
+                                    }),
+                                    is_error: true,
+                                },
+                            ));
+                        }
+                    }
+                }
+                results
             });
 
             for (call, result) in results {
