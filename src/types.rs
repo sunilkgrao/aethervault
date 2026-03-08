@@ -390,6 +390,7 @@ pub(crate) enum ClaudeStreamEvent {
         index: usize,
         delta_type: String,
         text: String,
+        signature: Option<String>,
     },
     BlockStop {
         index: usize,

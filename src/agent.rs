@@ -150,6 +150,7 @@ fn consume_stream(
     let mut block_texts: HashMap<usize, String> = HashMap::new();
     let mut block_tool_ids: HashMap<usize, String> = HashMap::new();
     let mut block_tool_names: HashMap<usize, String> = HashMap::new();
+    let mut block_signatures: HashMap<usize, String> = HashMap::new();
 
     let timeout_secs: u64 = std::env::var("ANTHROPIC_TIMEOUT")
         .ok()
@@ -202,9 +203,13 @@ fn consume_stream(
                 index,
                 delta_type,
                 text,
+                signature,
             } => {
                 if let Some(buf) = block_texts.get_mut(&index) {
                     buf.push_str(&text);
+                }
+                if let Some(sig) = signature {
+                    block_signatures.insert(index, sig);
                 }
                 let btype = block_types.get(&index).map(|s| s.as_str()).unwrap_or("");
                 match (btype, delta_type.as_str()) {
@@ -251,10 +256,14 @@ fn consume_stream(
                 match btype.as_str() {
                     "thinking" => {
                         if !accumulated.is_empty() {
-                            thinking_blocks.push(serde_json::json!({
+                            let mut block = serde_json::json!({
                                 "type": "thinking",
                                 "thinking": accumulated,
-                            }));
+                            });
+                            if let Some(sig) = block_signatures.remove(&index) {
+                                block["signature"] = serde_json::json!(sig);
+                            }
+                            thinking_blocks.push(block);
                         }
                     }
                     "redacted_thinking" => {

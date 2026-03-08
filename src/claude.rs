@@ -992,6 +992,28 @@ pub(crate) fn call_claude_with_model(
                 obj.remove("thinking");
                 obj.remove("output_config");
             }
+            // Also strip thinking blocks from message history — Sonnet rejects messages
+            // that contain thinking blocks when thinking is not enabled.
+            if let Some(messages) = payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                for msg in messages.iter_mut() {
+                    if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                        if let Some(content) =
+                            msg.get_mut("content").and_then(|c| c.as_array_mut())
+                        {
+                            content.retain(|block| {
+                                !matches!(
+                                    block.get("type").and_then(|t| t.as_str()),
+                                    Some("thinking") | Some("redacted_thinking")
+                                )
+                            });
+                            // Ensure non-empty content
+                            if content.is_empty() {
+                                content.push(serde_json::json!({"type": "text", "text": ""}));
+                            }
+                        }
+                    }
+                }
+            }
             // Re-add temperature/top_p now that thinking is disabled
             if let Some(temp) = temperature {
                 payload["temperature"] = serde_json::json!(temp);
@@ -1602,10 +1624,15 @@ fn parse_sse_event(event_type: &str, data: &str) -> Option<ClaudeStreamEvent> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let signature = delta
+                .get("signature")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             Some(ClaudeStreamEvent::BlockDelta {
                 index,
                 delta_type,
                 text,
+                signature,
             })
         }
         "content_block_stop" => {
