@@ -2190,7 +2190,7 @@ pub(crate) fn execute_tool(
                 static CLEANED_SESSIONS: std::sync::LazyLock<
                     Mutex<std::collections::HashSet<String>>,
                 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
-                let mut cleaned = CLEANED_SESSIONS.lock().unwrap();
+                let mut cleaned = CLEANED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
                 if cleaned.len() >= OBSERVATION_DEDUP_MAX {
                     cleaned.clear();
                 }
