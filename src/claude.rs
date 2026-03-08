@@ -471,6 +471,29 @@ pub(crate) fn collect_system_blocks(messages: &[AgentMessage]) -> Vec<String> {
     blocks
 }
 
+fn strip_cache_control_from_thinking_block(mut block: serde_json::Value) -> serde_json::Value {
+    let is_thinking_block = block
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v == "thinking" || v == "redacted_thinking");
+
+    if is_thinking_block {
+        if let Some(obj) = block.as_object_mut() {
+            obj.remove("cache_control");
+        }
+    }
+
+    block
+}
+
+fn strip_cache_control_from_thinking_blocks(blocks: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    blocks
+        .iter()
+        .cloned()
+        .map(strip_cache_control_from_thinking_block)
+        .collect()
+}
+
 pub(crate) fn to_anthropic_messages(messages: &[AgentMessage]) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     for msg in messages {
@@ -541,13 +564,7 @@ pub(crate) fn to_anthropic_messages(messages: &[AgentMessage]) -> Vec<serde_json
             "assistant" => {
                 let mut blocks = Vec::new();
                 // Thinking blocks must come first in assistant content
-                for tb in &msg.thinking_blocks {
-                    let mut cleaned = tb.clone();
-                    if let Some(obj) = cleaned.as_object_mut() {
-                        obj.remove("cache_control");
-                    }
-                    blocks.push(cleaned);
-                }
+                blocks.extend(strip_cache_control_from_thinking_blocks(&msg.thinking_blocks));
                 if let Some(content) = &msg.content {
                     if !content.is_empty() {
                         blocks.push(serde_json::json!({"type": "text", "text": content}));
@@ -662,11 +679,7 @@ pub(crate) fn parse_claude_response(
             }
             "thinking" | "redacted_thinking" => {
                 // Preserve thinking blocks for multi-turn tool-use conversations
-                let mut cleaned = block.clone();
-                if let Some(obj) = cleaned.as_object_mut() {
-                    obj.remove("cache_control");
-                }
-                thinking_blocks.push(cleaned);
+                thinking_blocks.push(strip_cache_control_from_thinking_block(block.clone()));
             }
             _ => {}
         }
