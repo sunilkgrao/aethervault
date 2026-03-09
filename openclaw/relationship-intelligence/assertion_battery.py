@@ -286,6 +286,31 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
                 return False, "Still using absolutist spawn-every-task phrasing"
             return True, "trivial inline policy ok"
 
+        def orchestration_policy_checker(text: str) -> tuple[bool, str]:
+            lowered = text.casefold()
+            has_inline_orientation = any(
+                phrase in lowered
+                for phrase in (
+                    "first-pass orientation",
+                    "task decomposition",
+                    "do it myself",
+                    "do it inline",
+                    "read the key files",
+                )
+            )
+            has_worker_fanout = (
+                "spawn subagents" in lowered
+                or "workers execute" in lowered
+                or ("subagents" in lowered and "parallel" in lowered)
+            )
+            if not has_inline_orientation:
+                return False, "Expected inline orientation/decomposition step"
+            if not has_worker_fanout:
+                return False, "Expected worker fan-out for deeper investigation"
+            if "spawn subagents. every time." in lowered or "never do work yourself" in lowered:
+                return False, "Still using absolutist delegation phrasing"
+            return True, "orchestration policy ok"
+
         agent_cases: list[tuple[str, str, Callable[[str], tuple[bool, str]]]] = [
             (
                 "agent_parents_alias",
@@ -320,7 +345,7 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
             (
                 "agent_orchestration_policy",
                 "You need to investigate a codebase and prepare a plan. Should you do the work yourself or spawn subagents?",
-                lambda text: assert_keywords(text, ["spawn subagents", "orchestrator"], ["do the digging myself"]),
+                orchestration_policy_checker,
             ),
             (
                 "agent_inline_trivial_policy",
