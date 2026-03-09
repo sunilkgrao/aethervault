@@ -27,6 +27,28 @@ const DEFAULT_AGENT_CONTEXT_MAX_BYTES: usize = 12_000;
 const DEFAULT_AGENT_MAX_STEPS: usize = 64;
 const DEFAULT_AGENT_LOG_COMMIT_INTERVAL: usize = 8;
 
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
+}
+
+fn suffix_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut boundary = s.len() - max_bytes;
+    while boundary < s.len() && !s.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    &s[boundary..]
+}
+
 #[derive(Debug, Serialize)]
 pub struct AgentSession {
     pub session: Option<String>,
@@ -137,7 +159,7 @@ fn build_memory_query_seed(prompt_text: &str, session_turns: &[SessionTurn]) -> 
             continue;
         }
         let condensed = if snippet.len() > 240 {
-            format!("{}...", &snippet[..240])
+            format!("{}...", truncate_utf8(snippet, 240))
         } else {
             snippet.to_string()
         };
@@ -146,7 +168,7 @@ fn build_memory_query_seed(prompt_text: &str, session_turns: &[SessionTurn]) -> 
     parts.push(format!("user: {}", prompt_text.trim()));
     let joined = parts.join("\n");
     if joined.len() > 1_200 {
-        joined[joined.len() - 1_200..].to_string()
+        suffix_utf8(&joined, 1_200).to_string()
     } else {
         joined
     }
@@ -305,7 +327,7 @@ fn compact_messages(
         .filter_map(|m| {
             let role = &m.role;
             m.content.as_ref().map(|c| {
-                let preview = if c.len() > 300 { &c[..300] } else { c.as_str() };
+                let preview = truncate_utf8(c, 300);
                 format!("[{role}] {preview}")
             })
         })
@@ -618,7 +640,7 @@ pub fn run_agent_with_prompt(
             messages.push(AgentMessage {
                 role: turn.role.clone(),
                 content: Some(if turn.content.len() > 500 {
-                    format!("{}...", &turn.content[..500])
+                    format!("{}...", truncate_utf8(&turn.content, 500))
                 } else {
                     turn.content.clone()
                 }),
@@ -751,7 +773,7 @@ pub fn run_agent_with_prompt(
                 ToolExecution {
                     output: format!(
                         "{}\n\n[Output truncated: {} chars total, showing first {}. Use a more specific query for full results.]",
-                        &result.output[..max_tool_output],
+                        truncate_utf8(&result.output, max_tool_output),
                         result.output.len(),
                         max_tool_output
                     ),
@@ -884,7 +906,7 @@ pub fn run_agent_with_prompt(
                     ToolExecution {
                         output: format!(
                             "{}\n\n[Output truncated: {} chars total, showing first {}.]",
-                            &result.output[..max_tool_output],
+                            truncate_utf8(&result.output, max_tool_output),
                             result.output.len(),
                             max_tool_output
                         ),
@@ -1212,7 +1234,7 @@ pub fn run_agent_for_bridge(
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionTurn, build_memory_query_seed};
+    use super::{SessionTurn, build_memory_query_seed, suffix_utf8, truncate_utf8};
 
     #[test]
     fn memory_query_seed_keeps_recent_thread_context() {
@@ -1234,5 +1256,19 @@ mod tests {
         assert!(seed.contains("Reach out to Dana"));
         assert!(seed.contains("still need two agenda items"));
         assert!(seed.contains("What still needs follow-up?"));
+    }
+
+    #[test]
+    fn truncate_utf8_respects_char_boundaries() {
+        assert_eq!(truncate_utf8("é🙂b", 1), "");
+        assert_eq!(truncate_utf8("é🙂b", 2), "é");
+        assert_eq!(truncate_utf8("é🙂b", 6), "é🙂");
+    }
+
+    #[test]
+    fn suffix_utf8_respects_char_boundaries() {
+        assert_eq!(suffix_utf8("aé🙂b", 5), "🙂b");
+        assert_eq!(suffix_utf8("aé🙂b", 6), "🙂b");
+        assert_eq!(suffix_utf8("aé🙂b", 8), "aé🙂b");
     }
 }
