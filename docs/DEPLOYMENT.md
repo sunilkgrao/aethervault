@@ -78,7 +78,7 @@ Use the Docker image and mount a persistent volume to `/data`. The CLI is statel
 
 ## Chat connectors
 
-Rust-native Telegram + WhatsApp bridges are built in. See `docs/CONNECTORS.md` for full setup.
+Rust-native Telegram, WhatsApp, and Twilio Voice callback bridges are built in. See `docs/CONNECTORS.md` for full setup.
 
 Minimal Docker example (Telegram):
 
@@ -99,4 +99,16 @@ docker run --rm -it -p 8080:8080 \
   -e ANTHROPIC_MODEL=claude-<model> \
   -v "$(pwd)/data:/data" \
   aethervault bridge whatsapp --mv2 /data/knowledge.mv2 --bind 0.0.0.0 --port 8080
+```
+
+Minimal Docker example (Twilio Voice callback bridge):
+
+```bash
+docker run --rm -it -p 8090:8090 \
+  -e TWILIO_ACCOUNT_SID=AC... \
+  -e TWILIO_AUTH_TOKEN=... \
+  -e TWILIO_VOICE_FROM=+15551234567 \
+  -e AETHERVAULT_PUBLIC_BASE_URL=https://linus.example.com \
+  -v "$(pwd)/data:/data" \
+  aethervault bridge voice --mv2 /data/knowledge.mv2 --bind 0.0.0.0 --port 8090
 ```

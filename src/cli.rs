@@ -519,7 +519,7 @@ pub(crate) enum Command {
     /// Reject a pending tool execution.
     Reject { mv2: PathBuf, id: String },
 
-    /// Rust-native chat connectors (Telegram + WhatsApp).
+    /// Rust-native chat and voice connectors (Telegram, WhatsApp, Twilio Voice callbacks).
     Bridge {
         #[command(subcommand)]
         command: BridgeCommand,
@@ -697,6 +697,18 @@ pub(crate) enum BridgeCommand {
         /// Commit agent logs every N entries (1 = fsync each log)
         #[arg(long, default_value_t = 1)]
         log_commit_interval: usize,
+    },
+    /// Twilio Voice callback bridge for interactive phone calls and call status webhooks.
+    Voice {
+        /// Capsule path (defaults to AETHERVAULT_MV2 or ./data/knowledge.mv2)
+        #[arg(long)]
+        mv2: Option<PathBuf>,
+        /// Bind address
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+        /// Bind port
+        #[arg(long, default_value_t = 8090)]
+        port: u16,
     },
     /// Slack Socket Mode bridge.
     Slack {

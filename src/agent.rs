@@ -956,6 +956,9 @@ fn prompt_file_reference_count(prompt: &str) -> usize {
         ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".java", ".rb", ".cpp", ".c", ".h",
         ".css", ".html", ".json", ".toml", ".yaml", ".yml", ".md", ".sh", ".sql",
     ];
+    let code_dirs = [
+        "src", "app", "apps", "bin", "lib", "tests", "test", "public", "config", "docs", "scripts",
+    ];
     prompt
         .split_whitespace()
         .filter(|w| {
@@ -964,13 +967,100 @@ fn prompt_file_reference_count(prompt: &str) -> usize {
                 .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '/' || *c == '_' || *c == '-')
                 .collect();
             let c_lower = cleaned.to_lowercase();
-            file_extensions.iter().any(|ext| c_lower.ends_with(ext))
-                || (cleaned.contains('/') && cleaned.len() > 2)
+            if file_extensions.iter().any(|ext| c_lower.ends_with(ext)) {
+                return true;
+            }
+            if !cleaned.contains('/') || cleaned.len() <= 2 {
+                return false;
+            }
+
+            let looks_like_explicit_path = cleaned.starts_with('/')
+                || cleaned.starts_with("./")
+                || cleaned.starts_with("../")
+                || cleaned.starts_with("~/");
+            if looks_like_explicit_path {
+                return true;
+            }
+
+            let segments: Vec<&str> = c_lower
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect();
+            if segments.len() < 2 {
+                return false;
+            }
+
+            let has_code_dir = segments.iter().any(|segment| code_dirs.contains(segment));
+            let has_fileish_segment = segments.iter().any(|segment| {
+                segment.contains('.')
+                    || segment.chars().any(|ch| ch.is_ascii_digit())
+                    || segment.contains('_')
+                    || segment.contains('-')
+            });
+
+            has_code_dir || has_fileish_segment
         })
         .count()
 }
 
-fn prompt_has_engineering_intent(prompt: &str) -> bool {
+fn build_user_intent_context(prompt_text: &str, session_turns: &[SessionTurn]) -> String {
+    let mut user_turns: Vec<String> = session_turns
+        .iter()
+        .rev()
+        .filter(|turn| turn.role == "user")
+        .filter_map(|turn| {
+            let trimmed = turn.content.trim();
+            if trimmed.is_empty() || trimmed.starts_with('[') {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .take(4)
+        .collect();
+    user_turns.reverse();
+    user_turns.push(prompt_text.trim().to_string());
+    user_turns.join(" ")
+}
+
+fn is_intent_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn contains_whole_term(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+
+    let mut search_from = 0usize;
+    while let Some(offset) = haystack[search_from..].find(needle) {
+        let start = search_from + offset;
+        let end = start + needle.len();
+        let left_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_intent_word_char(ch));
+        let right_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_intent_word_char(ch));
+        if left_ok && right_ok {
+            return true;
+        }
+        search_from = start + needle.len();
+    }
+
+    false
+}
+
+fn prompt_contains_intent_term(lower: &str, term: &str) -> bool {
+    if term.chars().all(is_intent_word_char) {
+        return contains_whole_term(lower, term);
+    }
+    lower.contains(term)
+}
+
+fn prompt_has_explicit_orchestration_request(prompt: &str) -> bool {
     let lower = prompt.to_lowercase();
     let explicit_orchestration = [
         "orchestrate",
@@ -982,7 +1072,90 @@ fn prompt_has_engineering_intent(prompt: &str) -> bool {
         "use orchestrator",
         "orchestrator mode",
     ];
-    if explicit_orchestration.iter().any(|kw| lower.contains(kw)) {
+    explicit_orchestration
+        .iter()
+        .any(|kw| prompt_contains_intent_term(&lower, kw))
+}
+
+fn prompt_has_executive_assistant_intent(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    let domain_terms = [
+        "flight",
+        "travel",
+        "hotel",
+        "airline",
+        "airport",
+        "parents",
+        "mom",
+        "dad",
+        "mother",
+        "father",
+        "doctor",
+        "appointment",
+        "referral",
+        "insurance",
+        "provider",
+        "specialist",
+        "clinic",
+        "calendar",
+        "meeting",
+        "restaurant",
+        "reservation",
+        "itinerary",
+        "guest",
+        "hosting",
+        "vendor",
+        "partner",
+        "visit",
+        "home",
+        "rhaine",
+        "inbox",
+        "email",
+        "slack",
+        "follow-up",
+        "follow up",
+        "phone call",
+        "birthday",
+        "gift",
+    ];
+    let coordination_terms = [
+        "schedule",
+        "book",
+        "plan",
+        "proposal",
+        "coordinate",
+        "delegate",
+        "draft",
+        "availability",
+        "confirm",
+        "handoff",
+        "follow-up",
+        "follow up",
+        "respond",
+        "call",
+    ];
+
+    let domain_hits = domain_terms
+        .iter()
+        .filter(|term| prompt_contains_intent_term(&lower, term))
+        .count();
+    let coordination_hits = coordination_terms
+        .iter()
+        .filter(|term| prompt_contains_intent_term(&lower, term))
+        .count();
+
+    domain_hits >= 2 || (domain_hits >= 1 && coordination_hits >= 1)
+}
+
+fn prompt_requests_structured_json_response(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    (lower.contains("respond with only") || lower.contains("reply with only"))
+        && (lower.contains("begin_json") || (lower.contains("json") && lower.contains('{')))
+}
+
+fn prompt_has_engineering_intent(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    if prompt_has_explicit_orchestration_request(prompt) {
         return true;
     }
 
@@ -1080,15 +1253,15 @@ fn prompt_has_engineering_intent(prompt: &str) -> bool {
 
     let strong_hits = strong_terms
         .iter()
-        .filter(|term| lower.contains(**term))
+        .filter(|term| prompt_contains_intent_term(&lower, term))
         .count();
     let medium_hits = medium_terms
         .iter()
-        .filter(|term| lower.contains(**term))
+        .filter(|term| prompt_contains_intent_term(&lower, term))
         .count();
     let human_hits = human_ops_terms
         .iter()
-        .filter(|term| lower.contains(**term))
+        .filter(|term| prompt_contains_intent_term(&lower, term))
         .count();
 
     let engineering_score = strong_hits * 2 + medium_hits;
@@ -1232,6 +1405,7 @@ fn prompt_is_complex(prompt: &str) -> bool {
 
     // Signal: implementation/feature creation keywords
     let implement_words = [
+        "build",
         "implement",
         "build out",
         "develop",
@@ -1519,7 +1693,24 @@ pub(crate) fn run_agent_with_prompt(
 
     let mut injected_skill_names: Vec<String> = Vec::new();
     let mut swarm_skill_matched = false;
-    let mut engineering_orchestration_intent = prompt_has_engineering_intent(&prompt_text);
+    let mut user_intent_context = build_user_intent_context(&prompt_text, &session_turns);
+    let mut explicit_orchestration_intent =
+        prompt_has_explicit_orchestration_request(&user_intent_context);
+    let mut executive_assistant_intent =
+        prompt_has_executive_assistant_intent(&user_intent_context);
+    let mut engineering_orchestration_intent = prompt_has_engineering_intent(&user_intent_context);
+    let mut orchestration_complexity_intent = prompt_is_complex(&user_intent_context);
+    if executive_assistant_intent && !explicit_orchestration_intent {
+        engineering_orchestration_intent = false;
+    }
+    let trace_intent = env_optional("AETHERVAULT_TRACE_INTENT")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false);
     // --- SkillRL R1: Auto-inject top skills into stable prefix ---
     if !skip_trivial_prefetch {
         if let Some(workspace) = resolve_workspace(None, &agent_cfg) {
@@ -1549,7 +1740,33 @@ pub(crate) fn run_agent_with_prompt(
                     prompt_text.clone()
                 };
                 let matched = match_skills_for_prompt(&conn, &match_context, 5);
-                engineering_orchestration_intent = prompt_has_engineering_intent(&match_context);
+                user_intent_context = build_user_intent_context(&prompt_text, &session_turns);
+                explicit_orchestration_intent =
+                    prompt_has_explicit_orchestration_request(&user_intent_context);
+                executive_assistant_intent =
+                    prompt_has_executive_assistant_intent(&user_intent_context);
+                engineering_orchestration_intent =
+                    prompt_has_engineering_intent(&user_intent_context);
+                orchestration_complexity_intent = prompt_is_complex(&user_intent_context);
+                if executive_assistant_intent && !explicit_orchestration_intent {
+                    engineering_orchestration_intent = false;
+                }
+                if trace_intent {
+                    eprintln!(
+                        "[intent] session={} explicit={} executive_assistant={} engineering={} complexity={} file_refs={} preview={}",
+                        session_label,
+                        explicit_orchestration_intent,
+                        executive_assistant_intent,
+                        engineering_orchestration_intent,
+                        orchestration_complexity_intent,
+                        prompt_file_reference_count(&user_intent_context),
+                        prompt_text
+                            .chars()
+                            .take(120)
+                            .collect::<String>()
+                            .replace('\n', " "),
+                    );
+                }
                 // Also get top general skills by success rate
                 let general = list_skills(&conn, 3);
 
@@ -1627,8 +1844,9 @@ pub(crate) fn run_agent_with_prompt(
                 // go through normal agent mode with full tool access.
                 if engineering_orchestration_intent
                     && matched.iter().any(|s| s.name == "bootstrap:swarm-dev-task")
+                    && (!executive_assistant_intent || explicit_orchestration_intent)
                 {
-                    if prompt_is_complex(&prompt_text) {
+                    if orchestration_complexity_intent {
                         swarm_skill_matched = true;
                         eprintln!(
                             "[complexity-gate] PASS — prompt is complex, orchestrator mode will activate"
@@ -1685,7 +1903,26 @@ pub(crate) fn run_agent_with_prompt(
     let mut system_dynamic = String::new();
 
     let mut context_pack = None;
-    let effective_max_steps = agent_cfg.max_steps.unwrap_or(max_steps);
+    let ea_structured_discovery_mode = executive_assistant_intent
+        && !engineering_orchestration_intent
+        && prompt_requests_structured_json_response(&prompt_text);
+    let ea_structured_step_cap = env_optional("AETHERVAULT_EA_DISCOVERY_MAX_STEPS")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8);
+    let effective_max_steps = if ea_structured_discovery_mode {
+        agent_cfg
+            .max_steps
+            .unwrap_or(max_steps)
+            .min(ea_structured_step_cap.max(1))
+    } else {
+        agent_cfg.max_steps.unwrap_or(max_steps)
+    };
+    if trace_intent && ea_structured_discovery_mode {
+        eprintln!(
+            "[intent] bounded_ea_steps session={} cap={} original_max_steps={}",
+            session_label, effective_max_steps, max_steps
+        );
+    }
     let explicit_context_query = context_query.clone().or(agent_cfg.context_query.clone());
     let auto_memory_prefetch = env_optional("AETHERVAULT_AUTO_MEMORY_PREFETCH")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
@@ -1779,7 +2016,7 @@ pub(crate) fn run_agent_with_prompt(
     let kg_path = agent_workspace
         .as_ref()
         .map(|ws| ws.join("data/knowledge-graph.json"))
-        .unwrap_or_else(|| PathBuf::from("/root/.aethervault/data/knowledge-graph.json"));
+        .unwrap_or_else(|| crate::aethervault_home_dir().join("data/knowledge-graph.json"));
     if !skip_trivial_prefetch && kg_path.exists() {
         if let Some(kg) = load_kg_graph(&kg_path) {
             let matched = find_kg_entities(&prompt_text, &kg);
@@ -2093,16 +2330,46 @@ pub(crate) fn run_agent_with_prompt(
         .as_deref()
         .map(|s| s.starts_with("subagent:"))
         .unwrap_or(false);
+    let session_has_orchestrator_history = session_turns.iter().any(|turn| {
+        turn.content.contains("[Orchestrator]")
+            || turn.content.contains("[SWARM MONITOR")
+            || turn.content.contains("subagent_batch")
+            || turn.content.contains("swarm_create")
+    });
     let mut orchestrator_mode = engineering_orchestration_intent
+        && (!executive_assistant_intent || explicit_orchestration_intent)
         && swarm_skill_matched
         && !is_subagent_early
         && tool_filter.is_none();
+    let swarm_monitor_enabled = !is_subagent
+        && (orchestrator_mode || engineering_orchestration_intent || explicit_orchestration_intent);
+    if trace_intent {
+        eprintln!(
+            "[intent] gate session={} explicit={} executive_assistant={} engineering={} complexity={} swarm_skill_matched={} swarm_monitor_enabled={} orchestrator_history={} tool_filter={} subagent={}",
+            session_label,
+            explicit_orchestration_intent,
+            executive_assistant_intent,
+            engineering_orchestration_intent,
+            orchestration_complexity_intent,
+            swarm_skill_matched,
+            swarm_monitor_enabled,
+            session_has_orchestrator_history,
+            tool_filter.is_some(),
+            is_subagent,
+        );
+    }
     if orchestrator_mode {
         eprintln!(
             "[harness] ORCHESTRATOR MODE (proactive): swarm-dev-task skill matched, tools already stripped"
         );
     }
-    if engineering_orchestration_intent && !is_subagent && tool_filter.is_none() {
+    if engineering_orchestration_intent
+        && (!executive_assistant_intent || explicit_orchestration_intent)
+        && orchestration_complexity_intent
+        && session_has_orchestrator_history
+        && !is_subagent
+        && tool_filter.is_none()
+    {
         if let Some(ref ws) = workspace_env {
             if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
                 let running = crate::swarm::swarm_list_tasks(&sdb, Some("running"), Some(100));
@@ -2270,7 +2537,7 @@ pub(crate) fn run_agent_with_prompt(
         // --- Deterministic Swarm Monitor: periodic check ---
         // Every 60s, check swarm task status via gh CLI (deterministic, not LLM-driven).
         // Inject status updates + action instructions as system messages.
-        if !is_subagent && last_swarm_check.elapsed() >= swarm_monitor_interval {
+        if swarm_monitor_enabled && last_swarm_check.elapsed() >= swarm_monitor_interval {
             last_swarm_check = std::time::Instant::now();
             if let Some(ref ws) = workspace_env {
                 if let Ok(sdb) = crate::swarm::open_swarm_db(ws) {
@@ -4142,7 +4409,7 @@ pub(crate) fn run_agent_with_prompt(
         };
 
         // Save checkpoint to file
-        let checkpoint_dir = PathBuf::from("/root/.aethervault/workspace/checkpoints");
+        let checkpoint_dir = crate::checkpoint_store_dir();
         let _ = fs::create_dir_all(&checkpoint_dir);
         let checkpoint_path = checkpoint_dir.join(format!(
             "{}.json",
@@ -4208,7 +4475,11 @@ pub(crate) fn run_agent_with_prompt(
 
 #[cfg(test)]
 mod tests {
-    use super::{prompt_has_engineering_intent, prompt_is_complex};
+    use super::{
+        build_user_intent_context, prompt_file_reference_count, prompt_has_engineering_intent,
+        prompt_has_executive_assistant_intent, prompt_is_complex,
+    };
+    use crate::SessionTurn;
 
     #[test]
     fn engineering_intent_detects_multi_file_build_prompt() {
@@ -4228,6 +4499,54 @@ mod tests {
         or my inbox if needed. Ask the smart questions you actually need, infer
         whether the likely destination is my home, and only ask what remains ambiguous.
         "#;
+        assert!(prompt_has_executive_assistant_intent(prompt));
         assert!(!prompt_has_engineering_intent(prompt));
+    }
+
+    #[test]
+    fn engineering_intent_ignores_assistant_oauth_noise_for_ea_followup() {
+        let session_turns = vec![
+            SessionTurn {
+                role: "user".to_string(),
+                content: "Help me find flights for my parents to visit me in Boca.".to_string(),
+                timestamp: 0,
+            },
+            SessionTurn {
+                role: "assistant".to_string(),
+                content: "I inferred the likely route but Gmail OAuth failed while checking inbox."
+                    .to_string(),
+                timestamp: 1,
+            },
+        ];
+        let prompt = "They should come around April 18 and stay about a week.";
+        let intent_context = build_user_intent_context(prompt, &session_turns);
+        assert!(!prompt_has_engineering_intent(&intent_context));
+    }
+
+    #[test]
+    fn engineering_intent_does_not_match_short_terms_inside_human_words() {
+        let prompt = "Search my inbox for prior specialists and help me schedule the right doctor appointment.";
+        assert!(prompt_has_executive_assistant_intent(prompt));
+        assert!(!prompt_has_engineering_intent(prompt));
+    }
+
+    #[test]
+    fn slash_separated_human_phrases_are_not_counted_as_file_references() {
+        let prompt =
+            "Do not ask the dumb baseline version of origin/destination if you can infer better.";
+        assert_eq!(prompt_file_reference_count(prompt), 0);
+        assert!(!prompt_has_engineering_intent(prompt));
+    }
+
+    #[test]
+    fn doctor_appointment_prompt_stays_out_of_complex_orchestrator_mode() {
+        let prompt = r#"
+        I need to get a doctor appointment sorted out. Search memory and inbox for
+        prior specialists, referral context, and anything Rhaine handled before.
+        Ask only the smart missing questions and propose whether email, portal,
+        Rhaine, or a direct phone call is the right next action.
+        "#;
+        assert!(!prompt_has_engineering_intent(prompt));
+        assert!(!prompt_is_complex(prompt));
     }
 }

@@ -474,14 +474,6 @@ pub(crate) fn try_handle_approval_chat(mv2: &Path, text: &str) -> Option<String>
 }
 
 pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
-    // In bridge mode (env AETHERVAULT_BRIDGE_AUTO_APPROVE=1), auto-approve ALL tools.
-    // The user explicitly opted in to full agency — no approval gates.
-    let bridge_auto = std::env::var("AETHERVAULT_BRIDGE_AUTO_APPROVE")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
-    if bridge_auto {
-        return false;
-    }
     // Per-tool autonomy override via env (e.g. TOOL_AUTONOMY_EXEC=autonomous)
     match tool_autonomy_for(name) {
         ToolAutonomyLevel::Autonomous | ToolAutonomyLevel::Background => return false,
@@ -495,8 +487,8 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
     match name {
         "exec" | "email_send" | "email_archive" | "config_set" | "gmail_send" | "gcal_create"
         | "ms_calendar_create" | "trigger_add" | "trigger_remove" | "notify" | "signal_send"
-        | "imessage_send" | "memory_export" | "fs_write" | "browser" | "excalidraw"
-        | "self_upgrade" => true,
+        | "imessage_send" | "phone_call" | "memory_export" | "fs_write" | "browser"
+        | "excalidraw" | "self_upgrade" => true,
         "http_request" => {
             let method = args
                 .get("method")
@@ -507,6 +499,31 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
         }
         "scale" => args.get("action").and_then(|v| v.as_str()) == Some("resize"),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::requires_approval;
+
+    #[test]
+    fn phone_calls_require_approval() {
+        assert!(requires_approval(
+            "phone_call",
+            &serde_json::json!({
+                "to": "+15551234567",
+                "objective": "doctor appointment",
+                "script": "This is Linus calling for Sunil."
+            })
+        ));
+    }
+
+    #[test]
+    fn get_requests_do_not_require_approval() {
+        assert!(!requires_approval(
+            "http_request",
+            &serde_json::json!({"method":"GET","url":"https://example.com"})
+        ));
     }
 }
 

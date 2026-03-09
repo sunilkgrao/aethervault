@@ -152,6 +152,33 @@ pub(crate) struct ToolIMessageSendArgs {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct ToolPhoneCallArgs {
+    pub(crate) to: String,
+    pub(crate) objective: String,
+    pub(crate) script: String,
+    #[serde(default)]
+    pub(crate) session: Option<String>,
+    #[serde(default)]
+    pub(crate) from: Option<String>,
+    #[serde(default)]
+    pub(crate) voice: Option<String>,
+    #[serde(default)]
+    pub(crate) questions: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) record: Option<bool>,
+    #[serde(default)]
+    pub(crate) machine_detection: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolPhoneCallStatusArgs {
+    #[serde(default)]
+    pub(crate) request_id: Option<String>,
+    #[serde(default)]
+    pub(crate) call_sid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct ToolGmailListArgs {
     #[serde(default)]
     pub(crate) query: Option<String>,

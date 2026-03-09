@@ -299,6 +299,40 @@ pub(crate) fn tool_definitions_json() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "phone_call",
+            "description": "Place an outbound phone call using Twilio Voice. Supports a spoken script plus optional structured question capture via the Twilio voice callback bridge. Requires approval.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string", "description": "Destination phone number in E.164 format." },
+                    "objective": { "type": "string", "description": "Why the assistant is calling." },
+                    "script": { "type": "string", "description": "Opening script Linus should say before any questions." },
+                    "session": { "type": "string", "description": "Optional agent session id to associate with the call record." },
+                    "from": { "type": "string", "description": "Override caller ID. Defaults to TWILIO_VOICE_FROM / TWILIO_FROM_NUMBER." },
+                    "voice": { "type": "string", "description": "Twilio <Say> voice name. Defaults to TWILIO_VOICE_DEFAULT or 'alice'." },
+                    "questions": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional structured questions. Requires the Twilio voice callback bridge and AETHERVAULT_PUBLIC_BASE_URL."
+                    },
+                    "record": { "type": "boolean", "description": "Request Twilio call recording." },
+                    "machine_detection": { "type": "boolean", "description": "Enable answering-machine detection before speaking." }
+                },
+                "required": ["to", "objective", "script"]
+            }
+        }),
+        serde_json::json!({
+            "name": "phone_call_status",
+            "description": "Inspect a Twilio-backed phone call by local request id or provider call SID, including gathered answers and provider status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "call_sid": { "type": "string" }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "http_request",
             "description": "Generic HTTP request (GET allowed without approval; other methods may require approval).",
             "inputSchema": {
@@ -930,6 +964,8 @@ pub(crate) fn base_tool_names() -> HashSet<String> {
         "approval_list",
         "exec",
         "notify",
+        "phone_call",
+        "phone_call_status",
         "http_request",
         "exa_search",
         "fs_list",

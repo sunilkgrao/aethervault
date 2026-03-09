@@ -1,5 +1,6 @@
 pub(crate) mod slack;
 pub(crate) mod telegram;
+pub(crate) mod voice;
 pub(crate) mod webhook;
 pub(crate) mod whatsapp;
 
@@ -11,6 +12,7 @@ use std::thread;
 
 use self::slack::run_slack_bridge;
 use self::telegram::run_telegram_bridge;
+use self::voice::run_twilio_voice_bridge;
 use self::webhook::{
     extract_discord_event, extract_imessage_event, extract_matrix_event, extract_signal_event,
     extract_teams_event, reply_none, run_webhook_bridge,
@@ -312,6 +314,10 @@ pub(crate) fn run_bridge(command: BridgeCommand) -> Result<(), Box<dyn std::erro
                 log_commit_interval,
             )?;
             run_whatsapp_bridge(bind, port, config)
+        }
+        BridgeCommand::Voice { mv2, bind, port } => {
+            let mv2 = resolve_mv2_path(mv2);
+            run_twilio_voice_bridge(bind, port, mv2)
         }
         BridgeCommand::Slack {
             mv2,

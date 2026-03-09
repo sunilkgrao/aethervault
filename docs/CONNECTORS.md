@@ -1,4 +1,4 @@
-# Connectors: Telegram + WhatsApp (Rust‑native)
+# Connectors: Telegram + WhatsApp + Twilio Voice (Rust‑native)
 
 AetherVault ships a built‑in `bridge` command. It runs the agent loop directly in Rust and maps chat IDs to stable session IDs.
 
@@ -17,6 +17,32 @@ export ANTHROPIC_MODEL=claude-<model>
 ```
 
 Messages now route into `aethervault agent` and back to Telegram.
+
+## Twilio Voice callbacks
+
+Use the Twilio Voice bridge when Linus needs to place real phone calls and collect structured answers from the callee.
+
+1. Export the required env vars:
+
+```bash
+export TWILIO_ACCOUNT_SID=AC...
+export TWILIO_AUTH_TOKEN=...
+export TWILIO_VOICE_FROM=+15551234567
+export AETHERVAULT_PUBLIC_BASE_URL=https://linus.example.com
+```
+
+2. Run the callback bridge on a public endpoint:
+
+```bash
+./target/release/aethervault bridge voice --bind 0.0.0.0 --port 8090
+```
+
+3. Route `https://linus.example.com/twilio/voice/*` to that bridge.
+
+Then the `phone_call` tool can:
+- place a simple scripted outbound call
+- ask follow-up questions with Twilio `<Gather>`
+- persist gathered answers for `phone_call_status`
 
 ## Slack / Discord / Teams (webhook receiver)
 
@@ -142,6 +168,12 @@ export ANTHROPIC_MODEL=claude-<model>
 ```
 
 3. Configure Twilio to POST to `https://<public-url>/`.
+
+## Phone-action tools
+
+- `phone_call` places an approval-gated outbound call via Twilio Voice.
+- `phone_call_status` inspects the local record and, when credentials are available, refreshes live status from Twilio.
+- For structured answer capture, run the Twilio Voice bridge above and set `AETHERVAULT_PUBLIC_BASE_URL`.
 
 ## Subagents / multi-session orchestration
 

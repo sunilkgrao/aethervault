@@ -1234,7 +1234,7 @@ pub(crate) struct SessionTurn {
 
 pub(crate) fn session_file_path(session_id: &str) -> PathBuf {
     let safe_id = session_id.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-    PathBuf::from("/root/.aethervault/workspace/sessions").join(format!("{safe_id}.json"))
+    crate::session_store_dir().join(format!("{safe_id}.json"))
 }
 
 pub(crate) fn load_session_turns(session_id: &str, max_turns: usize) -> Vec<SessionTurn> {

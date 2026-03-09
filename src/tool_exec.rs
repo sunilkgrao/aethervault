@@ -13,6 +13,7 @@ use crate::consolidation::{ConsolidationDecision, put_with_consolidation};
 use crate::memory_db::{MemoryDb, PutOptions, SearchRequest};
 use base64::Engine;
 use chrono::Utc;
+use url::form_urlencoded;
 use walkdir::WalkDir;
 
 use std::sync::mpsc;
@@ -381,6 +382,53 @@ fn oauth_api_post(
         Ok(resp) => resp
             .into_json::<serde_json::Value>()
             .map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(format!("{label} error {code}: {text}"))
+        }
+        Err(err) => Err(format!("{label} failed: {err}")),
+    }
+}
+
+fn twilio_form_post(
+    url: &str,
+    auth_header: &str,
+    params: &[(String, String)],
+    label: &str,
+) -> Result<serde_json::Value, String> {
+    let body = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .finish();
+    let agent = make_http_agent(DEFAULT_HTTP_TIMEOUT_MS);
+    let response = agent
+        .post(url)
+        .set("authorization", auth_header)
+        .set("accept", "application/json")
+        .set("content-type", "application/x-www-form-urlencoded")
+        .send_string(&body);
+    match response {
+        Ok(resp) => resp
+            .into_json::<serde_json::Value>()
+            .map_err(|e| format!("{label} parse error: {e}")),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(format!("{label} error {code}: {text}"))
+        }
+        Err(err) => Err(format!("{label} failed: {err}")),
+    }
+}
+
+fn twilio_get_json(url: &str, auth_header: &str, label: &str) -> Result<serde_json::Value, String> {
+    let agent = make_http_agent(DEFAULT_HTTP_TIMEOUT_MS);
+    let response = agent
+        .get(url)
+        .set("authorization", auth_header)
+        .set("accept", "application/json")
+        .call();
+    match response {
+        Ok(resp) => resp
+            .into_json::<serde_json::Value>()
+            .map_err(|e| format!("{label} parse error: {e}")),
         Err(ureq::Error::Status(code, resp)) => {
             let text = resp.into_string().unwrap_or_default();
             Err(format!("{label} error {code}: {text}"))
@@ -1104,28 +1152,32 @@ fn wait_for_child_monitored(
 use crate::{
     ActiveProject, AgentConfig, AgentLogEntry, AgentProgress, AgentRunOutput, ApprovalEntry,
     BackgroundTask, BackgroundTaskRegistry, BackgroundTaskStatus, CronExpr, DEFAULT_WORKSPACE_DIR,
-    FeedbackEvent, QueryArgs, SessionRegistry, SkillRecord, SubagentSession, SubagentSpec,
-    ToolBrowserArgs, ToolConfigSetArgs, ToolContextArgs, ToolEmailArchiveArgs, ToolEmailListArgs,
-    ToolEmailReadArgs, ToolEmailSendArgs, ToolExaSearchArgs, ToolExcalidrawArgs, ToolExecArgs,
-    ToolExecution, ToolFeedbackArgs, ToolFsListArgs, ToolFsReadArgs, ToolFsWriteArgs,
+    FeedbackEvent, PhoneCallRecord, QueryArgs, SessionRegistry, SkillRecord, SubagentSession,
+    SubagentSpec, ToolBrowserArgs, ToolConfigSetArgs, ToolContextArgs, ToolEmailArchiveArgs,
+    ToolEmailListArgs, ToolEmailReadArgs, ToolEmailSendArgs, ToolExaSearchArgs, ToolExcalidrawArgs,
+    ToolExecArgs, ToolExecution, ToolFeedbackArgs, ToolFsListArgs, ToolFsReadArgs, ToolFsWriteArgs,
     ToolGCalCreateArgs, ToolGCalListArgs, ToolGetArgs, ToolGmailListArgs, ToolGmailReadArgs,
     ToolGmailSendArgs, ToolHttpRequestArgs, ToolIMessageSendArgs, ToolLogArgs,
     ToolMemoryAppendArgs, ToolMemoryExportArgs, ToolMemoryRememberArgs, ToolMemorySearchArgs,
     ToolMemorySyncArgs, ToolMsCalendarCreateArgs, ToolMsCalendarListArgs, ToolMsMailListArgs,
-    ToolMsMailReadArgs, ToolNotifyArgs, ToolProjectListArgs, ToolProjectUpdateArgs, ToolPutArgs,
-    ToolQueryArgs, ToolReflectArgs, ToolScaleArgs, ToolSearchArgs, ToolSelfUpgradeArgs,
-    ToolSessionContextArgs, ToolSessionSendArgs, ToolSessionStartArgs, ToolSessionStatusArgs,
-    ToolSignalSendArgs, ToolSkillSearchArgs, ToolSkillStoreArgs, ToolSubagentBatchArgs,
-    ToolSubagentInvokeArgs, ToolSwarmCheckArgs, ToolSwarmCreateArgs, ToolSwarmListArgs,
-    ToolSwarmUpdateArgs, ToolToolSearchArgs, ToolTriggerAddArgs, ToolTriggerRemoveArgs,
-    TriggerEntry, allowed_fs_roots, append_agent_log, append_feedback, approval_hash, blake3_hash,
-    build_bridge_agent_config, build_context_pack, build_external_command, env_optional,
-    execute_query, export_capsule_memory, find_similar_skill, get_oauth_token, kill_process_tree,
-    load_approvals, load_capsule_config, load_session_logs, load_subagents_from_config,
-    load_triggers, log_dir_path, open_skill_db, parse_log_ts_from_uri, requires_approval,
-    resolve_fs_path, resolve_workspace, run_agent_for_bridge, save_approvals, save_config_to_file,
-    save_triggers, scope_prefix, search_skills, subprocess_exit_info, subprocess_output_text,
-    sync_workspace_memory, tool_definitions_json, tool_score, upsert_skill,
+    ToolMsMailReadArgs, ToolNotifyArgs, ToolPhoneCallArgs, ToolPhoneCallStatusArgs,
+    ToolProjectListArgs, ToolProjectUpdateArgs, ToolPutArgs, ToolQueryArgs, ToolReflectArgs,
+    ToolScaleArgs, ToolSearchArgs, ToolSelfUpgradeArgs, ToolSessionContextArgs,
+    ToolSessionSendArgs, ToolSessionStartArgs, ToolSessionStatusArgs, ToolSignalSendArgs,
+    ToolSkillSearchArgs, ToolSkillStoreArgs, ToolSubagentBatchArgs, ToolSubagentInvokeArgs,
+    ToolSwarmCheckArgs, ToolSwarmCreateArgs, ToolSwarmListArgs, ToolSwarmUpdateArgs,
+    ToolToolSearchArgs, ToolTriggerAddArgs, ToolTriggerRemoveArgs, TriggerEntry, allowed_fs_roots,
+    append_agent_log, append_feedback, approval_hash, blake3_hash, build_bridge_agent_config,
+    build_context_pack, build_external_command, build_phone_call_completion_twiml,
+    build_phone_call_gather_twiml, default_phone_voice, env_optional, execute_query,
+    export_capsule_memory, find_similar_skill, get_oauth_token, kill_process_tree, load_approvals,
+    load_capsule_config, load_phone_call_record, load_session_logs, load_subagents_from_config,
+    load_triggers, load_twilio_credentials, log_dir_path, now_rfc3339, open_skill_db,
+    parse_log_ts_from_uri, requires_approval, resolve_fs_path, resolve_public_base_url,
+    resolve_workspace, run_agent_for_bridge, save_approvals, save_config_to_file,
+    save_phone_call_record, save_triggers, scope_prefix, search_skills, subprocess_exit_info,
+    subprocess_output_text, sync_workspace_memory, tool_definitions_json, tool_score,
+    twilio_basic_auth_header, twilio_call_url, twilio_calls_url, upsert_skill,
 };
 
 const EXEC_BACKGROUND_THRESHOLD_MS: u64 = 300_000;
@@ -1962,6 +2014,229 @@ pub(crate) fn execute_tool(
             Ok(ToolExecution {
                 output: "iMessage sent.".to_string(),
                 details: serde_json::json!({ "status": "sent" }),
+                is_error: false,
+            })
+        }
+        "phone_call" => {
+            let parsed: ToolPhoneCallArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let credentials = load_twilio_credentials(parsed.from.as_deref())?;
+            let voice = parsed
+                .voice
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(default_phone_voice);
+            let questions: Vec<String> = parsed
+                .questions
+                .unwrap_or_default()
+                .into_iter()
+                .map(|question| question.trim().to_string())
+                .filter(|question| !question.is_empty())
+                .collect();
+            let callback_base_url = if questions.is_empty() {
+                resolve_public_base_url()
+            } else {
+                Some(
+                    resolve_public_base_url().ok_or(
+                        "interactive phone calls require AETHERVAULT_PUBLIC_BASE_URL or PUBLIC_BASE_URL",
+                    )?,
+                )
+            };
+            let now = now_rfc3339();
+            let seed = format!(
+                "{}:{}:{}:{}",
+                parsed.to, parsed.objective, parsed.script, now
+            );
+            let request_id = format!("call-{}", &blake3_hash(seed.as_bytes()).to_hex()[..12]);
+            let record_requested = parsed.record.unwrap_or(false);
+            let machine_detection = parsed.machine_detection.unwrap_or(true);
+            let mut record = PhoneCallRecord {
+                request_id: request_id.clone(),
+                call_sid: None,
+                session: parsed.session.clone(),
+                to: parsed.to.clone(),
+                from: credentials.from_number.clone(),
+                objective: parsed.objective.clone(),
+                script: parsed.script.clone(),
+                voice: voice.clone(),
+                status: "queued".to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+                record: record_requested,
+                machine_detection,
+                callback_base_url: callback_base_url.clone(),
+                questions,
+                answers: Vec::new(),
+                status_events: Vec::new(),
+            };
+            let twiml = if record.questions.is_empty() {
+                build_phone_call_completion_twiml(&record.voice, &record.script)
+            } else {
+                build_phone_call_gather_twiml(&record, 0)?
+            };
+
+            let auth_header =
+                twilio_basic_auth_header(&credentials.account_sid, &credentials.auth_token);
+            let mut form_pairs = vec![
+                ("To".to_string(), record.to.clone()),
+                ("From".to_string(), record.from.clone()),
+                ("Twiml".to_string(), twiml),
+            ];
+            if record.machine_detection {
+                form_pairs.push(("MachineDetection".to_string(), "Enable".to_string()));
+            }
+            if record.record {
+                form_pairs.push(("Record".to_string(), "true".to_string()));
+            }
+            if let Some(base_url) = callback_base_url {
+                let status_callback = format!(
+                    "{}/twilio/voice/status?request_id={}",
+                    base_url.trim_end_matches('/'),
+                    urlencoding::encode(&request_id)
+                );
+                form_pairs.push(("StatusCallback".to_string(), status_callback));
+                form_pairs.push((
+                    "StatusCallbackEvent".to_string(),
+                    "initiated ringing answered completed".to_string(),
+                ));
+                form_pairs.push(("StatusCallbackMethod".to_string(), "POST".to_string()));
+            }
+            let details = twilio_form_post(
+                &twilio_calls_url(&credentials.account_sid),
+                &auth_header,
+                &form_pairs,
+                "phone_call",
+            )?;
+            record.call_sid = details
+                .get("sid")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+            record.status = details
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("queued")
+                .to_string();
+            record.updated_at = now_rfc3339();
+            record.status_events.push(serde_json::json!({
+                "kind": "create",
+                "at": record.updated_at.clone(),
+                "payload": {
+                    "sid": record.call_sid.clone(),
+                    "status": record.status.clone(),
+                }
+            }));
+            save_phone_call_record(db, &record)?;
+            let output = if record.questions.is_empty() {
+                format!(
+                    "Phone call placed for {}. request_id={} call_sid={}",
+                    record.objective,
+                    record.request_id,
+                    record
+                        .call_sid
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string())
+                )
+            } else {
+                format!(
+                    "Interactive phone call placed for {}. request_id={} call_sid={}. The Twilio voice bridge should capture answers as the callee responds.",
+                    record.objective,
+                    record.request_id,
+                    record
+                        .call_sid
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string())
+                )
+            };
+            Ok(ToolExecution {
+                output,
+                details: serde_json::json!({
+                    "request_id": record.request_id,
+                    "call_sid": record.call_sid,
+                    "status": record.status,
+                    "to": record.to,
+                    "from": record.from,
+                    "interactive": !record.questions.is_empty(),
+                    "callback_base_url": record.callback_base_url,
+                    "provider_details": details,
+                }),
+                is_error: false,
+            })
+        }
+        "phone_call_status" => {
+            let parsed: ToolPhoneCallStatusArgs =
+                serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
+            let mut record = parsed
+                .request_id
+                .as_deref()
+                .and_then(|request_id| load_phone_call_record(db, request_id));
+
+            if record.is_none() && parsed.call_sid.is_none() {
+                return Err("phone_call_status requires request_id or call_sid".into());
+            }
+
+            let live_status = if let Some(call_sid) = parsed
+                .call_sid
+                .clone()
+                .or_else(|| record.as_ref().and_then(|item| item.call_sid.clone()))
+            {
+                if let Ok(credentials) =
+                    load_twilio_credentials(record.as_ref().map(|item| item.from.as_str()))
+                {
+                    let auth_header =
+                        twilio_basic_auth_header(&credentials.account_sid, &credentials.auth_token);
+                    Some(twilio_get_json(
+                        &twilio_call_url(&credentials.account_sid, &call_sid),
+                        &auth_header,
+                        "phone_call_status",
+                    )?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let (Some(ref mut local), Some(ref live)) = (record.as_mut(), live_status.as_ref()) {
+                if let Some(status) = live.get("status").and_then(|value| value.as_str()) {
+                    local.status = status.to_string();
+                    local.updated_at = now_rfc3339();
+                }
+                if let Some(sid) = live.get("sid").and_then(|value| value.as_str()) {
+                    local.call_sid = Some(sid.to_string());
+                }
+                let _ = save_phone_call_record(db, local);
+            }
+
+            let output = if let Some(ref local) = record {
+                format!(
+                    "Phone call {} status: {}{}",
+                    local.request_id,
+                    local.status,
+                    if local.answers.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({} answers captured)", local.answers.len())
+                    }
+                )
+            } else if let Some(ref live) = live_status {
+                let sid = live
+                    .get("sid")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let status = live
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                format!("Phone call {sid} status: {status}")
+            } else {
+                "No phone call record found.".to_string()
+            };
+            Ok(ToolExecution {
+                output,
+                details: serde_json::json!({
+                    "record": record,
+                    "provider_details": live_status,
+                }),
                 is_error: false,
             })
         }
@@ -4294,8 +4569,7 @@ pub(crate) fn execute_tool(
                 let reg = sess_reg.lock().unwrap_or_else(|e| e.into_inner());
                 reg.next_id(&parsed.name)
             };
-            let workspace_dir =
-                PathBuf::from("/root/.aethervault/workspace/sessions").join(&session_id);
+            let workspace_dir = crate::session_store_dir().join(&session_id);
             let _ = std::fs::create_dir_all(&workspace_dir);
 
             // Copy input file if provided

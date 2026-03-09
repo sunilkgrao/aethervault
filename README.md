@@ -86,6 +86,7 @@ cargo build --locked
 - `http_request` provides a generic API surface (non-GET requires approval).
 - `browser` provides CLI-based browser automation via agent-browser (ref-based element selection, named sessions).
 - `fs_list`, `fs_read`, `fs_write` give controlled filesystem access within allowed roots.
+- `phone_call` / `phone_call_status` provide approval-gated outbound calling backed by Twilio Voice, with optional structured answer capture when the voice callback bridge is running.
 - Sensitive tools require approval; reply `approve <id>` or `reject <id>` when prompted.
 - `tool_search` enables dynamic tool lookup (no bloated prompt).
 - `session_context` fetches recent session logs efficiently.
@@ -100,7 +101,7 @@ cargo build --locked
 ## Deployment and connectors
 
 - `docs/DEPLOYMENT.md` for local, Docker, and cloud deployment.
-- `docs/CONNECTORS.md` for Telegram + WhatsApp bridges and multi-session worker orchestration.
+- `docs/CONNECTORS.md` for Telegram, WhatsApp, Twilio Voice callbacks, and multi-session worker orchestration.
 - Rust‑native connectors are built in (`bridge`).
 - Optional: Himalaya integration enables `email_*` tools for Gmail IMAP workflows.
 - `notify`, `signal_send`, `imessage_send` provide outbound messaging helpers.

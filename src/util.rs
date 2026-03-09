@@ -56,6 +56,34 @@ pub(crate) fn blake3_hash(bytes: &[u8]) -> Hash {
     blake3::hash(bytes)
 }
 
+pub(crate) fn aethervault_home_dir() -> PathBuf {
+    if let Ok(home) = env::var("AETHERVAULT_HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join(".aethervault");
+        }
+    }
+    PathBuf::from(".aethervault")
+}
+
+pub(crate) fn aethervault_workspace_dir() -> PathBuf {
+    aethervault_home_dir().join("workspace")
+}
+
+pub(crate) fn session_store_dir() -> PathBuf {
+    aethervault_workspace_dir().join("sessions")
+}
+
+pub(crate) fn checkpoint_store_dir() -> PathBuf {
+    aethervault_workspace_dir().join("checkpoints")
+}
+
 pub(crate) fn open_or_create_db(
     path: &Path,
 ) -> Result<crate::memory_db::MemoryDb, Box<dyn std::error::Error>> {

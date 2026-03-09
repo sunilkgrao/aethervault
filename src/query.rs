@@ -220,11 +220,9 @@ pub(crate) fn bayesian_log_odds_fuse(
     let mut candidates: Vec<FusedCandidate> = scores
         .into_iter()
         .map(|(id, stats)| {
-            let fused_logit = bm25_weight * logit_f32(if stats.has_bm25 {
-                stats.p_bm25
-            } else {
-                0.5
-            }) + vec_weight * logit_f32(if stats.has_vec { stats.p_vec } else { 0.5 });
+            let fused_logit = bm25_weight
+                * logit_f32(if stats.has_bm25 { stats.p_bm25 } else { 0.5 })
+                + vec_weight * logit_f32(if stats.has_vec { stats.p_vec } else { 0.5 });
             let fused_score = sigmoid_f32(fused_logit);
 
             FusedCandidate {
@@ -520,11 +518,9 @@ pub(crate) fn execute_query(
 
     let fused = match args.fusion_mode {
         FusionMode::Rrf => rrf_fuse(&lists, 60.0),
-        FusionMode::BayesianLogOdds => bayesian_log_odds_fuse(
-            &lists,
-            args.bayesian_bm25_weight,
-            args.bayesian_vec_weight,
-        ),
+        FusionMode::BayesianLogOdds => {
+            bayesian_log_odds_fuse(&lists, args.bayesian_bm25_weight, args.bayesian_vec_weight)
+        }
     };
 
     let rerank_mode = if rerank_hook.is_some() {

@@ -19,6 +19,7 @@ mod tool_defs;
 mod tool_exec;
 mod types;
 mod util;
+mod voice;
 
 // Re-export all module items at crate root so cross-module references work.
 // Before this split, everything lived in main.rs and shared a single namespace.
@@ -40,6 +41,7 @@ pub(crate) use tool_defs::*;
 pub(crate) use tool_exec::*;
 pub(crate) use types::*;
 pub(crate) use util::*;
+pub(crate) use voice::*;
 
 // External crate imports used directly in main()
 use std::collections::HashMap;
