@@ -1,69 +1,70 @@
-# AetherVault
+# Linus Legacy Migration Utility
 
-**AetherVault** is a **single‑file, append‑only memory capsule** plus a **hybrid retrieval engine** for agents.
-All content, indexes, embeddings, queries, and feedback live inside one `.mv2` archive.
+This repository is no longer the intended runtime for Linus.
 
-## Why it's novel
+The target end state is:
+- upstream **OpenClaw** as the only live runtime
+- a clean `~/.openclaw/workspace/` with Linus memory and state
+- this Rust code used only to export legacy AetherVault data safely
+
+If you are looking for the runtime, use upstream OpenClaw.
+If you are looking for the bridge off the old system without losing memory, use this repo.
+
+## What This Repo Still Does
 
 - **Memory is portable, auditable, and mergeable**: everything (content + indexes + query/feedback traces) lives in one capsule you can diff/merge like a repo.
 - **Queries are first‑class memory**: searches, expansions, reranks, and feedback are stored as frames, so the system improves while staying explainable.
 - **Hybrid retrieval by design**: expansion → lex + vec lanes → fusion → rerank → blend, with hook points for local or remote models.
 - **Time‑travel retrieval**: "what did the agent know at time T?" is a built‑in query mode.
-- **Agent‑ready surface**: MCP server compatibility, context packs, and a minimal hook‑based agent loop.
+- **One-time export path**: move Linus memory/state/history into an OpenClaw workspace without dropping durable context.
 
-## System at a glance
+## Transitional Shape
 
 ```mermaid
 flowchart LR
-  A[Agent / Tool Caller] -->|query| B[AetherVault CLI]
-  B --> C{Expansion Hook}
-  C --> D[Lexical Lane BM25]
-  C --> E[Vector Lane Optional]
-  D --> F[Fusion RRF + bonuses]
-  E --> F
-  F --> G[Rerank Hook]
-  G --> H[Blended Results]
-  H --> I[Context Pack / JSON / Files]
-  I -->|feedback + logs| J[.mv2 Capsule]
+  A[Legacy AetherVault Data] --> B[linus-migrate exporter]
+  B --> C[OpenClaw workspace files]
+  C --> D[Upstream OpenClaw runtime]
 ```
 
 ```mermaid
 flowchart TB
-  CAP[.mv2 Capsule]
-  CAP --> WAL[Append-only WAL]
-  CAP --> TOC[TOC + Index Manifests]
-  CAP --> FR[Frames: content + metadata]
-  CAP --> TR[Tracks: queries, feedback, agent logs]
-  CAP --> CFG[aethervault://config/*]
+  CAP[Legacy capsule + workspace]
+  CAP --> EXP[linus-migrate export-open-claw]
+  EXP --> WS[~/.openclaw/workspace]
+  WS --> OC[OpenClaw]
 ```
 
 ## Design docs
 
 - `docs/ARCHITECTURE.md`
-- `FINAL_STATE.md` for the assistant product north star and target EA architecture
+- `FINAL_STATE.md` for the product north star
+- `docs/OPENCLAW_REFOUND.md` for the clean-slate migration target onto upstream OpenClaw
 
 ## Quick start
 
 ```bash
 cargo build --locked
 
-./target/debug/aethervault init knowledge.mv2
-./target/debug/aethervault bootstrap knowledge.mv2 --workspace ./assistant
-./target/debug/aethervault ingest knowledge.mv2 -c notes -r ~/notes
-./target/debug/aethervault search knowledge.mv2 "project timeline" -c notes -n 10
-./target/debug/aethervault query knowledge.mv2 "quarterly planning process" -c notes -n 10 --plan
-./target/debug/aethervault context knowledge.mv2 "quarterly planning process" -c notes --max-bytes 8000
-./target/debug/aethervault put knowledge.mv2 --uri aether://notes/hello.md --text "hello world"
-./target/debug/aethervault log knowledge.mv2 --session sprint-42 --role user --text "Summarize release risks"
-./target/debug/aethervault feedback knowledge.mv2 --uri aether://notes/plan.md --score 0.7 --note "Good source"
-./target/debug/aethervault embed knowledge.mv2 -c notes --batch 64
-./target/debug/aethervault get knowledge.mv2 aether://notes/some-note.md
-./target/debug/aethervault config set --key index --json '{"context":"You are my assistant"}'
-./target/debug/aethervault diff knowledge.mv2 other.mv2
-./target/debug/aethervault merge knowledge.mv2 other.mv2 merged.mv2 --force
+./target/debug/linus-migrate export-open-claw /path/to/memory.mv2 \
+  --workspace ~/.openclaw/workspace
 ```
 
-## Tool surface (agent‑friendly)
+The goal is to get these files into `~/.openclaw/workspace/`:
+- `SOUL.md`
+- `USER.md`
+- `MEMORY.md`
+- `STATE.md`
+- `STATE.json`
+- legacy logs/sessions under `imports/legacy-aethervault/`
+
+## What not to do
+
+- Do not treat this binary as the future OpenClaw runtime.
+- Do not keep adding AetherVault bridge/runtime behavior here.
+- Do not dual-maintain two assistant brains.
+
+## Transitional commands
 
 - `--json` returns a structured plan + results payload.
 - `--files` emits tab‑separated `score,frame_id,uri,title`.

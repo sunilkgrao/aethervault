@@ -6,8 +6,8 @@ use aether_core::Vault;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ToolExecution, blake3_hash, env_optional, execute_tool, load_config_json, open_or_create,
-    save_config_entry,
+    ToolExecution, blake3_hash, env_optional, env_optional_alias, execute_tool, load_config_json,
+    open_or_create, save_config_entry,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -136,7 +136,7 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> bool {
 }
 
 pub(crate) fn allowed_fs_roots(workspace_override: &Option<PathBuf>) -> Vec<PathBuf> {
-    if let Some(raw) = env_optional("AETHERVAULT_FS_ROOTS") {
+    if let Some(raw) = env_optional_alias(&["OPENCLAW_FS_ROOTS", "AETHERVAULT_FS_ROOTS"]) {
         let roots: Vec<PathBuf> = raw
             .split(':')
             .filter(|s| !s.trim().is_empty())

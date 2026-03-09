@@ -19,12 +19,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::executive_state::{
+    state_json_memory_uri_candidates, state_json_path, state_markdown_path,
+    state_memory_uri_candidates,
+};
 use crate::{
     AgentConfig, ApprovalEntry, BackgroundTask, BackgroundTaskRegistry, BackgroundTaskStatus,
-    BridgeAgentConfig, CronExpr, SessionRegistry, ToolAutonomyLevel, TriggerEntry, blake3_hash,
-    build_bridge_agent_config, env_optional, env_u64, execute_tool, load_capsule_config,
-    load_config_entry, open_or_create_db, resolve_workspace, run_agent_for_bridge,
-    save_config_entry, telegram_send_message, tool_autonomy_for,
+    BridgeAgentConfig, CronExpr, DEFAULT_WORKSPACE_DIR, SessionRegistry, ToolAutonomyLevel,
+    TriggerEntry, blake3_hash, build_bridge_agent_config, env_optional, env_optional_alias,
+    env_u64, execute_tool, load_capsule_config, load_config_entry, open_or_create_db,
+    resolve_workspace, run_agent_for_bridge, save_config_entry, telegram_send_message,
+    tool_autonomy_for,
 };
 use tiny_http::{Response, Server};
 use walkdir::WalkDir;
@@ -155,16 +160,27 @@ pub(crate) fn export_capsule_memory(
     let db = open_or_create_db(mv2)?;
     let mut paths = Vec::new();
     let items = vec![
-        (memory_uri("soul"), workspace.join("SOUL.md")),
-        (memory_uri("user"), workspace.join("USER.md")),
-        (memory_uri("longterm"), workspace.join("MEMORY.md")),
+        (vec![memory_uri("soul")], workspace.join("SOUL.md")),
+        (vec![memory_uri("user")], workspace.join("USER.md")),
+        (vec![memory_uri("longterm")], workspace.join("MEMORY.md")),
+        (
+            state_memory_uri_candidates(),
+            state_markdown_path(workspace),
+        ),
+        (
+            state_json_memory_uri_candidates(),
+            state_json_path(workspace),
+        ),
     ];
-    for (uri, path) in items {
-        if let Ok(frame) = db.frame_by_uri(&uri) {
-            if let Ok(text) = db.frame_text_by_id(frame.id) {
-                fs::create_dir_all(workspace)?;
-                fs::write(&path, text)?;
-                paths.push(path.display().to_string());
+    for (uris, path) in items {
+        for uri in uris {
+            if let Ok(frame) = db.frame_by_uri(&uri) {
+                if let Ok(text) = db.frame_text_by_id(frame.id) {
+                    fs::create_dir_all(workspace)?;
+                    fs::write(&path, text)?;
+                    paths.push(path.display().to_string());
+                }
+                break;
             }
         }
     }
@@ -180,7 +196,9 @@ pub(crate) fn export_capsule_memory(
             let Some(uri) = frame.uri.as_deref() else {
                 continue;
             };
-            if !uri.starts_with("aethervault://memory/daily/") {
+            if !uri.starts_with("aethervault://memory/daily/")
+                && !uri.starts_with("openclaw://memory/daily/")
+            {
                 continue;
             }
             if let Some(name) = uri.rsplit('/').next() {
@@ -193,6 +211,85 @@ pub(crate) fn export_capsule_memory(
         }
     }
     Ok(paths)
+}
+
+fn copy_tree_into(
+    source: &Path,
+    target: &Path,
+    copied: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !source.exists() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(source) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let Ok(relative) = path.strip_prefix(source) else {
+            continue;
+        };
+        let destination = target.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&destination)?;
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(path, &destination)?;
+        copied.push(destination.display().to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn export_openclaw_workspace(
+    mv2: &Path,
+    target_workspace: &Path,
+    include_daily: bool,
+    include_logs: bool,
+    include_sessions: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fs::create_dir_all(target_workspace)?;
+    let mut written = export_capsule_memory(mv2, target_workspace, include_daily)?;
+
+    let db = open_or_create_db(mv2)?;
+    let config = load_capsule_config(&db).unwrap_or_default();
+    let agent_cfg = config.agent.clone().unwrap_or_default();
+    let source_workspace =
+        resolve_workspace(None, &agent_cfg).unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+
+    let import_root = target_workspace.join("imports").join("legacy-aethervault");
+    if include_logs {
+        copy_tree_into(
+            &source_workspace.join("logs"),
+            &import_root.join("logs"),
+            &mut written,
+        )?;
+    }
+    if include_sessions {
+        copy_tree_into(
+            &source_workspace.join("sessions"),
+            &import_root.join("sessions"),
+            &mut written,
+        )?;
+    }
+
+    let manifest_path = target_workspace.join("LEGACY_IMPORT.md");
+    let manifest = format!(
+        "# Legacy Import\n\nImported from the legacy AetherVault runtime into an OpenClaw workspace.\n\n- Imported at: {}\n- Capsule: {}\n- Source workspace: {}\n- Included daily memory: {}\n- Included logs: {}\n- Included sessions: {}\n\n## Primary files\n- SOUL.md\n- USER.md\n- MEMORY.md\n- STATE.md\n- STATE.json\n\n## Imported history\n- imports/legacy-aethervault/logs/\n- imports/legacy-aethervault/sessions/\n",
+        Utc::now().to_rfc3339(),
+        mv2.display(),
+        source_workspace.display(),
+        include_daily,
+        include_logs,
+        include_sessions
+    );
+    fs::write(&manifest_path, manifest)?;
+    written.push(manifest_path.display().to_string());
+
+    Ok(written)
 }
 
 // ── OAuth ───────────────────────────────────────────────────────────────
@@ -694,7 +791,7 @@ pub(crate) fn save_triggers(db: &MemoryDb, triggers: &[TriggerEntry]) -> Result<
 
 pub(crate) fn allowed_fs_roots(workspace_override: &Option<PathBuf>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(raw) = env_optional("AETHERVAULT_FS_ROOTS") {
+    if let Some(raw) = env_optional_alias(&["OPENCLAW_FS_ROOTS", "AETHERVAULT_FS_ROOTS"]) {
         for entry in raw.split(':').filter(|s| !s.trim().is_empty()) {
             roots.push(PathBuf::from(entry));
         }
@@ -706,9 +803,13 @@ pub(crate) fn allowed_fs_roots(workspace_override: &Option<PathBuf>) -> Vec<Path
     }
     // Always include swarm worktree base so subagents can access worktrees
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let swarm_base = PathBuf::from(&home).join("aethervault-swarm");
-    if swarm_base.exists() && !roots.iter().any(|r| r == &swarm_base) {
-        roots.push(swarm_base);
+    for swarm_base in [
+        PathBuf::from(&home).join("openclaw-swarm"),
+        PathBuf::from(&home).join("aethervault-swarm"),
+    ] {
+        if swarm_base.exists() && !roots.iter().any(|r| r == &swarm_base) {
+            roots.push(swarm_base);
+        }
     }
     // Include home directory so agents can create new project directories
     let home_path = PathBuf::from(&home);
@@ -1258,9 +1359,9 @@ pub(crate) fn run_schedule_loop(
     let telegram_token = telegram_token
         .or(agent_cfg.telegram_token)
         .or_else(|| env_optional("TELEGRAM_BOT_TOKEN"));
-    let telegram_chat_id = telegram_chat_id
-        .or(agent_cfg.telegram_chat_id)
-        .or_else(|| env_optional("AETHERVAULT_TELEGRAM_CHAT_ID"));
+    let telegram_chat_id = telegram_chat_id.or(agent_cfg.telegram_chat_id).or_else(|| {
+        env_optional_alias(&["OPENCLAW_TELEGRAM_CHAT_ID", "AETHERVAULT_TELEGRAM_CHAT_ID"])
+    });
 
     let agent_config = build_bridge_agent_config(
         mv2.clone(),

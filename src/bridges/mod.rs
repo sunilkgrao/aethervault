@@ -20,14 +20,15 @@ use self::webhook::{
 use self::whatsapp::run_whatsapp_bridge;
 use crate::{
     AgentProgress, AgentRunOutput, BridgeAgentConfig, BridgeCommand, append_to_daily_note,
-    env_optional, load_capsule_config, open_or_create_db, resolve_workspace, run_agent_with_prompt,
+    env_optional, env_optional_alias, load_capsule_config, open_or_create_db, resolve_workspace,
+    run_agent_with_prompt,
 };
 
 pub(crate) fn resolve_mv2_path(cli_mv2: Option<PathBuf>) -> PathBuf {
     if let Some(path) = cli_mv2 {
         return path;
     }
-    if let Some(value) = env_optional("AETHERVAULT_MV2") {
+    if let Some(value) = env_optional_alias(&["OPENCLAW_MV2", "AETHERVAULT_MV2"]) {
         return PathBuf::from(value);
     }
     PathBuf::from("./data/knowledge.mv2")

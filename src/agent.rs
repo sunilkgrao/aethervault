@@ -25,7 +25,7 @@ use crate::{
     StreamPhase, ToolExecution, append_log_jsonl, base_tool_names, bootstrap_skills,
     build_context_pack, build_kg_context, classify_failure, collect_mid_loop_reminders,
     compute_drift_score, config_file_path, critic_should_fire, detect_cycle,
-    detect_invisible_unicode, env_optional, execute_tool, find_kg_entities,
+    detect_invisible_unicode, env_optional, env_optional_alias, execute_tool, find_kg_entities,
     format_tool_message_content, list_skills, load_capsule_config, load_config_from_file,
     load_kg_graph, load_session_turns, load_workspace_context, log_dir_path,
     match_skills_for_prompt, open_or_create_db, open_skill_db, prune_low_performing_skills,
@@ -478,7 +478,7 @@ pub(crate) fn run_agent(
 
 pub(crate) fn default_system_prompt() -> String {
     [
-        "You are AetherVault, a high-performance personal AI assistant with a rich toolkit.",
+        "You are OpenClaw, a high-performance personal AI assistant with a rich toolkit.",
         "You are not a limited chatbot; memory, search, filesystem, code execution, web, email, browser, notifications, subagents, and more are available immediately.",
         "Be proactive, concrete, concise, and action-first.",
         "",
@@ -525,14 +525,14 @@ pub(crate) fn default_system_prompt() -> String {
         "",
         "## Self-Modification",
         "You may modify your own source code, compile, and deploy without human intervention.",
-        "Workflow: 1) edit /root/aethervault/src/ with exec or fs_write; 2) `cd /root/aethervault && cargo check`; 3) `cd /root/aethervault && git add -A && git commit -m \"description\"`; 4) `cd /root/aethervault && git push origin main`; 5) call self_upgrade for blue-green deploy with automatic rollback; 6) after deploy you restart, and conversation state persists in the capsule.",
+        "Workflow: 1) edit the active repo with exec or fs_write; 2) run `cargo check`; 3) commit and push; 4) call self_upgrade for blue-green deploy with automatic rollback; 5) after deploy you restart, and conversation state persists in the capsule.",
         "Always commit and push before self_upgrade because it runs `git reset --hard`.",
         "If the new binary crashes, upgrade.sh auto-rolls back within 30s.",
-        "Check deploy status with exec: `cat /opt/aethervault/upgrade.log | tail -20`.",
+        "Check deploy status with exec against the current deployment log or systemd journal.",
         "",
         "## Autonomous Self-Improvement",
         "A systemd timer runs every 6 hours: scan for improvements, implement one, validate, and deploy.",
-        "Log each improvement in /root/.aethervault/data/self-improve-log.jsonl and store it as capsule reflections.",
+        "Log each improvement in the runtime home data directory and store it as capsule reflections.",
         "Prioritize, in order: reliability fixes, performance improvements, safety hardening, capability additions.",
         "Never autonomously remove safety checks or approval gates, modify deployment infrastructure (upgrade.sh, systemd configs), change API keys/secrets/authentication, or alter the Telegram bridge protocol.",
         "",
@@ -1677,7 +1677,7 @@ pub(crate) fn run_agent_with_prompt(
 
     if agent_cfg.onboarding_complete == Some(false) {
         system_prompt.push_str(
-            "\n\n# Onboarding\nYou are in onboarding mode. Guide the user to connect email, calendar, and messaging integrations. Verify tool access. When complete, append a note to MEMORY.md and ask the user to run `aethervault config set --key index` to set `agent.onboarding_complete=true`.",
+            "\n\n# Onboarding\nYou are in onboarding mode. Guide the user to connect email, calendar, and messaging integrations. Verify tool access. When complete, append a note to MEMORY.md and ask the user to run `openclaw config set --key index` to set `agent.onboarding_complete=true`.",
         );
     }
 
@@ -1703,7 +1703,7 @@ pub(crate) fn run_agent_with_prompt(
     if executive_assistant_intent && !explicit_orchestration_intent {
         engineering_orchestration_intent = false;
     }
-    let trace_intent = env_optional("AETHERVAULT_TRACE_INTENT")
+    let trace_intent = env_optional_alias(&["OPENCLAW_TRACE_INTENT", "AETHERVAULT_TRACE_INTENT"])
         .map(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -1906,9 +1906,12 @@ pub(crate) fn run_agent_with_prompt(
     let ea_structured_discovery_mode = executive_assistant_intent
         && !engineering_orchestration_intent
         && prompt_requests_structured_json_response(&prompt_text);
-    let ea_structured_step_cap = env_optional("AETHERVAULT_EA_DISCOVERY_MAX_STEPS")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(8);
+    let ea_structured_step_cap = env_optional_alias(&[
+        "OPENCLAW_EA_DISCOVERY_MAX_STEPS",
+        "AETHERVAULT_EA_DISCOVERY_MAX_STEPS",
+    ])
+    .and_then(|value| value.parse::<usize>().ok())
+    .unwrap_or(8);
     let effective_max_steps = if ea_structured_discovery_mode {
         agent_cfg
             .max_steps
@@ -1924,9 +1927,12 @@ pub(crate) fn run_agent_with_prompt(
         );
     }
     let explicit_context_query = context_query.clone().or(agent_cfg.context_query.clone());
-    let auto_memory_prefetch = env_optional("AETHERVAULT_AUTO_MEMORY_PREFETCH")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    let auto_memory_prefetch = env_optional_alias(&[
+        "OPENCLAW_AUTO_MEMORY_PREFETCH",
+        "AETHERVAULT_AUTO_MEMORY_PREFETCH",
+    ])
+    .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+    .unwrap_or(false);
     let should_load_memory_context = !no_memory
         && (explicit_context_query.is_some() || (auto_memory_prefetch && !skip_trivial_prefetch));
     if should_load_memory_context {

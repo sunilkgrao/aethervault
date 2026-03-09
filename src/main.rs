@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod config_file;
 mod consolidation;
+mod executive_state;
 mod mcp;
 mod memory_db;
 mod pool_state;
@@ -31,6 +32,7 @@ pub(crate) use claude::*;
 pub(crate) use cli::*;
 pub(crate) use config::*;
 pub(crate) use config_file::*;
+pub(crate) use executive_state::*;
 pub(crate) use mcp::*;
 pub(crate) use pool_state::*;
 pub(crate) use query::*;
@@ -103,8 +105,8 @@ fn frame_collection_name(frame: &Frame) -> String {
         return "<no-uri>".to_string();
     };
 
-    let Some(rest) = uri.strip_prefix("aethervault://") else {
-        return "<non-aethervault-uri>".to_string();
+    let Some(rest) = strip_known_uri_scheme(uri) else {
+        return "<non-capsule-uri>".to_string();
     };
     rest.split('/')
         .next()
@@ -126,7 +128,7 @@ fn frame_matches_collection(frame: &Frame, collection: &str) -> bool {
     frame
         .uri
         .as_deref()
-        .is_some_and(|uri| uri.starts_with(&scope_prefix(&expected)))
+        .is_some_and(|uri| uri_matches_collection(uri, &expected))
 }
 
 fn frame_age_bucket(age_days: i64) -> String {
@@ -1015,7 +1017,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             force,
         } => {
             let workspace = workspace
-                .or_else(|| env_optional("AETHERVAULT_WORKSPACE").map(PathBuf::from))
+                .or_else(|| {
+                    env_optional_alias(&["OPENCLAW_WORKSPACE", "AETHERVAULT_WORKSPACE"])
+                        .map(PathBuf::from)
+                })
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
             bootstrap_workspace(&mv2, &workspace, timezone, force)?;
             println!(
@@ -1023,6 +1028,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 workspace.display(),
                 mv2.display()
             );
+            Ok(())
+        }
+
+        Command::ExportOpenClaw {
+            mv2,
+            workspace,
+            include_daily,
+            include_logs,
+            include_sessions,
+            json,
+        } => {
+            let workspace = workspace.unwrap_or_else(|| openclaw_home_dir().join("workspace"));
+            let paths = export_openclaw_workspace(
+                &mv2,
+                &workspace,
+                include_daily,
+                include_logs,
+                include_sessions,
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "workspace": workspace,
+                        "written": paths,
+                    }))?
+                );
+            } else {
+                println!("exported legacy data into {}", workspace.display());
+                for path in paths {
+                    println!("- {path}");
+                }
+            }
             Ok(())
         }
 
@@ -1100,14 +1138,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => {
             let workspace = workspace
-                .or_else(|| env_optional("AETHERVAULT_WORKSPACE").map(PathBuf::from))
-                .unwrap_or_else(|| aethervault_home_dir().join("workspace"));
+                .or_else(|| {
+                    env_optional_alias(&["OPENCLAW_WORKSPACE", "AETHERVAULT_WORKSPACE"])
+                        .map(PathBuf::from)
+                })
+                .unwrap_or_else(|| openclaw_home_dir().join("workspace"));
             let mv2 = mv2
                 .or_else(|| env_optional("CAPSULE_PATH").map(PathBuf::from))
-                .or_else(|| env_optional("AETHERVAULT_MV2").map(PathBuf::from))
-                .unwrap_or_else(|| aethervault_home_dir().join("memory.mv2"));
+                .or_else(|| {
+                    env_optional_alias(&["OPENCLAW_MV2", "AETHERVAULT_MV2"]).map(PathBuf::from)
+                })
+                .unwrap_or_else(|| openclaw_home_dir().join("memory.mv2"));
             let repo_path = repo
-                .or_else(|| env_optional("AETHERVAULT_REPO").map(PathBuf::from))
+                .or_else(|| {
+                    env_optional_alias(&["OPENCLAW_REPO", "AETHERVAULT_REPO"]).map(PathBuf::from)
+                })
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
             let options = crate::swarm::SwarmMonitorOptions {
                 workspace,
@@ -1115,8 +1160,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 repo_path,
                 aethervault_bin: std::env::current_exe()?,
                 telegram_token: env_optional("TELEGRAM_BOT_TOKEN"),
-                telegram_chat_id: env_optional("TELEGRAM_CHAT_ID")
-                    .or_else(|| env_optional("AETHERVAULT_TELEGRAM_CHAT_ID")),
+                telegram_chat_id: env_optional("TELEGRAM_CHAT_ID").or_else(|| {
+                    env_optional_alias(&[
+                        "OPENCLAW_TELEGRAM_CHAT_ID",
+                        "AETHERVAULT_TELEGRAM_CHAT_ID",
+                    ])
+                }),
             };
             let report = crate::swarm::run_swarm_monitor(&options)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;

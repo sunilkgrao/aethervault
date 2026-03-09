@@ -15,7 +15,8 @@ use crate::{
     AgentHookRequest, AgentLogEntry, AgentMessage, AgentToolResult, CapsuleConfig, ContextPack,
     DEFAULT_WORKSPACE_DIR, HookSpec, QueryArgs, SubagentSpec, ToolExecution,
     ToolSubagentInvokeArgs, append_agent_log_uncommitted, build_context_pack, build_kg_context,
-    call_agent_hook, env_optional, execute_tool_with_handles, find_kg_entities,
+    call_agent_hook, env_optional, env_optional_alias, execute_tool_with_handles,
+    find_kg_entities,
     load_capsule_config, load_kg_graph, resolve_hook_spec, resolve_kg_path, resolve_workspace,
     tool_definitions_json,
 };
@@ -89,13 +90,14 @@ struct SessionTurn {
 }
 
 fn resolve_session_dir(workspace: Option<&Path>) -> PathBuf {
-    if let Some(value) = env_optional("AETHERVAULT_SESSION_DIR") {
+    if let Some(value) = env_optional_alias(&["OPENCLAW_SESSION_DIR", "AETHERVAULT_SESSION_DIR"])
+    {
         return PathBuf::from(value);
     }
     if let Some(ws) = workspace {
         return ws.join("sessions");
     }
-    if let Some(value) = env_optional("AETHERVAULT_WORKSPACE") {
+    if let Some(value) = env_optional_alias(&["OPENCLAW_WORKSPACE", "AETHERVAULT_WORKSPACE"]) {
         return PathBuf::from(value).join("sessions");
     }
     PathBuf::from(DEFAULT_WORKSPACE_DIR).join("sessions")
@@ -504,7 +506,7 @@ pub fn run_agent_with_prompt(
 
     if agent_cfg.onboarding_complete == Some(false) {
         system_prompt.push_str(
-            "\n\n# Onboarding\nYou are in onboarding mode. Guide the user to connect email, calendar, and messaging integrations. Verify tool access. When complete, append a note to MEMORY.md and ask the user to run `aethervault config set --key index` to set `agent.onboarding_complete=true`.",
+            "\n\n# Onboarding\nYou are in onboarding mode. Guide the user to connect email, calendar, and messaging integrations. Verify tool access. When complete, append a note to MEMORY.md and ask the user to run `openclaw config set --key index` to set `agent.onboarding_complete=true`.",
         );
     }
 
@@ -1067,7 +1069,9 @@ fn resolve_bridge_model_hook(cli: Option<String>) -> Option<String> {
 }
 
 fn resolve_bridge_timeout() -> Result<Option<Duration>, Box<dyn std::error::Error>> {
-    let Some(value) = env_optional("AETHERVAULT_BRIDGE_TIMEOUT_SECS") else {
+    let Some(value) =
+        env_optional_alias(&["OPENCLAW_BRIDGE_TIMEOUT_SECS", "AETHERVAULT_BRIDGE_TIMEOUT_SECS"])
+    else {
         return Ok(Some(Duration::from_secs(900)));
     };
     let normalized = value.trim().to_ascii_lowercase();
@@ -1080,7 +1084,7 @@ fn resolve_bridge_timeout() -> Result<Option<Duration>, Box<dyn std::error::Erro
     let secs = normalized.parse::<u64>().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Invalid AETHERVAULT_BRIDGE_TIMEOUT_SECS",
+            "Invalid OPENCLAW_BRIDGE_TIMEOUT_SECS / AETHERVAULT_BRIDGE_TIMEOUT_SECS",
         )
     })?;
     Ok(Some(Duration::from_secs(secs.max(1))))
@@ -1219,7 +1223,7 @@ pub fn run_agent_for_bridge(
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 return Err(format!(
-                    "Agent timed out after {}s. Set AETHERVAULT_BRIDGE_TIMEOUT_SECS=0 to disable the wall-clock deadline for long-running bridge tasks.",
+                    "Agent timed out after {}s. Set OPENCLAW_BRIDGE_TIMEOUT_SECS=0 to disable the wall-clock deadline for long-running bridge tasks.",
                     timeout.as_secs()
                 ));
             }

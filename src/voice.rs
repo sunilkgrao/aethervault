@@ -2,7 +2,7 @@ use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::{MemoryDb, env_optional, load_config_json, save_config_entry};
+use crate::{MemoryDb, env_optional, env_optional_alias, load_config_json, save_config_entry};
 
 const PHONE_CALL_CONFIG_PREFIX: &str = "phone.call.";
 const DEFAULT_PHONE_VOICE: &str = "alice";
@@ -61,7 +61,7 @@ pub(crate) fn default_phone_voice() -> String {
 }
 
 pub(crate) fn resolve_public_base_url() -> Option<String> {
-    env_optional("AETHERVAULT_PUBLIC_BASE_URL")
+    env_optional_alias(&["OPENCLAW_PUBLIC_BASE_URL", "AETHERVAULT_PUBLIC_BASE_URL"])
         .or_else(|| env_optional("PUBLIC_BASE_URL"))
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
@@ -159,7 +159,10 @@ pub(crate) fn build_phone_call_gather_twiml(
         ));
     }
     let Some(base_url) = record.callback_base_url.as_ref() else {
-        return Err("interactive phone calls require AETHERVAULT_PUBLIC_BASE_URL".to_string());
+        return Err(
+            "interactive phone calls require OPENCLAW_PUBLIC_BASE_URL, AETHERVAULT_PUBLIC_BASE_URL, or PUBLIC_BASE_URL"
+                .to_string(),
+        );
     };
     let action = format!(
         "{}/twilio/voice/gather?request_id={}&question_index={}",

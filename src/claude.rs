@@ -997,8 +997,7 @@ pub(crate) fn call_claude_with_model(
             if let Some(messages) = payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
                 for msg in messages.iter_mut() {
                     if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                        if let Some(content) =
-                            msg.get_mut("content").and_then(|c| c.as_array_mut())
+                        if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut())
                         {
                             content.retain(|block| {
                                 !matches!(

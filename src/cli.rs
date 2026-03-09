@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "aethervault")]
+#[command(name = "linus-migrate")]
 #[command(about = "Hybrid retrieval over single-file .mv2 capsules", long_about = None)]
 #[command(version)]
 pub(crate) struct Cli {
@@ -33,7 +33,7 @@ pub(crate) enum Command {
     /// Put a single text payload into the capsule.
     Put {
         mv2: PathBuf,
-        /// Fully-qualified URI (aether://... or aethervault://...)
+        /// Fully-qualified URI (aether://..., openclaw://..., or aethervault://...)
         #[arg(long)]
         uri: Option<String>,
         /// Collection name to build aether://<collection>/<path>
@@ -320,7 +320,7 @@ pub(crate) enum Command {
         json: bool,
     },
 
-    /// Manage capsule config stored at aethervault://config/...
+    /// Manage capsule config stored at openclaw://config/... (legacy aethervault:// supported)
     Config {
         mv2: PathBuf,
         #[command(subcommand)]
@@ -425,7 +425,7 @@ pub(crate) enum Command {
     /// Bootstrap local workspace (soul + memory) and write default config.
     Bootstrap {
         mv2: PathBuf,
-        /// Workspace folder (default: ./assistant or AETHERVAULT_WORKSPACE)
+        /// Workspace folder (default: OPENCLAW_WORKSPACE, AETHERVAULT_WORKSPACE, home workspace, or ./assistant)
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Timezone offset (e.g. -05:00)
@@ -436,10 +436,30 @@ pub(crate) enum Command {
         force: bool,
     },
 
+    /// Export legacy Linus memory/state/history into an OpenClaw workspace so the old runtime can be retired.
+    ExportOpenClaw {
+        mv2: PathBuf,
+        /// Target OpenClaw workspace (default: ~/.openclaw/workspace or detected OPENCLAW_HOME/workspace)
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Include daily memory notes from workspace/memory/
+        #[arg(long, default_value_t = true)]
+        include_daily: bool,
+        /// Include JSONL logs from the legacy workspace
+        #[arg(long, default_value_t = true)]
+        include_logs: bool,
+        /// Include persisted session transcripts from the legacy workspace
+        #[arg(long, default_value_t = true)]
+        include_sessions: bool,
+        /// Output JSON summary
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Run autonomous schedules (daily/weekly briefings).
     Schedule {
         mv2: PathBuf,
-        /// Workspace folder (default: ./assistant or AETHERVAULT_WORKSPACE)
+        /// Workspace folder (default: OPENCLAW_WORKSPACE, AETHERVAULT_WORKSPACE, home workspace, or ./assistant)
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Timezone offset (e.g. -05:00)
@@ -448,7 +468,7 @@ pub(crate) enum Command {
         /// Telegram bot token (env: TELEGRAM_BOT_TOKEN)
         #[arg(long)]
         telegram_token: Option<String>,
-        /// Telegram chat id (env: AETHERVAULT_TELEGRAM_CHAT_ID)
+        /// Telegram chat id (env: OPENCLAW_TELEGRAM_CHAT_ID or AETHERVAULT_TELEGRAM_CHAT_ID)
         #[arg(long)]
         telegram_chat_id: Option<String>,
         /// Override model hook command
@@ -468,7 +488,7 @@ pub(crate) enum Command {
     /// Run event-driven triggers (email/calendar).
     Watch {
         mv2: PathBuf,
-        /// Workspace folder (default: ./assistant or AETHERVAULT_WORKSPACE)
+        /// Workspace folder (default: OPENCLAW_WORKSPACE, AETHERVAULT_WORKSPACE, home workspace, or ./assistant)
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Timezone offset (e.g. -05:00)
@@ -521,7 +541,7 @@ pub(crate) enum Command {
 
     /// Deterministic swarm monitor pass owned by the Rust runtime.
     SwarmMonitor {
-        /// Workspace folder holding swarm.sqlite (default: $AETHERVAULT_WORKSPACE or ~/.aethervault/workspace)
+        /// Workspace folder holding swarm.sqlite (default: $OPENCLAW_WORKSPACE, $AETHERVAULT_WORKSPACE, or the detected home workspace)
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Capsule path used when spawning retry/review agents
@@ -635,7 +655,7 @@ pub(crate) enum HookCommand {
 pub(crate) enum BridgeCommand {
     /// Telegram long-polling bridge.
     Telegram {
-        /// Capsule path (defaults to AETHERVAULT_MV2 or ./data/knowledge.mv2)
+        /// Capsule path (defaults to OPENCLAW_MV2, AETHERVAULT_MV2, or ./data/knowledge.mv2)
         #[arg(long)]
         mv2: Option<PathBuf>,
         /// Telegram bot token (env: TELEGRAM_BOT_TOKEN)
@@ -677,7 +697,7 @@ pub(crate) enum BridgeCommand {
     },
     /// WhatsApp (Twilio) webhook bridge.
     Whatsapp {
-        /// Capsule path (defaults to AETHERVAULT_MV2 or ./data/knowledge.mv2)
+        /// Capsule path (defaults to OPENCLAW_MV2, AETHERVAULT_MV2, or ./data/knowledge.mv2)
         #[arg(long)]
         mv2: Option<PathBuf>,
         /// Bind address
@@ -716,7 +736,7 @@ pub(crate) enum BridgeCommand {
     },
     /// Twilio Voice callback bridge for interactive phone calls and call status webhooks.
     Voice {
-        /// Capsule path (defaults to AETHERVAULT_MV2 or ./data/knowledge.mv2)
+        /// Capsule path (defaults to OPENCLAW_MV2, AETHERVAULT_MV2, or ./data/knowledge.mv2)
         #[arg(long)]
         mv2: Option<PathBuf>,
         /// Bind address
@@ -903,7 +923,7 @@ pub(crate) enum BridgeCommand {
 pub(crate) enum ConfigCommand {
     /// Set a config document (stored as JSON).
     Set {
-        /// Config key (stored at aethervault://config/<key>.json)
+        /// Config key (stored at openclaw://config/<key>.json; legacy aethervault:// also resolves)
         #[arg(long, default_value = "index")]
         key: String,
         /// Read JSON from file
@@ -918,7 +938,7 @@ pub(crate) enum ConfigCommand {
     },
     /// Get a config document.
     Get {
-        /// Config key (stored at aethervault://config/<key>.json)
+        /// Config key (stored at openclaw://config/<key>.json; legacy aethervault:// also resolves)
         #[arg(long, default_value = "index")]
         key: String,
         /// Output raw bytes (no pretty print)

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::{AgentHookRequest, AgentMessage, env_optional};
+use crate::{AgentHookRequest, AgentMessage, env_optional, env_optional_alias, openclaw_home_dir};
 
 // ---------------------------------------------------------------------------
 // Auth profiles config (deserialized from config/auth-profiles.json)
@@ -156,8 +156,8 @@ fn global_pool() -> Arc<Mutex<PoolState>> {
         let mut state = PoolState::new();
 
         // Try to load auth-profiles.json from AETHERVAULT_HOME
-        let home = env_optional("AETHERVAULT_HOME")
-            .unwrap_or_else(|| dirs_home().unwrap_or_else(|| "/root/.aethervault".to_string()));
+        let home = env_optional_alias(&["OPENCLAW_HOME", "AETHERVAULT_HOME"])
+            .unwrap_or_else(|| openclaw_home_dir().display().to_string());
         let config_path = PathBuf::from(&home)
             .join("config")
             .join("auth-profiles.json");
@@ -188,12 +188,6 @@ fn global_pool() -> Arc<Mutex<PoolState>> {
         Arc::new(Mutex::new(state))
     })
     .clone()
-}
-
-fn dirs_home() -> Option<String> {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| format!("{h}/.aethervault"))
 }
 
 // ---------------------------------------------------------------------------
@@ -351,8 +345,11 @@ fn run_codex_once(prompt: &str, account: &str, read_only: bool) -> Result<AgentM
     }
 
     // Use workspace as cwd if available
-    let workspace = env_optional("AETHERVAULT_WORKSPACE")
-        .or_else(|| env_optional("AETHERVAULT_HOME").map(|h| format!("{h}/workspace")));
+    let workspace =
+        env_optional_alias(&["OPENCLAW_WORKSPACE", "AETHERVAULT_WORKSPACE"]).or_else(|| {
+            env_optional_alias(&["OPENCLAW_HOME", "AETHERVAULT_HOME"])
+                .map(|h| format!("{h}/workspace"))
+        });
     if let Some(ref cwd) = workspace {
         if Path::new(cwd).exists() {
             cmd.current_dir(cwd);

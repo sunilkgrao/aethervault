@@ -1,10 +1,10 @@
-# AetherVault Final State
+# OpenClaw Final State
 
-This file is the architectural north star for the repository. It is not the user's runtime `workspace/STATE.md`; it is the product-level statement of what AetherVault should become.
+This file is the architectural north star for the repository. It is not the user's runtime `workspace/STATE.md`; it is the product-level statement of what the Linus/OpenClaw stack should become.
 
 ## Objective
 
-AetherVault should be an executive assistant first and an agent harness second.
+Linus on OpenClaw should be an executive assistant first and an agent harness second.
 
 Success means:
 - It keeps durable track of priorities, open loops, waiting-fors, deadlines, contacts, and commitments.
@@ -58,6 +58,7 @@ The core agent loop should orchestrate:
 - recovery and reflection
 
 This control plane should decide when to spawn zero, one, or many workers. Delegation policy must come from state, task shape, and config, not fixed names or fixed fan-out.
+The top-level agent should orchestrate by default, but not abdicate simple work: trivial, low-latency, or clearly higher-quality one-shot tasks should stay inline when delegation would only add overhead or risk.
 
 ### 3. Execution Plane
 
@@ -99,10 +100,10 @@ The assistant should consistently do these well:
 ## Repository Direction
 
 The repo should converge toward this shape:
-- `src/`: core Rust assistant runtime
-- `scripts/`: thin operational jobs that consume the same shared state contract
-- `docs/`: a small set of canonical docs, with historical reports archived
-- `services/embedding-service/`: retained only as optional infrastructure
+- OpenClaw upstream handles the canonical runtime, channels, sandboxing, and session model.
+- This repo only keeps Linus-specific migration and memory/state export long enough to complete cutover cleanly.
+- `docs/` stays small and explicit about what is upstream OpenClaw versus what is Linus-specific.
+- Historical AetherVault behavior is retained only long enough to export/import data safely.
 
 If a subsystem does not clearly support the executive-assistant product, it should be split, archived, or demoted from the main path.
 
@@ -133,9 +134,10 @@ If a subsystem does not clearly support the executive-assistant product, it shou
 
 ## Definition Of Done
 
-AetherVault is "excellent EA" grade when:
+The stack is "excellent EA" grade when:
 - the assistant always knows the current top priorities and open loops
 - the scheduled jobs and interactive chat behavior agree on the same reality
 - delegation is dynamic and configurable rather than scripted
 - prompt growth is bounded by structured state and compaction
 - the repo has one obvious product architecture rather than several competing ones
+- the Rust runtime is no longer a competing brain

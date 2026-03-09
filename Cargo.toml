@@ -1,7 +1,16 @@
 [package]
-name = "aethervault"
+name = "linus-migrate"
 version = "0.0.2"
 edition = "2024"
+autobins = false
+
+[[bin]]
+name = "linus-migrate"
+path = "src/main.rs"
+
+[[bin]]
+name = "aethervault"
+path = "src/main.rs"
 
 [dependencies]
 blake3 = "1.8.2"

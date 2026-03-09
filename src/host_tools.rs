@@ -11,7 +11,7 @@ use crate::policy::{allowed_fs_roots, resolve_fs_path};
 use crate::{
     ToolBrowserRequestArgs, ToolExecArgs, ToolExecution, ToolFsListArgs, ToolFsReadArgs,
     ToolFsWriteArgs, ToolHttpRequestArgs, ToolIMessageSendArgs, ToolNotifyArgs, ToolScaleArgs,
-    ToolSignalSendArgs, build_external_command, env_optional,
+    ToolSignalSendArgs, build_external_command, env_optional, env_optional_alias,
 };
 
 pub(crate) fn handle_exec(args: serde_json::Value) -> Result<ToolExecution, String> {
@@ -218,7 +218,7 @@ pub(crate) fn handle_http_request(args: serde_json::Value) -> Result<ToolExecuti
 pub(crate) fn handle_browser_request(args: serde_json::Value) -> Result<ToolExecution, String> {
     let parsed: ToolBrowserRequestArgs =
         serde_json::from_value(args).map_err(|e| format!("args: {e}"))?;
-    let endpoint = env_optional("AETHERVAULT_BROWSER_ENDPOINT")
+    let endpoint = env_optional_alias(&["OPENCLAW_BROWSER_ENDPOINT", "AETHERVAULT_BROWSER_ENDPOINT"])
         .unwrap_or_else(|| "http://127.0.0.1:4040".to_string());
     let payload = serde_json::json!({
         "action": parsed.action,

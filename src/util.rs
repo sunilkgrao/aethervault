@@ -11,12 +11,46 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{AgentConfig, DEFAULT_WORKSPACE_DIR};
 
+pub(crate) const PRIMARY_URI_SCHEME: &str = "openclaw";
+pub(crate) const LEGACY_URI_SCHEME: &str = "aethervault";
+
 pub(crate) fn normalize_collection(name: &str) -> String {
     name.trim().trim_matches('/').to_string()
 }
 
 pub(crate) fn scope_prefix(collection: &str) -> String {
-    format!("aethervault://{}/", normalize_collection(collection))
+    format!(
+        "{PRIMARY_URI_SCHEME}://{}/",
+        normalize_collection(collection)
+    )
+}
+
+pub(crate) fn scope_prefix_candidates(collection: &str) -> Vec<String> {
+    let collection = normalize_collection(collection);
+    let mut prefixes = Vec::new();
+    for scheme in [PRIMARY_URI_SCHEME, LEGACY_URI_SCHEME] {
+        let prefix = format!("{scheme}://{collection}/");
+        if !prefixes.contains(&prefix) {
+            prefixes.push(prefix);
+        }
+    }
+    prefixes
+}
+
+pub(crate) fn strip_known_uri_scheme<'a>(uri: &'a str) -> Option<&'a str> {
+    for scheme in [PRIMARY_URI_SCHEME, LEGACY_URI_SCHEME] {
+        let prefix = format!("{scheme}://");
+        if let Some(rest) = uri.strip_prefix(&prefix) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+pub(crate) fn uri_matches_collection(uri: &str, collection: &str) -> bool {
+    scope_prefix_candidates(collection)
+        .into_iter()
+        .any(|prefix| uri.starts_with(&prefix))
 }
 
 pub(crate) fn uri_for_path(collection: &str, relative: &Path) -> String {
@@ -25,7 +59,10 @@ pub(crate) fn uri_for_path(collection: &str, relative: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/");
-    format!("aethervault://{}/{rel}", normalize_collection(collection))
+    format!(
+        "{PRIMARY_URI_SCHEME}://{}/{rel}",
+        normalize_collection(collection)
+    )
 }
 
 pub(crate) fn infer_title(path: &Path, bytes: &[u8]) -> String {
@@ -56,24 +93,48 @@ pub(crate) fn blake3_hash(bytes: &[u8]) -> Hash {
     blake3::hash(bytes)
 }
 
-pub(crate) fn aethervault_home_dir() -> PathBuf {
-    if let Ok(home) = env::var("AETHERVAULT_HOME") {
-        let trimmed = home.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
+pub(crate) fn env_optional_alias(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| env_optional(name))
+}
+
+fn preferred_home_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
     if let Ok(home) = env::var("HOME") {
         let trimmed = home.trim();
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join(".aethervault");
+            candidates.push(PathBuf::from(trimmed).join(".openclaw"));
+            candidates.push(PathBuf::from(trimmed).join(".aethervault"));
         }
     }
-    PathBuf::from(".aethervault")
+    candidates
+}
+
+pub(crate) fn openclaw_home_dir() -> PathBuf {
+    if let Some(home) = env_optional_alias(&["OPENCLAW_HOME", "AETHERVAULT_HOME"]) {
+        return PathBuf::from(home);
+    }
+
+    for candidate in preferred_home_candidates() {
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    if let Ok(home) = env::var("HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join(".openclaw");
+        }
+    }
+    PathBuf::from(".openclaw")
+}
+
+pub(crate) fn aethervault_home_dir() -> PathBuf {
+    openclaw_home_dir()
 }
 
 pub(crate) fn aethervault_workspace_dir() -> PathBuf {
-    aethervault_home_dir().join("workspace")
+    openclaw_home_dir().join("workspace")
 }
 
 pub(crate) fn session_store_dir() -> PathBuf {
@@ -395,7 +456,7 @@ pub(crate) fn parse_retry_after(resp: &ureq::Response) -> Option<f64> {
 }
 
 pub(crate) fn command_wrapper() -> Option<Vec<String>> {
-    env_optional("AETHERVAULT_COMMAND_WRAPPER").map(|raw| {
+    env_optional_alias(&["OPENCLAW_COMMAND_WRAPPER", "AETHERVAULT_COMMAND_WRAPPER"]).map(|raw| {
         raw.split_whitespace()
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
@@ -504,7 +565,7 @@ pub(crate) fn resolve_workspace(cli: Option<PathBuf>, agent_cfg: &AgentConfig) -
     if let Some(path) = cli {
         return Some(path);
     }
-    if let Some(value) = env_optional("AETHERVAULT_WORKSPACE") {
+    if let Some(value) = env_optional_alias(&["OPENCLAW_WORKSPACE", "AETHERVAULT_WORKSPACE"]) {
         if !value.trim().is_empty() {
             return Some(PathBuf::from(value));
         }
@@ -513,6 +574,10 @@ pub(crate) fn resolve_workspace(cli: Option<PathBuf>, agent_cfg: &AgentConfig) -
         if !value.trim().is_empty() {
             return Some(PathBuf::from(value));
         }
+    }
+    let home_workspace = openclaw_home_dir().join("workspace");
+    if home_workspace.exists() {
+        return Some(home_workspace);
     }
     Some(PathBuf::from(DEFAULT_WORKSPACE_DIR))
 }
