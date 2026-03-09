@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 // Types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SwarmStatus {
     Queued,
@@ -65,11 +65,72 @@ pub(crate) struct SwarmTask {
     pub(crate) updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SwarmMonitorOptions {
+    pub(crate) workspace: PathBuf,
+    pub(crate) mv2: PathBuf,
+    pub(crate) repo_path: PathBuf,
+    pub(crate) aethervault_bin: PathBuf,
+    pub(crate) telegram_token: Option<String>,
+    pub(crate) telegram_chat_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct SwarmMonitorReport {
+    pub(crate) checked_prs: usize,
+    pub(crate) ci_transitions: usize,
+    pub(crate) review_transitions: usize,
+    pub(crate) retries_spawned: usize,
+    pub(crate) reviews_spawned: usize,
+    pub(crate) cleaned_worktrees: usize,
+    pub(crate) pruned_tasks: usize,
+    pub(crate) notifications_sent: usize,
+    pub(crate) events: Vec<String>,
+    pub(crate) errors: Vec<String>,
+}
+
+impl SwarmMonitorReport {
+    pub(crate) fn push_event(&mut self, event: impl Into<String>) {
+        self.events.push(event.into());
+    }
+
+    pub(crate) fn push_error(&mut self, error: impl Into<String>) {
+        self.errors.push(error.into());
+    }
+
+    pub(crate) fn render_text(&self) -> String {
+        let mut lines = vec![
+            format!("checked_prs={}", self.checked_prs),
+            format!("ci_transitions={}", self.ci_transitions),
+            format!("review_transitions={}", self.review_transitions),
+            format!("retries_spawned={}", self.retries_spawned),
+            format!("reviews_spawned={}", self.reviews_spawned),
+            format!("cleaned_worktrees={}", self.cleaned_worktrees),
+            format!("pruned_tasks={}", self.pruned_tasks),
+            format!("notifications_sent={}", self.notifications_sent),
+        ];
+        if !self.events.is_empty() {
+            lines.push("events:".to_string());
+            for event in &self.events {
+                lines.push(format!("- {event}"));
+            }
+        }
+        if !self.errors.is_empty() {
+            lines.push("errors:".to_string());
+            for error in &self.errors {
+                lines.push(format!("- {error}"));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
 
 pub(crate) fn open_swarm_db(workspace: &Path) -> Result<Connection, String> {
+    std::fs::create_dir_all(workspace).map_err(|e| format!("create swarm workspace: {e}"))?;
     let db_path = workspace.join("swarm.sqlite");
     let conn = Connection::open(&db_path).map_err(|e| format!("open swarm db: {e}"))?;
     conn.execute_batch(
@@ -303,6 +364,501 @@ pub(crate) fn swarm_cleanup_done(conn: &Connection, older_than_days: u32) -> Res
         )
         .map_err(|e| format!("cleanup: {e}"))?;
     Ok(count)
+}
+
+fn ci_status_from_states(states: &[String]) -> &'static str {
+    if !states.is_empty()
+        && states
+            .iter()
+            .all(|s| matches!(s.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED"))
+    {
+        "passing"
+    } else if states
+        .iter()
+        .any(|s| matches!(s.as_str(), "FAILURE" | "ERROR"))
+    {
+        "failing"
+    } else {
+        "pending"
+    }
+}
+
+fn review_status_from_decision(decision: &str) -> &'static str {
+    match decision {
+        "APPROVED" => "approved",
+        "CHANGES_REQUESTED" => "changes_requested",
+        "REVIEW_REQUIRED" => "pending",
+        _ if decision.trim().is_empty() => "pending",
+        _ => "pending",
+    }
+}
+
+fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn gh_pr_check_states(pr_num: i64) -> Result<Vec<String>, String> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "checks",
+            &pr_num.to_string(),
+            "--json",
+            "state",
+            "-q",
+            ".[].state",
+        ])
+        .output()
+        .map_err(|e| format!("gh pr checks spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr checks failed for PR #{}: {}",
+            pr_num,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect())
+}
+
+fn gh_pr_check_details(pr_num: i64) -> Result<String, String> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "checks",
+            &pr_num.to_string(),
+            "--json",
+            "name,state,output",
+        ])
+        .output()
+        .map_err(|e| format!("gh pr checks detail spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr checks detail failed for PR #{}: {}",
+            pr_num,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let clipped: String = raw.chars().take(2_000).collect();
+    Ok(clipped)
+}
+
+fn gh_pr_review_decision(pr_num: i64) -> Result<String, String> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_num.to_string(),
+            "--json",
+            "reviewDecision",
+            "-q",
+            ".reviewDecision",
+        ])
+        .output()
+        .map_err(|e| format!("gh pr view spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr view failed for PR #{}: {}",
+            pr_num,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn build_retry_prompt(task: &SwarmTask, attempt: u32, error_output: &str) -> String {
+    format!(
+        "{original}\n\nPREVIOUS ATTEMPT FAILED (attempt {attempt}/{max_retries}):\n{error_output}\n\n\
+Fix the issues above and try again. The branch already exists. Work in the current repository \
+state, verify the fix, commit, and push the branch when done.",
+        original = task.prompt,
+        max_retries = task.max_retries
+    )
+}
+
+fn build_review_prompt(pr_num: i64, task_name: &str, reviewer_hint: &str) -> String {
+    format!(
+        "You are acting as {reviewer_hint} for swarm task '{task_name}'. Review PR #{pr_num}. \
+Run `gh pr diff {pr_num}` and inspect the actual changes. Focus on logic bugs, edge cases, race \
+conditions, security issues, and missing tests. If you find issues, post them with \
+`gh pr review {pr_num} --comment --body ...`. If the PR is solid, approve it with \
+`gh pr review {pr_num} --approve --body ...`."
+    )
+}
+
+fn spawn_background_agent(
+    options: &SwarmMonitorOptions,
+    prompt: &str,
+    cwd: Option<&str>,
+    session_label: &str,
+) -> Result<(), String> {
+    let mut cmd = Command::new(&options.aethervault_bin);
+    let run_dir = cwd
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| options.repo_path.clone());
+    cmd.arg("agent")
+        .arg(&options.mv2)
+        .arg("--prompt")
+        .arg(prompt)
+        .arg("--session")
+        .arg(session_label)
+        .arg("--log")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd.current_dir(run_dir);
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("spawn agent: {e}"))
+}
+
+fn notify_telegram(options: &SwarmMonitorOptions, text: &str) -> Result<bool, String> {
+    let Some(token) = options.telegram_token.as_ref() else {
+        return Ok(false);
+    };
+    let Some(chat_id) = options.telegram_chat_id.as_ref() else {
+        return Ok(false);
+    };
+    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": true
+    });
+    let response = ureq::post(&url)
+        .send_json(payload)
+        .map_err(|e| format!("telegram notify: {e}"))?;
+    if (200..300).contains(&response.status()) {
+        Ok(true)
+    } else {
+        Err(format!("telegram notify status {}", response.status()))
+    }
+}
+
+pub(crate) fn run_swarm_monitor(
+    options: &SwarmMonitorOptions,
+) -> Result<SwarmMonitorReport, String> {
+    let conn = open_swarm_db(&options.workspace)?;
+    let mut report = SwarmMonitorReport::default();
+
+    let pr_open_tasks = swarm_list_tasks(&conn, Some("pr_open"), Some(100));
+    for task in &pr_open_tasks {
+        let Some(pr_num) = task.pr_number else {
+            continue;
+        };
+        report.checked_prs += 1;
+        match gh_pr_check_states(pr_num) {
+            Ok(states) => {
+                let ci_status = ci_status_from_states(&states);
+                match ci_status {
+                    "passing" => {
+                        let _ = swarm_update_task(
+                            &conn,
+                            &task.id,
+                            Some("reviewing"),
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some("passing"),
+                            Some("pending"),
+                            None,
+                            None,
+                            None,
+                        );
+                        report.ci_transitions += 1;
+                        report.push_event(format!(
+                            "{} (PR #{}) CI passing -> reviewing",
+                            task.name, pr_num
+                        ));
+                        let message = format!(
+                            "Swarm task '{}' (PR #{}) has CI passing and is ready for review.",
+                            task.name, pr_num
+                        );
+                        match notify_telegram(options, &message) {
+                            Ok(true) => report.notifications_sent += 1,
+                            Ok(false) => {}
+                            Err(err) => report.push_error(err),
+                        }
+                    }
+                    "failing" => {
+                        let _ = swarm_update_task(
+                            &conn,
+                            &task.id,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some("failing"),
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        report.ci_transitions += 1;
+                        let details = gh_pr_check_details(pr_num)
+                            .unwrap_or_else(|err| format!("Could not fetch CI details: {err}"));
+                        if task.retry_count < task.max_retries {
+                            let retry_prompt =
+                                build_retry_prompt(task, task.retry_count + 1, &details);
+                            let session = format!(
+                                "swarm-monitor:retry:{}:{}",
+                                task.id,
+                                Utc::now().timestamp()
+                            );
+                            match spawn_background_agent(
+                                options,
+                                &retry_prompt,
+                                task.worktree_path.as_deref(),
+                                &session,
+                            ) {
+                                Ok(()) => {
+                                    let short_error: String = details.chars().take(500).collect();
+                                    let _ = swarm_update_task(
+                                        &conn,
+                                        &task.id,
+                                        Some("running"),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        Some("failing"),
+                                        None,
+                                        Some(&short_error),
+                                        None,
+                                        Some(task.retry_count + 1),
+                                    );
+                                    report.retries_spawned += 1;
+                                    report.push_event(format!(
+                                        "{} (PR #{}) CI failing -> retry {}/{}",
+                                        task.name,
+                                        pr_num,
+                                        task.retry_count + 1,
+                                        task.max_retries
+                                    ));
+                                    let message = format!(
+                                        "Swarm task '{}' hit CI failures on PR #{}. Spawned retry {}/{}.",
+                                        task.name,
+                                        pr_num,
+                                        task.retry_count + 1,
+                                        task.max_retries
+                                    );
+                                    match notify_telegram(options, &message) {
+                                        Ok(true) => report.notifications_sent += 1,
+                                        Ok(false) => {}
+                                        Err(err) => report.push_error(err),
+                                    }
+                                }
+                                Err(err) => {
+                                    report.push_error(format!(
+                                        "retry spawn failed for {} (PR #{}): {}",
+                                        task.id, pr_num, err
+                                    ));
+                                }
+                            }
+                        } else {
+                            let short_error: String = details.chars().take(500).collect();
+                            let _ = swarm_update_task(
+                                &conn,
+                                &task.id,
+                                Some("failed"),
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some("failing"),
+                                None,
+                                Some(&short_error),
+                                None,
+                                None,
+                            );
+                            report.push_event(format!(
+                                "{} (PR #{}) exhausted retries",
+                                task.name, pr_num
+                            ));
+                            let message = format!(
+                                "Swarm task '{}' failed after {} attempts on PR #{}.",
+                                task.name, task.max_retries, pr_num
+                            );
+                            match notify_telegram(options, &message) {
+                                Ok(true) => report.notifications_sent += 1,
+                                Ok(false) => {}
+                                Err(err) => report.push_error(err),
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = swarm_update_task(
+                            &conn,
+                            &task.id,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some("pending"),
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                }
+            }
+            Err(err) => report.push_error(err),
+        }
+    }
+
+    let reviewing_tasks = swarm_list_tasks(&conn, Some("reviewing"), Some(100));
+    for task in &reviewing_tasks {
+        let Some(pr_num) = task.pr_number else {
+            continue;
+        };
+        report.checked_prs += 1;
+        let mut effective_review_status = task.review_status.clone();
+        match gh_pr_review_decision(pr_num) {
+            Ok(decision) => {
+                let review_status = review_status_from_decision(&decision);
+                effective_review_status = Some(review_status.to_string());
+                let new_status = if review_status == "approved" {
+                    Some("done")
+                } else {
+                    None
+                };
+                let _ = swarm_update_task(
+                    &conn,
+                    &task.id,
+                    new_status,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(review_status),
+                    None,
+                    None,
+                    None,
+                );
+                if !decision.is_empty() {
+                    report.review_transitions += 1;
+                    report.push_event(format!(
+                        "{} (PR #{}) review {}",
+                        task.name, pr_num, review_status
+                    ));
+                    if review_status == "approved" {
+                        let message = format!(
+                            "Swarm task '{}' has an approved review on PR #{} and is ready to merge.",
+                            task.name, pr_num
+                        );
+                        match notify_telegram(options, &message) {
+                            Ok(true) => report.notifications_sent += 1,
+                            Ok(false) => {}
+                            Err(err) => report.push_error(err),
+                        }
+                    }
+                }
+            }
+            Err(err) => report.push_error(err),
+        }
+
+        let review_dispatch_needed = task.review_status.is_none()
+            && effective_review_status.as_deref().unwrap_or("pending") == "pending";
+        if review_dispatch_needed {
+            let reviewer_hint = if task
+                .agent_backend
+                .as_deref()
+                .unwrap_or_default()
+                .contains("codex")
+            {
+                "cross-model reviewer"
+            } else {
+                "independent reviewer"
+            };
+            let prompt = build_review_prompt(pr_num, &task.name, reviewer_hint);
+            let session = format!(
+                "swarm-monitor:review:{}:{}",
+                task.id,
+                Utc::now().timestamp()
+            );
+            match spawn_background_agent(options, &prompt, None, &session) {
+                Ok(()) => {
+                    let _ = swarm_update_task(
+                        &conn,
+                        &task.id,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("pending"),
+                        None,
+                        None,
+                        None,
+                    );
+                    report.reviews_spawned += 1;
+                    report.push_event(format!(
+                        "{} (PR #{}) review worker spawned",
+                        task.name, pr_num
+                    ));
+                }
+                Err(err) => report.push_error(format!(
+                    "review spawn failed for {} (PR #{}): {}",
+                    task.id, pr_num, err
+                )),
+            }
+        }
+    }
+
+    let all_tasks = swarm_list_tasks(&conn, None, Some(500));
+    for task in &all_tasks {
+        if !matches!(task.status, SwarmStatus::Done | SwarmStatus::Failed) {
+            continue;
+        }
+        let Some(worktree_path) = task.worktree_path.as_deref() else {
+            continue;
+        };
+        let Some(updated_at) = parse_timestamp(&task.updated_at) else {
+            continue;
+        };
+        if Utc::now().signed_duration_since(updated_at) < chrono::Duration::days(7) {
+            continue;
+        }
+        let path = PathBuf::from(worktree_path);
+        if !path.exists() {
+            let _ = conn.execute(
+                "UPDATE swarm_tasks SET worktree_path = NULL, updated_at = ?2 WHERE id = ?1",
+                params![task.id, Utc::now().to_rfc3339()],
+            );
+            continue;
+        }
+        match cleanup_worktree(&options.repo_path, &path) {
+            Ok(()) => {
+                let _ = conn.execute(
+                    "UPDATE swarm_tasks SET worktree_path = NULL, updated_at = ?2 WHERE id = ?1",
+                    params![task.id, Utc::now().to_rfc3339()],
+                );
+                report.cleaned_worktrees += 1;
+                report.push_event(format!("cleaned worktree for {}", task.id));
+            }
+            Err(err) => report.push_error(format!("cleanup {} failed: {}", task.id, err)),
+        }
+    }
+
+    report.pruned_tasks = swarm_cleanup_done(&conn, 30)?;
+    if report.pruned_tasks > 0 {
+        report.push_event(format!("pruned {} old swarm tasks", report.pruned_tasks));
+    }
+
+    Ok(report)
 }
 
 fn row_to_swarm_task(row: &rusqlite::Row<'_>) -> SwarmTask {
@@ -564,5 +1120,41 @@ pub(crate) fn swarm_check_open_tasks(conn: &Connection) -> String {
         "Checked open tasks — no status changes.".to_string()
     } else {
         format!("Swarm check results:\n{}", updates.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ci_status_from_states, parse_timestamp, review_status_from_decision};
+
+    #[test]
+    fn ci_status_classifies_success_failure_and_pending() {
+        assert_eq!(
+            ci_status_from_states(&["SUCCESS".to_string(), "NEUTRAL".to_string()]),
+            "passing"
+        );
+        assert_eq!(
+            ci_status_from_states(&["SUCCESS".to_string(), "ERROR".to_string()]),
+            "failing"
+        );
+        assert_eq!(ci_status_from_states(&["PENDING".to_string()]), "pending");
+        assert_eq!(ci_status_from_states(&[]), "pending");
+    }
+
+    #[test]
+    fn review_status_classifies_decisions() {
+        assert_eq!(review_status_from_decision("APPROVED"), "approved");
+        assert_eq!(
+            review_status_from_decision("CHANGES_REQUESTED"),
+            "changes_requested"
+        );
+        assert_eq!(review_status_from_decision("REVIEW_REQUIRED"), "pending");
+        assert_eq!(review_status_from_decision(""), "pending");
+    }
+
+    #[test]
+    fn parse_timestamp_handles_rfc3339() {
+        let parsed = parse_timestamp("2026-03-08T12:34:56Z").expect("timestamp");
+        assert_eq!(parsed.to_rfc3339(), "2026-03-08T12:34:56+00:00");
     }
 }

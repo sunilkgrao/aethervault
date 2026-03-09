@@ -643,6 +643,17 @@ pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {
     static MIGRATION_FAILED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
+    if crate::memory_db::trigger_table_quarantined() {
+        let mut triggers = load_legacy_triggers_config(db);
+        if triggers.is_empty() {
+            triggers = load_legacy_triggers_backup();
+        }
+        if !triggers.is_empty() {
+            backup_triggers(&triggers);
+        }
+        return triggers;
+    }
+
     match db.triggers_list() {
         Ok(triggers) if !triggers.is_empty() => {
             MIGRATION_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -650,7 +661,11 @@ pub(crate) fn load_triggers(db: &MemoryDb) -> Vec<TriggerEntry> {
             return triggers;
         }
         Ok(_) => {}
-        Err(err) => eprintln!("[load_triggers] failed to load trigger table: {err}"),
+        Err(err) => {
+            if !crate::memory_db::trigger_table_quarantined() {
+                eprintln!("[load_triggers] failed to load trigger table: {err}");
+            }
+        }
     };
 
     let mut triggers = load_legacy_triggers_config(db);
@@ -2263,11 +2278,8 @@ pub(crate) fn run_trigger_thread(
                 let db_ok = db_persistent.triggers_list().is_ok();
                 if !db_ok {
                     if let Some(err) = db_persistent.triggers_list().err() {
-                        let msg = err.to_string().to_ascii_lowercase();
-                        if msg.contains("malformed")
-                            || msg.contains("disk i/o error")
-                            || msg.contains("locking protocol")
-                        {
+                        let msg = err.to_string();
+                        if crate::memory_db::looks_like_sqlite_corruption(&msg) {
                             attempt += 1;
                             if attempt >= MAX_TRIGGER_DB_RETRIES {
                                 eprintln!(

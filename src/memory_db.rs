@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
@@ -322,6 +322,35 @@ CREATE INDEX IF NOT EXISTS idx_feedback_uri ON feedback(uri);
 ";
 
 static TRIGGER_ID_COUNTER: OnceLock<AtomicU64> = OnceLock::new();
+static TRIGGER_TABLE_QUARANTINED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn looks_like_sqlite_corruption(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("disk i/o error")
+        || lower.contains("database disk image is malformed")
+        || lower.contains("malformed")
+        || lower.contains("locking protocol")
+}
+
+fn quarantine_trigger_table(reason: &str) {
+    if !looks_like_sqlite_corruption(reason) {
+        return;
+    }
+    let was_set = TRIGGER_TABLE_QUARANTINED.swap(true, Ordering::Relaxed);
+    if !was_set {
+        eprintln!(
+            "[trigger-db] quarantining trigger table after probable SQLite corruption: {reason}"
+        );
+    }
+}
+
+fn clear_trigger_table_quarantine() {
+    TRIGGER_TABLE_QUARANTINED.store(false, Ordering::Relaxed);
+}
+
+pub(crate) fn trigger_table_quarantined() -> bool {
+    TRIGGER_TABLE_QUARANTINED.load(Ordering::Relaxed)
+}
 
 fn parse_trigger_counter(id: &str) -> Option<u64> {
     let raw = id.strip_prefix("trg_")?;
@@ -1091,7 +1120,11 @@ impl MemoryDb {
                     });
                 }
                 Err(e) => {
-                    eprintln!("[memory_db] search row error: {e}");
+                    let msg = e.to_string();
+                    eprintln!("[memory_db] search row error: {msg}");
+                    if looks_like_sqlite_corruption(&msg) {
+                        break;
+                    }
                 }
             }
         }
@@ -1220,6 +1253,12 @@ impl MemoryDb {
     }
 
     pub(crate) fn triggers_list(&self) -> Result<Vec<TriggerEntry>, String> {
+        if trigger_table_quarantined() {
+            return Err(
+                "trigger table quarantined after prior SQLite corruption; restore from backup or run doctor"
+                    .to_string(),
+            );
+        }
         let mut stmt = self
             .conn
             .prepare(
@@ -1228,7 +1267,11 @@ impl MemoryDb {
                  FROM triggers
                  ORDER BY rowid ASC",
             )
-            .map_err(|e| format!("triggers_list prepare: {e}"))?;
+            .map_err(|e| {
+                let msg = format!("triggers_list prepare: {e}");
+                quarantine_trigger_table(&msg);
+                msg
+            })?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(TriggerEntry {
@@ -1248,13 +1291,22 @@ impl MemoryDb {
                     schedule_name: row.get(13)?,
                 })
             })
-            .map_err(|e| format!("triggers_list query: {e}"))?;
+            .map_err(|e| {
+                let msg = format!("triggers_list query: {e}");
+                quarantine_trigger_table(&msg);
+                msg
+            })?;
         let mut triggers = Vec::new();
         for row in rows {
-            if let Ok(trigger) = row {
-                triggers.push(trigger);
+            match row {
+                Ok(trigger) => triggers.push(trigger),
+                Err(err) => {
+                    quarantine_trigger_table(&err.to_string());
+                    return Err(format!("triggers_list row: {err}"));
+                }
             }
         }
+        clear_trigger_table_quarantine();
         Ok(triggers)
     }
 
@@ -1265,22 +1317,31 @@ impl MemoryDb {
     }
 
     fn seed_trigger_id_counter_from_db(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM triggers")
-            .map_err(|e| format!("seed_trigger_id_counter_from_db prepare: {e}"))?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| format!("seed_trigger_id_counter_from_db query: {e}"))?;
+        if trigger_table_quarantined() {
+            return Ok(());
+        }
+        let mut stmt = self.conn.prepare("SELECT id FROM triggers").map_err(|e| {
+            let msg = format!("seed_trigger_id_counter_from_db prepare: {e}");
+            quarantine_trigger_table(&msg);
+            msg
+        })?;
+        let mut rows = stmt.query([]).map_err(|e| {
+            let msg = format!("seed_trigger_id_counter_from_db query: {e}");
+            quarantine_trigger_table(&msg);
+            msg
+        })?;
 
         let mut maximum = 0u64;
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("seed_trigger_id_counter_from_db row: {e}"))?
-        {
-            let id: String = row
-                .get(0)
-                .map_err(|e| format!("seed_trigger_id_counter_from_db read: {e}"))?;
+        while let Some(row) = rows.next().map_err(|e| {
+            let msg = format!("seed_trigger_id_counter_from_db row: {e}");
+            quarantine_trigger_table(&msg);
+            msg
+        })? {
+            let id: String = row.get(0).map_err(|e| {
+                let msg = format!("seed_trigger_id_counter_from_db read: {e}");
+                quarantine_trigger_table(&msg);
+                msg
+            })?;
             if let Some(counter) = parse_trigger_counter(&id) {
                 if counter > maximum {
                     maximum = counter;
@@ -1288,15 +1349,25 @@ impl MemoryDb {
             }
         }
         ensure_trigger_id_counter_seed(maximum);
+        clear_trigger_table_quarantine();
         Ok(())
     }
 
     pub(crate) fn triggers_replace(&self, triggers: &[TriggerEntry]) -> Result<(), String> {
-        self.conn
-            .execute("BEGIN IMMEDIATE", [])
-            .map_err(|e| format!("triggers_replace begin tx: {e}"))?;
+        if trigger_table_quarantined() {
+            return Err(
+                "trigger table quarantined after prior SQLite corruption; refusing to write until recovery"
+                    .to_string(),
+            );
+        }
+        self.conn.execute("BEGIN IMMEDIATE", []).map_err(|e| {
+            let msg = format!("triggers_replace begin tx: {e}");
+            quarantine_trigger_table(&msg);
+            msg
+        })?;
         if let Err(err) = self.conn.execute("DELETE FROM triggers", []) {
             let _ = self.conn.execute("ROLLBACK", []);
+            quarantine_trigger_table(&err.to_string());
             return Err(format!("triggers_replace clear: {err}"));
         }
         {
@@ -1310,6 +1381,7 @@ impl MemoryDb {
                 )
                 .map_err(|e| {
                     let _ = self.conn.execute("ROLLBACK", []);
+                    quarantine_trigger_table(&e.to_string());
                     format!("triggers_replace prepare: {e}")
                 })?;
             for trigger in triggers {
@@ -1330,13 +1402,17 @@ impl MemoryDb {
                     trigger.schedule_name,
                 ]) {
                     let _ = self.conn.execute("ROLLBACK", []);
+                    quarantine_trigger_table(&err.to_string());
                     return Err(format!("triggers_replace insert {}: {err}", trigger.id));
                 }
             }
         }
-        self.conn
-            .execute("COMMIT", [])
-            .map_err(|e| format!("triggers_replace commit: {e}"))?;
+        self.conn.execute("COMMIT", []).map_err(|e| {
+            let msg = format!("triggers_replace commit: {e}");
+            quarantine_trigger_table(&msg);
+            msg
+        })?;
+        clear_trigger_table_quarantine();
         Ok(())
     }
 
@@ -2307,5 +2383,14 @@ mod tests {
         assert!((val - 0.75).abs() < 0.01);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn detects_sqlite_corruption_signals() {
+        assert!(looks_like_sqlite_corruption("disk I/O error"));
+        assert!(looks_like_sqlite_corruption(
+            "database disk image is malformed"
+        ));
+        assert!(!looks_like_sqlite_corruption("no such table: triggers"));
     }
 }

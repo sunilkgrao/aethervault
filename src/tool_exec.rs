@@ -1241,6 +1241,93 @@ fn submit_exec_background_job(
         .map_err(|err| format!("invalid background queue response: {err}"))
 }
 
+fn expand_command_path_token(token: &str) -> PathBuf {
+    if let Some(rest) = token.strip_prefix("~/") {
+        if let Some(home) = env_optional("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(token)
+}
+
+fn is_live_aethervault_db_path(candidate: &Path, live_roots: &[PathBuf]) -> bool {
+    let file_name = candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let looks_like_db = file_name.ends_with(".sqlite")
+        || file_name.ends_with(".db")
+        || file_name.ends_with(".mv2")
+        || matches!(
+            file_name.as_str(),
+            "memory.mv2" | "swarm.sqlite" | "skills.sqlite"
+        );
+    looks_like_db && live_roots.iter().any(|root| candidate.starts_with(root))
+}
+
+fn live_aethervault_db_roots(workspace_override: &Option<PathBuf>) -> Vec<PathBuf> {
+    let mut roots = vec![crate::aethervault_home_dir()];
+    if let Some(value) = env_optional("AETHERVAULT_WORKSPACE") {
+        roots.push(PathBuf::from(value));
+    }
+    if let Some(workspace) = workspace_override {
+        roots.push(workspace.clone());
+    }
+    let default_workspace = crate::aethervault_home_dir().join("workspace");
+    if !roots.iter().any(|root| root == &default_workspace) {
+        roots.push(default_workspace);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn command_touches_live_aethervault_db(
+    command: &str,
+    cwd: Option<&String>,
+    workspace_override: &Option<PathBuf>,
+) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let mentions_sqlite = lower.contains("sqlite3")
+        || lower.contains("sqlite3.connect")
+        || lower.contains("import sqlite3");
+    if !mentions_sqlite {
+        return false;
+    }
+
+    let live_roots = live_aethervault_db_roots(workspace_override);
+    if live_roots.iter().any(|root| {
+        let root_text = root.to_string_lossy().to_ascii_lowercase();
+        lower.contains(&root_text)
+            && (lower.contains(".sqlite")
+                || lower.contains(".db")
+                || lower.contains(".mv2")
+                || lower.contains("swarm.sqlite")
+                || lower.contains("skills.sqlite"))
+    }) {
+        return true;
+    }
+
+    let base_dir = cwd
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let parts = shlex::split(command).unwrap_or_default();
+    parts.into_iter().any(|part| {
+        if part.starts_with('-') {
+            return false;
+        }
+        let raw_path = expand_command_path_token(&part);
+        let resolved = if raw_path.is_absolute() {
+            raw_path
+        } else {
+            base_dir.join(raw_path)
+        };
+        is_live_aethervault_db_path(&resolved, &live_roots)
+    })
+}
+
 pub(crate) fn execute_tool(
     name: &str,
     args: serde_json::Value,
@@ -1880,21 +1967,23 @@ pub(crate) fn execute_tool(
             // The system sqlite3 (different version from bundled rusqlite)
             // corrupts WAL/SHM state when accessing a DB held open by the
             // Rust process, causing "disk I/O error" in all other connections.
-            {
-                let cmd_lower = parsed.command.to_ascii_lowercase();
-                if cmd_lower.contains("sqlite3")
-                    && (cmd_lower.contains("memory.mv2") || cmd_lower.contains(".aethervault"))
-                {
-                    return Ok(ToolExecution {
-                        output: "BLOCKED: Do not use the sqlite3 CLI on the production database. \
-                                 The system sqlite3 version differs from the embedded one and will \
-                                 corrupt the WAL index. Use the query/put tools instead, or run \
-                                 sqlite3 on a COPY of the database file."
-                            .to_string(),
-                        details: serde_json::json!({"blocked": true, "reason": "sqlite3_production_db"}),
-                        is_error: true,
-                    });
-                }
+            if command_touches_live_aethervault_db(
+                &parsed.command,
+                parsed.cwd.as_ref(),
+                &workspace_override,
+            ) {
+                return Ok(ToolExecution {
+                    output: "BLOCKED: Do not use sqlite tooling against live AetherVault databases. \
+                             External sqlite access can corrupt WAL/SHM state and trigger disk I/O \
+                             errors or malformed database images. Use built-in tools, or operate on \
+                             a COPY of the DB outside live AetherVault roots."
+                        .to_string(),
+                    details: serde_json::json!({
+                        "blocked": true,
+                        "reason": "sqlite_live_aethervault_db"
+                    }),
+                    is_error: true,
+                });
             }
 
             // SSH hardening: inject safety flags before spawning
@@ -5117,5 +5206,36 @@ pub(crate) fn execute_tool(
             })
         }
         _ => Err("unknown tool".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_touches_live_aethervault_db;
+    use std::path::PathBuf;
+
+    #[test]
+    fn blocks_sqlite_on_live_workspace_db() {
+        let workspace = Some(PathBuf::from("/tmp/assistant"));
+        assert!(command_touches_live_aethervault_db(
+            "sqlite3 swarm.sqlite 'select * from swarm_tasks'",
+            Some(&"/tmp/assistant".to_string()),
+            &workspace,
+        ));
+        assert!(command_touches_live_aethervault_db(
+            "python3 -c \"import sqlite3; sqlite3.connect('/tmp/assistant/skills.sqlite')\"",
+            None,
+            &workspace,
+        ));
+    }
+
+    #[test]
+    fn allows_non_sqlite_commands() {
+        let workspace = Some(PathBuf::from("/tmp/assistant"));
+        assert!(!command_touches_live_aethervault_db(
+            "ls -la /tmp/assistant",
+            None,
+            &workspace,
+        ));
     }
 }

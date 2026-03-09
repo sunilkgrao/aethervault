@@ -519,6 +519,22 @@ pub(crate) enum Command {
     /// Reject a pending tool execution.
     Reject { mv2: PathBuf, id: String },
 
+    /// Deterministic swarm monitor pass owned by the Rust runtime.
+    SwarmMonitor {
+        /// Workspace folder holding swarm.sqlite (default: $AETHERVAULT_WORKSPACE or ~/.aethervault/workspace)
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Capsule path used when spawning retry/review agents
+        #[arg(long)]
+        mv2: Option<PathBuf>,
+        /// Repository root for worktree cleanup and background agent cwd
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Output JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Rust-native chat and voice connectors (Telegram, WhatsApp, Twilio Voice callbacks).
     Bridge {
         #[command(subcommand)]

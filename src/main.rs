@@ -1093,6 +1093,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
 
+        Command::SwarmMonitor {
+            workspace,
+            mv2,
+            repo,
+            json,
+        } => {
+            let workspace = workspace
+                .or_else(|| env_optional("AETHERVAULT_WORKSPACE").map(PathBuf::from))
+                .unwrap_or_else(|| aethervault_home_dir().join("workspace"));
+            let mv2 = mv2
+                .or_else(|| env_optional("CAPSULE_PATH").map(PathBuf::from))
+                .or_else(|| env_optional("AETHERVAULT_MV2").map(PathBuf::from))
+                .unwrap_or_else(|| aethervault_home_dir().join("memory.mv2"));
+            let repo_path = repo
+                .or_else(|| env_optional("AETHERVAULT_REPO").map(PathBuf::from))
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let options = crate::swarm::SwarmMonitorOptions {
+                workspace,
+                mv2,
+                repo_path,
+                aethervault_bin: std::env::current_exe()?,
+                telegram_token: env_optional("TELEGRAM_BOT_TOKEN"),
+                telegram_chat_id: env_optional("TELEGRAM_CHAT_ID")
+                    .or_else(|| env_optional("AETHERVAULT_TELEGRAM_CHAT_ID")),
+            };
+            let report = crate::swarm::run_swarm_monitor(&options)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", report.render_text());
+            }
+            Ok(())
+        }
+
         Command::Bridge { command } => run_bridge(command),
 
         Command::Doctor {
