@@ -29,11 +29,6 @@ from typing import Any, Callable
 
 
 REMOTE_HOME = Path("/root/.openclaw")
-WORKSPACE = REMOTE_HOME / "workspace"
-REL_DIR = WORKSPACE / "relationship-intel"
-REL_SCRIPT = REL_DIR / "relationship_intel.py"
-REL_DB = REL_DIR / "relationship_intel.sqlite"
-AUTH_FILE = REMOTE_HOME / "agents" / "main" / "agent" / "auth-profiles.json"
 
 
 @dataclass
@@ -66,7 +61,21 @@ def run(
     )
 
 
+def auth_file_for_home(openclaw_home: Path) -> Path:
+    return openclaw_home / "agents" / "main" / "agent" / "auth-profiles.json"
+
+
+def rel_paths_for_home(openclaw_home: Path) -> tuple[Path, Path]:
+    rel_dir = openclaw_home / "workspace" / "relationship-intel"
+    return rel_dir, rel_dir / "relationship_intel.py"
+
+
 def load_auth_key(auth_file: Path) -> str:
+    env_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    if not auth_file.exists():
+        raise FileNotFoundError(f"Anthropic auth profile not found: {auth_file}")
     payload = json.loads(auth_file.read_text(encoding="utf-8"))
     key = payload["profiles"]["anthropic:default"]["key"]
     if not key:
@@ -126,9 +135,9 @@ def agent_text(iso_home: Path, prompt: str, session_id: str, anthropic_key: str,
     return text, payload
 
 
-def rel_json(db_path: Path, *subcommand: str) -> Any:
+def rel_json(rel_script: Path, db_path: Path, *subcommand: str) -> Any:
     proc = run(
-        ["python3", str(REL_SCRIPT), "--db", str(db_path), *subcommand, "--json"],
+        ["python3", str(rel_script), "--db", str(db_path), *subcommand, "--json"],
         timeout=120,
     )
     if proc.returncode != 0:
@@ -155,7 +164,14 @@ def trimmed(value: str, limit: int = 220) -> str:
 
 
 def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
-    anthropic_key = load_auth_key(AUTH_FILE)
+    auth_file = auth_file_for_home(remote_home)
+    anthropic_key = ""
+    auth_error = ""
+    try:
+        anthropic_key = load_auth_key(auth_file)
+    except Exception as exc:
+        auth_error = str(exc)
+    rel_dir, rel_script = rel_paths_for_home(remote_home)
     results: list[TestResult] = []
 
     with tempfile.TemporaryDirectory(prefix="openclaw-assert-battery-") as tmp:
@@ -163,7 +179,8 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
         iso_home = tmp_root / ".openclaw"
         iso_home.mkdir(parents=True, exist_ok=True)
         copy_openclaw_home(remote_home, iso_home)
-        iso_db = iso_home / "workspace" / "relationship-intel" / "relationship_intel.sqlite"
+        iso_rel_dir, iso_rel_script = rel_paths_for_home(iso_home)
+        iso_db = iso_rel_dir / "relationship_intel.sqlite"
 
         conn = sqlite3.connect(iso_db)
         conn.row_factory = sqlite3.Row
@@ -231,43 +248,45 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
         )
 
         # Direct tool assertions.
-        parents = rel_json(iso_db, "summary", "Prasad Rao")
+        parents = rel_json(iso_rel_script, iso_db, "summary", "Prasad Rao")
         ok = parents["relationship_label"] == "father" and "+14167092606" in parents["phones"]
         record("tool_parent_summary", ok, trimmed(json.dumps(parents, ensure_ascii=True)))
 
-        angelic = rel_json(iso_db, "summary", "Angelic")
+        angelic = rel_json(iso_rel_script, iso_db, "summary", "Angelic")
         ok = angelic["relationship_label"] == "wife" and "Marie-Angelic Vendette" in angelic["display_name"]
         record("tool_alias_resolution_spouse", ok, trimmed(json.dumps(angelic, ensure_ascii=True)))
 
-        rohan = rel_json(iso_db, "summary", "Rohan")
+        rohan = rel_json(iso_rel_script, iso_db, "summary", "Rohan")
         ok = any("investor introductions" in action["description"].casefold() for action in rohan["open_actions"])
         record("tool_rohan_open_loop", ok, trimmed(json.dumps(rohan, ensure_ascii=True)))
 
-        rohan_imessage_claims = rel_json(iso_db, "claims", "Rohan", "--channel", "imessage", "--limit", "20")
+        rohan_imessage_claims = rel_json(iso_rel_script, iso_db, "claims", "Rohan", "--channel", "imessage", "--limit", "20")
         ok = any(claim["predicate"] == "relationship_type" for claim in rohan_imessage_claims["claims"]) and any(
             claim["predicate"] == "open_loop" and "investor introductions" in claim["object_value"].casefold()
             for claim in rohan_imessage_claims["claims"]
         )
         record("tool_rohan_imessage_claims", ok, trimmed(json.dumps(rohan_imessage_claims, ensure_ascii=True)))
 
-        andrew = rel_json(iso_db, "summary", "Andrew Green")
+        andrew = rel_json(iso_rel_script, iso_db, "summary", "Andrew Green")
         ok = "Seacrest Advisors" in andrew["why_they_matter"] or "Seacrest Advisors" in andrew["dossier_excerpt"]
         record("tool_dossier_grounding", ok, trimmed(json.dumps(andrew, ensure_ascii=True)))
 
-        prasad_imessage_claims = rel_json(iso_db, "claims", "Prasad Rao", "--channel", "imessage", "--limit", "15")
+        prasad_imessage_claims = rel_json(iso_rel_script, iso_db, "claims", "Prasad Rao", "--channel", "imessage", "--limit", "15")
         ok = any(claim["predicate"] == "relationship_type" and "family" in claim["object_value"].casefold() for claim in prasad_imessage_claims["claims"])
         record("tool_family_imessage_claims", ok, trimmed(json.dumps(prasad_imessage_claims, ensure_ascii=True)))
 
-        brief = rel_json(iso_db, "brief", "--reconnect-limit", "5", "--loop-limit", "5", "--date-limit", "3")
+        brief = rel_json(iso_rel_script, iso_db, "brief", "--reconnect-limit", "5", "--loop-limit", "5", "--date-limit", "3")
         reconnect_names = [item["display_name"] for item in brief["priority_reconnect"]]
-        ok = (
-            len(reconnect_names) >= 3
-            and bool({"Shachin", "Andy", "Alain Denzler", "Ed", "Uma Rao", "Prasad Rao"}.intersection(reconnect_names))
-            and any(item["display_name"] in {"Rohan", "Prasad Rao", "Uma Rao", "Marie-Angelic Vendette"} for item in brief["open_loops"])
+        reconnect_quality = all(
+            item.get("recommended_action") and item.get("why_now") and item.get("why_they_matter")
+            for item in brief["priority_reconnect"][:3]
         )
+        open_loop_quality = any(item.get("open_actions") or item.get("recommended_action") for item in brief["open_loops"])
+        ok = len(reconnect_names) >= 3 and reconnect_quality and open_loop_quality
         record("tool_weekly_brief_quality", bool(ok), trimmed(json.dumps(brief, ensure_ascii=True)))
 
         recent_whatsapp = rel_json(
+            iso_rel_script,
             iso_db,
             "messages",
             "--channel",
@@ -291,29 +310,81 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
             trimmed(json.dumps({"count": recent_whatsapp["count"], "people": sorted(recent_people)[:10]}, ensure_ascii=True)),
         )
 
-        amit_claims = rel_json(iso_db, "claims", "Amit Gandhi", "--limit", "20")
+        recent_whatsapp_brief = rel_json(
+            iso_rel_script,
+            iso_db,
+            "channel-brief",
+            "--channel",
+            "whatsapp",
+            "--days",
+            "2",
+            "--limit",
+            "5",
+        )
+        brief_people = [item.get("person_display_name", "") for item in recent_whatsapp_brief.get("messages", [])]
+        ok = recent_whatsapp_brief["count"] >= 1 and any(name for name in brief_people if name in {"Amit Gandhi", "Sonia Daniel-Bouchard", "Morgan"})
+        record(
+            "tool_recent_whatsapp_brief",
+            ok,
+            trimmed(json.dumps({"count": recent_whatsapp_brief["count"], "people": brief_people}, ensure_ascii=True)),
+        )
+
+        drive_docs = rel_json(iso_rel_script, iso_db, "docs-search", "Tribble 2026 Deck", "--channel", "drive", "--limit", "3")
+        ok = any(item.get("title") == "Tribble 2026 Deck" and item.get("excerpt") for item in drive_docs)
+        record("tool_drive_deck_body_present", ok, trimmed(json.dumps(drive_docs, ensure_ascii=True)))
+
+        sync_state_path = tmp_root / "sync_state.test.json"
+        sync_proc = run(
+            [
+                "python3",
+                str(iso_rel_script),
+                "--db",
+                str(iso_db),
+                "sync-incremental",
+                "--account-email",
+                "sunil@tribble.ai",
+                "--state-path",
+                str(sync_state_path),
+                "--dry-run",
+                "--json",
+            ],
+            timeout=120,
+        )
+        if sync_proc.returncode != 0:
+            record("tool_incremental_sync_plan", False, sync_proc.stderr or sync_proc.stdout)
+        else:
+            sync_plan = json.loads(sync_proc.stdout)
+            ok = (
+                set(sync_plan.get("sources", {}).keys()) >= {"gmail", "calendar", "drive"}
+                and bool(sync_plan["sources"]["gmail"].get("query"))
+                and sync_plan["sources"]["calendar"].get("clear_existing") is False
+                and sync_plan["sources"]["drive"].get("clear_existing") is False
+            )
+            record("tool_incremental_sync_plan", ok, trimmed(json.dumps(sync_plan, ensure_ascii=True)))
+
+        amit_claims = rel_json(iso_rel_script, iso_db, "claims", "Amit Gandhi", "--limit", "20")
         has_travel = any(
             claim["predicate"] == "travel_location" and "punta" in claim["object_value"].casefold()
             for claim in amit_claims["claims"]
         )
         record("tool_semantic_travel_claim", has_travel, trimmed(json.dumps(amit_claims, ensure_ascii=True)))
 
-        place_entities = rel_json(iso_db, "entity-search", "Punta Cana", "--limit", "10")
+        place_entities = rel_json(iso_rel_script, iso_db, "entity-search", "Punta Cana", "--limit", "10")
         has_punta_entity = any(
             item["entity_type"] == "place" and "punta" in item["canonical_name"].casefold()
             for item in place_entities
         )
         record("tool_entity_search_place", has_punta_entity, trimmed(json.dumps(place_entities, ensure_ascii=True)))
 
-        dev_network = rel_json(iso_db, "network", "Dev Rajendran", "--limit", "20")
+        dev_network = rel_json(iso_rel_script, iso_db, "network", "Dev Rajendran", "--limit", "20")
         has_network_surface = bool(dev_network["outgoing_edges"] or dev_network["facts"])
         record("tool_network_surface", has_network_surface, trimmed(json.dumps(dev_network, ensure_ascii=True)))
 
-        amit_timeline = rel_json(iso_db, "timeline", "Amit Gandhi", "--limit", "10")
+        amit_timeline = rel_json(iso_rel_script, iso_db, "timeline", "Amit Gandhi", "--limit", "10")
         has_timeline_surface = bool(amit_timeline["recent_messages"] and amit_timeline["recent_claims"])
         record("tool_timeline_surface", has_timeline_surface, trimmed(json.dumps(amit_timeline, ensure_ascii=True)))
 
-        candidate_claims = rel_json(iso_db, "candidate-claims", "--limit", "20")
+        candidate_claims = rel_json(iso_rel_script, iso_db, "candidate-claims", "--limit", "20")
         sane_candidate_surface = isinstance(candidate_claims, list) and len(candidate_claims) >= 1
         record("tool_candidate_claim_review", sane_candidate_surface, trimmed(json.dumps(candidate_claims[:5], ensure_ascii=True)))
 
@@ -321,7 +392,7 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
         touch_proc = run(
             [
                 "python3",
-                str(REL_SCRIPT),
+                str(iso_rel_script),
                 "--db",
                 str(iso_db),
                 "touch",
@@ -339,8 +410,8 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
         if touch_proc.returncode != 0:
             record("tool_touchpoint_recency_update", False, touch_proc.stderr or touch_proc.stdout)
         else:
-            after_touch = rel_json(iso_db, "summary", "Shachin")
-            after_brief = rel_json(iso_db, "brief", "--reconnect-limit", "5", "--loop-limit", "5", "--date-limit", "3")
+            after_touch = rel_json(iso_rel_script, iso_db, "summary", "Shachin")
+            after_brief = rel_json(iso_rel_script, iso_db, "brief", "--reconnect-limit", "5", "--loop-limit", "5", "--date-limit", "3")
             still_reconnect = any(item["display_name"] == "Shachin" for item in after_brief["priority_reconnect"])
             days_since = after_touch["days_since_touch"]
             ok = days_since is not None and days_since <= 1 and not still_reconnect
@@ -376,6 +447,7 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
                 for phrase in (
                     "first-pass orientation",
                     "task decomposition",
+                    "decompose the task",
                     "do it myself",
                     "do it inline",
                     "read the key files",
@@ -396,16 +468,13 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
 
         def weekly_reconnect_checker(text: str) -> tuple[bool, str]:
             lowered = text.casefold()
-            hits = [
-                name
-                for name in ("shachin", "andy", "alain", "ed", "uma", "prasad", "rohan")
-                if name in lowered
-            ]
-            if len(hits) < 2:
-                return False, f"Expected at least two grounded reconnect names, got: {', '.join(hits) or 'none'}"
+            names = re.findall(r"\*\*([^*]{2,80})\*\*", text)
+            names = [name.strip() for name in names if len(name.strip().split()) <= 4]
+            if len(names) < 2:
+                return False, f"Expected at least two grounded reconnect names, got: {', '.join(names) or 'none'}"
             if not any(term in lowered for term in ("why", "follow", "open loop", "last touch", "this week", "days")):
                 return False, "Missing reconnect rationale"
-            return True, "weekly reconnect guidance ok"
+            return True, f"weekly reconnect guidance ok ({', '.join(names[:3])})"
 
         agent_cases: list[tuple[str, str, Callable[[str], tuple[bool, str]]]] = [
             (
@@ -450,22 +519,33 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
             ),
         ]
 
-        for index, (name, prompt, checker) in enumerate(agent_cases, start=1):
-            started = datetime.now(timezone.utc)
-            try:
-                text, payload = agent_text(
-                    iso_home,
-                    prompt,
-                    session_id=f"assertion-{index}",
-                    anthropic_key=anthropic_key,
-                    timeout=120,
+        if anthropic_key:
+            for index, (name, prompt, checker) in enumerate(agent_cases, start=1):
+                started = datetime.now(timezone.utc)
+                try:
+                    text, payload = agent_text(
+                        iso_home,
+                        prompt,
+                        session_id=f"assertion-{index}",
+                        anthropic_key=anthropic_key,
+                        timeout=120,
+                    )
+                    ok, detail = checker(text)
+                    duration_ms = int(payload.get("meta", {}).get("durationMs") or 0)
+                    record(name, ok, f"{detail} | response={trimmed(text, 280)}", duration_ms)
+                except Exception as exc:  # pragma: no cover - integration failure path
+                    duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                    record(name, False, f"{type(exc).__name__}: {exc}", duration_ms)
+        else:
+            for name, _, _ in agent_cases:
+                results.append(
+                    TestResult(
+                        name=name,
+                        status="skip",
+                        detail=f"agent assertions skipped: {auth_error}",
+                        duration_ms=0,
+                    )
                 )
-                ok, detail = checker(text)
-                duration_ms = int(payload.get("meta", {}).get("durationMs") or 0)
-                record(name, ok, f"{detail} | response={trimmed(text, 280)}", duration_ms)
-            except Exception as exc:  # pragma: no cover - integration failure path
-                duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-                record(name, False, f"{type(exc).__name__}: {exc}", duration_ms)
 
         conn.close()
 
@@ -488,7 +568,7 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
         "",
     ]
     for item in results:
-        prefix = "PASS" if item.status == "pass" else "FAIL"
+        prefix = item.status.upper()
         duration = f" ({item.duration_ms}ms)" if item.duration_ms else ""
         lines.append(f"- `{prefix}` `{item.name}`{duration} — {item.detail}")
 

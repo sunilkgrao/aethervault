@@ -11,13 +11,18 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
+import io
 import json
 import math
 import os
 import re
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
+import zipfile
+import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -360,6 +365,7 @@ OWNER_EMAILS = {
     "sunil@tribble.ai",
     "sunilrao.inc@gmail.com",
 }
+DEFAULT_SYNC_STATE_PATH = Path("/root/.openclaw/workspace/relationship-intel/sync_state.json")
 GOOGLE_CREDENTIALS_DIR = Path.home() / ".google_workspace_mcp" / "credentials"
 GOOGLE_TOKEN_CACHE: dict[str, tuple[str, datetime]] = {}
 GOOGLE_RETRYABLE_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -615,6 +621,99 @@ def trim_body(value: str, limit: int = 40000) -> str:
     if len(clean) <= limit:
         return clean
     return clean[:limit]
+
+
+def load_sync_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"sources": {}}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"sources": {}}
+    payload.setdefault("sources", {})
+    return payload
+
+
+def save_sync_state(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def state_source(payload: dict[str, Any], source: str) -> dict[str, Any]:
+    sources = payload.setdefault("sources", {})
+    record = sources.setdefault(source, {})
+    return record
+
+
+def iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def pptx_text(raw: bytes) -> str:
+    texts: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            slide_names = sorted(
+                name
+                for name in archive.namelist()
+                if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+            )
+            notes_names = sorted(
+                name
+                for name in archive.namelist()
+                if name.startswith("ppt/notesSlides/notesSlide") and name.endswith(".xml")
+            )
+            for name in slide_names + notes_names:
+                try:
+                    root = ET.fromstring(archive.read(name))
+                except Exception:
+                    continue
+                chunks = [
+                    normalize_text(node.text)
+                    for node in root.iter()
+                    if str(node.tag).endswith("}t")
+                ]
+                merged = " ".join(piece for piece in chunks if piece)
+                if merged:
+                    texts.append(merged)
+    except Exception:
+        return ""
+    return trim_body("\n\n".join(texts))
+
+
+def pptx_image_ocr(raw: bytes, max_images: int = 12) -> str:
+    chunks: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            image_names = sorted(
+                name
+                for name in archive.namelist()
+                if name.startswith("ppt/media/")
+                and name.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"))
+            )[:max_images]
+            for name in image_names:
+                suffix = Path(name).suffix or ".png"
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=suffix) as handle:
+                        handle.write(archive.read(name))
+                        handle.flush()
+                        proc = subprocess.run(
+                            ["tesseract", handle.name, "stdout", "--psm", "6"],
+                            capture_output=True,
+                            text=True,
+                            timeout=25,
+                            check=False,
+                        )
+                except Exception:
+                    continue
+                if proc.returncode != 0:
+                    continue
+                text = normalize_text(proc.stdout)
+                if text:
+                    chunks.append(text)
+    except Exception:
+        return ""
+    return trim_body("\n\n".join(chunks))
 
 
 def doc_text(*parts: str) -> str:
@@ -4097,6 +4196,7 @@ def import_google_gmail(
     account_email: str | None = None,
     query: str = "in:anywhere",
     max_messages: int = 0,
+    rebuild_ontology: bool = True,
     memory_dir: Path | None = None,
     top_n: int = 250,
 ) -> dict[str, Any]:
@@ -4294,7 +4394,7 @@ def import_google_gmail(
         if not next_page_token:
             break
 
-    ontology = rebuild_message_channel_ontology(conn, "email")
+    ontology = rebuild_message_channel_ontology(conn, "email") if rebuild_ontology else {}
     normalized_special_contacts = enforce_special_contacts(conn)
     conn.commit()
     conn.close()
@@ -4307,6 +4407,7 @@ def import_google_gmail(
         "imported_contacts": imported_contacts,
         "failed_messages": failed_messages,
         "linked_people": len(linked_people),
+        "rebuild_ontology": rebuild_ontology,
         "normalized_special_contacts": normalized_special_contacts,
         "ontology": ontology,
         "rerendered_memory_dir": str(rerendered) if rerendered else None,
@@ -4319,16 +4420,18 @@ def import_google_calendar(
     account_email: str | None = None,
     past_days: int = 365,
     future_days: int = 180,
+    clear_existing: bool = True,
     memory_dir: Path | None = None,
     top_n: int = 250,
 ) -> dict[str, Any]:
     account, _ = google_access_token(account_email)
     conn = open_store(db_path)
-    clear_source_documents_channel(conn, "calendar")
-    conn.execute("DELETE FROM semantic_claims WHERE channel = 'calendar'")
-    conn.execute("DELETE FROM person_facts WHERE channel = 'calendar'")
-    conn.execute("DELETE FROM relationship_edges WHERE channel = 'calendar'")
-    conn.execute("DELETE FROM touch_events WHERE channel = 'calendar' AND source = 'calendar-import'")
+    if clear_existing:
+        clear_source_documents_channel(conn, "calendar")
+        conn.execute("DELETE FROM semantic_claims WHERE channel = 'calendar'")
+        conn.execute("DELETE FROM person_facts WHERE channel = 'calendar'")
+        conn.execute("DELETE FROM relationship_edges WHERE channel = 'calendar'")
+        conn.execute("DELETE FROM touch_events WHERE channel = 'calendar' AND source = 'calendar-import'")
     calendars = google_api_json(account, "https://www.googleapis.com/calendar/v3/users/me/calendarList").get("items") or []
     imported_events = 0
     linked_people: set[str] = set()
@@ -4447,6 +4550,7 @@ def import_google_calendar(
         "imported_events": imported_events,
         "linked_people": len(linked_people),
         "updated_people": updated_people,
+        "clear_existing": clear_existing,
         "normalized_special_contacts": normalized_special_contacts,
         "rerendered_memory_dir": str(rerendered) if rerendered else None,
     }
@@ -4459,6 +4563,8 @@ def drive_file_body(account_email: str | None, payload: dict[str, Any]) -> str:
         return ""
     exportable = {
         "application/vnd.google-apps.document": "text/plain",
+        "application/vnd.google-apps.presentation": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.google-apps.spreadsheet": "text/tab-separated-values",
     }
     downloadable = {
         "text/plain",
@@ -4473,6 +4579,11 @@ def drive_file_body(account_email: str | None, payload: dict[str, Any]) -> str:
                 f"https://www.googleapis.com/drive/v3/files/{file_id}/export",
                 params={"mimeType": exportable[mime_type]},
             )
+            if mime_type == "application/vnd.google-apps.presentation":
+                body = pptx_text(raw)
+                if body:
+                    return body
+                return pptx_image_ocr(raw)
             return trim_body(raw.decode("utf-8", errors="ignore"))
         if mime_type in downloadable:
             raw = google_api_bytes(
@@ -4492,6 +4603,8 @@ def should_fetch_drive_body(payload: dict[str, Any], remaining_budget: int) -> b
     mime_type = normalize_text(payload.get("mimeType"))
     if mime_type not in {
         "application/vnd.google-apps.document",
+        "application/vnd.google-apps.presentation",
+        "application/vnd.google-apps.spreadsheet",
         "text/plain",
         "text/markdown",
         "application/json",
@@ -4515,12 +4628,15 @@ def import_google_drive(
     account_email: str | None = None,
     metadata_only: bool = False,
     body_limit: int = 250,
+    clear_existing: bool = True,
+    drive_query: str = "trashed=false",
     memory_dir: Path | None = None,
     top_n: int = 250,
 ) -> dict[str, Any]:
     account, _ = google_access_token(account_email)
     conn = open_store(db_path)
-    clear_source_documents_channel(conn, "drive")
+    if clear_existing:
+        clear_source_documents_channel(conn, "drive")
     next_page_token = ""
     imported_files = 0
     body_candidates = 0
@@ -4532,7 +4648,7 @@ def import_google_drive(
             params={
                 "pageSize": 200,
                 "pageToken": next_page_token,
-                "q": "trashed=false",
+                "q": drive_query,
                 "fields": "nextPageToken,files(id,name,mimeType,createdTime,modifiedTime,webViewLink,description,owners(displayName,emailAddress))",
             },
         )
@@ -4579,6 +4695,8 @@ def import_google_drive(
         "body_candidates": body_candidates,
         "imported_bodies": imported_bodies,
         "metadata_only": metadata_only,
+        "clear_existing": clear_existing,
+        "drive_query": drive_query,
         "rerendered_memory_dir": str(rerendered) if rerendered else None,
     }
 
@@ -4639,6 +4757,139 @@ def import_roam_notes(
     return {
         "notes_dir": str(notes_dir),
         "imported_notes": imported_notes,
+        "rerendered_memory_dir": str(rerendered) if rerendered else None,
+    }
+
+
+def gmail_after_query(base_query: str, dt: datetime, lookback_days: int) -> str:
+    anchor = (dt - timedelta(days=max(0, lookback_days))).astimezone(timezone.utc)
+    after_clause = f"after:{anchor.strftime('%Y/%m/%d')}"
+    clean_base = normalize_text(base_query) or "in:anywhere"
+    return f"({clean_base}) {after_clause}"
+
+
+def drive_incremental_query(dt: datetime, lookback_days: int) -> str:
+    anchor = (dt - timedelta(days=max(0, lookback_days))).astimezone(timezone.utc)
+    return f"trashed=false and modifiedTime > '{iso_z(anchor)}'"
+
+
+def sync_incremental(
+    db_path: Path,
+    *,
+    account_email: str | None = None,
+    state_path: Path,
+    gmail_query: str = "in:anywhere",
+    gmail_lookback_days: int = 14,
+    gmail_max_messages: int = 750,
+    calendar_lookback_days: int = 30,
+    calendar_future_days: int = 180,
+    drive_lookback_days: int = 30,
+    drive_body_limit: int = 80,
+    memory_dir: Path | None = None,
+    top_n: int = 250,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    state = load_sync_state(state_path)
+    plan: dict[str, Any] = {
+        "account_email": normalize_email(account_email) or "",
+        "state_path": str(state_path),
+        "dry_run": dry_run,
+        "sources": {},
+    }
+    results: dict[str, Any] = {}
+    sync_now = now_utc()
+
+    gmail_state = state_source(state, "gmail")
+    gmail_last = parse_date(normalize_text(gmail_state.get("last_success")))
+    gmail_query_effective = (
+        gmail_after_query(gmail_query, gmail_last, gmail_lookback_days)
+        if gmail_last
+        else f"({normalize_text(gmail_query) or 'in:anywhere'}) newer_than:{max(1, gmail_lookback_days)}d"
+    )
+    plan["sources"]["gmail"] = {
+        "last_success": gmail_state.get("last_success"),
+        "query": gmail_query_effective,
+        "max_messages": gmail_max_messages,
+    }
+
+    calendar_state = state_source(state, "calendar")
+    calendar_last = parse_date(normalize_text(calendar_state.get("last_success")))
+    calendar_past_days = (
+        max(1, int((sync_now - calendar_last).total_seconds() // 86400) + calendar_lookback_days)
+        if calendar_last
+        else calendar_lookback_days
+    )
+    plan["sources"]["calendar"] = {
+        "last_success": calendar_state.get("last_success"),
+        "past_days": calendar_past_days,
+        "future_days": calendar_future_days,
+        "clear_existing": False,
+    }
+
+    drive_state = state_source(state, "drive")
+    drive_last = parse_date(normalize_text(drive_state.get("last_success")))
+    drive_query_effective = (
+        drive_incremental_query(drive_last, drive_lookback_days)
+        if drive_last
+        else "trashed=false"
+    )
+    plan["sources"]["drive"] = {
+        "last_success": drive_state.get("last_success"),
+        "query": drive_query_effective,
+        "body_limit": drive_body_limit,
+        "clear_existing": False,
+    }
+
+    if dry_run:
+        return plan
+
+    results["gmail"] = import_google_gmail(
+        db_path,
+        account_email=account_email,
+        query=gmail_query_effective,
+        max_messages=max(0, gmail_max_messages),
+        rebuild_ontology=False,
+        memory_dir=None,
+        top_n=top_n,
+    )
+    gmail_state["last_success"] = sync_now.isoformat()
+    gmail_state["last_query"] = gmail_query_effective
+    gmail_state["last_imported_messages"] = results["gmail"]["imported_messages"]
+
+    results["calendar"] = import_google_calendar(
+        db_path,
+        account_email=account_email,
+        past_days=calendar_past_days,
+        future_days=calendar_future_days,
+        clear_existing=False,
+        memory_dir=None,
+        top_n=top_n,
+    )
+    calendar_state["last_success"] = sync_now.isoformat()
+    calendar_state["last_past_days"] = calendar_past_days
+    calendar_state["last_imported_events"] = results["calendar"]["imported_events"]
+
+    results["drive"] = import_google_drive(
+        db_path,
+        account_email=account_email,
+        metadata_only=False,
+        body_limit=drive_body_limit,
+        clear_existing=False,
+        drive_query=drive_query_effective,
+        memory_dir=None,
+        top_n=top_n,
+    )
+    drive_state["last_success"] = sync_now.isoformat()
+    drive_state["last_query"] = drive_query_effective
+    drive_state["last_imported_files"] = results["drive"]["imported_files"]
+    drive_state["last_imported_bodies"] = results["drive"]["imported_bodies"]
+
+    save_sync_state(state_path, state)
+    rerendered = maybe_rerender_after_touch(db_path, memory_dir, top_n)
+    return {
+        **plan,
+        "sources": results,
+        "saved_state_path": str(state_path),
         "rerendered_memory_dir": str(rerendered) if rerendered else None,
     }
 
@@ -7172,6 +7423,99 @@ def recent_messages(
     }
 
 
+def recent_message_brief(
+    db_path: Path,
+    *,
+    channel: str,
+    days: int,
+    limit: int,
+    person_query: str | None = None,
+    direction: str = "any",
+) -> dict[str, Any]:
+    payload = recent_messages(
+        db_path,
+        channel=channel,
+        days=days,
+        limit=max(limit * 8, 80),
+        direction=direction,
+        person_query=person_query,
+        chat_query=None,
+    )
+    conn = open_store(db_path)
+    ranked: list[dict[str, Any]] = []
+    now = now_utc()
+    for item in payload["messages"]:
+        display_name = normalize_text(item["person_display_name"] or item["sender_name"] or item["chat_name"])
+        if is_probably_noise_name(display_name):
+            continue
+        person_row = None
+        record = None
+        if item.get("person_id"):
+            person_row = conn.execute("SELECT * FROM people WHERE person_id = ?", (item["person_id"],)).fetchone()
+            if person_row:
+                record = record_for_row(person_row)
+        excerpt = trim_message_excerpt(item.get("text") or item.get("message_type") or "", 200)
+        if not excerpt:
+            continue
+        sent_dt = parse_date(item["sent_at"])
+        recency_score = 0.0
+        if sent_dt:
+            age_hours = max(0.0, (now - sent_dt).total_seconds() / 3600.0)
+            recency_score = max(0.0, 36.0 - min(age_hours, 72.0)) / 2.5
+        score = recency_score
+        why: list[str] = []
+        if item["direction"] == "inbound":
+            score += 6.0
+            why.append("inbound")
+        if not item["is_group"]:
+            score += 8.0
+            why.append("direct chat")
+        else:
+            score += 2.0
+            why.append("group context")
+        if record:
+            score += float(record.importance) * 1.6
+            score += float(record.relationship_score) * 1.2
+            if record.relationship_label:
+                score += 6.0
+                why.append(record.relationship_label)
+            if record.open_actions:
+                score += 5.0
+                why.append("open loop")
+            why.append(person_reason(record))
+        lowered = excerpt.casefold()
+        if any(token in lowered for token in ("flight", "parents", "airport", "booked", "passport", "invoice", "meeting", "intro", "follow up", "follow-up")):
+            score += 6.0
+            why.append("actionable context")
+        if len(excerpt) > 80:
+            score += 2.5
+        ranked.append(
+            {
+                "sent_at": item["sent_at"],
+                "direction": item["direction"],
+                "channel": channel,
+                "chat_name": item["chat_name"],
+                "chat_id": item["chat_id"],
+                "person_id": item.get("person_id"),
+                "person_display_name": display_name,
+                "relationship_label": item.get("person_relationship_label") or (record.relationship_label if record else ""),
+                "is_group": item["is_group"],
+                "text": excerpt,
+                "score": round(score, 2),
+                "why": dedupe_preserve(why)[:5],
+            }
+        )
+    conn.close()
+    ranked.sort(key=lambda entry: (-float(entry["score"]), entry["sent_at"]), reverse=False)
+    return {
+        "channel": channel,
+        "days": days,
+        "direction": normalize_text(direction).lower() or "any",
+        "count": len(ranked[:limit]),
+        "messages": ranked[:limit],
+    }
+
+
 def stats(db_path: Path) -> dict[str, Any]:
     conn = open_store(db_path)
     total = conn.execute("SELECT COUNT(*) AS c FROM people").fetchone()["c"]
@@ -7408,6 +7752,24 @@ def main(argv: list[str] | None = None) -> int:
     import_roam.add_argument("--top-n", type=int, default=250, help="How many people pages to render when --memory-dir is set")
     import_roam.add_argument("--json", action="store_true")
 
+    sync_incremental_cmd = subparsers.add_parser(
+        "sync-incremental",
+        help="Run incremental Gmail/Calendar/Drive sync using a persisted sync state",
+    )
+    sync_incremental_cmd.add_argument("--account-email", help="Google account email; defaults to first available credential")
+    sync_incremental_cmd.add_argument("--state-path", default=str(DEFAULT_SYNC_STATE_PATH), help="Path to sync_state.json")
+    sync_incremental_cmd.add_argument("--gmail-query", default="in:anywhere", help="Base Gmail query before incremental time shaping")
+    sync_incremental_cmd.add_argument("--gmail-lookback-days", type=int, default=14)
+    sync_incremental_cmd.add_argument("--gmail-max-messages", type=int, default=750)
+    sync_incremental_cmd.add_argument("--calendar-lookback-days", type=int, default=30)
+    sync_incremental_cmd.add_argument("--calendar-future-days", type=int, default=180)
+    sync_incremental_cmd.add_argument("--drive-lookback-days", type=int, default=30)
+    sync_incremental_cmd.add_argument("--drive-body-limit", type=int, default=80)
+    sync_incremental_cmd.add_argument("--memory-dir", help="Optional memory directory to re-render after sync")
+    sync_incremental_cmd.add_argument("--top-n", type=int, default=250)
+    sync_incremental_cmd.add_argument("--dry-run", action="store_true")
+    sync_incremental_cmd.add_argument("--json", action="store_true")
+
     reconcile_whatsapp = subparsers.add_parser(
         "reconcile-whatsapp",
         help="Mass-reconcile WhatsApp people/message history into the relationship ontology",
@@ -7436,6 +7798,17 @@ def main(argv: list[str] | None = None) -> int:
     messages.add_argument("--person", help="Optional person name/alias filter")
     messages.add_argument("--chat", help="Optional chat name or chat id filter")
     messages.add_argument("--json", action="store_true")
+
+    channel_brief = subparsers.add_parser(
+        "channel-brief",
+        help="Rank the most important recent messages from an imported channel history",
+    )
+    channel_brief.add_argument("--channel", default="whatsapp", help="Channel name, defaults to whatsapp")
+    channel_brief.add_argument("--days", type=int, default=2, help="How many trailing days to inspect")
+    channel_brief.add_argument("--limit", type=int, default=12, help="Maximum ranked messages to return")
+    channel_brief.add_argument("--direction", default="any", help="inbound|outbound|any")
+    channel_brief.add_argument("--person", help="Optional person name/alias filter")
+    channel_brief.add_argument("--json", action="store_true")
 
     docs_search = subparsers.add_parser("docs-search", help="Search imported source documents")
     docs_search.add_argument("query", help="Document query")
@@ -7835,6 +8208,38 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Re-rendered memory into {payload['rerendered_memory_dir']}")
         return 0
 
+    if args.command == "sync-incremental":
+        payload = sync_incremental(
+            db_path,
+            account_email=args.account_email,
+            state_path=Path(args.state_path).expanduser().resolve(),
+            gmail_query=args.gmail_query,
+            gmail_lookback_days=args.gmail_lookback_days,
+            gmail_max_messages=args.gmail_max_messages,
+            calendar_lookback_days=args.calendar_lookback_days,
+            calendar_future_days=args.calendar_future_days,
+            drive_lookback_days=args.drive_lookback_days,
+            drive_body_limit=args.drive_body_limit,
+            memory_dir=Path(args.memory_dir).expanduser().resolve() if args.memory_dir else None,
+            top_n=args.top_n,
+            dry_run=args.dry_run,
+        )
+        if args.json:
+            print_json(payload)
+        else:
+            if args.dry_run:
+                print("# Incremental Sync Plan")
+                for source, info in payload["sources"].items():
+                    print(f"- {source}: {json.dumps(info, ensure_ascii=True)}")
+            else:
+                print("Incremental sync completed.")
+                for source, info in payload["sources"].items():
+                    print(f"- {source}: {json.dumps(info, ensure_ascii=True)}")
+                print(f"Saved state: {payload['saved_state_path']}")
+                if payload.get("rerendered_memory_dir"):
+                    print(f"Re-rendered memory into {payload['rerendered_memory_dir']}")
+        return 0
+
     if args.command == "reconcile-whatsapp":
         payload = reconcile_whatsapp_graph(
             db_path,
@@ -7896,6 +8301,29 @@ def main(argv: list[str] | None = None) -> int:
                     f"- {item['sent_at']} | {item['direction']} | "
                     f"{item['person_display_name'] or item['chat_name'] or item['chat_id']} | {text}"
                 )
+        return 0
+
+    if args.command == "channel-brief":
+        payload = recent_message_brief(
+            db_path,
+            channel=args.channel,
+            days=args.days,
+            limit=args.limit,
+            person_query=args.person,
+            direction=args.direction,
+        )
+        if args.json:
+            print_json(payload)
+        else:
+            print(f"# Recent Important {payload['channel'].title()} Messages")
+            print()
+            for item in payload["messages"]:
+                why = "; ".join(item["why"]) if item.get("why") else "recent context"
+                print(
+                    f"- {item['sent_at']} | score={item['score']} | "
+                    f"{item['person_display_name']} | {item['text']}"
+                )
+                print(f"  why: {why}")
         return 0
 
     if args.command == "docs-search":

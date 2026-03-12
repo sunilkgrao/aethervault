@@ -102,6 +102,18 @@ If the store is empty or stale, refresh it first:
 /root/.openclaw/workspace/relationship-intel/whatsapp_history_sync.sh
 ```
 
+For broad “what important messages came in recently?” questions, use:
+
+```bash
+python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
+  --db /root/.openclaw/workspace/relationship-intel/relationship_intel.sqlite \
+  channel-brief \
+  --channel whatsapp \
+  --days 2 \
+  --limit 12 \
+  --json
+```
+
 ### Other imported sources
 
 Use `messages` for channels that were imported as message evidence:
@@ -138,6 +150,20 @@ python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
   --json
 ```
 
+### Incremental freshness
+
+For routine Google-source freshness on the host, use:
+
+```bash
+/root/.openclaw/workspace/relationship-intel/incremental_sync.sh
+```
+
+To inspect what it will do before running:
+
+```bash
+DRY_RUN=1 /root/.openclaw/workspace/relationship-intel/incremental_sync.sh
+```
+
 ### Record a real touchpoint
 
 When Sunil mentions a meaningful interaction, update the graph:
@@ -161,8 +187,10 @@ Then refresh the prompt surface:
 
 - Query the relationship store before asking the user obvious people-context questions.
 - For recent WhatsApp questions, use `messages` first instead of guessing or saying you cannot inspect WhatsApp.
+- Never use the generic `message` tool to read WhatsApp/Slack/email history. That path is for delivery actions, not archival review. Use `channel-brief` or `messages` from `relationship_intel.py`.
 - For Slack or email recency questions, use `messages --channel slack|email` before improvising.
 - For targeted inbox questions about a known person, project, or open loop, use `gmail-guided` before broad Gmail import.
+- Prefer `incremental_sync.sh` for routine Gmail/Calendar/Drive freshness instead of broad manual re-imports.
 - For company or personal note questions, use `docs-search` before claiming the context is unavailable.
 - Prefer `operating-state` and `HOT-STATE.md` before pulling the broader document archive into prompt context.
 - After any major multi-source import, run `reconcile-identities` so duplicate people do not linger under separate phone/email records.

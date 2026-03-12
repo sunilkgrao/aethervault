@@ -37,9 +37,11 @@ Commands:
 - `import-google-calendar` imports Calendar events as meeting evidence and touchpoints
 - `import-google-drive` imports Drive metadata broadly and only promoted bodies selectively
 - `import-roam-notes` imports extracted Roam markdown notes as document evidence
+- `sync-incremental` runs an incremental Gmail/Calendar/Drive sync using a persisted sync state
 - `reconcile-whatsapp` rebuilds the WhatsApp relationship ontology, semantic claims, and edges from imported history
 - `reconcile-identities` merges duplicate people across sources using email/phone identity while preserving claims and edges
 - `messages` queries recent channel messages already imported into the relationship store
+- `channel-brief` ranks the most important recent channel messages using relationship signal and recency
 - `docs-search` searches imported Roam/Drive/Calendar document evidence
 - `stats` prints high-level counts
 
@@ -111,6 +113,18 @@ Typical live run on the host:
 /root/.openclaw/workspace/relationship-intel/whatsapp_history_sync.sh
 ```
 
+For routine freshness across Google sources, use the incremental wrapper:
+
+```bash
+/root/.openclaw/workspace/relationship-intel/incremental_sync.sh
+```
+
+Dry-run the next sync window/query plan without mutating anything:
+
+```bash
+DRY_RUN=1 /root/.openclaw/workspace/relationship-intel/incremental_sync.sh
+```
+
 If the current linked session will not provide history, use the safer relink
 flow instead:
 
@@ -143,11 +157,13 @@ The intended live pattern is:
 - use `operating-state --json` when Linus needs the compact high-value relationship + company/personal context surface
 - use `docs-search --json` when the answer likely lives in Roam, Drive, or Calendar evidence rather than in a person summary
 - use `gmail-guided --person ... --objective ... --json` before broad Gmail import when the task is about a known person, company thread, travel flow, or open loop
+- use `channel-brief --channel whatsapp|slack|email --days ... --json` when the question is “what important messages came in recently?”
 - use `import-imessage-profiles --profiles-dir ...` when refreshing the curated iMessage profile layer from preserved archives
 - use `import-slack-archive --archive-dir ...` when backfilling company chat context
 - use `import-google-gmail --account-email ...` for inbox history
 - use `import-google-calendar --account-email ...` for meeting and attendee history
 - use `import-google-drive --account-email ... --body-limit 80` for strategic document ingestion
+- use `sync-incremental --account-email ... --dry-run --json` to inspect the next Gmail/Calendar/Drive refresh plan
 - use `import-roam-notes --notes-dir ...` for personal notes and long-horizon thinking context
 - use `messages --channel whatsapp --days 2 --direction inbound --json` when the task is about recent WhatsApp traffic
 - use `touch ... --memory-dir ...` after meaningful interactions so the graph stays current
