@@ -1757,6 +1757,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "linus-migrate"
+version = "0.0.2"
+dependencies = [
+ "aether-core",
+ "ammonia",
+ "base64 0.22.1",
+ "blake3",
+ "chrono",
+ "clap",
+ "libc",
+ "rayon",
+ "regex",
+ "reqwest",
+ "rmcp",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "shlex",
+ "tiny_http",
+ "tokio",
+ "tungstenite",
+ "ureq 2.12.1",
+ "url",
+ "urlencoding",
+ "walkdir",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2168,34 +2196,6 @@ checksum = "c7f86c6eef3d6df15f23bcfb6af487cbd2fed4e5581d58d5bf1f5f8b7f6727dc"
 dependencies = [
  "cc",
  "pkg-config",
-]
-
-[[package]]
-name = "openclaw"
-version = "0.0.2"
-dependencies = [
- "aether-core",
- "ammonia",
- "base64 0.22.1",
- "blake3",
- "chrono",
- "clap",
- "libc",
- "rayon",
- "regex",
- "reqwest",
- "rmcp",
- "rusqlite",
- "serde",
- "serde_json",
- "shlex",
- "tiny_http",
- "tokio",
- "tungstenite",
- "ureq 2.12.1",
- "url",
- "urlencoding",
- "walkdir",
 ]
 
 [[package]]

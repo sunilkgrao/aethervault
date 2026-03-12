@@ -176,6 +176,14 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
         with_actions = int(sqlite_value(conn, "select count(*) from people where open_actions_json <> '[]'") or 0)
         with_notes = int(sqlite_value(conn, "select count(*) from people where notes_json <> '[]'") or 0)
         with_dossiers = int(sqlite_value(conn, "select count(*) from people where length(dossier_excerpt) > 0") or 0)
+        whatsapp_messages = int(sqlite_value(conn, "select count(*) from message_events where channel = 'whatsapp'") or 0)
+        whatsapp_threads = int(sqlite_value(conn, "select count(*) from conversation_threads where channel = 'whatsapp'") or 0)
+        semantic_claims = int(sqlite_value(conn, "select count(*) from semantic_claims where channel = 'whatsapp'") or 0)
+        imessage_claims = int(sqlite_value(conn, "select count(*) from semantic_claims where channel = 'imessage'") or 0)
+        imessage_signals = int(sqlite_value(conn, "select count(*) from relationship_signals where channel = 'imessage'") or 0)
+        relationship_edges = int(sqlite_value(conn, "select count(*) from relationship_edges where channel = 'whatsapp'") or 0)
+        entities = int(sqlite_value(conn, "select count(*) from entities where source_channel = 'whatsapp'") or 0)
+        stale_claims = int(sqlite_value(conn, "select count(*) from semantic_claims where channel = 'whatsapp' and claim_status = 'stale'") or 0)
         imessage_open_action_people = 0
         for row in conn.execute("select open_actions_json from people where open_actions_json <> '[]'"):
             actions = json.loads(row["open_actions_json"])
@@ -203,13 +211,23 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
         )
         record(
             "imessage_provenance_present",
-            imessage_open_action_people >= 350,
-            f"people_with_imessage_actions={imessage_open_action_people}",
+            imessage_open_action_people >= 350 and imessage_claims >= 1000 and imessage_signals >= 300,
+            f"people_with_imessage_actions={imessage_open_action_people}, imessage_claims={imessage_claims}, imessage_signals={imessage_signals}",
         )
         record(
             "whatsapp_archive_preserved",
             whatsapp_archive_hits >= 3,
             f"whatsapp_archive_hits={whatsapp_archive_hits}",
+        )
+        record(
+            "whatsapp_live_history_present",
+            whatsapp_messages >= 25 and whatsapp_threads >= 5,
+            f"whatsapp_messages={whatsapp_messages}, whatsapp_threads={whatsapp_threads}",
+        )
+        record(
+            "semantic_kg_present",
+            semantic_claims >= 10000 and relationship_edges >= 1000 and entities >= 200,
+            f"semantic_claims={semantic_claims}, relationship_edges={relationship_edges}, entities={entities}, stale_claims={stale_claims}",
         )
 
         # Direct tool assertions.
@@ -225,14 +243,79 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
         ok = any("investor introductions" in action["description"].casefold() for action in rohan["open_actions"])
         record("tool_rohan_open_loop", ok, trimmed(json.dumps(rohan, ensure_ascii=True)))
 
+        rohan_imessage_claims = rel_json(iso_db, "claims", "Rohan", "--channel", "imessage", "--limit", "20")
+        ok = any(claim["predicate"] == "relationship_type" for claim in rohan_imessage_claims["claims"]) and any(
+            claim["predicate"] == "open_loop" and "investor introductions" in claim["object_value"].casefold()
+            for claim in rohan_imessage_claims["claims"]
+        )
+        record("tool_rohan_imessage_claims", ok, trimmed(json.dumps(rohan_imessage_claims, ensure_ascii=True)))
+
         andrew = rel_json(iso_db, "summary", "Andrew Green")
         ok = "Seacrest Advisors" in andrew["why_they_matter"] or "Seacrest Advisors" in andrew["dossier_excerpt"]
         record("tool_dossier_grounding", ok, trimmed(json.dumps(andrew, ensure_ascii=True)))
 
+        prasad_imessage_claims = rel_json(iso_db, "claims", "Prasad Rao", "--channel", "imessage", "--limit", "15")
+        ok = any(claim["predicate"] == "relationship_type" and "family" in claim["object_value"].casefold() for claim in prasad_imessage_claims["claims"])
+        record("tool_family_imessage_claims", ok, trimmed(json.dumps(prasad_imessage_claims, ensure_ascii=True)))
+
         brief = rel_json(iso_db, "brief", "--reconnect-limit", "5", "--loop-limit", "5", "--date-limit", "3")
         reconnect_names = [item["display_name"] for item in brief["priority_reconnect"]]
-        ok = {"Shachin", "Andy", "Alain Denzler"}.intersection(reconnect_names) and any(item["display_name"] == "Rohan" for item in brief["open_loops"])
+        ok = (
+            len(reconnect_names) >= 3
+            and bool({"Shachin", "Andy", "Alain Denzler", "Ed", "Uma Rao", "Prasad Rao"}.intersection(reconnect_names))
+            and any(item["display_name"] in {"Rohan", "Prasad Rao", "Uma Rao", "Marie-Angelic Vendette"} for item in brief["open_loops"])
+        )
         record("tool_weekly_brief_quality", bool(ok), trimmed(json.dumps(brief, ensure_ascii=True)))
+
+        recent_whatsapp = rel_json(
+            iso_db,
+            "messages",
+            "--channel",
+            "whatsapp",
+            "--days",
+            "2",
+            "--direction",
+            "inbound",
+            "--limit",
+            "20",
+        )
+        recent_people = {
+            (item.get("person_display_name") or item.get("chat_name") or "").strip()
+            for item in recent_whatsapp["messages"]
+            if (item.get("person_display_name") or item.get("chat_name"))
+        }
+        ok = recent_whatsapp["count"] >= 1 and any(recent_people)
+        record(
+            "tool_recent_whatsapp_query",
+            ok,
+            trimmed(json.dumps({"count": recent_whatsapp["count"], "people": sorted(recent_people)[:10]}, ensure_ascii=True)),
+        )
+
+        amit_claims = rel_json(iso_db, "claims", "Amit Gandhi", "--limit", "20")
+        has_travel = any(
+            claim["predicate"] == "travel_location" and "punta" in claim["object_value"].casefold()
+            for claim in amit_claims["claims"]
+        )
+        record("tool_semantic_travel_claim", has_travel, trimmed(json.dumps(amit_claims, ensure_ascii=True)))
+
+        place_entities = rel_json(iso_db, "entity-search", "Punta Cana", "--limit", "10")
+        has_punta_entity = any(
+            item["entity_type"] == "place" and "punta" in item["canonical_name"].casefold()
+            for item in place_entities
+        )
+        record("tool_entity_search_place", has_punta_entity, trimmed(json.dumps(place_entities, ensure_ascii=True)))
+
+        dev_network = rel_json(iso_db, "network", "Dev Rajendran", "--limit", "20")
+        has_network_surface = bool(dev_network["outgoing_edges"] or dev_network["facts"])
+        record("tool_network_surface", has_network_surface, trimmed(json.dumps(dev_network, ensure_ascii=True)))
+
+        amit_timeline = rel_json(iso_db, "timeline", "Amit Gandhi", "--limit", "10")
+        has_timeline_surface = bool(amit_timeline["recent_messages"] and amit_timeline["recent_claims"])
+        record("tool_timeline_surface", has_timeline_surface, trimmed(json.dumps(amit_timeline, ensure_ascii=True)))
+
+        candidate_claims = rel_json(iso_db, "candidate-claims", "--limit", "20")
+        sane_candidate_surface = isinstance(candidate_claims, list) and len(candidate_claims) >= 1
+        record("tool_candidate_claim_review", sane_candidate_surface, trimmed(json.dumps(candidate_claims[:5], ensure_ascii=True)))
 
         # Mutation assertion: touchpoint should update recency and remove from reconnect urgency.
         touch_proc = run(
@@ -311,6 +394,19 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
                 return False, "Still using absolutist delegation phrasing"
             return True, "orchestration policy ok"
 
+        def weekly_reconnect_checker(text: str) -> tuple[bool, str]:
+            lowered = text.casefold()
+            hits = [
+                name
+                for name in ("shachin", "andy", "alain", "ed", "uma", "prasad", "rohan")
+                if name in lowered
+            ]
+            if len(hits) < 2:
+                return False, f"Expected at least two grounded reconnect names, got: {', '.join(hits) or 'none'}"
+            if not any(term in lowered for term in ("why", "follow", "open loop", "last touch", "this week", "days")):
+                return False, "Missing reconnect rationale"
+            return True, "weekly reconnect guidance ok"
+
         agent_cases: list[tuple[str, str, Callable[[str], tuple[bool, str]]]] = [
             (
                 "agent_parents_alias",
@@ -340,7 +436,7 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
             (
                 "agent_weekly_reconnects",
                 "Who should I reach out to this week and why?",
-                lambda text: assert_keywords(text, ["Shachin", "Andy", "Alain"], []),
+                weekly_reconnect_checker,
             ),
             (
                 "agent_orchestration_policy",

@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -56,6 +58,45 @@ Browser violations:\n\
 // Set high enough that long sessions (64+ steps) don't prematurely disable the critic.
 static CRITIC_CONSECUTIVE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 const CRITIC_MAX_CONSECUTIVE_FAILURES: usize = 8;
+static RAW_ASSISTANT_BLOCKS: LazyLock<Mutex<HashMap<String, Vec<serde_json::Value>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const RAW_ASSISTANT_BLOCKS_CAP: usize = 4096;
+
+fn assistant_message_fingerprint(msg: &AgentMessage) -> String {
+    let payload = serde_json::json!({
+        "role": msg.role,
+        "content": msg.content,
+        "tool_calls": msg.tool_calls,
+        "thinking_blocks": msg.thinking_blocks,
+    });
+    blake3::hash(payload.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+pub(crate) fn remember_raw_assistant_blocks(msg: &AgentMessage, blocks: &[serde_json::Value]) {
+    if msg.role != "assistant" || blocks.is_empty() {
+        return;
+    }
+    let mut guard = RAW_ASSISTANT_BLOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= RAW_ASSISTANT_BLOCKS_CAP {
+        guard.clear();
+    }
+    guard.insert(assistant_message_fingerprint(msg), blocks.to_vec());
+}
+
+fn recall_raw_assistant_blocks(msg: &AgentMessage) -> Option<Vec<serde_json::Value>> {
+    if msg.role != "assistant" {
+        return None;
+    }
+    RAW_ASSISTANT_BLOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&assistant_message_fingerprint(msg))
+        .cloned()
+}
 
 fn model_supports_adaptive_thinking(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
@@ -539,32 +580,33 @@ pub(crate) fn to_anthropic_messages(messages: &[AgentMessage]) -> Vec<serde_json
                 }
             }
             "assistant" => {
-                let mut blocks = Vec::new();
-                // Thinking blocks must come first in assistant content
-                for tb in &msg.thinking_blocks {
-                    let mut cleaned = tb.clone();
-                    if let Some(obj) = cleaned.as_object_mut() {
-                        obj.remove("cache_control");
+                if let Some(blocks) = recall_raw_assistant_blocks(msg) {
+                    out.push(serde_json::json!({"role": "assistant", "content": blocks}));
+                } else {
+                    let mut blocks = Vec::new();
+                    // Thinking blocks must come first in assistant content when we
+                    // have to reconstruct from the normalized AgentMessage form.
+                    for tb in &msg.thinking_blocks {
+                        blocks.push(tb.clone());
                     }
-                    blocks.push(cleaned);
-                }
-                if let Some(content) = &msg.content {
-                    if !content.is_empty() {
-                        blocks.push(serde_json::json!({"type": "text", "text": content}));
+                    if let Some(content) = &msg.content {
+                        if !content.is_empty() {
+                            blocks.push(serde_json::json!({"type": "text", "text": content}));
+                        }
                     }
+                    for call in &msg.tool_calls {
+                        blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": call.id.clone(),
+                            "name": call.name.clone(),
+                            "input": call.args.clone()
+                        }));
+                    }
+                    if blocks.is_empty() {
+                        blocks.push(serde_json::json!({"type": "text", "text": ""}));
+                    }
+                    out.push(serde_json::json!({"role": "assistant", "content": blocks}));
                 }
-                for call in &msg.tool_calls {
-                    blocks.push(serde_json::json!({
-                        "type": "tool_use",
-                        "id": call.id.clone(),
-                        "name": call.name.clone(),
-                        "input": call.args.clone()
-                    }));
-                }
-                if blocks.is_empty() {
-                    blocks.push(serde_json::json!({"type": "text", "text": ""}));
-                }
-                out.push(serde_json::json!({"role": "assistant", "content": blocks}));
             }
             "tool" => {
                 let Some(tool_id) = msg.tool_call_id.clone() else {
@@ -661,12 +703,7 @@ pub(crate) fn parse_claude_response(
                 tool_calls.push(AgentToolCall { id, name, args });
             }
             "thinking" | "redacted_thinking" => {
-                // Preserve thinking blocks for multi-turn tool-use conversations
-                let mut cleaned = block.clone();
-                if let Some(obj) = cleaned.as_object_mut() {
-                    obj.remove("cache_control");
-                }
-                thinking_blocks.push(cleaned);
+                thinking_blocks.push(block.clone());
             }
             _ => {}
         }
@@ -678,17 +715,18 @@ pub(crate) fn parse_claude_response(
         Some(text_parts.join("\n"))
     };
 
-    Ok(AgentHookResponse {
-        message: AgentMessage {
-            role: "assistant".to_string(),
-            content: content_text,
-            tool_calls,
-            name: None,
-            tool_call_id: None,
-            is_error: None,
-            thinking_blocks,
-        },
-    })
+    let message = AgentMessage {
+        role: "assistant".to_string(),
+        content: content_text,
+        tool_calls,
+        name: None,
+        tool_call_id: None,
+        is_error: None,
+        thinking_blocks,
+    };
+    remember_raw_assistant_blocks(&message, content);
+
+    Ok(AgentHookResponse { message })
 }
 
 pub(crate) fn call_claude(
@@ -1682,7 +1720,11 @@ pub(crate) fn call_agent_hook_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{prompt_is_operational_automation, prompt_needs_deep_reasoning};
+    use super::{
+        prompt_is_operational_automation, prompt_needs_deep_reasoning,
+        remember_raw_assistant_blocks, to_anthropic_messages,
+    };
+    use crate::{AgentMessage, AgentToolCall};
 
     #[test]
     fn deep_reasoning_turns_on_for_exec_assistant_planning() {
@@ -1695,5 +1737,47 @@ mod tests {
         let prompt = "Perform hourly infrastructure health check. Verify all services are healthy, restart any that are down, and log actions taken.";
         assert!(prompt_is_operational_automation(prompt));
         assert!(!prompt_needs_deep_reasoning(prompt));
+    }
+
+    #[test]
+    fn anthropic_serialization_reuses_exact_assistant_blocks_when_available() {
+        let message = AgentMessage {
+            role: "assistant".to_string(),
+            content: Some("Done".to_string()),
+            tool_calls: vec![AgentToolCall {
+                id: "toolu_123".to_string(),
+                name: "search".to_string(),
+                args: serde_json::json!({"q": "linus"}),
+            }],
+            name: None,
+            tool_call_id: None,
+            is_error: None,
+            thinking_blocks: vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "raw thoughts",
+                "signature": "sig_abc"
+            })],
+        };
+        let raw_blocks = vec![
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "raw thoughts",
+                "signature": "sig_abc",
+                "cache_control": { "type": "ephemeral" }
+            }),
+            serde_json::json!({"type": "text", "text": "Done"}),
+            serde_json::json!({
+                "type": "tool_use",
+                "id": "toolu_123",
+                "name": "search",
+                "input": {"q": "linus"}
+            }),
+        ];
+        remember_raw_assistant_blocks(&message, &raw_blocks);
+
+        let serialized = to_anthropic_messages(&[message]);
+        assert_eq!(serialized.len(), 1);
+        assert_eq!(serialized[0]["role"], "assistant");
+        assert_eq!(serialized[0]["content"], serde_json::json!(raw_blocks));
     }
 }

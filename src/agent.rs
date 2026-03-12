@@ -16,6 +16,7 @@ use serde_json;
 
 use crate::claude::{
     call_agent_hook, call_agent_hook_streaming, call_claude, call_claude_with_model, call_critic,
+    remember_raw_assistant_blocks,
 };
 use crate::{
     AgentHookRequest, AgentLogEntry, AgentMessage, AgentProgress, AgentRunOutput, AgentSession,
@@ -144,6 +145,7 @@ fn consume_stream(
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<AgentToolCall> = Vec::new();
     let mut thinking_blocks: Vec<serde_json::Value> = Vec::new();
+    let mut raw_blocks_by_index: HashMap<usize, serde_json::Value> = HashMap::new();
 
     // Per-block accumulators (keyed by block index)
     let mut block_types: HashMap<usize, String> = HashMap::new();
@@ -264,16 +266,27 @@ fn consume_stream(
                                 block["signature"] = serde_json::json!(sig);
                             }
                             thinking_blocks.push(block);
+                            raw_blocks_by_index
+                                .insert(index, thinking_blocks.last().cloned().unwrap());
                         }
                     }
                     "redacted_thinking" => {
-                        thinking_blocks.push(serde_json::json!({
+                        let block = serde_json::json!({
                             "type": "redacted_thinking",
-                        }));
+                        });
+                        thinking_blocks.push(block.clone());
+                        raw_blocks_by_index.insert(index, block);
                     }
                     "text" => {
                         if !accumulated.is_empty() {
                             text_parts.push(accumulated);
+                            raw_blocks_by_index.insert(
+                                index,
+                                serde_json::json!({
+                                    "type": "text",
+                                    "text": text_parts.last().cloned().unwrap(),
+                                }),
+                            );
                         }
                     }
                     "tool_use" => {
@@ -281,7 +294,20 @@ fn consume_stream(
                         let name = block_tool_names.remove(&index).unwrap_or_default();
                         let args: serde_json::Value = serde_json::from_str(&accumulated)
                             .unwrap_or_else(|_| serde_json::json!({}));
-                        tool_calls.push(AgentToolCall { id, name, args });
+                        tool_calls.push(AgentToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            args: args.clone(),
+                        });
+                        raw_blocks_by_index.insert(
+                            index,
+                            serde_json::json!({
+                                "type": "tool_use",
+                                "id": id,
+                                "name": name,
+                                "input": args,
+                            }),
+                        );
                     }
                     _ => {}
                 }
@@ -308,7 +334,7 @@ fn consume_stream(
         Some(text_parts.join("\n"))
     };
 
-    Ok(AgentMessage {
+    let message = AgentMessage {
         role: "assistant".to_string(),
         content: content_text,
         tool_calls,
@@ -316,7 +342,13 @@ fn consume_stream(
         tool_call_id: None,
         is_error: None,
         thinking_blocks,
-    })
+    };
+    let mut raw_blocks: Vec<(usize, serde_json::Value)> = raw_blocks_by_index.into_iter().collect();
+    raw_blocks.sort_by_key(|(index, _)| *index);
+    let raw_blocks: Vec<serde_json::Value> =
+        raw_blocks.into_iter().map(|(_, block)| block).collect();
+    remember_raw_assistant_blocks(&message, &raw_blocks);
+    Ok(message)
 }
 
 pub(crate) fn run_agent(
@@ -689,7 +721,9 @@ pub(crate) fn compact_messages(
         .find(|line| line.starts_with("GOAL:"))
         .map(|line| line.trim_start_matches("GOAL:").trim().to_string());
 
-    // Rebuild messages: system blocks + compaction notice + recent (thinking blocks stripped)
+    // Rebuild messages: system blocks + compaction notice + recent.
+    // Preserve recent thinking blocks verbatim so the latest assistant tool-use turn
+    // remains valid for Anthropic multi-turn continuation.
     *messages = system_msgs;
     messages.push(AgentMessage {
         role: "user".to_string(),
@@ -713,9 +747,7 @@ pub(crate) fn compact_messages(
         is_error: None,
         thinking_blocks: vec![],
     });
-    // Strip thinking blocks from recent messages — they're huge and stale post-compaction
-    for mut msg in recent {
-        msg.thinking_blocks.clear();
+    for msg in recent {
         messages.push(msg);
     }
     Ok(extracted_goal)

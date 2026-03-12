@@ -14,6 +14,9 @@ Use it when the user asks things like:
 - whether Linus knows Sunil's parents, wife, EA, or family context
 - intros, reconnects, anniversaries, birthdays, or follow-ups
 - travel or logistics where people context matters
+- what arrived recently on WhatsApp, who sent it, or what recent WhatsApp context matters
+- what recent Slack or email context matters
+- what a Drive doc, Roam note, or meeting history says about a person or company
 
 Do not rely on generic memory retrieval first. Query the relationship store directly.
 
@@ -22,6 +25,8 @@ Do not rely on generic memory retrieval first. Query the relationship store dire
 - Store: `/root/.openclaw/workspace/relationship-intel/relationship_intel.sqlite`
 - Script: `/root/.openclaw/workspace/relationship-intel/relationship_intel.py`
 - Radar markdown: `/root/.openclaw/workspace/memory/RELATIONSHIP-RADAR.md`
+- Operating state: `/root/.openclaw/workspace/memory/HOT-STATE.md`
+- Promoted docs: `/root/.openclaw/workspace/memory/PROMOTED-DOCS.md`
 - Index: `/root/.openclaw/workspace/memory/PEOPLE-INDEX.md`
 - Person pages: `/root/.openclaw/workspace/memory/people/*.md`
 
@@ -41,6 +46,14 @@ This is the default path for:
 - "who should I reach out to this week?"
 - "what open loops do I have with people?"
 - "what birthdays or anniversaries matter?"
+
+If Linus needs the smallest high-value surface first, use:
+
+```bash
+python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
+  --db /root/.openclaw/workspace/relationship-intel/relationship_intel.sqlite \
+  operating-state --json
+```
 
 ### Person lookup
 
@@ -68,6 +81,63 @@ python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
   search "founder toronto" --json
 ```
 
+### Recent WhatsApp context
+
+Use:
+
+```bash
+python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
+  --db /root/.openclaw/workspace/relationship-intel/relationship_intel.sqlite \
+  messages \
+  --channel whatsapp \
+  --days 2 \
+  --direction inbound \
+  --limit 20 \
+  --json
+```
+
+If the store is empty or stale, refresh it first:
+
+```bash
+/root/.openclaw/workspace/relationship-intel/whatsapp_history_sync.sh
+```
+
+### Other imported sources
+
+Use `messages` for channels that were imported as message evidence:
+
+```bash
+python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
+  --db /root/.openclaw/workspace/relationship-intel/relationship_intel.sqlite \
+  messages \
+  --channel slack \
+  --days 14 \
+  --limit 20 \
+  --json
+```
+
+Use `docs-search` for Roam, Drive, and Calendar evidence:
+
+```bash
+python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
+  --db /root/.openclaw/workspace/relationship-intel/relationship_intel.sqlite \
+  docs-search "Tribble reasoning" \
+  --channel roam \
+  --json
+```
+
+Use `gmail-guided` when the task is email-shaped but should be driven by people/open-loop/project context rather than a broad mailbox crawl:
+
+```bash
+python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
+  --db /root/.openclaw/workspace/relationship-intel/relationship_intel.sqlite \
+  gmail-guided \
+  --person "Rohan Verma" \
+  --objective "investor introductions" \
+  --days 365 \
+  --json
+```
+
 ### Record a real touchpoint
 
 When Sunil mentions a meaningful interaction, update the graph:
@@ -90,6 +160,12 @@ Then refresh the prompt surface:
 ## Operating rules
 
 - Query the relationship store before asking the user obvious people-context questions.
+- For recent WhatsApp questions, use `messages` first instead of guessing or saying you cannot inspect WhatsApp.
+- For Slack or email recency questions, use `messages --channel slack|email` before improvising.
+- For targeted inbox questions about a known person, project, or open loop, use `gmail-guided` before broad Gmail import.
+- For company or personal note questions, use `docs-search` before claiming the context is unavailable.
+- Prefer `operating-state` and `HOT-STATE.md` before pulling the broader document archive into prompt context.
+- After any major multi-source import, run `reconcile-identities` so duplicate people do not linger under separate phone/email records.
 - Treat `brief` and `summary` as the primary source; treat markdown pages as a quick human-readable fallback.
 - If the relationship store is thin or ambiguous, say so and ask only the missing high-signal question.
 - Handle fast person lookups and reconnect queries inline; do not spawn workers just to answer a trivial relationship question.
