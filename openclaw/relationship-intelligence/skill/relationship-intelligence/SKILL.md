@@ -16,6 +16,7 @@ Use it when the user asks things like:
 - travel or logistics where people context matters
 - what arrived recently on WhatsApp, who sent it, or what recent WhatsApp context matters
 - what recent Slack or email context matters
+- what important emails are waiting on Sunil
 - what a Drive doc, Roam note, or meeting history says about a person or company
 
 Do not rely on generic memory retrieval first. Query the relationship store directly.
@@ -150,9 +151,45 @@ python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
   --json
 ```
 
+Use `import-himalaya-email` when the question depends on the personal Gmail account that is still accessed through Himalaya:
+
+```bash
+python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
+  --db /root/.openclaw/workspace/relationship-intel/relationship_intel.sqlite \
+  import-himalaya-email \
+  --account-name personal \
+  --folder "Needs Action" \
+  --folder "EA to Action" \
+  --max-messages 200 \
+  --json
+```
+
+For proactive inbox triage or “what am I neglecting?” questions, use:
+
+```bash
+python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
+  --db /root/.openclaw/workspace/relationship-intel/relationship_intel.sqlite \
+  email-attention \
+  --days 21 \
+  --limit 12 \
+  --json
+```
+
+If the question is specifically about deals, intros, partnerships, customers, or investor follow-through, bias the ranking:
+
+```bash
+python3 /root/.openclaw/workspace/relationship-intel/relationship_intel.py \
+  --db /root/.openclaw/workspace/relationship-intel/relationship_intel.sqlite \
+  email-attention \
+  --days 21 \
+  --focus deals \
+  --limit 12 \
+  --json
+```
+
 ### Incremental freshness
 
-For routine Google-source freshness on the host, use:
+For routine cross-inbox freshness on the host, use:
 
 ```bash
 /root/.openclaw/workspace/relationship-intel/incremental_sync.sh
@@ -189,8 +226,11 @@ Then refresh the prompt surface:
 - For recent WhatsApp questions, use `messages` first instead of guessing or saying you cannot inspect WhatsApp.
 - Never use the generic `message` tool to read WhatsApp/Slack/email history. That path is for delivery actions, not archival review. Use `channel-brief` or `messages` from `relationship_intel.py`.
 - For Slack or email recency questions, use `messages --channel slack|email` before improvising.
-- For targeted inbox questions about a known person, project, or open loop, use `gmail-guided` before broad Gmail import.
-- Prefer `incremental_sync.sh` for routine Gmail/Calendar/Drive freshness instead of broad manual re-imports.
+- For targeted inbox questions about a known person, project, or open loop, use `gmail-guided` before broad Gmail import in the live Google lane.
+- For important-inbox triage, use `email-attention` before improvising from generic email search.
+- For deal or intro slippage, use `email-attention --focus deals` so internal ops, family, and accepted calendar noise do not dominate the ranking.
+- Prefer `incremental_sync.sh` for routine Gmail/Calendar/Drive/personal-email freshness instead of broad manual re-imports.
+- Personal Gmail (`sunilkgrao@gmail.com`) currently comes from Himalaya; corporate Gmail (`sunil@tribble.ai`) comes from Google OAuth. Treat them as one evidence plane once imported.
 - For company or personal note questions, use `docs-search` before claiming the context is unavailable.
 - Prefer `operating-state` and `HOT-STATE.md` before pulling the broader document archive into prompt context.
 - After any major multi-source import, run `reconcile-identities` so duplicate people do not linger under separate phone/email records.

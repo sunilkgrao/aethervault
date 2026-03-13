@@ -14,6 +14,11 @@ CALENDAR_LOOKBACK_DAYS="${CALENDAR_LOOKBACK_DAYS:-30}"
 CALENDAR_FUTURE_DAYS="${CALENDAR_FUTURE_DAYS:-180}"
 DRIVE_LOOKBACK_DAYS="${DRIVE_LOOKBACK_DAYS:-30}"
 DRIVE_BODY_LIMIT="${DRIVE_BODY_LIMIT:-80}"
+HIMALAYA_ACCOUNT="${HIMALAYA_ACCOUNT:-personal}"
+HIMALAYA_QUERY="${HIMALAYA_QUERY:-}"
+HIMALAYA_LOOKBACK_DAYS="${HIMALAYA_LOOKBACK_DAYS:-21}"
+HIMALAYA_MAX_MESSAGES="${HIMALAYA_MAX_MESSAGES:-500}"
+HIMALAYA_FOLDERS="${HIMALAYA_FOLDERS:-INBOX|Needs Action|EA to Action|Other Labels/Family|[Gmail]/Sent Mail}"
 RUN_WHATSAPP="${RUN_WHATSAPP:-0}"
 RUN_SLACK="${RUN_SLACK:-0}"
 SLACK_ARCHIVE_DIR="${SLACK_ARCHIVE_DIR:-}"
@@ -48,6 +53,8 @@ if [[ "$RUN_SLACK" == "1" && -n "$SLACK_ARCHIVE_DIR" ]]; then
     --top-n "$TOP_N"
 fi
 
+IFS='|' read -r -a himalaya_folders <<< "$HIMALAYA_FOLDERS"
+
 args=(
   python3 "$ROOT_DIR/relationship_intel.py"
   --db "$DB_PATH"
@@ -61,9 +68,19 @@ args=(
   --calendar-future-days "$CALENDAR_FUTURE_DAYS"
   --drive-lookback-days "$DRIVE_LOOKBACK_DAYS"
   --drive-body-limit "$DRIVE_BODY_LIMIT"
+  --himalaya-account "$HIMALAYA_ACCOUNT"
+  --himalaya-query "$HIMALAYA_QUERY"
+  --himalaya-lookback-days "$HIMALAYA_LOOKBACK_DAYS"
+  --himalaya-max-messages "$HIMALAYA_MAX_MESSAGES"
   --top-n "$TOP_N"
   --json
 )
+
+for folder in "${himalaya_folders[@]}"; do
+  if [[ -n "$folder" ]]; then
+    args+=(--himalaya-folder "$folder")
+  fi
+done
 
 if [[ "$DRY_RUN" == "1" ]]; then
   args+=(--dry-run)

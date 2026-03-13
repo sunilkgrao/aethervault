@@ -21,11 +21,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from email import policy
+from email.parser import Parser
 from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -347,6 +350,83 @@ EMAIL_GUIDED_STOPWORDS = LOW_SIGNAL_WORDS | {
     "threads",
     "travel",
 }
+EMAIL_ATTENTION_KEYWORDS = {
+    "deal",
+    "pricing",
+    "proposal",
+    "contract",
+    "msa",
+    "sow",
+    "renewal",
+    "pilot",
+    "poc",
+    "intro",
+    "introduction",
+    "investor",
+    "customer",
+    "client",
+    "revenue",
+    "meeting",
+    "follow up",
+    "follow-up",
+    "next steps",
+    "book",
+    "booking",
+    "travel",
+    "flight",
+    "passport",
+    "calendar",
+    "availability",
+    "schedule",
+    "urgent",
+    "asap",
+    "term sheet",
+    "fundraise",
+    "partnership",
+}
+DEAL_EMAIL_ATTENTION_KEYWORDS = {
+    "deal",
+    "pricing",
+    "proposal",
+    "contract",
+    "msa",
+    "sow",
+    "renewal",
+    "pilot",
+    "poc",
+    "intro",
+    "introduction",
+    "investor",
+    "customer",
+    "client",
+    "revenue",
+    "follow up",
+    "follow-up",
+    "next steps",
+    "fundraise",
+    "term sheet",
+    "partnership",
+}
+LOW_SIGNAL_EMAIL_SUBJECT_PATTERNS = (
+    "accepted:",
+    "appointment canceled:",
+    "report domain:",
+    "dmarc",
+    "security alert",
+    "verification code",
+    "password reset",
+    "newsletter",
+    "digest",
+    "unsubscribe",
+    "receipt for your payment",
+    "weekly insights",
+    "perspectives",
+    "looking ahead:",
+    "outlook weekly insights",
+    "view in browser",
+    "canceled event:",
+    "declined:",
+)
 KINSHIP_CONTRADICTIONS = {
     "father": {"daughter", "son", "sister", "brother", "wife", "husband"},
     "mother": {"daughter", "son", "sister", "brother", "wife", "husband"},
@@ -363,10 +443,21 @@ CHANNEL_BY_PREFERENCE = {
 OWNER_ENTITY_REF = "sunil-rao"
 OWNER_EMAILS = {
     "sunil@tribble.ai",
+    "sunilkgrao@gmail.com",
     "sunilrao.inc@gmail.com",
 }
 DEFAULT_SYNC_STATE_PATH = Path("/root/.openclaw/workspace/relationship-intel/sync_state.json")
 GOOGLE_CREDENTIALS_DIR = Path.home() / ".google_workspace_mcp" / "credentials"
+DEFAULT_HIMALAYA_CONFIG_PATH = Path.home() / ".config" / "himalaya" / "config.toml"
+DEFAULT_HIMALAYA_ACCOUNT = "personal"
+DEFAULT_HIMALAYA_FOLDERS = (
+    "INBOX",
+    "Needs Action",
+    "EA to Action",
+    "Other Labels/Family",
+    "[Gmail]/Sent Mail",
+)
+HIMALAYA_STICKY_FOLDERS = {"needs action", "ea to action", "other labels/family"}
 GOOGLE_TOKEN_CACHE: dict[str, tuple[str, datetime]] = {}
 GOOGLE_RETRYABLE_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 PROMOTABLE_CANDIDATE_PREDICATES = {
@@ -437,6 +528,10 @@ def normalize_email(value: str | None) -> str:
     if not clean or "@" not in clean:
         return ""
     return clean
+
+
+def is_email_identity(value: str | None) -> bool:
+    return bool(normalize_email(value))
 
 
 def normalize_phone(value: str | None) -> str:
@@ -510,6 +605,17 @@ def is_probably_noise_name(name: str | None) -> bool:
     return False
 
 
+def is_placeholder_identity_name(name: str | None) -> bool:
+    clean = normalize_text(name)
+    if not clean:
+        return True
+    if clean == DISPLAY_NAME_FALLBACK:
+        return True
+    if is_email_identity(clean):
+        return True
+    return is_probably_noise_name(clean)
+
+
 def is_trusted_anchor_name(name: str | None) -> bool:
     clean = normalize_text(name).casefold()
     return clean in {item["canonical"].casefold() for item in SPECIAL_CONTACTS}
@@ -531,6 +637,201 @@ def choose_display_name(current: str, candidate: str) -> str:
     if len(candidate_clean) > len(current_clean) and candidate_clean.count(" ") <= current_clean.count(" ") + 2:
         return candidate_clean
     return current_clean
+
+
+def exact_phone_person_row(conn: sqlite3.Connection, normalized_phone: str) -> sqlite3.Row | None:
+    clean_phone = normalize_phone(normalized_phone)
+    if not clean_phone:
+        return None
+    return conn.execute(
+        """
+        SELECT p.*
+        FROM people p
+        WHERE EXISTS (
+            SELECT 1
+            FROM json_each(p.phones_json)
+            WHERE lower(json_each.value) = ?
+        )
+        ORDER BY p.importance DESC
+        LIMIT 1
+        """,
+        (clean_phone.casefold(),),
+    ).fetchone()
+
+
+def exact_email_person_row(conn: sqlite3.Connection, email: str) -> sqlite3.Row | None:
+    clean_email = normalize_email(email)
+    if not clean_email:
+        return None
+    return conn.execute(
+        """
+        SELECT p.*
+        FROM people p
+        WHERE EXISTS (
+            SELECT 1
+            FROM json_each(p.emails_json)
+            WHERE lower(json_each.value) = ?
+        )
+        ORDER BY p.importance DESC
+        LIMIT 1
+        """,
+        (clean_email.casefold(),),
+    ).fetchone()
+
+
+def exact_name_person_row(conn: sqlite3.Connection, display_name: str) -> sqlite3.Row | None:
+    clean_name = normalize_text(display_name)
+    if not clean_name:
+        return None
+    return conn.execute(
+        """
+        SELECT p.*
+        FROM people p
+        WHERE lower(p.display_name) = lower(?)
+           OR lower(p.canonical_name) = lower(?)
+           OR EXISTS (
+                SELECT 1
+                FROM json_each(p.aliases_json)
+                WHERE lower(json_each.value) = lower(?)
+           )
+        ORDER BY p.importance DESC
+        LIMIT 1
+        """,
+        (clean_name, clean_name, clean_name),
+    ).fetchone()
+
+
+def allow_fuzzy_name_lookup(name: str) -> bool:
+    clean_name = normalize_text(name)
+    if not clean_name or is_probably_noise_name(clean_name):
+        return False
+    if is_trusted_anchor_name(clean_name):
+        return True
+    parts = [part for part in clean_name.split() if part]
+    if len(parts) >= 2 and len(clean_name) >= 6:
+        return True
+    return False
+
+
+def person_has_email(row: sqlite3.Row, email: str) -> bool:
+    clean_email = normalize_email(email)
+    if not clean_email:
+        return False
+    return clean_email in {normalize_email(item) for item in json.loads(row["emails_json"])}
+
+
+def name_identity_tokens(value: str | None) -> set[str]:
+    return {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z0-9]+", normalize_text(value))
+        if len(token) >= 2
+    }
+
+
+def compact_identity(value: str | None) -> str:
+    return "".join(
+        token.casefold()
+        for token in re.findall(r"[A-Za-z0-9]+", normalize_text(value))
+        if token
+    )
+
+
+def email_local_identity(email: str) -> tuple[set[str], str]:
+    clean_email = normalize_email(email)
+    if not clean_email:
+        return set(), ""
+    local = clean_email.split("@", 1)[0]
+    return name_identity_tokens(local), compact_identity(local)
+
+
+def email_identity_confident(row: sqlite3.Row, email: str, display_name: str = "") -> bool:
+    clean_email = normalize_email(email)
+    if not clean_email or not person_has_email(row, clean_email):
+        return False
+    if row["relationship_label"] in {"father", "mother", "wife", "executive assistant"}:
+        return True
+    if row["category"] in {"family", "operations"}:
+        return True
+
+    clean_name = normalize_text(display_name)
+    candidate_names = [
+        normalize_text(row["display_name"]),
+        normalize_text(row["canonical_name"]),
+    ]
+    candidate_names = [item for item in dedupe_preserve(candidate_names) if item]
+    if clean_name and any(normalize_name(clean_name) == normalize_name(item) for item in candidate_names):
+        return True
+
+    email_tokens, email_compact = email_local_identity(clean_email)
+    header_tokens = name_identity_tokens(clean_name)
+    header_compact = compact_identity(clean_name)
+    evidence_tokens = email_tokens | header_tokens
+
+    for candidate in candidate_names:
+        candidate_tokens = name_identity_tokens(candidate)
+        candidate_compact = compact_identity(candidate)
+        if not candidate_tokens and not candidate_compact:
+            continue
+        if email_compact and candidate_compact and len(email_compact) >= 6:
+            if candidate_compact.endswith(email_compact) or email_compact.endswith(candidate_compact):
+                return True
+        if header_compact and candidate_compact and header_compact == candidate_compact:
+            return True
+        token_overlap = evidence_tokens & candidate_tokens
+        if len(token_overlap) >= 2:
+            return True
+    return False
+
+
+def prune_email_identities(conn: sqlite3.Connection) -> dict[str, int]:
+    scanned_people = 0
+    pruned_people = 0
+    removed_emails = 0
+    changed_people: list[str] = []
+    for row in conn.execute("SELECT * FROM people WHERE emails_json <> '[]'").fetchall():
+        emails = [normalize_email(item) for item in json.loads(row["emails_json"]) if normalize_email(item)]
+        if len(emails) <= 1:
+            continue
+        scanned_people += 1
+        trusted = [
+            email
+            for email in emails
+            if email_identity_confident(row, email, row["display_name"])
+            or email_identity_confident(row, email, row["canonical_name"])
+        ]
+        trusted = dedupe_preserve(trusted)
+        if not trusted or len(trusted) == len(emails):
+            continue
+        conn.execute(
+            "UPDATE people SET emails_json = ? WHERE person_id = ?",
+            (safe_json(trusted), row["person_id"]),
+        )
+        changed_people.append(str(row["person_id"]))
+        pruned_people += 1
+        removed_emails += len(emails) - len(trusted)
+    for person_id in changed_people:
+        refresh_people_fts(conn, person_id)
+    return {
+        "scanned_people": scanned_people,
+        "pruned_people": pruned_people,
+        "removed_emails": removed_emails,
+    }
+
+
+def detach_email_from_person(conn: sqlite3.Connection, row: sqlite3.Row, email: str) -> bool:
+    clean_email = normalize_email(email)
+    if not clean_email:
+        return False
+    existing_emails = [normalize_email(item) for item in json.loads(row["emails_json"])]
+    filtered = [item for item in existing_emails if item and item != clean_email]
+    if len(filtered) == len(existing_emails):
+        return False
+    conn.execute(
+        "UPDATE people SET emails_json = ? WHERE person_id = ?",
+        (safe_json(filtered), row["person_id"]),
+    )
+    refresh_people_fts(conn, str(row["person_id"]))
+    return True
 
 
 def tier_rank(tier: str) -> int:
@@ -2165,6 +2466,190 @@ def google_access_token(account_email: str | None = None) -> tuple[str, str]:
     return path.stem, access_token
 
 
+def available_himalaya_accounts(config_path: Path = DEFAULT_HIMALAYA_CONFIG_PATH) -> dict[str, str]:
+    if not config_path.exists():
+        return {}
+    try:
+        payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    accounts = payload.get("accounts")
+    if not isinstance(accounts, dict):
+        return {}
+    resolved: dict[str, str] = {}
+    for name, value in accounts.items():
+        if not isinstance(value, dict):
+            continue
+        email_value = normalize_email(value.get("email"))
+        if email_value:
+            resolved[str(name)] = email_value
+    return resolved
+
+
+def load_himalaya_account(
+    account_name: str | None = None,
+    *,
+    config_path: Path = DEFAULT_HIMALAYA_CONFIG_PATH,
+) -> tuple[str, str]:
+    accounts = available_himalaya_accounts(config_path)
+    if not accounts:
+        raise SystemExit(f"No Himalaya accounts found under {config_path}")
+    chosen = normalize_text(account_name)
+    if chosen and chosen not in accounts:
+        raise SystemExit(f"No Himalaya account named {chosen}")
+    if not chosen:
+        chosen = DEFAULT_HIMALAYA_ACCOUNT if DEFAULT_HIMALAYA_ACCOUNT in accounts else sorted(accounts)[0]
+    return chosen, accounts[chosen]
+
+
+def run_himalaya_json(
+    account_name: str,
+    args: list[str],
+    *,
+    config_path: Path = DEFAULT_HIMALAYA_CONFIG_PATH,
+    query: str | None = None,
+) -> Any:
+    command = [
+        "himalaya",
+        *args,
+        "-a",
+        account_name,
+        "-c",
+        str(config_path),
+        "-o",
+        "json",
+    ]
+    if normalize_text(query):
+        command.append(normalize_text(query))
+    proc = subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=180,
+    )
+    if proc.returncode != 0:
+        stderr = normalize_text(proc.stderr) or normalize_text(proc.stdout)
+        raise SystemExit(f"Himalaya command failed for account {account_name}: {stderr or 'unknown error'}")
+    stdout = proc.stdout.strip()
+    if not stdout:
+        return None
+    return json.loads(stdout)
+
+
+def himalaya_folder_names(
+    account_name: str,
+    *,
+    config_path: Path = DEFAULT_HIMALAYA_CONFIG_PATH,
+) -> set[str]:
+    payload = run_himalaya_json(account_name, ["folder", "list"], config_path=config_path) or []
+    names: set[str] = set()
+    for item in payload:
+        if isinstance(item, dict):
+            clean_name = normalize_text(item.get("name"))
+            if clean_name:
+                names.add(clean_name)
+    return names
+
+
+def email_header_message_ids(*values: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for raw in re.findall(r"<([^>]+)>", value or ""):
+            clean = normalize_text(raw).casefold()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            found.append(clean)
+    return found
+
+
+def email_thread_fallback(subject: str, counterpart_email: str, sender_email: str) -> str:
+    clean_subject = normalize_text(subject)
+    clean_subject = re.sub(r"^(re|fwd?|aw):\\s*", "", clean_subject, flags=re.IGNORECASE)
+    counterparty = counterpart_email or sender_email or "unknown"
+    return f"subject:{slugify(clean_subject or '(no-subject)')}:{slugify(counterparty)}"
+
+
+def parse_email_message(raw_message: str) -> dict[str, Any]:
+    message = Parser(policy=policy.default).parsestr(raw_message)
+    subject = normalize_text(message.get("Subject"))
+    from_addresses = parse_address_list(message.get("From", ""))
+    to_addresses = parse_address_list(message.get("To", ""))
+    cc_addresses = parse_address_list(message.get("Cc", ""))
+    bcc_addresses = parse_address_list(message.get("Bcc", ""))
+    date_header = normalize_text(message.get("Date"))
+    sent_at = ""
+    if date_header:
+        try:
+            sent_at = parsedate_to_datetime(date_header).astimezone(timezone.utc).replace(microsecond=0).isoformat()
+        except Exception:
+            sent_at = ""
+    message_ids = email_header_message_ids(message.get("Message-ID", ""))
+    reference_ids = email_header_message_ids(message.get("References", ""), message.get("In-Reply-To", ""))
+
+    body_parts: list[str] = []
+    if message.is_multipart():
+        for part in message.walk():
+            disposition = normalize_text(part.get_content_disposition())
+            if disposition == "attachment":
+                continue
+            content_type = normalize_text(part.get_content_type()).lower()
+            if not content_type.startswith("text/"):
+                continue
+            try:
+                content = part.get_content()
+            except Exception:
+                payload = part.get_payload(decode=True) or b""
+                charset = part.get_content_charset() or "utf-8"
+                content = payload.decode(charset, errors="ignore")
+            if content_type == "text/html":
+                content = strip_html(content)
+            clean = normalize_text(content)
+            if clean:
+                body_parts.append(clean)
+    else:
+        try:
+            content = message.get_content()
+        except Exception:
+            payload = message.get_payload(decode=True) or b""
+            charset = message.get_content_charset() or "utf-8"
+            content = payload.decode(charset, errors="ignore")
+        if normalize_text(message.get_content_type()).lower() == "text/html":
+            content = strip_html(content)
+        clean = normalize_text(content)
+        if clean:
+            body_parts.append(clean)
+    body = "\n\n".join(dedupe_preserve(body_parts))
+    snippet = trim_message_excerpt(body or subject or "", 400)
+
+    return {
+        "subject": subject,
+        "from": from_addresses,
+        "to": to_addresses,
+        "cc": cc_addresses,
+        "bcc": bcc_addresses,
+        "sent_at": sent_at,
+        "message_id": message_ids[0] if message_ids else "",
+        "thread_root": reference_ids[0] if reference_ids else "",
+        "references": reference_ids,
+        "snippet": snippet,
+        "body": body,
+        "headers": {
+            "from": message.get("From", ""),
+            "to": message.get("To", ""),
+            "cc": message.get("Cc", ""),
+            "bcc": message.get("Bcc", ""),
+            "subject": message.get("Subject", ""),
+            "date": message.get("Date", ""),
+            "message_id": message.get("Message-ID", ""),
+            "in_reply_to": message.get("In-Reply-To", ""),
+            "references": message.get("References", ""),
+        },
+    }
+
+
 def google_api_json(
     account_email: str | None,
     url: str,
@@ -2445,55 +2930,46 @@ def choose_channel(current: str, candidate: str) -> str:
     return current_clean
 
 
-def match_person_row(conn: sqlite3.Connection, phone: str, display_name: str, email: str = "") -> sqlite3.Row | None:
+def match_person_row(
+    conn: sqlite3.Connection,
+    phone: str,
+    display_name: str,
+    email: str = "",
+    *,
+    allow_name_fallback: bool = True,
+    allow_fuzzy_name: bool = True,
+) -> sqlite3.Row | None:
     normalized_phone = normalize_phone(phone)
     if normalized_phone:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM people
-            WHERE lower(phones_json) LIKE ?
-            ORDER BY importance DESC
-            LIMIT 1
-            """,
-            (f"%{normalized_phone.lower()}%",),
-        ).fetchone()
+        row = exact_phone_person_row(conn, normalized_phone)
         if row:
             return row
-    clean_email = normalize_text(email).lower()
+    clean_email = normalize_email(email)
     if clean_email:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM people
-            WHERE lower(emails_json) LIKE ?
-            ORDER BY importance DESC
-            LIMIT 1
-            """,
-            (f"%{clean_email}%",),
-        ).fetchone()
+        row = exact_email_person_row(conn, clean_email)
         if row:
             return row
     clean_name = normalize_text(display_name)
-    if clean_name:
-        like = f"%{clean_name.casefold()}%"
-        row = conn.execute(
-            """
-            SELECT *
-            FROM people
-            WHERE lower(display_name) = lower(?)
-               OR lower(canonical_name) = lower(?)
-               OR lower(aliases_json) LIKE ?
-               OR lower(display_name) LIKE ?
-               OR lower(canonical_name) LIKE ?
-            ORDER BY importance DESC
-            LIMIT 1
-            """,
-            (clean_name, clean_name, like, like, like),
-        ).fetchone()
-        if row:
-            return row
-    return None
+    if not clean_name or not allow_name_fallback:
+        return None
+    row = exact_name_person_row(conn, clean_name)
+    if row:
+        return row
+    if not allow_fuzzy_name or not allow_fuzzy_name_lookup(clean_name):
+        return None
+    like = f"%{clean_name.casefold()}%"
+    return conn.execute(
+        """
+        SELECT *
+        FROM people
+        WHERE lower(display_name) LIKE ?
+           OR lower(canonical_name) LIKE ?
+           OR lower(aliases_json) LIKE ?
+        ORDER BY importance DESC
+        LIMIT 1
+        """,
+        (like, like, like),
+    ).fetchone()
 
 
 def refresh_people_fts(conn: sqlite3.Connection, person_id: str) -> None:
@@ -2719,17 +3195,37 @@ def ensure_person_for_counterparty(
     if not clean_name and not normalized_phone and not clean_email:
         return None
 
-    existing = match_person_row(conn, normalized_phone, clean_name, clean_email)
+    allow_email_name_fallback = not (channel == "email" and clean_email)
+    existing = match_person_row(
+        conn,
+        normalized_phone,
+        clean_name,
+        clean_email,
+        allow_name_fallback=allow_email_name_fallback,
+        allow_fuzzy_name=allow_email_name_fallback,
+    )
     timestamp = now_utc().isoformat()
     special = special_match(normalize_name(clean_name), normalized_phone, clean_email)
+    if existing and channel == "email" and clean_email and person_has_email(existing, clean_email):
+        if not email_identity_confident(existing, clean_email, clean_name):
+            detach_email_from_person(conn, existing, clean_email)
+            existing = None
 
     if existing:
         updates: dict[str, Any] = {}
-        if clean_name and normalize_name(existing["display_name"]) != normalize_name(clean_name):
-            updates["display_name"] = choose_display_name(existing["display_name"], clean_name)
-            updates["canonical_name"] = choose_display_name(existing["canonical_name"], clean_name)
         if clean_name:
             updates["aliases_json"] = append_json_list(existing["aliases_json"], [clean_name])
+            should_promote_name = normalize_name(existing["display_name"]) != normalize_name(clean_name)
+            if channel == "email":
+                should_promote_name = should_promote_name and (
+                    is_placeholder_identity_name(existing["display_name"])
+                    or is_placeholder_identity_name(existing["canonical_name"])
+                    or not person_has_email(existing, clean_email)
+                    or (special is not None and normalize_name(clean_name) == normalize_name(special["canonical"]))
+                )
+            if should_promote_name:
+                updates["display_name"] = choose_display_name(existing["display_name"], clean_name)
+                updates["canonical_name"] = choose_display_name(existing["canonical_name"], clean_name)
         if normalized_phone:
             updates["phones_json"] = append_json_list(existing["phones_json"], [normalized_phone])
         if clean_email:
@@ -4414,6 +4910,373 @@ def import_google_gmail(
     }
 
 
+def import_himalaya_email(
+    db_path: Path,
+    *,
+    account_name: str | None = None,
+    config_path: Path = DEFAULT_HIMALAYA_CONFIG_PATH,
+    folders: Iterable[str] | None = None,
+    query: str = "order by date desc",
+    max_messages: int = 0,
+    page_size: int = 150,
+    rebuild_ontology: bool = True,
+    memory_dir: Path | None = None,
+    top_n: int = 250,
+) -> dict[str, Any]:
+    himalaya_account, account_email = load_himalaya_account(account_name, config_path=config_path)
+    conn = open_store(db_path)
+    imported_messages = 0
+    imported_threads = 0
+    imported_contacts = 0
+    failed_messages = 0
+    linked_people: set[str] = set()
+    seen_threads: set[str] = set()
+
+    available_folders = himalaya_folder_names(himalaya_account, config_path=config_path)
+    requested = [normalize_text(item) for item in (folders or DEFAULT_HIMALAYA_FOLDERS) if normalize_text(item)]
+    selected_folders = [folder for folder in requested if folder in available_folders]
+    if not selected_folders:
+        fallback = "INBOX" if "INBOX" in available_folders else (sorted(available_folders)[0] if available_folders else "")
+        if not fallback:
+            raise SystemExit(f"No accessible Himalaya folders found for {himalaya_account}")
+        selected_folders = [fallback]
+
+    for folder in selected_folders:
+        page = 1
+        folder_query = himalaya_query_for_folder(folder, query)
+        while True:
+            if max_messages and imported_messages >= max_messages:
+                break
+            try:
+                envelopes = run_himalaya_json(
+                    himalaya_account,
+                    [
+                        "envelope",
+                        "list",
+                        "-f",
+                        folder,
+                        "-p",
+                        str(page),
+                        "-s",
+                        str(page_size),
+                    ],
+                    config_path=config_path,
+                    query=folder_query,
+                ) or []
+            except SystemExit as exc:
+                if "out of bound" in str(exc).casefold():
+                    break
+                raise
+            if not envelopes:
+                break
+
+            for envelope in envelopes:
+                if max_messages and imported_messages >= max_messages:
+                    break
+                if not isinstance(envelope, dict):
+                    continue
+                envelope_id = normalize_text(envelope.get("id"))
+                try:
+                    raw_message = str(
+                        run_himalaya_json(
+                            himalaya_account,
+                            ["message", "read", "-f", folder, "-p", envelope_id],
+                            config_path=config_path,
+                        )
+                        or ""
+                    )
+                except Exception:
+                    failed_messages += 1
+                    continue
+                if not raw_message:
+                    failed_messages += 1
+                    continue
+                parsed = parse_email_message(raw_message)
+                subject = parsed["subject"] or normalize_text(envelope.get("subject"))
+                from_addresses = parsed["from"] or parse_address_list(
+                    normalize_text((envelope.get("from") or {}).get("name")),
+                    normalize_text((envelope.get("from") or {}).get("addr")),
+                )
+                to_addresses = parsed["to"] or parse_address_list(
+                    normalize_text((envelope.get("to") or {}).get("name")),
+                    normalize_text((envelope.get("to") or {}).get("addr")),
+                )
+                cc_addresses = parsed["cc"]
+                bcc_addresses = parsed["bcc"]
+                sender_name, sender_email = from_addresses[0] if from_addresses else ("", "")
+                direction = "outbound" if sender_email in OWNER_EMAILS else "inbound"
+                all_external = [
+                    (name, email)
+                    for name, email in [*from_addresses, *to_addresses, *cc_addresses, *bcc_addresses]
+                    if email and email not in OWNER_EMAILS
+                ]
+                if not all_external:
+                    continue
+                primary_email = all_external[0][1].casefold()
+                if any(pattern in primary_email for pattern in LOW_SIGNAL_EMAIL_PATTERNS):
+                    continue
+                external_recipients = [
+                    (name, email)
+                    for name, email in [*to_addresses, *cc_addresses, *bcc_addresses]
+                    if email and email not in OWNER_EMAILS
+                ]
+                counterpart_name = ""
+                counterpart_email = ""
+                person_id = None
+                is_group = len({email for _, email in all_external}) > 1
+                if direction == "inbound":
+                    counterpart_name, counterpart_email = sender_name, sender_email
+                elif not is_group and external_recipients:
+                    counterpart_name, counterpart_email = external_recipients[0]
+                if is_low_signal_email_thread(subject, parsed["snippet"], sender_email, counterpart_email):
+                    continue
+                if counterpart_email:
+                    person_id = ensure_person_for_counterparty(
+                        conn,
+                        display_name=counterpart_name,
+                        phone="",
+                        email=counterpart_email,
+                        channel="email",
+                    )
+                elif counterpart_name:
+                    person_id = ensure_person_for_counterparty(
+                        conn,
+                        display_name=counterpart_name,
+                        phone="",
+                        email="",
+                        channel="email",
+                    )
+                if person_id:
+                    linked_people.add(person_id)
+
+                seen_contacts: set[str] = set()
+                for parsed_name, parsed_email in all_external:
+                    if parsed_email in seen_contacts:
+                        continue
+                    seen_contacts.add(parsed_email)
+                    upsert_channel_contact(
+                        conn,
+                        {
+                            "channel": "email",
+                            "account_id": account_email,
+                            "contact_id": parsed_email,
+                            "display_name": parsed_name,
+                            "short_name": parsed_name.split(" ", 1)[0] if parsed_name else parsed_email,
+                            "phone": "",
+                            "email": parsed_email,
+                            "raw": {
+                                "source": "himalaya",
+                                "account": himalaya_account,
+                                "account_email": account_email,
+                            },
+                            "updated_at": parsed["sent_at"] or now_utc().isoformat(),
+                        },
+                    )
+                    imported_contacts += 1
+
+                thread_id = parsed["thread_root"] or email_thread_fallback(subject, counterpart_email, sender_email)
+                sent_at = parsed["sent_at"] or now_utc().isoformat()
+                if thread_id not in seen_threads:
+                    upsert_conversation_thread(
+                        conn,
+                        {
+                            "channel": "email",
+                            "account_id": account_email,
+                            "chat_id": thread_id,
+                            "chat_name": subject or counterpart_name or counterpart_email or thread_id,
+                            "chat_phone": "",
+                            "is_group": is_group,
+                            "last_message_at": sent_at,
+                            "raw": {
+                                "subject": subject,
+                                "account": himalaya_account,
+                                "account_email": account_email,
+                                "folder": folder,
+                            },
+                            "updated_at": sent_at,
+                        },
+                    )
+                    seen_threads.add(thread_id)
+                    imported_threads += 1
+
+                message_key = parsed["message_id"] or f"{account_email}:{folder}:{envelope_id}"
+                excerpt = trim_message_excerpt(parsed["snippet"] or subject or "Email")
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO message_events (
+                        channel, account_id, chat_id, chat_name, chat_phone, is_group, message_id,
+                        sender_id, sender_name, sender_phone, sender_email, counterpart_name, counterpart_phone, counterpart_email,
+                        person_id, direction, sent_at, message_type, text, excerpt, is_history, raw_json, imported_at
+                    ) VALUES (?, ?, ?, ?, '', ?, ?, '', ?, '', ?, ?, '', ?, ?, ?, ?, 'email', ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        "email",
+                        account_email,
+                        thread_id,
+                        subject or counterpart_name or counterpart_email or thread_id,
+                        1 if is_group else 0,
+                        message_key,
+                        sender_name,
+                        sender_email,
+                        counterpart_name,
+                        counterpart_email,
+                        person_id,
+                        direction,
+                        sent_at,
+                        trim_body(parsed["body"]),
+                        excerpt,
+                        safe_json(
+                            {
+                                "himalaya_account": himalaya_account,
+                                "account_email": account_email,
+                                "folder": folder,
+                                "envelope_id": envelope_id,
+                                "flags": envelope.get("flags") or [],
+                                "headers": parsed["headers"],
+                                "references": parsed["references"],
+                            }
+                        ),
+                        now_utc().isoformat(),
+                    ),
+                )
+                if cursor.rowcount <= 0:
+                    continue
+                imported_messages += 1
+                if person_id:
+                    maybe_insert_touch_event(
+                        conn,
+                        person_id=person_id,
+                        touched_at=sent_at,
+                        channel="email",
+                        note=excerpt or subject or "Email",
+                        direction=direction,
+                        source="himalaya-import",
+                    )
+
+            if len(envelopes) < page_size:
+                break
+            page += 1
+
+    ontology = rebuild_message_channel_ontology(conn, "email") if rebuild_ontology else {}
+    normalized_special_contacts = enforce_special_contacts(conn)
+    conn.commit()
+    conn.close()
+    rerendered = maybe_rerender_after_touch(db_path, memory_dir, top_n)
+    return {
+        "account_name": himalaya_account,
+        "account_email": account_email,
+        "folders": selected_folders,
+        "query": query,
+        "folder_queries": {folder: himalaya_query_for_folder(folder, query) for folder in selected_folders},
+        "imported_messages": imported_messages,
+        "imported_threads": imported_threads,
+        "imported_contacts": imported_contacts,
+        "failed_messages": failed_messages,
+        "linked_people": len(linked_people),
+        "rebuild_ontology": rebuild_ontology,
+        "normalized_special_contacts": normalized_special_contacts,
+        "ontology": ontology,
+        "rerendered_memory_dir": str(rerendered) if rerendered else None,
+    }
+
+
+def relink_email_identities(
+    conn: sqlite3.Connection,
+    *,
+    account_ids: Iterable[str] | None = None,
+    days: int = 90,
+) -> dict[str, Any]:
+    prune_stats = prune_email_identities(conn)
+    email_index: dict[str, str] = {}
+    for person_row in conn.execute("SELECT person_id, importance, emails_json FROM people ORDER BY importance DESC").fetchall():
+        person_id = normalize_text(person_row["person_id"])
+        if not person_id:
+            continue
+        for value in json.loads(person_row["emails_json"]):
+            clean_value = normalize_email(value)
+            if clean_value and clean_value not in email_index:
+                email_index[clean_value] = person_id
+
+    params: list[Any] = ["email"]
+    sql = """
+        SELECT message_id, account_id, direction, sender_name, sender_email, counterpart_name, counterpart_email, person_id, sent_at
+        FROM message_events
+        WHERE channel = ?
+    """
+    if account_ids:
+        normalized_accounts = [normalize_email(item) for item in account_ids if normalize_email(item)]
+        if normalized_accounts:
+            placeholders = ",".join("?" for _ in normalized_accounts)
+            sql += f" AND account_id IN ({placeholders})"
+            params.extend(normalized_accounts)
+    if days > 0:
+        cutoff = (now_utc() - timedelta(days=days)).isoformat()
+        sql += " AND sent_at >= ?"
+        params.append(cutoff)
+    sql += " ORDER BY sent_at ASC"
+
+    relinked = 0
+    created = 0
+    cleared = 0
+    scanned = 0
+    for row in conn.execute(sql, tuple(params)).fetchall():
+        scanned += 1
+        direction = normalize_text(row["direction"]).lower()
+        target_email = normalize_email(row["sender_email"] if direction == "inbound" else row["counterpart_email"])
+        target_name = normalize_text(row["sender_name"] if direction == "inbound" else row["counterpart_name"])
+        if not target_email or target_email in OWNER_EMAILS:
+            continue
+        if any(pattern in target_email for pattern in LOW_SIGNAL_EMAIL_PATTERNS):
+            continue
+
+        exact_person_id = email_index.get(target_email)
+        exact = (
+            conn.execute("SELECT * FROM people WHERE person_id = ?", (exact_person_id,)).fetchone()
+            if exact_person_id
+            else None
+        )
+        if exact is not None and not email_identity_confident(exact, target_email, target_name):
+            detach_email_from_person(conn, exact, target_email)
+            email_index.pop(target_email, None)
+            exact = None
+        if exact is None:
+            person_id = ensure_person_for_counterparty(
+                conn,
+                display_name=target_name,
+                phone="",
+                email=target_email,
+                channel="email",
+            )
+            if person_id:
+                exact = conn.execute("SELECT * FROM people WHERE person_id = ?", (person_id,)).fetchone()
+                email_index[target_email] = person_id
+                created += 1
+
+        new_person_id = str(exact["person_id"]) if exact else None
+        current_person_id = normalize_text(row["person_id"])
+        if current_person_id == (new_person_id or ""):
+            continue
+        conn.execute(
+            "UPDATE message_events SET person_id = ? WHERE message_id = ?",
+            (new_person_id, row["message_id"]),
+        )
+        if new_person_id:
+            relinked += 1
+        else:
+            cleared += 1
+
+    return {
+        "pruned_people": prune_stats["pruned_people"],
+        "removed_emails": prune_stats["removed_emails"],
+        "scanned_messages": scanned,
+        "relinked_messages": relinked,
+        "created_people": created,
+        "cleared_messages": cleared,
+        "days": days,
+        "account_ids": [normalize_email(item) for item in (account_ids or []) if normalize_email(item)],
+    }
+
+
 def import_google_calendar(
     db_path: Path,
     *,
@@ -4768,6 +5631,26 @@ def gmail_after_query(base_query: str, dt: datetime, lookback_days: int) -> str:
     return f"({clean_base}) {after_clause}"
 
 
+def himalaya_after_query(base_query: str, dt: datetime, lookback_days: int) -> str:
+    anchor = (dt - timedelta(days=max(0, lookback_days))).astimezone(timezone.utc).date().isoformat()
+    clean_base = normalize_text(base_query)
+    sort_clause = "order by date desc"
+    filter_clause = clean_base
+    match = re.search(r"\border by\b", clean_base, flags=re.IGNORECASE)
+    if match:
+        filter_clause = clean_base[: match.start()].strip()
+        sort_clause = clean_base[match.start() :].strip() or sort_clause
+    if filter_clause:
+        return f"{filter_clause} and after {anchor} {sort_clause}".strip()
+    return f"after {anchor} {sort_clause}"
+
+
+def himalaya_query_for_folder(folder: str, base_query: str) -> str:
+    if normalize_text(folder).casefold() in HIMALAYA_STICKY_FOLDERS:
+        return "order by date desc"
+    return base_query
+
+
 def drive_incremental_query(dt: datetime, lookback_days: int) -> str:
     anchor = (dt - timedelta(days=max(0, lookback_days))).astimezone(timezone.utc)
     return f"trashed=false and modifiedTime > '{iso_z(anchor)}'"
@@ -4785,6 +5668,11 @@ def sync_incremental(
     calendar_future_days: int = 180,
     drive_lookback_days: int = 30,
     drive_body_limit: int = 80,
+    himalaya_account: str | None = None,
+    himalaya_query: str = "",
+    himalaya_lookback_days: int = 21,
+    himalaya_max_messages: int = 500,
+    himalaya_folders: Iterable[str] | None = None,
     memory_dir: Path | None = None,
     top_n: int = 250,
     dry_run: bool = False,
@@ -4840,6 +5728,50 @@ def sync_incremental(
         "clear_existing": False,
     }
 
+    himalaya_label = ""
+    himalaya_email = ""
+    himalaya_source_key = ""
+    himalaya_plan: dict[str, Any] = {"enabled": False}
+    try:
+        himalaya_label, himalaya_email = load_himalaya_account(himalaya_account)
+        himalaya_source_key = f"himalaya:{himalaya_email}"
+        himalaya_state = state_source(state, himalaya_source_key)
+        himalaya_last = parse_date(normalize_text(himalaya_state.get("last_success")))
+        himalaya_query_effective = (
+            himalaya_after_query(himalaya_query, himalaya_last, himalaya_lookback_days)
+            if himalaya_last
+            else himalaya_after_query(himalaya_query, sync_now, himalaya_lookback_days)
+        )
+        available_folders = himalaya_folder_names(himalaya_label)
+        requested_folders = [
+            normalize_text(item)
+            for item in (himalaya_folders or DEFAULT_HIMALAYA_FOLDERS)
+            if normalize_text(item)
+        ]
+        effective_folders = [folder for folder in requested_folders if folder in available_folders]
+        if not effective_folders:
+            fallback = "INBOX" if "INBOX" in available_folders else (sorted(available_folders)[0] if available_folders else "")
+            effective_folders = [fallback] if fallback else []
+        himalaya_plan = {
+            "enabled": bool(effective_folders),
+            "account_name": himalaya_label,
+            "account_email": himalaya_email,
+            "last_success": himalaya_state.get("last_success"),
+            "query": himalaya_query_effective,
+            "max_messages": himalaya_max_messages,
+            "folders": effective_folders,
+            "folder_queries": {
+                folder: himalaya_query_for_folder(folder, himalaya_query_effective)
+                for folder in effective_folders
+            },
+        }
+    except SystemExit as exc:
+        himalaya_plan = {
+            "enabled": False,
+            "reason": str(exc),
+        }
+    plan["sources"]["himalaya_email"] = himalaya_plan
+
     if dry_run:
         return plan
 
@@ -4883,6 +5815,35 @@ def sync_incremental(
     drive_state["last_query"] = drive_query_effective
     drive_state["last_imported_files"] = results["drive"]["imported_files"]
     drive_state["last_imported_bodies"] = results["drive"]["imported_bodies"]
+
+    if himalaya_plan.get("enabled"):
+        results["himalaya_email"] = import_himalaya_email(
+            db_path,
+            account_name=himalaya_label,
+            folders=himalaya_plan.get("folders"),
+            query=himalaya_plan.get("query") or "",
+            max_messages=max(0, himalaya_max_messages),
+            rebuild_ontology=False,
+            memory_dir=None,
+            top_n=top_n,
+        )
+        himalaya_state = state_source(state, himalaya_source_key)
+        himalaya_state["last_success"] = sync_now.isoformat()
+        himalaya_state["last_query"] = himalaya_plan.get("query")
+        himalaya_state["last_imported_messages"] = results["himalaya_email"]["imported_messages"]
+        himalaya_state["last_folders"] = himalaya_plan.get("folders") or []
+    else:
+        results["himalaya_email"] = himalaya_plan
+
+    repair_accounts = [normalize_email(account_email) if account_email else "", normalize_email(himalaya_email)]
+    conn = open_store(db_path)
+    results["email_identity_repair"] = relink_email_identities(
+        conn,
+        account_ids=repair_accounts,
+        days=max(gmail_lookback_days, himalaya_lookback_days, 45),
+    )
+    conn.commit()
+    conn.close()
 
     save_sync_state(state_path, state)
     rerendered = maybe_rerender_after_touch(db_path, memory_dir, top_n)
@@ -6708,8 +7669,10 @@ def operating_state(
     reconnect_limit: int = 5,
     loop_limit: int = 5,
     doc_limit: int = 10,
+    email_limit: int = 5,
 ) -> dict[str, Any]:
     brief = weekly_brief(db_path, reconnect_limit=reconnect_limit, loop_limit=loop_limit, date_limit=3)
+    email_threads = email_attention(db_path, days=21, limit=email_limit)
     conn = open_store(db_path)
     docs = promoted_documents(conn, limit=max(doc_limit * 2, 12))
     conn.close()
@@ -6722,6 +7685,7 @@ def operating_state(
         "priority_reconnect": brief["priority_reconnect"],
         "open_loops": brief["open_loops"],
         "important_dates": brief["important_dates"],
+        "email_attention": email_threads["threads"],
         "company_context_docs": company_docs,
         "personal_context_docs": personal_docs,
         "general_context_docs": general_docs,
@@ -6729,7 +7693,7 @@ def operating_state(
 
 
 def prompt_surface_block(db_path: Path, reconnect_limit: int = 5, loop_limit: int = 5) -> str:
-    brief = operating_state(db_path, reconnect_limit=reconnect_limit, loop_limit=loop_limit, doc_limit=4)
+    brief = operating_state(db_path, reconnect_limit=reconnect_limit, loop_limit=loop_limit, doc_limit=4, email_limit=3)
     lines = [
         "## Operating Snapshot",
         "",
@@ -6762,6 +7726,14 @@ def prompt_surface_block(db_path: Path, reconnect_limit: int = 5, loop_limit: in
         lines.append(f"- {item['display_name']} — {action}")
     if not brief["open_loops"][:loop_limit]:
         lines.append("- None currently.")
+
+    lines.extend(["", "### Email Attention", ""])
+    for item in brief["email_attention"][:3]:
+        lines.append(
+            f"- {item['person_display_name']} — {item['subject']}; {item['age_days']}d old; {item['suggested_action']}"
+        )
+    if not brief["email_attention"][:3]:
+        lines.append("- No high-signal pending email threads right now.")
 
     lines.extend(["", "### Upcoming Moments", ""])
     for item in brief["important_dates"]:
@@ -7019,6 +7991,13 @@ def render_memory(db_path: Path, memory_dir: Path, top_n: int) -> None:
         hot_lines.append(f"- {item['display_name']} — {action}")
     if not operating["open_loops"][:5]:
         hot_lines.append("- None right now.")
+    hot_lines.extend(["", "## Email Attention", ""])
+    for item in operating["email_attention"][:5]:
+        hot_lines.append(
+            f"- {item['person_display_name']} — {item['subject']} ({item['age_days']}d). {item['suggested_action']}"
+        )
+    if not operating["email_attention"][:5]:
+        hot_lines.append("- No high-signal pending email threads right now.")
     hot_lines.extend(["", "## Company Context", ""])
     for item in operating["company_context_docs"][:6]:
         hot_lines.append(f"- {item['title']} — {item['excerpt'] or ', '.join(item['reasons'])}")
@@ -7030,6 +8009,26 @@ def render_memory(db_path: Path, memory_dir: Path, top_n: int) -> None:
     if not operating["personal_context_docs"][:6]:
         hot_lines.append("- None promoted yet.")
     write_text(memory_dir / "HOT-STATE.md", "\n".join(hot_lines))
+
+    email_lines = [
+        "# Email Attention",
+        "",
+        "Inbound email threads that look important and appear to be waiting on Sunil.",
+        "",
+        f"- Refreshed: {operating['generated_at']}",
+        "",
+    ]
+    for item in operating["email_attention"][:20]:
+        email_lines.append(
+            f"- {item['person_display_name']} — {item['subject']} [{item['age_days']}d, score {item['score']}]"
+        )
+        email_lines.append(f"  - Why: {', '.join(item['why'])}")
+        email_lines.append(f"  - Next: {item['suggested_action']}")
+        if item["snippet"]:
+            email_lines.append(f"  - Snippet: {item['snippet']}")
+    if not operating["email_attention"][:20]:
+        email_lines.append("- No high-signal pending email threads right now.")
+    write_text(memory_dir / "EMAIL-ATTENTION.md", "\n".join(email_lines))
 
     doc_rows = conn.execute(
         """
@@ -7081,6 +8080,7 @@ def render_memory(db_path: Path, memory_dir: Path, top_n: int) -> None:
             "- `import-whatsapp --source-file exported.ndjson`",
             "- `import-slack-archive --archive-dir slack-export-dir`",
             "- `import-google-gmail --account-email sunil@tribble.ai`",
+            "- `import-himalaya-email --account-name personal`",
             "- `import-google-calendar --account-email sunil@tribble.ai`",
             "- `import-google-drive --account-email sunil@tribble.ai` (strategic metadata + promoted bodies)",
             "- `import-roam-notes --notes-dir roam-export-dir`",
@@ -7516,6 +8516,209 @@ def recent_message_brief(
     }
 
 
+def is_low_signal_email_thread(subject: str, excerpt: str, sender_email: str, counterpart_email: str) -> bool:
+    blob = " ".join(
+        part for part in (normalize_text(subject), normalize_text(excerpt), normalize_text(sender_email), normalize_text(counterpart_email)) if part
+    ).casefold()
+    if not blob:
+        return True
+    if any(pattern in blob for pattern in LOW_SIGNAL_EMAIL_SUBJECT_PATTERNS):
+        return True
+    if any(pattern in normalize_text(sender_email).casefold() for pattern in LOW_SIGNAL_EMAIL_PATTERNS):
+        return True
+    if any(pattern in normalize_text(counterpart_email).casefold() for pattern in LOW_SIGNAL_EMAIL_PATTERNS):
+        return True
+    if any(fragment in normalize_text(sender_email).casefold() for fragment in ("claconnect.com", "mxtoolbox", "security@", "connect@")):
+        return True
+    return False
+
+
+def email_attention(
+    db_path: Path,
+    *,
+    days: int = 21,
+    limit: int = 12,
+    min_age_hours: int = 6,
+    focus: str = "all",
+) -> dict[str, Any]:
+    conn = open_store(db_path)
+    cutoff = (now_utc() - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        """
+        SELECT
+            m.*,
+            p.display_name AS person_display_name,
+            p.relationship_label AS person_relationship_label,
+            p.importance AS person_importance,
+            p.relationship_score AS person_relationship_score,
+            p.open_actions_json AS person_open_actions_json,
+            p.notes_json AS person_notes_json,
+            p.cadence_days AS person_cadence_days,
+            p.category AS person_category,
+            p.preferred_channel AS person_preferred_channel
+        FROM message_events m
+        LEFT JOIN people p ON p.person_id = m.person_id
+        WHERE m.channel = 'email' AND m.sent_at >= ?
+        ORDER BY m.chat_id ASC, m.sent_at DESC
+        """,
+        (cutoff,),
+    ).fetchall()
+    ranked: list[dict[str, Any]] = []
+    now = now_utc()
+    focus_clean = normalize_text(focus).lower() or "all"
+    threads: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        threads.setdefault(normalize_text(row["chat_id"]) or normalize_text(row["message_id"]), []).append(row)
+
+    for thread_id, thread_rows in threads.items():
+        latest = thread_rows[0]
+        if normalize_text(latest["direction"]).lower() != "inbound":
+            continue
+        subject = normalize_text(latest["chat_name"])
+        excerpt = trim_message_excerpt(latest["text"] or latest["excerpt"] or subject, 240)
+        sender_email = normalize_email(latest["sender_email"])
+        counterpart_email = normalize_email(latest["counterpart_email"])
+        if is_low_signal_email_thread(subject, excerpt, sender_email, counterpart_email):
+            continue
+        subject_lower = subject.casefold()
+        sent_dt = parse_date(latest["sent_at"])
+        if not sent_dt:
+            continue
+        age_hours = max(0.0, (now - sent_dt).total_seconds() / 3600.0)
+        if age_hours < float(min_age_hours):
+            continue
+
+        sender_name = normalize_text(latest["sender_name"])
+        counterpart_name = normalize_text(latest["counterpart_name"])
+        record: PersonRecord | None = None
+        record_email_match = False
+        target_email = sender_email if normalize_text(latest["direction"]).lower() == "inbound" else counterpart_email
+        if latest["person_id"]:
+            person_row = conn.execute("SELECT * FROM people WHERE person_id = ?", (latest["person_id"],)).fetchone()
+            if person_row:
+                record = record_for_row(person_row)
+                record_email_match = email_identity_confident(
+                    person_row,
+                    target_email,
+                    sender_name if normalize_text(latest["direction"]).lower() == "inbound" else counterpart_name,
+                )
+                if not record_email_match:
+                    record = None
+        if not record and target_email:
+            exact_person = exact_email_person_row(conn, target_email)
+            if exact_person and email_identity_confident(
+                exact_person,
+                target_email,
+                sender_name if normalize_text(latest["direction"]).lower() == "inbound" else counterpart_name,
+            ):
+                record = record_for_row(exact_person)
+                record_email_match = True
+        if "invitation:" in subject_lower or subject_lower.startswith("updated invitation"):
+            record = None
+
+        display_name = normalize_text(
+            (record.display_name if record and record_email_match else "")
+            or (sender_name if normalize_text(latest["direction"]).lower() == "inbound" else counterpart_name)
+            or latest["person_display_name"]
+            or latest["chat_name"]
+        )
+        if is_probably_noise_name(display_name):
+            continue
+
+        score = 0.0
+        why: list[str] = ["awaiting reply"]
+        matched_keywords = sorted(
+            {keyword for keyword in EMAIL_ATTENTION_KEYWORDS if keyword in f"{subject} {excerpt}".casefold()}
+        )
+        matched_deal_keywords = [keyword for keyword in matched_keywords if keyword in DEAL_EMAIL_ATTENTION_KEYWORDS]
+        age_days = age_hours / 24.0
+        score += min(age_days, 14.0) * 1.4
+        if age_days >= 3:
+            score += 4.0
+            why.append("aging thread")
+        if age_days >= 7:
+            score += 5.0
+            why.append("week old")
+        if record:
+            score += float(record.importance) * 1.8
+            score += float(record.relationship_score) * 1.2
+            if record.relationship_label:
+                score += 5.0
+                why.append(record.relationship_label)
+            if record.open_actions:
+                score += 7.0
+                why.append("open loop")
+            if record.category in {"family", "operations"}:
+                score += 4.0
+            why.append(person_reason(record))
+        if len(thread_rows) <= 3:
+            score += 2.0
+            why.append("short thread")
+        if sender_email and sender_email not in OWNER_EMAILS:
+            score += 2.0
+        if matched_keywords:
+            score += min(12.0, 3.0 + len(matched_keywords) * 1.7)
+            why.append(f"keywords: {', '.join(matched_keywords[:4])}")
+
+        if focus_clean == "deals":
+            internal_thread = counterpart_email.endswith("@tribble.ai") or sender_email.endswith("@tribble.ai")
+            if internal_thread:
+                continue
+            if record and record.relationship_label == "executive assistant":
+                continue
+            if record and (
+                record.category == "family"
+                or record.relationship_label in {"close_friend", "wife", "father", "mother"}
+            ):
+                continue
+            if matched_deal_keywords:
+                score += 12.0
+                why.append("deal focus")
+            else:
+                continue
+
+        suggested_action = "Review and reply with the next action or delegate to Rhaine."
+        lowered = f"{subject} {excerpt}".casefold()
+        if any(term in lowered for term in ("flight", "travel", "itinerary", "passport", "booking")):
+            suggested_action = "Confirm the travel decision or hand the booking/follow-up to Rhaine."
+        elif any(term in lowered for term in ("deal", "proposal", "pricing", "contract", "msa", "renewal", "pilot", "poc", "partnership")):
+            suggested_action = "Decide the commercial next step and send a concise reply or delegate follow-through."
+        elif any(term in lowered for term in ("meeting", "calendar", "availability", "schedule")):
+            suggested_action = "Reply with availability or push scheduling to Rhaine."
+        elif record and record.relationship_label == "executive assistant":
+            suggested_action = "Resolve the operational decision so Rhaine can execute."
+
+        ranked.append(
+            {
+                "thread_id": thread_id,
+                "subject": subject or "(no subject)",
+                "sent_at": latest["sent_at"],
+                "age_hours": round(age_hours, 1),
+                "age_days": round(age_days, 1),
+                "person_id": latest["person_id"],
+                "person_display_name": display_name,
+                "relationship_label": normalize_text(record.relationship_label if record else ""),
+                "counterpart_email": counterpart_email or sender_email,
+                "snippet": excerpt,
+                "message_count": len(thread_rows),
+                "matched_keywords": matched_keywords[:8],
+                "why": dedupe_preserve([entry for entry in why if entry])[:6],
+                "suggested_action": suggested_action,
+                "score": round(score, 2),
+            }
+        )
+    conn.close()
+    ranked.sort(key=lambda item: (-float(item["score"]), item["sent_at"]))
+    return {
+        "generated_at": now.isoformat(),
+        "days": days,
+        "min_age_hours": min_age_hours,
+        "focus": focus_clean,
+        "count": len(ranked[:limit]),
+        "threads": ranked[:limit],
+    }
+
+
 def stats(db_path: Path) -> dict[str, Any]:
     conn = open_store(db_path)
     total = conn.execute("SELECT COUNT(*) AS c FROM people").fetchone()["c"]
@@ -7718,6 +8921,26 @@ def main(argv: list[str] | None = None) -> int:
     import_gmail.add_argument("--top-n", type=int, default=250, help="How many people pages to render when --memory-dir is set")
     import_gmail.add_argument("--json", action="store_true")
 
+    import_himalaya = subparsers.add_parser("import-himalaya-email", help="Import personal Gmail via Himalaya into the relationship store")
+    import_himalaya.add_argument("--account-name", help="Himalaya account name; defaults to personal")
+    import_himalaya.add_argument("--query", default="order by date desc", help="Himalaya envelope query for backfill")
+    import_himalaya.add_argument("--folder", action="append", dest="folders", help="Folder to import; repeat for multiple folders")
+    import_himalaya.add_argument("--max-messages", type=int, default=0, help="Optional cap; 0 means no cap")
+    import_himalaya.add_argument("--page-size", type=int, default=150, help="How many envelopes to fetch per page")
+    import_himalaya.add_argument("--memory-dir", help="Optional memory directory to re-render after import")
+    import_himalaya.add_argument("--top-n", type=int, default=250, help="How many people pages to render when --memory-dir is set")
+    import_himalaya.add_argument("--json", action="store_true")
+
+    repair_email = subparsers.add_parser(
+        "repair-email-identities",
+        help="Relink imported email message evidence to exact email identities",
+    )
+    repair_email.add_argument("--account-id", action="append", dest="account_ids", help="Specific email account id to repair; repeatable")
+    repair_email.add_argument("--days", type=int, default=180, help="How many trailing days of email evidence to repair")
+    repair_email.add_argument("--memory-dir", help="Optional memory directory to re-render after repair")
+    repair_email.add_argument("--top-n", type=int, default=250, help="How many people pages to render when --memory-dir is set")
+    repair_email.add_argument("--json", action="store_true")
+
     guided_gmail = subparsers.add_parser(
         "gmail-guided",
         help="Use graph signal to retrieve high-value Gmail messages without broad mailbox import",
@@ -7765,6 +8988,11 @@ def main(argv: list[str] | None = None) -> int:
     sync_incremental_cmd.add_argument("--calendar-future-days", type=int, default=180)
     sync_incremental_cmd.add_argument("--drive-lookback-days", type=int, default=30)
     sync_incremental_cmd.add_argument("--drive-body-limit", type=int, default=80)
+    sync_incremental_cmd.add_argument("--himalaya-account", help="Optional Himalaya account name for personal Gmail sync")
+    sync_incremental_cmd.add_argument("--himalaya-query", default="", help="Base Himalaya query before incremental time shaping")
+    sync_incremental_cmd.add_argument("--himalaya-lookback-days", type=int, default=21)
+    sync_incremental_cmd.add_argument("--himalaya-max-messages", type=int, default=500)
+    sync_incremental_cmd.add_argument("--himalaya-folder", action="append", dest="himalaya_folders", help="Folder to include in personal Gmail sync; repeatable")
     sync_incremental_cmd.add_argument("--memory-dir", help="Optional memory directory to re-render after sync")
     sync_incremental_cmd.add_argument("--top-n", type=int, default=250)
     sync_incremental_cmd.add_argument("--dry-run", action="store_true")
@@ -7809,6 +9037,16 @@ def main(argv: list[str] | None = None) -> int:
     channel_brief.add_argument("--direction", default="any", help="inbound|outbound|any")
     channel_brief.add_argument("--person", help="Optional person name/alias filter")
     channel_brief.add_argument("--json", action="store_true")
+
+    email_attention_cmd = subparsers.add_parser(
+        "email-attention",
+        help="Rank important inbound email threads that appear to be waiting on Sunil",
+    )
+    email_attention_cmd.add_argument("--days", type=int, default=21, help="How many trailing days of email to inspect")
+    email_attention_cmd.add_argument("--limit", type=int, default=12, help="Maximum email threads to return")
+    email_attention_cmd.add_argument("--min-age-hours", type=int, default=6, help="Ignore very fresh inbound email newer than this")
+    email_attention_cmd.add_argument("--focus", default="all", choices=["all", "deals"], help="Bias ranking toward all important email or deal/introduction follow-through")
+    email_attention_cmd.add_argument("--json", action="store_true")
 
     docs_search = subparsers.add_parser("docs-search", help="Search imported source documents")
     docs_search.add_argument("query", help="Document query")
@@ -8116,6 +9354,55 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Re-rendered memory into {payload['rerendered_memory_dir']}")
         return 0
 
+    if args.command == "import-himalaya-email":
+        payload = import_himalaya_email(
+            db_path,
+            account_name=args.account_name,
+            folders=args.folders,
+            query=args.query,
+            max_messages=args.max_messages,
+            page_size=args.page_size,
+            memory_dir=Path(args.memory_dir).expanduser().resolve() if args.memory_dir else None,
+            top_n=args.top_n,
+        )
+        if args.json:
+            print_json(payload)
+        else:
+            print(f"Imported {payload['imported_messages']} email messages for {payload['account_email']}")
+            print(f"Folders: {', '.join(payload['folders'])}")
+            print(f"Linked people: {payload['linked_people']}")
+            if payload.get("rerendered_memory_dir"):
+                print(f"Re-rendered memory into {payload['rerendered_memory_dir']}")
+        return 0
+
+    if args.command == "repair-email-identities":
+        conn = open_store(db_path)
+        payload = relink_email_identities(
+            conn,
+            account_ids=args.account_ids,
+            days=args.days,
+        )
+        conn.commit()
+        conn.close()
+        rerendered = maybe_rerender_after_touch(
+            db_path,
+            Path(args.memory_dir).expanduser().resolve() if args.memory_dir else None,
+            args.top_n,
+        )
+        if args.json:
+            response = dict(payload)
+            if rerendered:
+                response["rerendered_memory_dir"] = str(rerendered)
+            print_json(response)
+        else:
+            print(f"Scanned {payload['scanned_messages']} email messages")
+            print(f"Relinked: {payload['relinked_messages']}")
+            print(f"Created people: {payload['created_people']}")
+            print(f"Cleared: {payload['cleared_messages']}")
+            if rerendered:
+                print(f"Re-rendered memory into {rerendered}")
+        return 0
+
     if args.command == "gmail-guided":
         payload = guided_gmail_results(
             db_path,
@@ -8220,6 +9507,11 @@ def main(argv: list[str] | None = None) -> int:
             calendar_future_days=args.calendar_future_days,
             drive_lookback_days=args.drive_lookback_days,
             drive_body_limit=args.drive_body_limit,
+            himalaya_account=args.himalaya_account,
+            himalaya_query=args.himalaya_query,
+            himalaya_lookback_days=args.himalaya_lookback_days,
+            himalaya_max_messages=args.himalaya_max_messages,
+            himalaya_folders=args.himalaya_folders,
             memory_dir=Path(args.memory_dir).expanduser().resolve() if args.memory_dir else None,
             top_n=args.top_n,
             dry_run=args.dry_run,
@@ -8324,6 +9616,28 @@ def main(argv: list[str] | None = None) -> int:
                     f"{item['person_display_name']} | {item['text']}"
                 )
                 print(f"  why: {why}")
+        return 0
+
+    if args.command == "email-attention":
+        payload = email_attention(
+            db_path,
+            days=args.days,
+            limit=args.limit,
+            min_age_hours=args.min_age_hours,
+            focus=args.focus,
+        )
+        if args.json:
+            print_json(payload)
+        else:
+            print("# Email Attention")
+            print()
+            for item in payload["threads"]:
+                print(
+                    f"- {item['person_display_name']} | {item['subject']} | "
+                    f"{item['age_days']}d | score={item['score']}"
+                )
+                print(f"  next: {item['suggested_action']}")
+                print(f"  why: {'; '.join(item['why'])}")
         return 0
 
     if args.command == "docs-search":

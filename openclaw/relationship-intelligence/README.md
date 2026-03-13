@@ -33,15 +33,19 @@ Commands:
 - `import-imessage-profiles` imports curated iMessage profile summaries into the same people/claims graph
 - `import-slack-archive` imports a `slackdump.sqlite` archive into the same evidence and relationship graph
 - `import-google-gmail` imports Gmail metadata as message evidence
-- `gmail-guided` uses graph signal to retrieve only the most relevant Gmail messages and threads for a person or objective
+- `import-himalaya-email` imports personal Gmail from the existing Himalaya account into the same evidence store
+- `repair-email-identities` relinks imported email evidence to exact email identities and prunes polluted email merges
+- `gmail-guided` uses graph signal to retrieve only the most relevant live Gmail messages and threads for a person or objective
 - `import-google-calendar` imports Calendar events as meeting evidence and touchpoints
 - `import-google-drive` imports Drive metadata broadly and only promoted bodies selectively
 - `import-roam-notes` imports extracted Roam markdown notes as document evidence
-- `sync-incremental` runs an incremental Gmail/Calendar/Drive sync using a persisted sync state
+- `sync-incremental` runs an incremental Gmail/Calendar/Drive/personal-email sync using a persisted sync state
 - `reconcile-whatsapp` rebuilds the WhatsApp relationship ontology, semantic claims, and edges from imported history
 - `reconcile-identities` merges duplicate people across sources using email/phone identity while preserving claims and edges
 - `messages` queries recent channel messages already imported into the relationship store
 - `channel-brief` ranks the most important recent channel messages using relationship signal and recency
+- `email-attention` ranks important inbound email threads that look like they are waiting on Sunil
+  - use `--focus deals` when the task is specifically about deals, intros, customers, or investor follow-through
 - `docs-search` searches imported Roam/Drive/Calendar document evidence
 - `stats` prints high-level counts
 
@@ -125,6 +129,12 @@ Dry-run the next sync window/query plan without mutating anything:
 DRY_RUN=1 /root/.openclaw/workspace/relationship-intel/incremental_sync.sh
 ```
 
+Default live inbox lanes:
+- corporate Gmail: Google OAuth (`sunil@tribble.ai`)
+- personal Gmail: Himalaya IMAP (`sunilkgrao@gmail.com`)
+
+Those feeds land in one email evidence plane, so `email-attention`, `channel-brief --channel email`, and the hot operating surface do not need to care which inbox produced the thread.
+
 If the current linked session will not provide history, use the safer relink
 flow instead:
 
@@ -156,14 +166,18 @@ The intended live pattern is:
 - use `candidate-claims --json` to review still-noisy claims before promoting them into stronger guidance
 - use `operating-state --json` when Linus needs the compact high-value relationship + company/personal context surface
 - use `docs-search --json` when the answer likely lives in Roam, Drive, or Calendar evidence rather than in a person summary
-- use `gmail-guided --person ... --objective ... --json` before broad Gmail import when the task is about a known person, company thread, travel flow, or open loop
+- use `gmail-guided --person ... --objective ... --json` before broad Gmail import when the task is about a known person, company thread, travel flow, or open loop in the live Google account
 - use `channel-brief --channel whatsapp|slack|email --days ... --json` when the question is “what important messages came in recently?”
+- use `email-attention --days 21 --json` when the question is “what important emails am I letting slip?”
+- use `email-attention --days 21 --focus deals --json` when the question is specifically about deals, intros, partnerships, or investor follow-through
+- use `repair-email-identities --days 180 --json` after large email backfills if older imports used weaker merge rules
 - use `import-imessage-profiles --profiles-dir ...` when refreshing the curated iMessage profile layer from preserved archives
 - use `import-slack-archive --archive-dir ...` when backfilling company chat context
 - use `import-google-gmail --account-email ...` for inbox history
+- use `import-himalaya-email --account-name personal ...` for personal Gmail backfill and refresh
 - use `import-google-calendar --account-email ...` for meeting and attendee history
 - use `import-google-drive --account-email ... --body-limit 80` for strategic document ingestion
-- use `sync-incremental --account-email ... --dry-run --json` to inspect the next Gmail/Calendar/Drive refresh plan
+- use `sync-incremental --account-email ... --dry-run --json` to inspect the next Gmail/Calendar/Drive/personal-email refresh plan
 - use `import-roam-notes --notes-dir ...` for personal notes and long-horizon thinking context
 - use `messages --channel whatsapp --days 2 --direction inbound --json` when the task is about recent WhatsApp traffic
 - use `touch ... --memory-dir ...` after meaningful interactions so the graph stays current

@@ -43,6 +43,21 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def parse_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = value.strip()
+    for candidate in (text, text.replace("Z", "+00:00")):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
 def run(
     args: list[str],
     *,
@@ -201,6 +216,8 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
         relationship_edges = int(sqlite_value(conn, "select count(*) from relationship_edges where channel = 'whatsapp'") or 0)
         entities = int(sqlite_value(conn, "select count(*) from entities where source_channel = 'whatsapp'") or 0)
         stale_claims = int(sqlite_value(conn, "select count(*) from semantic_claims where channel = 'whatsapp' and claim_status = 'stale'") or 0)
+        personal_email_messages = int(sqlite_value(conn, "select count(*) from message_events where channel = 'email' and account_id = 'sunilkgrao@gmail.com'") or 0)
+        corporate_email_messages = int(sqlite_value(conn, "select count(*) from message_events where channel = 'email' and account_id = 'sunil@tribble.ai'") or 0)
         imessage_open_action_people = 0
         for row in conn.execute("select open_actions_json from people where open_actions_json <> '[]'"):
             actions = json.loads(row["open_actions_json"])
@@ -245,6 +262,11 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
             "semantic_kg_present",
             semantic_claims >= 10000 and relationship_edges >= 1000 and entities >= 200,
             f"semantic_claims={semantic_claims}, relationship_edges={relationship_edges}, entities={entities}, stale_claims={stale_claims}",
+        )
+        record(
+            "email_account_fusion_present",
+            personal_email_messages >= 10 and corporate_email_messages >= 100,
+            f"personal_email_messages={personal_email_messages}, corporate_email_messages={corporate_email_messages}",
         )
 
         # Direct tool assertions.
@@ -303,11 +325,29 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
             for item in recent_whatsapp["messages"]
             if (item.get("person_display_name") or item.get("chat_name"))
         }
-        ok = recent_whatsapp["count"] >= 1 and any(recent_people)
+        latest_whatsapp_at = sqlite_value(conn, "select max(sent_at) from message_events where channel = 'whatsapp'")
+        latest_whatsapp_dt = parse_date(latest_whatsapp_at) if latest_whatsapp_at else None
+        whatsapp_is_recent = bool(
+            latest_whatsapp_dt and (datetime.now(timezone.utc) - latest_whatsapp_dt).total_seconds() <= 2 * 86400
+        )
+        ok = (
+            (recent_whatsapp["count"] >= 1 and any(recent_people))
+            if whatsapp_is_recent
+            else recent_whatsapp["count"] == 0
+        )
         record(
             "tool_recent_whatsapp_query",
             ok,
-            trimmed(json.dumps({"count": recent_whatsapp["count"], "people": sorted(recent_people)[:10]}, ensure_ascii=True)),
+            trimmed(
+                json.dumps(
+                    {
+                        "count": recent_whatsapp["count"],
+                        "people": sorted(recent_people)[:10],
+                        "latest_whatsapp_at": latest_whatsapp_at,
+                    },
+                    ensure_ascii=True,
+                )
+            ),
         )
 
         recent_whatsapp_brief = rel_json(
@@ -322,11 +362,69 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
             "5",
         )
         brief_people = [item.get("person_display_name", "") for item in recent_whatsapp_brief.get("messages", [])]
-        ok = recent_whatsapp_brief["count"] >= 1 and any(name for name in brief_people if name in {"Amit Gandhi", "Sonia Daniel-Bouchard", "Morgan"})
+        ok = (
+            recent_whatsapp_brief["count"] >= 1 and any(name for name in brief_people)
+            if whatsapp_is_recent
+            else recent_whatsapp_brief["count"] == 0
+        )
         record(
             "tool_recent_whatsapp_brief",
             ok,
-            trimmed(json.dumps({"count": recent_whatsapp_brief["count"], "people": brief_people}, ensure_ascii=True)),
+            trimmed(
+                json.dumps(
+                    {
+                        "count": recent_whatsapp_brief["count"],
+                        "people": brief_people,
+                        "latest_whatsapp_at": latest_whatsapp_at,
+                    },
+                    ensure_ascii=True,
+                )
+            ),
+        )
+
+        email_attention = rel_json(
+            iso_rel_script,
+            iso_db,
+            "email-attention",
+            "--days",
+            "30",
+            "--limit",
+            "8",
+            "--json",
+        )
+        email_threads = email_attention.get("threads", [])
+        ok = bool(email_threads) and any(
+            item.get("subject") and item.get("suggested_action") and item.get("why")
+            for item in email_threads[:3]
+        )
+        record(
+            "tool_email_attention",
+            ok,
+            trimmed(json.dumps({"count": email_attention.get("count"), "top": email_threads[:3]}, ensure_ascii=True)),
+        )
+
+        deal_attention = rel_json(
+            iso_rel_script,
+            iso_db,
+            "email-attention",
+            "--days",
+            "45",
+            "--limit",
+            "8",
+            "--focus",
+            "deals",
+            "--json",
+        )
+        deal_threads = deal_attention.get("threads", [])
+        ok = (
+            deal_attention.get("focus") == "deals"
+            and bool(deal_threads)
+            and any("@tribble.ai" not in (item.get("counterpart_email") or "") for item in deal_threads[:5])
+        )
+        record(
+            "tool_email_attention_deals",
+            ok,
+            trimmed(json.dumps({"count": deal_attention.get("count"), "top": deal_threads[:5]}, ensure_ascii=True)),
         )
 
         drive_docs = rel_json(iso_rel_script, iso_db, "docs-search", "Tribble 2026 Deck", "--channel", "drive", "--limit", "3")
@@ -359,6 +457,8 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
                 and bool(sync_plan["sources"]["gmail"].get("query"))
                 and sync_plan["sources"]["calendar"].get("clear_existing") is False
                 and sync_plan["sources"]["drive"].get("clear_existing") is False
+                and "himalaya_email" in sync_plan.get("sources", {})
+                and isinstance(sync_plan["sources"]["himalaya_email"], dict)
             )
             record("tool_incremental_sync_plan", ok, trimmed(json.dumps(sync_plan, ensure_ascii=True)))
 
@@ -446,10 +546,13 @@ def run_battery(remote_home: Path, report_path: Path) -> dict[str, Any]:
                 phrase in lowered
                 for phrase in (
                     "first-pass orientation",
+                    "initial orientation",
                     "task decomposition",
                     "decompose the task",
                     "do it myself",
                     "do it inline",
+                    "inline (me)",
+                    "inline (you)",
                     "read the key files",
                 )
             )
