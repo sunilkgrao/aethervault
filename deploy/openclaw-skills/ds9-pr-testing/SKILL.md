@@ -100,7 +100,7 @@ cat "$TARGET_DS9/Q/.node-version"
 
 In practice:
 - root and `lcars` usually want Node `20.19.0`
-- `Q` may want `18.16.1`
+- `Q` may declare `18.16.1`, but if local dev throws `ERR_REQUIRE_ESM` from `@google/genai`, use the same Node 20 lane as the known-good working checkout instead of forcing `18.16.1`
 - `positronic-files` is safer on Node `20` than `24`
 
 Machine prerequisites that must already work:
@@ -218,11 +218,14 @@ bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/start_lcars_canonical
 
 Expected ports:
 - `50051` -> `Q`
+- `50061` -> `apps/exocomp` conversation gRPC
 - `3000` -> `lcars`
 - `3091` -> `apps/exocomp`
 - `7072` -> `positronic-files`
 - `3001` -> `tribble-chat`
 - `5173` -> `lcars/ui`
+
+If you only have `50051`, `7072`, and a UI on `5174`, or if `50061` is missing, the stack is **not** ready for local chat E2E. In that state the chat websocket path is incomplete, so the visible chat input will stay disabled with placeholder `Connecting...`.
 
 Do not treat `5174` as acceptable for authenticated DS9 testing. The frontend uses Auth0 with:
 
@@ -248,7 +251,7 @@ Those origins may trigger Auth0 callback mismatch failures even when the Chrome 
 Use the bundled verifier:
 
 ```bash
-REQUIRED_PORTS="50051 3000 3091 7072 3001" \
+REQUIRED_PORTS="50051 50061 3000 3091 7072 3001" \
 bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/verify_stack.sh
 ```
 
@@ -259,6 +262,21 @@ If you have a real valid bearer token from the authenticated browser session, yo
 ```bash
 AUTH_TOKEN="<real bearer token>" bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/verify_stack.sh
 ```
+
+For chat-based DS9 validation, also require the authenticated browser to prove the chat box is actually usable:
+
+```bash
+TARGET_DS9="$TARGET_DS9" \
+bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/assert_chat_ready_via_cdp.sh
+```
+
+This attaches to the Windows Chrome CDP session, opens the blue chat critter if needed, and verifies:
+- page origin is `http://localhost:5173`
+- the chat panel is open
+- the visible textarea is enabled and editable
+- the placeholder is `Type your message`, not `Connecting...`
+
+Do **not** diagnose “Playwright can’t type” until this check passes. In DS9, the main chat input is explicitly disabled while `isConnected` is false, so a disabled textarea is a websocket / local-stack failure, not a browser-automation failure.
 
 Do not fabricate a `local-dev-token` unless the branch explicitly implements a real local auth bypass.
 
@@ -311,15 +329,29 @@ For authenticated DS9 testing with CDP:
 For local UI chat testing, the browser path is:
 - UI at `http://localhost:5173`
 - `tribble-chat` websocket backend at `ws://localhost:3001/api/chat`
+- `apps/exocomp` conversation gRPC on `localhost:50061`
 
 The UI may still boot with a stale `VITE_WEBCHAT_API_URL=ws://localhost:8080/api/chat` from the committed `.env`. That is wrong for the current local DS9 topology. Override it locally before claiming chat is broken.
 
 If the “Chat with Tribble” panel opens but stays on `Connecting...`, check these in order:
 1. `tribble-chat` is actually listening on `3001`
-2. `lcars/ui/.env.local` overrides `VITE_WEBCHAT_API_URL` to `ws://localhost:3001/api/chat`
-3. the UI was restarted after the override
-4. the browser console/network tab shows the websocket target you expect
-5. the active local client schema has the settings tables the chat flow reads
+2. `apps/exocomp` is actually listening on `50061`
+3. `lcars/ui/.env.local` overrides `VITE_WEBCHAT_API_URL` to `ws://localhost:3001/api/chat`
+4. the UI was restarted after the override
+5. the browser console/network tab shows the websocket target you expect
+6. the active local client schema has the settings tables the chat flow reads
+
+Important UI detail:
+- the chat surface can render more than one `textarea`
+- one of them may be a hidden/internal MUI helper textarea
+- browser automation must target the visible enabled textarea, not a generic `textarea` selector
+
+If the visible textarea is disabled or still says `Connecting...`, classify that as:
+- `local stack not fully up`
+- `websocket not connected`
+- or `wrong websocket target`
+
+Do not call it a Playwright typing problem unless the visible chat textarea is already enabled and editable.
 
 Do not confuse a websocket/config problem with an Auth0 problem after the browser is already authenticated.
 
@@ -332,7 +364,7 @@ For issues like the verbatim document retrieval bug, “fully tested locally” 
 4. the document reached `Complete`
 5. the document was tagged with a real verbatim metadata filter
 6. the tag is visible on the source in the UI
-7. the local chat flow answered the target question through the UI
+7. the local chat flow answered the target question through the UI after the chat readiness probe passed
 8. you captured screenshots of both the tagged source and the successful answer
 
 Useful UI landmarks:
@@ -433,6 +465,14 @@ In shared Slack channels, do not stream console thoughts line-by-line. Use only:
 - one short acknowledgement when work starts, if helpful
 - one blocker update if genuinely stuck
 - one final evidence-backed summary
+
+Do not post:
+- raw running commentary
+- tool or model names
+- "spawned X" messages
+- repeated progress messages that do not change the user decision
+
+If a blocker update was already sent, the next shared-thread message should be the final summary unless Sunil asked a new direct question.
 
 Use precise status labels:
 - `reviewed`

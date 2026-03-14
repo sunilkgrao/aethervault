@@ -2,9 +2,11 @@
 set -euo pipefail
 
 AUTH_TOKEN="${AUTH_TOKEN:-}"
-REQUIRED_PORTS="${REQUIRED_PORTS:-50051 3000 3091 7072 3001}"
+REQUIRED_PORTS="${REQUIRED_PORTS:-50051 50061 3000 3091 7072 3001}"
 UI_PORT="${UI_PORT:-5173}"
 DATABASE_URL="${DATABASE_URL:-postgres://tribbledev@localhost:5432/postgres}"
+VERIFY_CHAT_READY="${VERIFY_CHAT_READY:-0}"
+TARGET_DS9="${TARGET_DS9:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "== listeners =="
@@ -59,6 +61,18 @@ if [[ -n "$AUTH_TOKEN" ]]; then
   echo "== lcars projects =="
   curl -s http://127.0.0.1:3000/api/projects \
     -H "Authorization: Bearer $AUTH_TOKEN"
+  echo
+fi
+
+if [[ "$VERIFY_CHAT_READY" == "1" ]]; then
+  echo
+  echo "== authenticated chat readiness =="
+  if [[ -z "$TARGET_DS9" ]]; then
+    echo "VERIFY_CHAT_READY=1 requires TARGET_DS9=/path/to/ds9" >&2
+    missing=1
+  elif ! bash "$SCRIPT_DIR/assert_chat_ready_via_cdp.sh" "$TARGET_DS9" "http://localhost:${UI_PORT}"; then
+    missing=1
+  fi
   echo
 fi
 
