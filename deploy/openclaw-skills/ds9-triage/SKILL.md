@@ -48,12 +48,46 @@ Never say `tested` or `ready to merge` unless the evidence actually supports tha
 ## Triage flow
 
 1. Read the thread carefully and restate the problem internally.
-2. Inspect the DS9 codebase to form a concrete hypothesis.
-3. If code changes, builds, or runtime testing are needed, delegate the execution to a coding subagent. Linus should orchestrate, not be the hands-on implementer.
-4. If code changes are needed, prepare the fix on a branch or PR through a coding subagent.
-5. If a branch or PR exists and Sunil asks whether it works, invoke the `ds9-pr-testing` skill.
-6. If Sunil asks about a production DS9 / Tribble issue, use the `ds9-prod-debug` skill on `raoDesktop` for App Insights and readonly DB inspection instead of guessing from source alone.
-7. Only after the relevant skill completes should you call the change locally tested or production-diagnosed.
+2. For any new coding/debugging issue thread, create or reuse a thread-isolated DS9 worktree that starts from `origin/main`. Do not work directly in the anchor checkout.
+3. Inspect the DS9 codebase to form a concrete hypothesis.
+4. If code changes, builds, or runtime testing are needed, delegate the execution to a coding subagent. Linus should orchestrate, not be the hands-on implementer.
+5. If code changes are needed, prepare the fix on a branch or PR through a coding subagent in that thread-specific worktree.
+6. If a branch or PR exists and Sunil asks whether it works, invoke the `ds9-pr-testing` skill in the same thread-specific worktree.
+7. If Sunil asks about a production DS9 / Tribble issue, use the `ds9-prod-debug` skill on `raoDesktop` for App Insights and readonly DB inspection instead of guessing from source alone.
+8. Only after the relevant skill completes should you call the change locally tested or production-diagnosed.
+
+## Branch and worktree policy
+
+Each Slack issue thread gets its own DS9 worktree and branch.
+
+Default assumption:
+- new issue thread -> new worktree from `origin/main`
+
+Reuse only when:
+- the same Slack thread is continuing the same body of work
+- or Sunil explicitly points Linus at an existing PR / branch
+
+Do not:
+- implement in `/Users/sunilrao/dev/ds9` on macOS
+- implement in `/home/sunil/ds9` on `raoDesktop`
+- stack unrelated work on an existing feature branch from another thread
+
+Preferred branch pattern:
+- `linus/<thread-key>/<issue-slug>`
+
+Preferred worktree roots:
+- macOS: `/Users/sunilrao/dev/ds9-worktrees`
+- `raoDesktop` WSL: `/home/sunil/ds9-worktrees`
+
+Use the helper from `ds9-pr-testing` to create or reuse the thread worktree before any code change or local test bootstrapping:
+
+```bash
+bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/ensure_thread_worktree.sh \
+  "/home/sunil/ds9" \
+  "/home/sunil/ds9-worktrees" \
+  "slack-<thread-id>" \
+  "<issue-slug>"
+```
 
 Production trigger phrases that must route to `ds9-prod-debug` first:
 - `prod`
@@ -66,6 +100,24 @@ Production trigger phrases that must route to `ds9-prod-debug` first:
 - `can you check prod`
 
 Never say production is unreachable from `raoDesktop`, private-only, or portal-only unless the `ds9-prod-debug` verification path actually failed in the current session.
+
+## Production deployment rule
+
+No DS9 or Tribble code may reach production without a reviewed PR and the normal deployment path.
+
+Never:
+- hotfix production code directly from Linus
+- run `az webapp deploy`, OneDeploy, zip deploy, or equivalent direct production code deployment commands
+- upload ad-hoc build artifacts to production
+- edit production runtime files to apply a code fix
+
+If a production issue reveals a code bug:
+- diagnose it in production through `ds9-prod-debug`
+- prepare the fix in a thread-isolated worktree from `origin/main`
+- open or update a PR
+- report the diagnosis, proposed fix, and safest next step
+
+Do not treat production as a hotfix lane. Treat it as a diagnosis lane only.
 
 ## Testing rule
 

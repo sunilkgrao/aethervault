@@ -19,6 +19,8 @@ Do not use this skill to:
 - apply schema changes
 - rotate secrets
 - change network rules beyond the minimum already established for `raoDesktop`
+- deploy code or build artifacts to production
+- patch production runtime files with source changes
 
 ## Environment assumptions
 
@@ -55,6 +57,16 @@ Not allowed unless Sunil explicitly asks:
 - using the admin DB URL for arbitrary queries
 - `INSERT`, `UPDATE`, `DELETE`, `ALTER`, `DROP`, `TRUNCATE`
 - changing Azure resource config
+
+Never allowed through this skill:
+- `az webapp deploy`
+- direct OneDeploy / zip deploy / artifact upload to production
+- copying a locally built package into production to hotfix behavior
+
+If production diagnosis reveals a code bug:
+- stop at diagnosis
+- prepare the fix in a branch / PR outside production
+- report the evidence and recommended deploy path
 
 One already-applied prod hardening change to know about:
 - readonly access for `tribble.allowed_bot` is now granted to the existing readonly role, so Linus can inspect Slack bot allow-list rows without using the admin DB lane

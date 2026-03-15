@@ -10,6 +10,38 @@ Use this skill whenever Linus needs to test DS9 code for real instead of stoppin
 
 If you have not brought up the local stack, opened the route in a browser, and inspected the resulting artifacts, do **not** say the branch or PR was tested. Say it was reviewed or prepared locally.
 
+## Thread-isolated worktrees
+
+Treat each new Slack issue thread as its own isolated git worktree.
+
+Rules:
+- never do real implementation or test setup in the anchor checkout
+- assume a new issue starts from `origin/main` unless Sunil explicitly points to an existing branch or PR
+- reuse the same worktree only for follow-up messages in the same issue thread
+- when the thread is done and the change is merged or abandoned, remove the worktree and keep the anchor checkout on `main`
+
+Canonical worktree roots:
+- macOS: `/Users/sunilrao/dev/ds9-worktrees`
+- `raoDesktop` WSL: `/home/sunil/ds9-worktrees`
+
+Use the thread helper before bootstrapping env/config:
+
+```bash
+bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/ensure_thread_worktree.sh \
+  "/home/sunil/ds9" \
+  "/home/sunil/ds9-worktrees" \
+  "slack-<thread-id>" \
+  "<issue-slug>"
+```
+
+That helper will:
+- fetch `origin`
+- create a fresh branch from `origin/main` for a new issue thread
+- reuse the existing branch/worktree for the same thread if it already exists
+- print the resolved `branch_name` and `target_ds9`
+
+Only after that should you sync env/config into the target worktree and start local services.
+
 ## Canonical variables
 
 ```bash
@@ -21,7 +53,7 @@ mkdir -p "$ARTIFACT_DIR"
 
 - `SOURCE_DS9` is the known-good checkout with working secrets and local config.
 - `TARGET_DS9` is the branch or PR checkout under test.
-- If `TARGET_DS9` does not exist yet, create it as a worktree from `SOURCE_DS9`.
+- If `TARGET_DS9` does not exist yet, create it as a thread-isolated worktree from `origin/main` using `ensure_thread_worktree.sh`.
 
 Known-good paths on Sunil's machines:
 - macOS source checkout: `/Users/sunilrao/dev/ds9`
