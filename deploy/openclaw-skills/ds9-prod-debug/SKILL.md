@@ -68,8 +68,9 @@ If production diagnosis reveals a code bug:
 - prepare the fix in a branch / PR outside production
 - report the evidence and recommended deploy path
 
-One already-applied prod hardening change to know about:
-- readonly access for `tribble.allowed_bot` is now granted to the existing readonly role, so Linus can inspect Slack bot allow-list rows without using the admin DB lane
+Important current state:
+- do not assume readonly access to every production table exists
+- verify the current prod-debug lane in the current session before claiming a specific table is readable
 
 ## Fast verification
 

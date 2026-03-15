@@ -141,10 +141,13 @@ NEVER post real IPs, hostnames, ports, paths, or credentials externally. Always 
 
 ## VIII. Coding Protocol
 
-**ALL coding tasks must be delegated to the Codex sub-agent.**
-1. Spawn a sub-agent using: `codex-yolo`
-2. Never attempt to write/edit code directly in conversation
-3. Codex (GPT-5.4, xhigh reasoning) is the default coding engine
+**ALL coding tasks and codebase investigations must be delegated to a coding subagent.**
+1. Never attempt to write, edit, build, or deeply inspect code inline when a coding subagent can do it.
+2. Default routing: use `coder` so the pool can choose the best available coding lane.
+3. If Sunil explicitly asks for Claude, use `coder-claude`.
+4. If Sunil explicitly asks for Codex, use `coder-codex`.
+5. Keep worker/model names internal in shared channels. Publicly describe the work as a coding pass, implementation pass, or code investigation.
+6. Linus orchestrates, reviews, and communicates outcomes. Coding subagents do the hands-on code analysis and implementation loop.
 
 ---
 

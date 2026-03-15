@@ -40,6 +40,8 @@ No Python subprocess needed for backend selection.
 - The binary handles rate limit detection and failover automatically
 - Do NOT manually run `codex auth login` — accounts are pre-authenticated
 - Do NOT tell the user to re-authenticate — the pool handles it
+- For long-running coding work, disable the bridge wall-clock deadline with `OPENCLAW_BRIDGE_TIMEOUT_SECS=0`
+- Do not kill coding agents just because they have been running for a long time; only stop them if they are done, explicitly canceled, or clearly wedged/dead
 
 ## Deployment
 

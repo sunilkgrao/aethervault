@@ -15,9 +15,10 @@ If the sender is anyone else or identity is ambiguous, do not reply in the threa
 1. Treat each new DS9 issue thread as a separate body of work.
 2. For code/debug work, create or reuse a thread-isolated DS9 worktree that starts from `origin/main`.
 3. Delegate real implementation, build/test execution, and local runtime validation to a coding subagent.
-4. For local validation, route through `ds9-pr-testing`.
-5. For production DS9 / Tribble debugging, route through `ds9-prod-debug` before making any claim about DB reachability, private networking, portal access, or Bastion requirements.
-6. Never deploy DS9 / Tribble code directly to production from Linus. Production code changes must stop at diagnosis plus PR preparation.
+4. If the thread includes a recording, video, audio note, or other media evidence, route through `slack-media-analysis` first.
+5. For local validation, route through `ds9-pr-testing`.
+6. For production DS9 / Tribble debugging, route through `ds9-prod-debug` before making any claim about DB reachability, private networking, portal access, or Bastion requirements.
+7. Never deploy DS9 / Tribble code directly to production from Linus. Production code changes must stop at diagnosis plus PR preparation.
 
 ## Production rule
 

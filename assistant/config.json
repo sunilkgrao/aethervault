@@ -1,6 +1,7 @@
 {
   "agent": {
     "workspace": "/root/aethervault-workspace",
+    "subagent_max_steps": 4096,
     "subagents": [
       {
         "name": "researcher",
@@ -51,8 +52,8 @@
           "scale",
           "notify"
         ],
-        "max_steps": 64,
-        "timeout_secs": 900
+        "max_steps": 4096,
+        "timeout_secs": 31536000
       },
       {
         "name": "coder-codex",
@@ -77,8 +78,8 @@
           "scale",
           "notify"
         ],
-        "max_steps": 64,
-        "timeout_secs": 900
+        "max_steps": 4096,
+        "timeout_secs": 31536000
       },
       {
         "name": "coder-claude",
@@ -103,8 +104,8 @@
           "scale",
           "notify"
         ],
-        "max_steps": 64,
-        "timeout_secs": 900
+        "max_steps": 4096,
+        "timeout_secs": 31536000
       },
       {
         "name": "critic",
@@ -154,8 +155,8 @@
           "scale",
           "notify"
         ],
-        "max_steps": 64,
-        "timeout_secs": 1200
+        "max_steps": 4096,
+        "timeout_secs": 31536000
       },
       {
         "name": "swarm-reviewer-codex",
@@ -177,8 +178,8 @@
           "scale",
           "notify"
         ],
-        "max_steps": 32,
-        "timeout_secs": 600
+        "max_steps": 4096,
+        "timeout_secs": 31536000
       },
       {
         "name": "swarm-reviewer-claude",
@@ -200,8 +201,8 @@
           "scale",
           "notify"
         ],
-        "max_steps": 32,
-        "timeout_secs": 600
+        "max_steps": 4096,
+        "timeout_secs": 31536000
       }
     ],
     "default_subagent_hook": "builtin:pool"
