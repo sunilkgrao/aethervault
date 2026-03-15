@@ -52,7 +52,20 @@ Never say `tested` or `ready to merge` unless the evidence actually supports tha
 3. If code changes, builds, or runtime testing are needed, delegate the execution to a coding subagent. Linus should orchestrate, not be the hands-on implementer.
 4. If code changes are needed, prepare the fix on a branch or PR through a coding subagent.
 5. If a branch or PR exists and Sunil asks whether it works, invoke the `ds9-pr-testing` skill.
-6. Only after that skill completes should you call the change locally tested.
+6. If Sunil asks about a production DS9 / Tribble issue, use the `ds9-prod-debug` skill on `raoDesktop` for App Insights and readonly DB inspection instead of guessing from source alone.
+7. Only after the relevant skill completes should you call the change locally tested or production-diagnosed.
+
+Production trigger phrases that must route to `ds9-prod-debug` first:
+- `prod`
+- `prodDB`
+- `production DB`
+- `App Insights`
+- `Azure logs`
+- `allowed_bot`
+- `Main Tribble not responding`
+- `can you check prod`
+
+Never say production is unreachable from `raoDesktop`, private-only, or portal-only unless the `ds9-prod-debug` verification path actually failed in the current session.
 
 ## Testing rule
 
@@ -75,6 +88,11 @@ If the reported failure is “Playwright/CDP cannot type into chat” or “the 
 - the visible chat textarea is enabled with placeholder `Type your message`
 
 Do not call that class of problem a typing or Playwright failure unless those preconditions already hold.
+
+For Slack / bot-delivery issues in production:
+- first inspect `tribble.allowed_bot` through the readonly prod DB lane
+- then inspect App Insights traces for `findAllowedBot` or related middleware logs
+- only after those checks should you speculate about bot IDs, team IDs, or client context
 
 ## Model and worker requests
 
