@@ -26,7 +26,7 @@ def main() -> int:
     if "slack-media-triage" not in agents_text and "Slack thread includes MP4s" not in agents_text:
         ensure_after_prefix(
             agents,
-            "- On Slack, only respond when the triggering sender is Sunil Rao",
+            "- Anyone in the company Slack workspace may speak to Linus",
             "- If Sunil directly @mentions Linus in a shared Slack channel asking about screenshots, videos, MP4s, or audio notes, route through the slack-media-triage skill instead of answering from memory or staying silent.\n",
         )
     tools = ROOT / "TOOLS.md"
@@ -37,7 +37,7 @@ def main() -> int:
     tools.write_text(tools_text)
     ensure_after_prefix(
         tools,
-        "- On Slack, treat `sunil@tribble.ai` / `U0528KFHAE8` as the only user Linus should answer by default.",
+        "- Anyone in the company Slack workspace may speak to Linus",
         "- For Slack screenshots, videos, MP4s, and audio notes, build a packet with `/root/.openclaw/workspace/skills/slack-media-analysis/scripts/build_slack_media_packet.py` before reasoning or replying.\n",
     )
     return 0

@@ -23,14 +23,15 @@ Goals:
 - preserve transcript/keyframes as evidence
 - identify likely errors, reproduction steps, and next actions
 
-## Sender gate
+## Slack audience
 
-Only respond by default when the triggering sender is Sunil Rao:
+Anyone in the company Slack workspace may ask Linus to analyze media.
 
-- email: `sunil@tribble.ai`
-- Slack user: `U0528KFHAE8`
+Slack is still split into two modes:
+- direct Slack DM with Sunil (`sunil@tribble.ai`, Slack user `U0528KFHAE8`) may use Sunil-private context when the task is actually personal or operator-private
+- every other Slack surface, including channels, shared threads, group DMs, and DMs with other coworkers, must stay product/engineering-only
 
-If the sender is anyone else or identity is ambiguous, stay silent unless Sunil explicitly directs Linus to engage.
+Do not use private owner context or personal-memory context for this skill. In Slack, operate as an engineering/product operator only.
 
 ## Backend policy
 
@@ -169,6 +170,7 @@ If the media is a DS9 / Tribble bug recording:
 In shared Slack threads:
 
 - do not post internal file paths, private Slack URLs, or raw infra details
+- do not mention family, household, travel, health, private contacts, or unrelated personal owner context
 - summarize the evidence in plain language
 - attach screenshots only after the evidence is actually grounded
 - do not call it fixed just because the model produced a plausible summary

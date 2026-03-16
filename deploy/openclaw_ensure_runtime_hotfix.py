@@ -292,6 +292,171 @@ FOLLOWUP_QUEUE_BRANCH_NEW = """\tif (activeRunQueueAction === "enqueue-followup"
 \t\treturn;
 \t}"""
 
+ROUTE_REPLY_START_OLD = """async function routeReply(params) {
+\tconst { payload, channel, to, accountId, threadId, cfg, abortSignal } = params;
+\tif (shouldSuppressReasoningPayload(payload)) return { ok: true };
+\tconst normalizedChannel = normalizeMessageChannel(channel);
+\tconst resolvedAgentId = params.sessionKey ? resolveSessionAgentId({
+\t\tsessionKey: params.sessionKey,
+\t\tconfig: cfg
+\t}) : void 0;
+\tconst normalized = normalizeReplyPayload(payload, {
+\t\tresponsePrefix: params.sessionKey ? resolveEffectiveMessagesConfig(cfg, resolvedAgentId ?? resolveSessionAgentId({ config: cfg }), {
+\t\t\tchannel: normalizedChannel,
+\t\t\taccountId
+\t\t}).responsePrefix : cfg.messages?.responsePrefix === "auto" ? void 0 : cfg.messages?.responsePrefix,
+\t\tenableSlackInteractiveReplies: channel === "slack" ? isSlackInteractiveRepliesEnabled({
+\t\t\tcfg,
+\t\t\taccountId
+\t\t}) : false
+\t});
+\tif (!normalized) return { ok: true };
+"""
+
+ROUTE_REPLY_START_NEW = """const SHARED_SLACK_PRIVATE_ALLOWED_USERS = new Set(["U0528KFHAE8"]);
+const SHARED_SLACK_TEXT_REDACTIONS = [
+\t[/sunilkgrao@gmail\\.com/gi, "[redacted-private-email]"],
+\t[/sunilrao\\.inc@gmail\\.com/gi, "[redacted-private-email]"],
+\t[/angelicvendette@gmail\\.com/gi, "[redacted-private-email]"],
+\t[/rhaine\\.arongat@tribble\\.ai/gi, "[redacted-private-email]"],
+\t[/cleondelavega@guidepointglobal\\.com/gi, "[redacted-private-email]"],
+\t[/\\+1\\s*646\\s*395\\s*9405/g, "[redacted-private-phone]"],
+\t[/8239\\s+Oceanus\\s+Dr[^\\n]*/gi, "[redacted-private-address]"],
+\t[/\\bAngelic\\b/g, "[redacted-private-name]"],
+\t[/\\bEmile\\b/g, "[redacted-private-name]"],
+\t[/\\bBali\\b/g, "[redacted-private-name]"],
+\t[/\\bHachi\\b/g, "[redacted-private-name]"],
+\t[/\\bCircle Surrogacy\\b/g, "[redacted-private-context]"],
+\t[/\\bProgny\\b/g, "[redacted-private-context]"],
+\t[/\\bGuidepoint\\b/g, "[redacted-private-context]"],
+\t[/\\bBoca Raton\\b/g, "[redacted-private-location]"],
+\t[/\\bLotus Community\\b/g, "[redacted-private-location]"],
+\t[/\\bFort Lauderdale\\b/g, "[redacted-private-location]"],
+\t[/\\bFLL\\b/g, "[redacted-private-location]"],
+\t[/\\blipoma\\b/gi, "[redacted-private-health]"],
+\t[/\\braoDesktop\\b/g, "local development environment"],
+\t[/\\bclawdbot\\b/g, "live service environment"],
+\t[/\\/root\\/[^\\s)\\]}]+/g, "[redacted-path]"],
+\t[/\\/home\\/sunil\\/[^\\s)\\]}]+/g, "[redacted-path]"],
+\t[/\\/Users\\/sunilrao\\/[^\\s)\\]}]+/g, "[redacted-path]"],
+\t[/\\b[0-9a-f]{7,40}\\b/g, "[redacted-commit]"],
+\t[/\\blinus\\/[a-z0-9._\\/-]+/gi, "working branch"],
+\t[/\\bCodex\\b/g, "coding subagent"],
+\t[/\\bClaude Code\\b/g, "coding subagent"],
+\t[/\\bClaude\\b/g, "reasoning subagent"],
+\t[/\\bOpenAI\\b/g, "model provider"],
+\t[/\\bAnthropic\\b/g, "model provider"]
+];
+function normalizeSlackPrivacyTarget(to) {
+\tif (typeof to !== "string") return "";
+\tif (to.startsWith("channel:")) return to.slice(8);
+\tif (to.startsWith("user:")) return to.slice(5);
+\treturn to;
+}
+function isSharedSlackSurface(params) {
+\tif (params.channel !== "slack") return false;
+\tconst target = normalizeSlackPrivacyTarget(params.to);
+\tif (!target) return true;
+\tif (target.startsWith("D")) return false;
+\tif (target.startsWith("U")) return !SHARED_SLACK_PRIVATE_ALLOWED_USERS.has(target);
+\treturn true;
+}
+function sanitizeSharedSlackText(text) {
+\tlet scrubbed = typeof text === "string" ? text : "";
+\tfor (const [pattern, replacement] of SHARED_SLACK_TEXT_REDACTIONS) scrubbed = scrubbed.replace(pattern, replacement);
+\treturn scrubbed;
+}
+function sanitizeSharedSlackNormalizedPayload(params, normalized) {
+\tif (!isSharedSlackSurface(params) || !normalized || typeof normalized !== "object") return normalized;
+\tlet next = normalized;
+\tconst originalText = typeof next.text === "string" ? next.text : "";
+\tconst scrubbedText = sanitizeSharedSlackText(originalText);
+\tif (scrubbedText !== originalText) next = {
+\t\t...next,
+\t\ttext: scrubbedText
+\t};
+\tif (next.channelData?.slack && typeof next.channelData.slack === "object" && !Array.isArray(next.channelData.slack) && next.channelData.slack.blocks) next = {
+\t\t...next,
+\t\tchannelData: {
+\t\t\t...next.channelData,
+\t\t\tslack: {
+\t\t\t\t...next.channelData.slack,
+\t\t\t\tblocks: void 0
+\t\t\t}
+\t\t}
+\t};
+\treturn next;
+}
+async function routeReply(params) {
+\tconst { payload, channel, to, accountId, threadId, cfg, abortSignal } = params;
+\tif (shouldSuppressReasoningPayload(payload)) return { ok: true };
+\tconst normalizedChannel = normalizeMessageChannel(channel);
+\tconst resolvedAgentId = params.sessionKey ? resolveSessionAgentId({
+\t\tsessionKey: params.sessionKey,
+\t\tconfig: cfg
+\t}) : void 0;
+\tconst normalized = normalizeReplyPayload(payload, {
+\t\tresponsePrefix: params.sessionKey ? resolveEffectiveMessagesConfig(cfg, resolvedAgentId ?? resolveSessionAgentId({ config: cfg }), {
+\t\t\tchannel: normalizedChannel,
+\t\t\taccountId
+\t\t}).responsePrefix : cfg.messages?.responsePrefix === "auto" ? void 0 : cfg.messages?.responsePrefix,
+\t\tenableSlackInteractiveReplies: channel === "slack" ? isSlackInteractiveRepliesEnabled({
+\t\t\tcfg,
+\t\t\taccountId
+\t\t}) : false
+\t});
+\tconst routedNormalized = sanitizeSharedSlackNormalizedPayload(params, normalized);
+\tif (!routedNormalized) return { ok: true };
+"""
+
+ROUTE_REPLY_USE_OLD = """\tlet text = normalized.text ?? "";
+\tlet mediaUrls = (normalized.mediaUrls?.filter(Boolean) ?? []).length ? normalized.mediaUrls?.filter(Boolean) : normalized.mediaUrl ? [normalized.mediaUrl] : [];
+\tconst replyToId = normalized.replyToId;
+\tlet hasSlackBlocks = false;
+\tif (channel === "slack" && normalized.channelData?.slack && typeof normalized.channelData.slack === "object" && !Array.isArray(normalized.channelData.slack)) try {
+\t\thasSlackBlocks = Boolean(parseSlackBlocksInput(normalized.channelData.slack.blocks)?.length);
+"""
+
+ROUTE_REPLY_USE_NEW = """\tlet text = routedNormalized.text ?? "";
+\tlet mediaUrls = (routedNormalized.mediaUrls?.filter(Boolean) ?? []).length ? routedNormalized.mediaUrls?.filter(Boolean) : routedNormalized.mediaUrl ? [routedNormalized.mediaUrl] : [];
+\tconst replyToId = routedNormalized.replyToId;
+\tlet hasSlackBlocks = false;
+\tif (channel === "slack" && routedNormalized.channelData?.slack && typeof routedNormalized.channelData.slack === "object" && !Array.isArray(routedNormalized.channelData.slack)) try {
+\t\thasSlackBlocks = Boolean(parseSlackBlocksInput(routedNormalized.channelData.slack.blocks)?.length);
+"""
+
+ROUTE_REPLY_PAYLOADS_OLD = """\t\t\t\tpayloads: [normalized],
+"""
+
+ROUTE_REPLY_PAYLOADS_NEW = """\t\t\t\tpayloads: [routedNormalized],
+"""
+
+ROUTE_REPLY_START_RE = re.compile(
+    r"""async function routeReply\(params\) \{\n"""
+    r"""\tconst \{ payload, channel, to, accountId, threadId, cfg, abortSignal \} = params;\n"""
+    r"""\tif \(shouldSuppressReasoningPayload\(payload\)\) return \{ ok: true \};\n"""
+    r"""\tconst normalizedChannel = normalizeMessageChannel\(channel\);\n"""
+    r"""\tconst resolvedAgentId = params\.sessionKey \? resolveSessionAgentId\(\{\n"""
+    r"""\t\tsessionKey: params\.sessionKey,\n"""
+    r"""\t\tconfig: cfg\n"""
+    r"""\t\}\) : void 0;\n"""
+    r"""\tconst normalized = normalizeReplyPayload\(payload, \{\n"""
+    r"""(?:.|\n)*?"""
+    r"""\t\}\);\n"""
+    r"""\tif \(!normalized\) return \{ ok: true \};\n"""
+)
+
+ROUTE_REPLY_USE_RE = re.compile(
+    r"""\tlet text = normalized\.text \?\? "";\n"""
+    r"""\tlet mediaUrls = \(normalized\.mediaUrls\?\.filter\(Boolean\) \?\? \[\]\)\.length \? normalized\.mediaUrls\?\.filter\(Boolean\) : normalized\.mediaUrl \? \[normalized\.mediaUrl\] : \[\];\n"""
+    r"""\tconst replyToId = normalized\.replyToId;\n"""
+    r"""\tlet hasSlackBlocks = false;\n"""
+    r"""\tif \(channel === "slack" && normalized\.channelData\?\.slack && typeof normalized\.channelData\.slack === "object" && !Array\.isArray\(normalized\.channelData\.slack\)\) try \{\n"""
+    r"""\t\thasSlackBlocks = Boolean\(parseSlackBlocksInput\(normalized\.channelData\.slack\.blocks\)\?\.length\);\n"""
+)
+
+ROUTE_REPLY_PAYLOADS_RE = re.compile(r"""\t\t\t\tpayloads: \[normalized\],\n""")
+
 
 def patch_file(path: Path) -> bool:
     original = path.read_text()
@@ -306,6 +471,12 @@ def patch_file(path: Path) -> bool:
     updated = SLACK_MESSAGE_POLLER_RE.sub(SLACK_MESSAGE_POLLER_NEW, updated, count=1)
     updated = updated.replace(FOLLOWUP_QUEUE_ACK_ANCHOR, FOLLOWUP_QUEUE_ACK_INSERT)
     updated = updated.replace(FOLLOWUP_QUEUE_BRANCH_OLD, FOLLOWUP_QUEUE_BRANCH_NEW)
+    updated = updated.replace(ROUTE_REPLY_START_OLD, ROUTE_REPLY_START_NEW)
+    updated = updated.replace(ROUTE_REPLY_USE_OLD, ROUTE_REPLY_USE_NEW)
+    updated = updated.replace(ROUTE_REPLY_PAYLOADS_OLD, ROUTE_REPLY_PAYLOADS_NEW)
+    updated = ROUTE_REPLY_START_RE.sub(lambda _: ROUTE_REPLY_START_NEW, updated, count=1)
+    updated = ROUTE_REPLY_USE_RE.sub(lambda _: ROUTE_REPLY_USE_NEW, updated, count=1)
+    updated = ROUTE_REPLY_PAYLOADS_RE.sub(lambda _: ROUTE_REPLY_PAYLOADS_NEW, updated, count=1)
     if updated == original:
         return False
     path.write_text(updated)

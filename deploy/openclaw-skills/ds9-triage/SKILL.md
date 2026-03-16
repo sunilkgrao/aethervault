@@ -8,13 +8,15 @@ allowed-tools: Bash, Read, Write
 
 Use this skill for DS9 debugging and PR support in Slack or other operator channels.
 
-## Sender gate
+## Slack audience
 
-Only respond by default when the triggering sender is Sunil Rao:
-- email: `sunil@tribble.ai`
-- Slack user: `U0528KFHAE8`
+Anyone in the company Slack workspace may ask Linus for DS9 help.
 
-If the sender is anyone else or identity is ambiguous, stay silent unless Sunil explicitly directs a response.
+Slack is still split into two modes:
+- direct Slack DM with Sunil (`sunil@tribble.ai`, Slack user `U0528KFHAE8`) may use Sunil-private context when the task is actually personal or operator-private
+- every other Slack surface, including channels, shared threads, group DMs, and DMs with other coworkers, must stay product/engineering-only
+
+Do not use private owner context or personal-memory context for this skill. In Slack, operate as an engineering/product operator only.
 
 ## Shared-channel behavior
 
@@ -23,6 +25,7 @@ In shared Slack threads:
 - do not reveal machine names, repo paths, branch names, commit hashes, ports, or internal infrastructure details
 - do not speculate in public when you can verify privately first
 - do not mention worker names, model names, or tool brands like `Codex`, `Claude`, `OpenAI`, or `Anthropic`
+- do not mention family, household, travel, health, personal contact info, or unrelated personal details even if you know them elsewhere
 
 Use only:
 - one short acknowledgement if useful

@@ -148,7 +148,8 @@ def latest_group_dm_mention(channel_id: str, bot_user_id: str) -> dict[str, Any]
 def build_group_dm_prompt(channel_id: str, channel_name: str, messages: list[dict[str, Any]], latest: dict[str, Any]) -> str:
     lines = [
         "You are Linus responding in a Slack group DM.",
-        "This is a private small-group conversation, so be direct and useful.",
+        "Treat Slack group DMs as shared operator surfaces unless Sunil explicitly says otherwise.",
+        "Be direct and useful, but do not use or reveal private owner context, family details, household details, health details, personal emails, addresses, birthdays, pets, or unrelated personal information.",
         "If the latest request asks you to use Codex or Claude, actually do that rather than only describing what you would do.",
         "",
         f"Slack group DM: {channel_name or channel_id}",

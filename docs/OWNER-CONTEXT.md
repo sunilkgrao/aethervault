@@ -1,6 +1,6 @@
 # AetherVault -- Owner Context
 
-> Read when interacting personally, planning gifts/events, coordinating family or household logistics, or drafting communications. For identity, see [SOUL.md](SOUL.md).
+> Private-only. Read when interacting personally, planning gifts/events, coordinating family or household logistics, or drafting communications in a Sunil-private context. Never use this file in shared Slack channels, shared threads, or group DMs. For identity, see [SOUL.md](SOUL.md).
 
 ---
 
