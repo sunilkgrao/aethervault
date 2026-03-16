@@ -215,6 +215,83 @@ SLACK_MESSAGE_POLLER_NEW = """\\1\tconst threadMentionPollSeen = new Map();
 \tthreadMentionPoll().catch(() => void 0);
 }"""
 
+FOLLOWUP_QUEUE_ACK_ANCHOR = """function resolveActiveRunQueueAction(params) {
+\tif (!params.isActive) return "run-now";
+\tif (params.isHeartbeat) return "drop";
+\tif (params.shouldFollowup || params.queueMode === "steer") return "enqueue-followup";
+\treturn "run-now";
+}"""
+
+FOLLOWUP_QUEUE_ACK_INSERT = """const RECENT_BUSY_QUEUE_ACKS = resolveGlobalSingleton(Symbol.for("openclaw.recentBusyQueueAcks"), () => createDedupeCache({
+\tttlMs: 45 * 1e3,
+\tmaxSize: 1e4
+}));
+async function maybeSendQueuedBusyAck(params) {
+\tconst channel = resolveOriginMessageProvider({
+\t\toriginatingChannel: params.followupRun.originatingChannel,
+\t\tprovider: params.sessionCtx.Surface ?? params.sessionCtx.Provider
+\t});
+\tconst to = resolveOriginMessageTo({
+\t\toriginatingTo: params.followupRun.originatingTo
+\t});
+\tconst accountId = resolveOriginAccountId({
+\t\toriginatingAccountId: params.followupRun.originatingAccountId,
+\t\taccountId: params.followupRun.run.agentAccountId
+\t});
+\tconst threadId = params.followupRun.originatingThreadId;
+\tconst chatType = typeof params.sessionCtx.ChatType === "string" ? params.sessionCtx.ChatType.toLowerCase() : "";
+\tconst isDirectish = chatType === "direct" || chatType === "dm" || chatType === "private" || channel === "telegram" || typeof to === "string" && to.startsWith("user:");
+\tif (!channel || !to || !isDirectish) return;
+\tconst ackKey = JSON.stringify([
+\t\tparams.queueKey ?? params.sessionKey ?? "",
+\t\tchannel,
+\t\tto,
+\t\taccountId ?? "",
+\t\tthreadId == null ? "" : String(threadId)
+\t]);
+\tif (RECENT_BUSY_QUEUE_ACKS.check(ackKey)) return;
+\tawait routeReply({
+\t\tpayload: {
+\t\t\ttext: "Still working on the current task. I queued your follow-up and will answer it next."
+\t\t},
+\t\tchannel,
+\t\tto,
+\t\taccountId,
+\t\tthreadId,
+\t\tcfg: params.cfg,
+\t\tsessionKey: params.sessionKey,
+\t\tmirror: false,
+\t\tisGroup: false
+\t});
+}
+function resolveActiveRunQueueAction(params) {
+\tif (!params.isActive) return "run-now";
+\tif (params.isHeartbeat) return "drop";
+\tif (params.shouldFollowup || params.queueMode === "steer") return "enqueue-followup";
+\treturn "run-now";
+}"""
+
+FOLLOWUP_QUEUE_BRANCH_OLD = """\tif (activeRunQueueAction === "enqueue-followup") {
+\t\tenqueueFollowupRun(queueKey, followupRun, resolvedQueue);
+\t\tawait touchActiveSessionEntry();
+\t\ttyping.cleanup();
+\t\treturn;
+\t}"""
+
+FOLLOWUP_QUEUE_BRANCH_NEW = """\tif (activeRunQueueAction === "enqueue-followup") {
+\t\tconst enqueued = enqueueFollowupRun(queueKey, followupRun, resolvedQueue);
+\t\tif (enqueued) await maybeSendQueuedBusyAck({
+\t\t\tqueueKey,
+\t\t\tfollowupRun,
+\t\t\tsessionCtx,
+\t\t\tcfg,
+\t\t\tsessionKey
+\t\t});
+\t\tawait touchActiveSessionEntry();
+\t\ttyping.cleanup();
+\t\treturn;
+\t}"""
+
 
 def patch_file(path: Path) -> bool:
     original = path.read_text()
@@ -227,6 +304,8 @@ def patch_file(path: Path) -> bool:
     updated = updated.replace(SLACK_APP_MENTION_SKIP_OLD, SLACK_APP_MENTION_SKIP_NEW)
     updated = SLACK_MESSAGE_HANDLER_RE.sub(SLACK_MESSAGE_HANDLER_NEW, updated, count=1)
     updated = SLACK_MESSAGE_POLLER_RE.sub(SLACK_MESSAGE_POLLER_NEW, updated, count=1)
+    updated = updated.replace(FOLLOWUP_QUEUE_ACK_ANCHOR, FOLLOWUP_QUEUE_ACK_INSERT)
+    updated = updated.replace(FOLLOWUP_QUEUE_BRANCH_OLD, FOLLOWUP_QUEUE_BRANCH_NEW)
     if updated == original:
         return False
     path.write_text(updated)
