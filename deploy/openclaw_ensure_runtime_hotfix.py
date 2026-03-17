@@ -200,8 +200,17 @@ SLACK_MESSAGE_POLLER_NEW = """\\1\t/* openclaw-thread-mention-poll:start */
 \t\t\t\t\t\tlatest: latestReplyTs,
 \t\t\t\t\t\toldest: latestReplyTs,
 \t\t\t\t\t\tinclusive: true,
-\t\t\t\t\t\tlimit: 1
+\t\t\t\t\t\tlimit: 20
 \t\t\t\t\t});
+\t\t\t\t\tconst latestReplyTsNumber = Number(latestReplyTs);
+\t\t\t\t\tconst botAlreadyReplied = (replies.messages ?? []).some((entry) => {
+\t\t\t\t\t\tconst entryTs = typeof entry?.ts === "string" ? Number(entry.ts) : 0;
+\t\t\t\t\t\treturn entryTs > latestReplyTsNumber && (entry?.user === botUserId || entry?.bot_id);
+\t\t\t\t\t});
+\t\t\t\t\tif (botAlreadyReplied) {
+\t\t\t\t\t\tif (shouldLogVerbose()) logVerbose(`slack thread poll: skipping channel=${channelId} thread_ts=${rootTs} reply_ts=${latestReplyTs} because bot already replied`);
+\t\t\t\t\t\tcontinue;
+\t\t\t\t\t}
 \t\t\t\t\tconst reply = replies.messages?.find((entry) => entry.ts === latestReplyTs) ?? replies.messages?.at(-1);
 \t\t\t\t\tif (!reply || typeof reply !== "object") continue;
 \t\t\t\t\tif (reply.user === botUserId || reply.bot_id) continue;
