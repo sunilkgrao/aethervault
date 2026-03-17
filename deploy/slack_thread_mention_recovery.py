@@ -12,6 +12,7 @@ from typing import Any
 
 
 MASTER_ENV = Path("/root/.secrets/master.env")
+OPENCLAW_DIST = Path("/usr/lib/node_modules/openclaw/dist")
 SESSIONS_JSON = Path("/root/.openclaw/agents/main/sessions/sessions.json")
 STATE_PATH = Path("/root/.openclaw/slack-thread-mention-recovery-state.json")
 MEDIA_PACKET_SCRIPT = Path(
@@ -20,9 +21,9 @@ MEDIA_PACKET_SCRIPT = Path(
 MEDIA_PACKET_DIR = Path("/tmp/openclaw-slack-thread-recovery")
 POLL_SECONDS = 15
 RECENT_WINDOW_SECS = 3600
+RECOVERY_DELAY_SECS = 20
 HISTORY_LIMIT = 30
 MAX_THREAD_MESSAGES = 12
-MAX_GROUP_MESSAGES = 12
 MAX_PACKET_SUMMARY_CHARS = 4000
 
 
@@ -124,29 +125,37 @@ def discover_channel_ids() -> list[str]:
     return sorted(channels)
 
 
-def discover_mpim_ids() -> list[str]:
-    ids: set[str] = set()
-    cursor = ""
-    while True:
-        params = {
-            "types": "mpim",
-            "exclude_archived": "true",
-            "limit": "200",
-        }
-        if cursor:
-            params["cursor"] = cursor
-        listed = slack_api("conversations.list", params)
-        for convo in listed.get("channels", []):
-            if convo.get("is_mpim") and convo.get("is_member") and convo.get("id"):
-                ids.add(str(convo["id"]))
-        cursor = str(listed.get("response_metadata", {}).get("next_cursor") or "")
-        if not cursor:
-            break
-    return sorted(ids)
-
-
 def auth_test() -> dict[str, Any]:
     return slack_api("auth.test", {})
+
+
+def gateway_has_builtin_thread_poll() -> bool:
+    if not OPENCLAW_DIST.exists():
+        return False
+    for path in OPENCLAW_DIST.glob("*.js"):
+        try:
+            text = path.read_text(errors="ignore")
+        except Exception:
+            continue
+        if "const threadMentionPoll = async () => {" in text or "slack thread mention poll armed" in text:
+            return True
+    return False
+
+
+def is_bot_authored(message: dict[str, Any], bot_user_id: str) -> bool:
+    return bool(message.get("bot_id")) or message.get("user") == bot_user_id
+
+
+def has_bot_reply_after(messages: list[dict[str, Any]], after_ts: str, bot_user_id: str) -> bool:
+    after = ts_value(after_ts)
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if not is_bot_authored(message, bot_user_id):
+            continue
+        if ts_value(str(message.get("ts") or "")) > after:
+            return True
+    return False
 
 
 def recent_thread_candidates(channel_id: str, bot_user_id: str) -> list[dict[str, Any]]:
@@ -160,6 +169,8 @@ def recent_thread_candidates(channel_id: str, bot_user_id: str) -> list[dict[str
             continue
         try:
             if float(latest_reply) < now - RECENT_WINDOW_SECS:
+                continue
+            if float(latest_reply) > now - RECOVERY_DELAY_SECS:
                 continue
         except Exception:
             continue
@@ -185,7 +196,7 @@ def recent_thread_candidates(channel_id: str, bot_user_id: str) -> list[dict[str
             reply = replies["messages"][-1]
         if not isinstance(reply, dict):
             continue
-        if reply.get("user") == bot_user_id or reply.get("bot_id"):
+        if is_bot_authored(reply, bot_user_id):
             continue
         text = str(reply.get("text") or "")
         if f"<@{bot_user_id}>" not in text:
@@ -237,10 +248,13 @@ def maybe_build_media_summary(channel_id: str, thread_ts: str) -> str:
 def build_prompt(channel_id: str, channel_name: str, root: dict[str, Any], reply: dict[str, Any], thread: list[dict[str, Any]], media_summary: str) -> str:
     lines = [
         "You are Linus responding in an existing Slack thread.",
+        "Reply only in this same Slack thread, in this same Slack channel. Never move the conversation to another channel.",
         "Keep the reply concise and professional for a shared engineering channel.",
         "Treat shared Slack as an engineering/product surface only.",
         "Do not use or reveal private owner context, family details, household details, health details, personal emails, addresses, birthdays, pets, or unrelated personal information.",
         "If the latest user request asks you to investigate with Codex or Claude, do that rather than just describing what you would do.",
+        "Do not send stream-of-consciousness updates, exploration traces, or repeated status pings like 'let me check' or 'now let me try'.",
+        "Use at most one concise status or blocker update, or one concise final answer. Prefer the final answer when possible.",
         "",
         f"Slack channel: #{channel_name or channel_id}",
         f"Thread root ts: {root.get('ts', '')}",
@@ -294,75 +308,13 @@ def run_agent(prompt: str) -> str:
     texts = [str(item.get("text") or "").strip() for item in payloads if isinstance(item, dict) and str(item.get("text") or "").strip()]
     if not texts:
         raise RuntimeError("agent returned no text payload")
-    return "\n\n".join(texts)
+    return texts[-1]
 
 
-def process_candidate(channel_id: str, channel_name: str, root: dict[str, Any], reply: dict[str, Any]) -> str:
+def process_candidate(channel_id: str, channel_name: str, root: dict[str, Any], reply: dict[str, Any], thread: list[dict[str, Any]]) -> str:
     thread_ts = str(root["ts"])
-    thread = thread_messages(channel_id, thread_ts)
     media_summary = maybe_build_media_summary(channel_id, thread_ts)
     prompt = build_prompt(channel_id, channel_name, root, reply, thread, media_summary)
-    return run_agent(prompt)
-
-
-def recent_group_dm_mentions(channel_id: str, bot_user_id: str) -> list[dict[str, Any]]:
-    history = slack_api("conversations.history", {"channel": channel_id, "limit": str(HISTORY_LIMIT)})
-    now = time.time()
-    matches: list[dict[str, Any]] = []
-    for message in history.get("messages", []):
-        if not isinstance(message, dict):
-            continue
-        if message.get("user") == bot_user_id or message.get("bot_id"):
-            continue
-        ts = str(message.get("ts") or "")
-        if not ts:
-            continue
-        try:
-            if float(ts) < now - RECENT_WINDOW_SECS:
-                continue
-        except Exception:
-            continue
-        text = str(message.get("text") or "")
-        if f"<@{bot_user_id}>" not in text:
-            continue
-        matches.append(message)
-        break
-    return matches
-
-
-def build_group_dm_prompt(channel_id: str, channel_name: str, messages: list[dict[str, Any]], latest: dict[str, Any]) -> str:
-    lines = [
-        "You are Linus responding in a Slack group DM.",
-        "Treat Slack group DMs as shared operator surfaces unless Sunil explicitly says otherwise.",
-        "Be direct and useful, but do not use or reveal private owner context, family details, household details, health details, personal emails, addresses, birthdays, pets, or unrelated personal information.",
-        "If the latest request asks you to use Codex or Claude, actually do that rather than only describing what you would do.",
-        "",
-        f"Slack group DM: {channel_name or channel_id}",
-        f"Latest message ts: {latest.get('ts', '')}",
-        "",
-        "Recent conversation:",
-    ]
-    for item in messages[:MAX_GROUP_MESSAGES]:
-        sender = item.get("user") or item.get("bot_id") or "unknown"
-        text = str(item.get("text") or "").strip().replace("\n", " ")
-        if text:
-            lines.append(f"- {sender}: {text[:500]}")
-    lines.extend(
-        [
-            "",
-            "Latest user request:",
-            str(latest.get("text") or "").strip(),
-            "",
-            "Reply with exactly the Slack message Linus should send next.",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def process_group_dm_candidate(channel_id: str, channel_name: str, latest: dict[str, Any]) -> str:
-    history = slack_api("conversations.history", {"channel": channel_id, "limit": str(HISTORY_LIMIT)})
-    messages = list(reversed(history.get("messages", [])))
-    prompt = build_group_dm_prompt(channel_id, channel_name, messages, latest)
     return run_agent(prompt)
 
 
@@ -374,28 +326,15 @@ def main() -> int:
         raise SystemExit("Could not resolve Slack bot user id")
     log(f"thread-recovery: bot_user_id={bot_user_id}")
     while True:
+        if gateway_has_builtin_thread_poll():
+            log("thread-recovery: builtin gateway thread poll detected; worker idle")
+            time.sleep(max(POLL_SECONDS, 300))
+            continue
         state = load_state()
         handled = state.setdefault("handled", {})
         channel_ids = discover_channel_ids()
         if channel_ids:
             log(f"thread-recovery: scanning {len(channel_ids)} channels")
-        for channel_id in discover_mpim_ids():
-            try:
-                info = slack_api("conversations.info", {"channel": channel_id})
-                channel_name = str(info.get("channel", {}).get("name") or channel_id)
-                for message in recent_group_dm_mentions(channel_id, bot_user_id):
-                    message_ts = str(message["ts"])
-                    state_key = f"mpim:{channel_id}"
-                    if ts_value(handled.get(state_key)) >= ts_value(message_ts):
-                        continue
-                    log(f"thread-recovery: handling group dm mention channel={channel_name} ts={message_ts}")
-                    response = process_group_dm_candidate(channel_id, channel_name, message)
-                    sent_ts = slack_post_message(channel_id, response)
-                    handled[state_key] = message_ts
-                    save_state(state)
-                    log(f"thread-recovery: posted group dm reply ts={sent_ts}")
-            except Exception as err:
-                log(f"thread-recovery: group dm {channel_id} failed: {err}")
         for channel_id in channel_ids:
             try:
                 info = slack_api("conversations.info", {"channel": channel_id})
@@ -407,8 +346,16 @@ def main() -> int:
                     state_key = f"{channel_id}:{root['ts']}"
                     if handled.get(state_key) == reply_ts:
                         continue
+                    thread = thread_messages(channel_id, str(root["ts"]))
+                    if has_bot_reply_after(thread, reply_ts, bot_user_id):
+                        handled[state_key] = reply_ts
+                        save_state(state)
+                        log(
+                            f"thread-recovery: skipping channel={channel_name} thread={root['ts']} ts={reply_ts} because bot already replied"
+                        )
+                        continue
                     log(f"thread-recovery: handling missed mention channel={channel_name} thread={root['ts']} ts={reply_ts}")
-                    response = process_candidate(channel_id, channel_name, root, reply)
+                    response = process_candidate(channel_id, channel_name, root, reply, thread)
                     sent_ts = slack_post_message(channel_id, response, thread_ts=str(root["ts"]))
                     handled[state_key] = reply_ts
                     save_state(state)

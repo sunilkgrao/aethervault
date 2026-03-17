@@ -31,8 +31,8 @@ ensure_after(
 
 ensure_after(
     "/root/.openclaw/workspace/skills/ds9-triage/SKILL.md",
-    "1. **Detect**: New message in #engineering-triage channel\n",
-    "   - Anyone in the company Slack workspace may trigger DS9 triage. Keep shared Slack replies engineering-only.\n",
+    "1. **Detect**: New shared Slack message or thread request about DS9\n",
+    "   - Anyone in the company Slack workspace may trigger DS9 triage. Keep shared Slack replies engineering-only and reply in the originating channel/thread.\n",
 )
 
 ensure_after(

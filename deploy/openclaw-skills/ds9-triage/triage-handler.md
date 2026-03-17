@@ -17,8 +17,9 @@ All other Slack surfaces must stay product/engineering-only.
 4. Delegate real implementation, build/test execution, and local runtime validation to a coding subagent.
 5. If the thread includes a recording, video, audio note, or other media evidence, route through `slack-media-analysis` first.
 6. For local validation, route through `ds9-pr-testing`.
-7. For production DS9 / Tribble debugging, route through `ds9-prod-debug` before making any claim about DB reachability, private networking, portal access, or Bastion requirements.
-8. Never deploy DS9 / Tribble code directly to production from Linus. Production code changes must stop at diagnosis plus PR preparation.
+7. Before opening or updating a PR, route through `jira-eng-board` to search for a relevant ENG ticket and create one if needed.
+8. For production DS9 / Tribble debugging, route through `ds9-prod-debug` before making any claim about DB reachability, private networking, portal access, or Bastion requirements.
+9. Never deploy DS9 / Tribble code directly to production from Linus. Production code changes must stop at diagnosis plus PR preparation.
 
 ## Production rule
 
@@ -41,6 +42,9 @@ Do not use production debugging as justification for a direct code hotfix. Produ
 In shared Slack threads:
 - do not narrate every step
 - do not mention machine names, repo paths, branch names, commit hashes, model names, worker names, tool brands, ports, or infrastructure topology
+- always reply in the same originating channel/thread
+- do not post internal exploration traces or repeated dead ends
+- do not state a root cause as confirmed until it is backed by direct evidence
 - use at most one short acknowledgement, one real blocker update, and one final evidence-backed summary
 
 Use precise labels:
@@ -52,3 +56,25 @@ Use precise labels:
 - `production-diagnosed`
 
 Never say `tested` or `ready` unless the evidence supports it.
+
+## Investigation sequence
+
+Unless Sunil explicitly changes the order:
+1. reproduce locally
+2. capture screenshot/evidence of the failure
+3. isolate the cause
+4. validate the fix locally
+5. capture screenshot/evidence of the fixed state
+6. then prepare or update the PR
+
+If a PR is needed, it must use the linked ENG Jira key in the title, for example `ENG-123 Fix multi-column answer editing`.
+
+If Sunil gives a more explicit sequence, obey it exactly and treat it as the new default for similar DS9 debugging until he overrides it.
+
+If the bug depends on customer/project data shape:
+1. prefer exact local data if already available
+2. else clone the exact shape locally from approved readonly production data
+3. else ask for the smallest missing artifact that collapses uncertainty fastest
+4. only then use a synthetic/mock reproduction
+
+Do not thrash through repeated local pivots or public theory revisions when the real blocker is missing data shape or missing evidence.

@@ -60,6 +60,19 @@ Still require explicit direction for:
 - changing repo settings, secrets, or protections
 - any production release action
 
+## Jira linkage rule
+
+Every `tribble-desktop` PR must be linked to an ENG Jira issue.
+
+Before opening or updating a PR:
+1. search ENG Jira for an existing relevant ticket
+2. if one exists, use it
+3. if no relevant ticket exists, create one through the `jira-eng-board` skill before opening the PR
+4. title the PR with the Jira key first, for example `ENG-123 Fix desktop updater crash`
+5. include the Jira key or issue link in the PR body so the ticket and PR stay tied together
+
+Do not open a `tribble-desktop` PR without Jira linkage unless Sunil explicitly overrides that rule.
+
 ## Triage flow
 
 1. Read the thread carefully and restate the problem internally.
@@ -68,7 +81,8 @@ Still require explicit direction for:
 4. If code changes, builds, or runtime testing are needed, delegate the execution to a coding subagent. Linus should orchestrate, not be the hands-on implementer.
 5. If the Slack thread includes a bug video, screen recording, audio note, or other media evidence, run `slack-media-analysis` first so the diagnosis uses the actual artifact rather than thread text alone.
 6. If code changes are needed, prepare the fix on a branch or PR through a coding subagent in that thread-specific worktree.
-7. Only after local repro and validation should you call the issue locally tested.
+7. Before opening or updating the PR, route through `jira-eng-board` to search for the relevant ENG ticket and create one if needed.
+8. Only after local repro and validation should you call the issue locally tested.
 
 ## Branch and worktree policy
 

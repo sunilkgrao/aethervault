@@ -9,6 +9,14 @@ VERIFY_CHAT_READY="${VERIFY_CHAT_READY:-0}"
 TARGET_DS9="${TARGET_DS9:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+if [[ -n "$TARGET_DS9" && -x "$SCRIPT_DIR/preflight_local_infra.sh" ]]; then
+  echo "== local infra preflight =="
+  if ! ALLOW_FOREIGN_STACK="${ALLOW_FOREIGN_STACK:-0}" bash "$SCRIPT_DIR/preflight_local_infra.sh" "$TARGET_DS9"; then
+    missing=1
+  fi
+  echo
+fi
+
 echo "== listeners =="
 lsof_args=()
 for port in $REQUIRED_PORTS; do

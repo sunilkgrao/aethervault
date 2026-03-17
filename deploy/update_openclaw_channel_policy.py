@@ -99,7 +99,7 @@ def main() -> int:
     skill_text = replace_once(
         skill_text,
         "## Response Format\n\n"
-        "Post solution as a Slack thread reply:\n\n"
+        "Post solution as a Slack thread reply in the same channel/thread where the request started:\n\n"
         "```\n"
         "🔧 **Triage Analysis**\n\n"
         "**Issue**: {summary}\n\n"
@@ -147,7 +147,7 @@ def main() -> int:
         "message(\n"
         "  action=\"send\",\n"
         "  channel=\"slack\",\n"
-        "  target=\"#engineering-triage\",\n"
+        "  target=<originating channel>,\n"
         "  threadId=thread_ts,\n"
         "  message=formatted_solution\n"
         ")\n"
@@ -163,7 +163,7 @@ def main() -> int:
         "message(\n"
         "  action=\"send\",\n"
         "  channel=\"slack\",\n"
-        "  target=\"#engineering-triage\",\n"
+        "  target=<originating channel>,\n"
         "  threadId=thread_ts,\n"
         "  message=formatted_solution\n"
         ")\n"

@@ -10,6 +10,19 @@ Use this skill whenever Linus needs to test DS9 code for real instead of stoppin
 
 If you have not brought up the local stack, opened the route in a browser, and inspected the resulting artifacts, do **not** say the branch or PR was tested. Say it was reviewed or prepared locally.
 
+## Instruction precedence
+
+If Sunil gives a more explicit debugging or testing order, follow it exactly and treat it as the durable default for similar issue work unless he explicitly overrides it later.
+
+Example durable instruction:
+1. reproduce the error locally
+2. show screenshots of the broken state
+3. test the fix locally
+4. show screenshots of the fixed state
+5. only then cut or update the PR
+
+Do not compress, reorder, or skip those steps just because a code read points to a likely cause.
+
 ## Thread-isolated worktrees
 
 Treat each new Slack issue thread as its own isolated git worktree.
@@ -95,6 +108,20 @@ At minimum, these usually matter:
 - other `positronic-*/local.settings*.json` files touched by the change
 - `/scripts/.env`
 
+Immediately after bootstrap, run the local infra preflight:
+
+```bash
+bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/preflight_local_infra.sh "$TARGET_DS9"
+```
+
+This catches the exact failure modes that waste time during local DS9 repro:
+- a foreign DS9 checkout already owns the canonical ports
+- WSL/Linux inotify limits are too low and Vite/lcars will die with `ENOSPC`
+- installs are missing in the target worktree
+- the target bug needs spreadsheet/E2E workbook data that the local DB does not actually contain
+
+Do not start guessing about the app until this preflight is clean or the blocker is explicitly acknowledged.
+
 ## Decide what to run
 
 Start from the diff:
@@ -179,6 +206,47 @@ bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/verify_local_ds9_db.s
 ```
 
 If this check fails, do not claim the local stack is ready. Fix the DB first.
+
+For spreadsheet/E2E questionnaire bugs, the minimum useful local project shape is stricter than “a project with content_details”:
+- `rfx` / `rfx_content`
+- question/content rows
+- `e2e_answer_entry`
+- `e2e_workbook`
+- `e2e_sheet`
+- whatever view-setting/client-setting data makes the UI choose the spreadsheet/questionnaire path you are actually testing
+
+If the local project has answer text but no workbook/sheet data, a blank spreadsheet view is expected. That is a data-shape blocker, not proof of a frontend regression.
+
+Do not mutate arbitrary project fields like status, `rfpId`, or view flags just to force the UI through a route unless you already know that route matches the customer’s real data shape.
+
+## Customer-data reproduction hierarchy
+
+For customer-specific bugs, use this order:
+
+1. reproduce against an existing local project that already has the right data shape
+2. if that does not exist, clone the exact project/data shape locally from approved readonly production data
+3. if readonly data extraction is blocked, ask for the smallest missing artifact that will collapse uncertainty fastest, usually:
+   - a short screen recording
+   - the exact source file/fixture
+   - the missing readonly access
+4. only after that should you build a synthetic/mock reproduction
+
+Be explicit about which level you achieved:
+- `exact customer data cloned locally`
+- `realistic synthetic fixture`
+- `recording-guided diagnosis`
+
+Do not hand-build partial workbook/questionnaire structures for a long time if an exact readonly clone or a recording would answer the question faster.
+
+After two failed local repro pivots without materially new evidence, stop pivoting and choose one of:
+- exact readonly production-data clone
+- request the missing artifact
+- report a crisp blocker
+
+Examples of failed pivots that should trigger this stop rule:
+- switching repeatedly between web app, extension, minimal harness, and direct API tests without reproducing the actual UI failure
+- trying to “fix” local data shape by manually toggling status or `rfpId`
+- restarting Vite/lcars repeatedly while `ENOSPC` or foreign port ownership is still unresolved
 
 ## Network access to Azure-backed local services
 
@@ -413,6 +481,8 @@ then the PR was **not** fully E2E tested yet. Say `build passed`, `typecheck pas
 
 If the local environment does not contain the original customer documents, create a realistic synthetic document and prove the exact behavior against that mock. Be explicit that the original customer data was not reproduced locally.
 
+For customer-project UI bugs, prefer an exact readonly production-data clone over a synthetic fixture when the bug appears data-shape dependent.
+
 ## Testing order
 
 Always use this sequence:
@@ -423,6 +493,48 @@ Always use this sequence:
 5. Capture screenshots, downloads, browser console errors, page exceptions, and relevant service logs.
 6. Inspect exported files or downloads.
 7. Compare UI output to API or DB state when persistence matters.
+
+When Sunil explicitly asks for repro-first proof, tighten the sequence further:
+1. reproduce the broken state locally
+2. capture screenshots of the broken state
+3. apply or validate the fix locally
+4. capture screenshots of the fixed state
+5. only then say the PR should be cut or updated
+
+Do not substitute:
+- API-only validation for UI reproduction
+- code-read theory for screenshots
+- synthetic harness proof for the actual product route
+
+Those can narrow the search, but they do not satisfy the repro-first sequence by themselves.
+
+## Known local-infra traps
+
+Treat these as common DS9 traps, not novel mysteries:
+
+1. Canonical ports already occupied by the source checkout.
+   - Branch-specific validation is not isolated until you stop the foreign stack or intentionally reuse it.
+
+2. WSL/Linux inotify exhaustion.
+   - Symptoms: Vite or lcars starts, then dies or restarts with `ENOSPC`.
+   - Fix the limits before continuing.
+
+3. Wrong UI origin.
+   - Authenticated local DS9 testing must stay on `http://localhost:5173`.
+   - Do not drift to `5174`, `127.0.0.1`, or a WSL bridge IP.
+
+4. Blank spreadsheet/questionnaire body with otherwise “good” backend data.
+   - Usually a missing project data shape, especially `e2e_workbook` / `e2e_sheet`, not immediate proof of a frontend bug.
+
+5. “No project found” or route-level 404 in local.
+   - Check the backend query path and schema alignment before theorizing about the frontend.
+
+6. Backend API accepts edits but the UI bug is still unreproduced.
+   - That proves only that the backend path works.
+   - It does not prove the customer-facing UI failure or identify the frontend root cause.
+
+7. Repeated tactic changes without new evidence.
+   - Collapse to one best next move: exact readonly data clone, missing artifact request, or crisp blocker.
 
 ## What to check in the browser
 

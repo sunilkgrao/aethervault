@@ -1,0 +1,7 @@
+[Unit]
+Description=OpenClaw Thrash Audit
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -lc 'set -euo pipefail; out_dir=/root/.openclaw/reports/thrash-audit; mkdir -p "$out_dir"; ts=$(date -u +%%Y%%m%%dT%%H%%M%%SZ); python3 /root/.local/bin/openclaw_thrashing_audit.py --lookback-hours 168 --top 12 --out "$out_dir/$ts.md" >/tmp/openclaw-thrash-audit-latest.md; cp /tmp/openclaw-thrash-audit-latest.md "$out_dir/latest.md"'
+

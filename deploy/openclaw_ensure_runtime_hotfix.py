@@ -80,6 +80,19 @@ SLACK_MESSAGE_POLLER_RE = re.compile(
     r"""\}"""
 )
 
+THREAD_MENTION_POLL_MARKED_RE = re.compile(
+    r"""\t/\* openclaw-thread-mention-poll:start \*/\n"""
+    r"""(?:.|\n)*?"""
+    r"""\t/\* openclaw-thread-mention-poll:end \*/\n"""
+)
+
+THREAD_MENTION_POLL_LEGACY_RE = re.compile(
+    r"""\tconst threadMentionPollSeen = new Map\(\);\n"""
+    r"""(?:.|\n)*?"""
+    r"""\tthreadMentionPoll\(\)\.catch\(.*?\);\n""",
+    re.DOTALL,
+)
+
 SLACK_MESSAGE_HANDLER_NEW = """const handleIncomingMessageEvent = async ({ event, body }) => {
 \t\ttry {
 \t\t\tif (ctx.shouldDropMismatchedSlackEvent(body)) return;
@@ -119,7 +132,9 @@ SLACK_MESSAGE_HANDLER_NEW = """const handleIncomingMessageEvent = async ({ event
 \t\t\tconst subtypeHandler = resolveSlackMessageSubtypeHandler(message);
 \t\t\tif (subtypeHandler) {"""
 
-SLACK_MESSAGE_POLLER_NEW = """\\1\tconst threadMentionPollSeen = new Map();
+SLACK_MESSAGE_POLLER_NEW = """\\1\t/* openclaw-thread-mention-poll:start */
+\tconst threadMentionRecoveryMinAgeSeconds = 20;
+\tconst threadMentionPollSeen = new Map();
 \tlet threadMentionPollInFlight = false;
 \tconst threadMentionPoll = async () => {
 \t\tif (threadMentionPollInFlight) return;
@@ -175,6 +190,7 @@ SLACK_MESSAGE_POLLER_NEW = """\\1\tconst threadMentionPollSeen = new Map();
 \t\t\t\t\tconst latestReplyTs = typeof root?.latest_reply === "string" && root.latest_reply ? root.latest_reply : void 0;
 \t\t\t\t\tif (!rootTs || !latestReplyTs || latestReplyTs === rootTs) continue;
 \t\t\t\t\tif (Number(latestReplyTs) < nowSeconds - 900) continue;
+\t\t\t\t\tif (Number(latestReplyTs) > nowSeconds - threadMentionRecoveryMinAgeSeconds) continue;
 \t\t\t\t\tconst seenKey = `${channelId}:${rootTs}`;
 \t\t\t\t\tif (threadMentionPollSeen.get(seenKey) === latestReplyTs) continue;
 \t\t\t\t\tthreadMentionPollSeen.set(seenKey, latestReplyTs);
@@ -213,6 +229,7 @@ SLACK_MESSAGE_POLLER_NEW = """\\1\tconst threadMentionPollSeen = new Map();
 \tif (typeof threadMentionPollTimer?.unref === "function") threadMentionPollTimer.unref();
 \tctx.runtime.log?.("slack thread mention poll armed");
 \tthreadMentionPoll().catch(() => void 0);
+\t/* openclaw-thread-mention-poll:end */
 }"""
 
 FOLLOWUP_QUEUE_ACK_ANCHOR = """function resolveActiveRunQueueAction(params) {
@@ -347,6 +364,23 @@ const SHARED_SLACK_TEXT_REDACTIONS = [
 \t[/\\bOpenAI\\b/g, "model provider"],
 \t[/\\bAnthropic\\b/g, "model provider"]
 ];
+const SHARED_SLACK_LOW_SIGNAL_PATTERNS = [
+\t/^\\s*(?:let me|now let me|good, now let me|ok, now let me|okay, now let me)\\b/im,
+\t/^\\s*(?:i'm spending too much time|this approach is getting too convoluted|i need a different approach)\\b/im,
+\t/^\\s*(?:wait\\b|actually\\b|interesting\\b|hmm\\b|good,\\b|ok,\\b|okay,\\b)\\s/im,
+\t/^\\s*(?:on it\\b|understood\\b)\\s*[-—:]/im
+];
+const SHARED_SLACK_EVIDENCE_PATTERNS = [
+\t/\\bStatus\\s*:/i,
+\t/\\bBlocker\\s*:/i,
+\t/\\breviewed\\b/i,
+\t/\\bbuild passed\\b/i,
+\t/\\btypecheck passed\\b/i,
+\t/\\bbackend validated locally\\b/i,
+\t/\\bfully locally tested\\b/i,
+\t/\\bstaging-tested\\b/i,
+\t/\\bhypothesis\\b/i
+];
 function normalizeSlackPrivacyTarget(to) {
 \tif (typeof to !== "string") return "";
 \tif (to.startsWith("channel:")) return to.slice(8);
@@ -366,11 +400,26 @@ function sanitizeSharedSlackText(text) {
 \tfor (const [pattern, replacement] of SHARED_SLACK_TEXT_REDACTIONS) scrubbed = scrubbed.replace(pattern, replacement);
 \treturn scrubbed;
 }
+function hasSharedSlackEvidenceSignal(text) {
+\treturn SHARED_SLACK_EVIDENCE_PATTERNS.some((pattern) => pattern.test(text));
+}
+function isLowSignalSharedSlackUpdate(text) {
+\tif (typeof text !== "string") return false;
+\tconst trimmed = text.trim();
+\tif (!trimmed) return false;
+\tif (hasSharedSlackEvidenceSignal(trimmed)) return false;
+\tconst lineCount = trimmed.split(/\\n+/).length;
+\tconst patternHits = SHARED_SLACK_LOW_SIGNAL_PATTERNS.filter((pattern) => pattern.test(trimmed)).length;
+\tif (patternHits >= 2) return true;
+\tif (patternHits >= 1 && lineCount >= 3) return true;
+\treturn false;
+}
 function sanitizeSharedSlackNormalizedPayload(params, normalized) {
 \tif (!isSharedSlackSurface(params) || !normalized || typeof normalized !== "object") return normalized;
 \tlet next = normalized;
 \tconst originalText = typeof next.text === "string" ? next.text : "";
 \tconst scrubbedText = sanitizeSharedSlackText(originalText);
+\tif (isLowSignalSharedSlackUpdate(scrubbedText)) return null;
 \tif (scrubbedText !== originalText) next = {
 \t\t...next,
 \t\ttext: scrubbedText
@@ -446,6 +495,23 @@ ROUTE_REPLY_START_RE = re.compile(
     r"""\tif \(!normalized\) return \{ ok: true \};\n"""
 )
 
+ROUTE_REPLY_PATCHED_START_RE = re.compile(
+    r"""const SHARED_SLACK_PRIVATE_ALLOWED_USERS = new Set\(\["U0528KFHAE8"\]\);\n"""
+    r"""(?:.|\n)*?"""
+    r"""async function routeReply\(params\) \{\n"""
+    r"""\tconst \{ payload, channel, to, accountId, threadId, cfg, abortSignal \} = params;\n"""
+    r"""\tif \(shouldSuppressReasoningPayload\(payload\)\) return \{ ok: true \};\n"""
+    r"""\tconst normalizedChannel = normalizeMessageChannel\(channel\);\n"""
+    r"""\tconst resolvedAgentId = params\.sessionKey \? resolveSessionAgentId\(\{\n"""
+    r"""\t\tsessionKey: params\.sessionKey,\n"""
+    r"""\t\tconfig: cfg\n"""
+    r"""\t\}\) : void 0;\n"""
+    r"""\tconst normalized = normalizeReplyPayload\(payload, \{\n"""
+    r"""(?:.|\n)*?"""
+    r"""\t\}\);\n"""
+    r"""(?:\tif \(!normalized\) return \{ ok: true \};\n|\tconst routedNormalized = sanitizeSharedSlackNormalizedPayload\(params, normalized\);\n\tif \(!routedNormalized\) return \{ ok: true \};\n)"""
+)
+
 ROUTE_REPLY_USE_RE = re.compile(
     r"""\tlet text = normalized\.text \?\? "";\n"""
     r"""\tlet mediaUrls = \(normalized\.mediaUrls\?\.filter\(Boolean\) \?\? \[\]\)\.length \? normalized\.mediaUrls\?\.filter\(Boolean\) : normalized\.mediaUrl \? \[normalized\.mediaUrl\] : \[\];\n"""
@@ -468,6 +534,8 @@ def patch_file(path: Path) -> bool:
     updated = updated.replace(BROWSER_USER_DATA_OLD, BROWSER_USER_DATA_NEW)
     updated = updated.replace(SLACK_APP_MENTION_SKIP_OLD, SLACK_APP_MENTION_SKIP_NEW)
     updated = SLACK_MESSAGE_HANDLER_RE.sub(SLACK_MESSAGE_HANDLER_NEW, updated, count=1)
+    updated = THREAD_MENTION_POLL_MARKED_RE.sub("", updated)
+    updated = THREAD_MENTION_POLL_LEGACY_RE.sub("", updated)
     updated = SLACK_MESSAGE_POLLER_RE.sub(SLACK_MESSAGE_POLLER_NEW, updated, count=1)
     updated = updated.replace(FOLLOWUP_QUEUE_ACK_ANCHOR, FOLLOWUP_QUEUE_ACK_INSERT)
     updated = updated.replace(FOLLOWUP_QUEUE_BRANCH_OLD, FOLLOWUP_QUEUE_BRANCH_NEW)
@@ -475,6 +543,7 @@ def patch_file(path: Path) -> bool:
     updated = updated.replace(ROUTE_REPLY_USE_OLD, ROUTE_REPLY_USE_NEW)
     updated = updated.replace(ROUTE_REPLY_PAYLOADS_OLD, ROUTE_REPLY_PAYLOADS_NEW)
     updated = ROUTE_REPLY_START_RE.sub(lambda _: ROUTE_REPLY_START_NEW, updated, count=1)
+    updated = ROUTE_REPLY_PATCHED_START_RE.sub(lambda _: ROUTE_REPLY_START_NEW, updated, count=1)
     updated = ROUTE_REPLY_USE_RE.sub(lambda _: ROUTE_REPLY_USE_NEW, updated, count=1)
     updated = ROUTE_REPLY_PAYLOADS_RE.sub(lambda _: ROUTE_REPLY_PAYLOADS_NEW, updated, count=1)
     if updated == original:

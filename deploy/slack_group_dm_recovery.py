@@ -15,6 +15,7 @@ MASTER_ENV = Path("/root/.secrets/master.env")
 STATE_PATH = Path("/root/.openclaw/slack-group-dm-recovery-state.json")
 POLL_SECONDS = 15
 RECENT_WINDOW_SECS = 3600
+RECOVERY_DELAY_SECS = 20
 HISTORY_LIMIT = 30
 MAX_GROUP_MESSAGES = 12
 
@@ -101,6 +102,22 @@ def auth_test() -> dict[str, Any]:
     return slack_api("auth.test", {})
 
 
+def is_bot_authored(message: dict[str, Any], bot_user_id: str) -> bool:
+    return bool(message.get("bot_id")) or message.get("user") == bot_user_id
+
+
+def has_bot_reply_after(messages: list[dict[str, Any]], after_ts: str, bot_user_id: str) -> bool:
+    after = ts_value(after_ts)
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if not is_bot_authored(message, bot_user_id):
+            continue
+        if ts_value(str(message.get("ts") or "")) > after:
+            return True
+    return False
+
+
 def discover_mpim_ids() -> list[str]:
     ids: set[str] = set()
     cursor = ""
@@ -128,13 +145,15 @@ def latest_group_dm_mention(channel_id: str, bot_user_id: str) -> dict[str, Any]
     for message in history.get("messages", []):
         if not isinstance(message, dict):
             continue
-        if message.get("user") == bot_user_id or message.get("bot_id"):
+        if is_bot_authored(message, bot_user_id):
             continue
         ts = str(message.get("ts") or "")
         if not ts:
             continue
         try:
             if float(ts) < now - RECENT_WINDOW_SECS:
+                continue
+            if float(ts) > now - RECOVERY_DELAY_SECS:
                 continue
         except Exception:
             continue
@@ -148,9 +167,12 @@ def latest_group_dm_mention(channel_id: str, bot_user_id: str) -> dict[str, Any]
 def build_group_dm_prompt(channel_id: str, channel_name: str, messages: list[dict[str, Any]], latest: dict[str, Any]) -> str:
     lines = [
         "You are Linus responding in a Slack group DM.",
+        "Reply only in this same Slack group DM. Never move the conversation to another Slack channel or thread.",
         "Treat Slack group DMs as shared operator surfaces unless Sunil explicitly says otherwise.",
         "Be direct and useful, but do not use or reveal private owner context, family details, household details, health details, personal emails, addresses, birthdays, pets, or unrelated personal information.",
         "If the latest request asks you to use Codex or Claude, actually do that rather than only describing what you would do.",
+        "Do not send stream-of-consciousness updates, exploration traces, or repeated status pings like 'let me check' or 'now let me try'.",
+        "Use at most one concise status or blocker update, or one concise final answer. Prefer the final answer when possible.",
         "",
         f"Slack group DM: {channel_name or channel_id}",
         f"Latest message ts: {latest.get('ts', '')}",
@@ -200,7 +222,7 @@ def run_agent(prompt: str) -> str:
     texts = [str(item.get("text") or "").strip() for item in payloads if isinstance(item, dict) and str(item.get("text") or "").strip()]
     if not texts:
         raise RuntimeError("agent returned no text payload")
-    return "\n\n".join(texts)
+    return texts[-1]
 
 
 def main() -> int:
@@ -225,6 +247,11 @@ def main() -> int:
                     continue
                 history = slack_api("conversations.history", {"channel": channel_id, "limit": str(HISTORY_LIMIT)})
                 messages = list(reversed(history.get("messages", [])))
+                if has_bot_reply_after(messages, latest_ts, bot_user_id):
+                    handled[state_key] = latest_ts
+                    save_state(state)
+                    log(f"group-dm-recovery: skipping channel={channel_name} ts={latest_ts} because bot already replied")
+                    continue
                 log(f"group-dm-recovery: handling channel={channel_name} ts={latest_ts}")
                 prompt = build_group_dm_prompt(channel_id, channel_name, messages, latest)
                 response = run_agent(prompt)

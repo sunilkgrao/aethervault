@@ -16,7 +16,8 @@ All other Slack surfaces must stay product/engineering-only.
 3. For code/debug work, create or reuse a thread-isolated `tribble-desktop` worktree that starts from `origin/main`.
 4. Delegate real implementation, build/test execution, and local runtime validation to a coding subagent.
 5. If the thread includes a recording, video, audio note, or other media evidence, route through `slack-media-analysis` first.
-6. Never release or publish `tribble-desktop` directly from Linus. Code changes must stop at diagnosis plus PR preparation until the reviewed release path is used.
+6. Before opening or updating a PR, route through `jira-eng-board` to search for a relevant ENG ticket and create one if needed.
+7. Never release or publish `tribble-desktop` directly from Linus. Code changes must stop at diagnosis plus PR preparation until the reviewed release path is used.
 
 ## Shared Slack behavior
 
@@ -34,3 +35,5 @@ Use precise labels:
 - `fully locally tested`
 
 Never say `tested` or `ready` unless the evidence supports it.
+
+If a PR is needed, it must use the linked ENG Jira key in the title, for example `ENG-123 Fix desktop updater crash`.
