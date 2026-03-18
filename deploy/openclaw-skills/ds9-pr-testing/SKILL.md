@@ -10,6 +10,14 @@ Use this skill whenever Linus needs to test DS9 code for real instead of stoppin
 
 If you have not brought up the local stack, opened the route in a browser, and inspected the resulting artifacts, do **not** say the branch or PR was tested. Say it was reviewed or prepared locally.
 
+## Preferred test host
+
+Default host order for DS9 local testing:
+1. the droplet-resident DS9 checkout and browser/runtime lane
+2. `raoDesktop` only when the droplet cannot exercise the needed flow or data
+
+Do not assume `raoDesktop` is the default lane. Prefer the droplet because it is more reliable and does not depend on Sunil physically re-authing a workstation browser.
+
 ## Instruction precedence
 
 If Sunil gives a more explicit debugging or testing order, follow it exactly and treat it as the durable default for similar issue work unless he explicitly overrides it later.
@@ -83,7 +91,18 @@ Helper locations:
 - OpenClaw workspace copy: `/root/.openclaw/workspace/skills/ds9-pr-testing/scripts/`
 - DS9 workstation copy: `/home/sunil/.local/share/linus/ds9-pr-testing/`
 
-Use the workstation copy when the DS9 checkout lives on the remote development machine:
+Use the helper copy that lives on the machine where the DS9 checkout is running.
+
+Droplet example:
+
+```bash
+bash /root/.openclaw/workspace/skills/ds9-pr-testing/scripts/bootstrap_local_stack.sh \
+  "$SOURCE_DS9" \
+  "$TARGET_DS9" \
+  "<branch-or-pr-ref>"
+```
+
+`raoDesktop` example:
 
 ```bash
 bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/bootstrap_local_stack.sh \
@@ -299,12 +318,10 @@ Why this matters:
 - `tribble-chat` listens on `3001`
 - DS9 local `lcars/ui/.env` may still point `VITE_WEBCHAT_API_URL` at `ws://localhost:8080/api/chat`
 - that stale value leaves the blue “Chat with Tribble” panel stuck on `Connecting...`
-- old `VITE_LOCAL_DEV_AUTH_*` values in `.env.local` are also stale; DS9 does not implement that bypass, so remove them instead of treating them as a real auth lane
 
 `prepare_lcars_local_chat_env.sh` writes an override in `lcars/ui/.env.local` so the browser uses:
 - `VITE_WEBCHAT_API_URL=ws://localhost:3001/api/chat`
 - `VITE_WEBCHAT_DOMAIN=localhost:3001`
-- and strips old `VITE_LOCAL_DEV_AUTH_*` lines that would otherwise send Linus down the wrong path
 
 Restart the UI after writing that override.
 
@@ -379,14 +396,54 @@ This attaches to the Windows Chrome CDP session, opens the blue chat critter if 
 
 Do **not** diagnose “Playwright can’t type” until this check passes. In DS9, the main chat input is explicitly disabled while `isConnected` is false, so a disabled textarea is a websocket / local-stack failure, not a browser-automation failure.
 
-Do not fabricate a `local-dev-token` unless the branch explicitly implements a real local auth bypass.
+## Local-only auth bypass lane
 
-Do not assume a local auth bypass exists. As of this skill version, DS9 does **not** implement the previously-documented `VITE_LOCAL_DEV_AUTH_BYPASS` / `LOCAL_DEV_AUTH_ENABLED` flow.
+If browser auth is the blocker, Linus may use the known local-auth-bypass pattern for **local testing only**.
+
+Use this lane only when:
+- it is needed to unblock local validation
+- the checkout actually contains the bypass implementation in source
+- the bypass stays local-only and is never included in a branch push or PR
+
+The implementation pattern to look for is:
+- UI mock Auth0 client behind `VITE_LOCAL_DEV_AUTH_BYPASS=true`
+- backend acceptance of a special local bearer token behind `LOCAL_DEV_AUTH_ENABLED=true`
+- websocket auth accepting the same local token
+- normal service startup loading `.env.local`
+- browser harnesses optionally injecting the same local token automatically
+
+Canonical local tokens:
+- `local-dev-token.sunil__at__tribble.ai`
+- `local-dev-token:sunil@tribble.ai`
+
+To prepare the local env flags for a checkout that already implements this bypass:
+
+Droplet:
+
+```bash
+bash /root/.openclaw/workspace/skills/ds9-pr-testing/scripts/enable_local_auth_bypass_env.sh \
+  "$TARGET_DS9" \
+  "sunil@tribble.ai"
+```
+
+`raoDesktop`:
+
+```bash
+bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/enable_local_auth_bypass_env.sh \
+  "$TARGET_DS9" \
+  "sunil@tribble.ai"
+```
+
+Important:
+- this helper only writes local env flags
+- it does **not** create the bypass implementation in source
+- if the checkout lacks the source-side bypass code, say so plainly instead of pretending auth is bypassed
+- never let bypass code leak into a PR; before opening or updating a PR, make sure any source-side bypass changes are absent from `git diff`
 
 Default authenticated testing mode is:
-- real Auth0 flow
-- real logged-in Windows Chrome profile
-- CDP attach from WSL
+- droplet-first local testing
+- local auth bypass when available and needed
+- otherwise real login
 - canonical local UI origin `http://localhost:5173`
 
 ## Authenticated browser path via Windows Chrome CDP

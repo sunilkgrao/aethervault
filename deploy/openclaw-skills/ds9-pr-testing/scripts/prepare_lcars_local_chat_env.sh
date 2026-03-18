@@ -19,7 +19,7 @@ mkdir -p "$UI_DIR"
 tmp="$(mktemp)"
 
 if [[ -f "$ENV_LOCAL" ]]; then
-  grep -vE '^(VITE_WEBCHAT_API_URL|VITE_WEBCHAT_DOMAIN|VITE_LOCAL_DEV_AUTH_[A-Z_]+)=' "$ENV_LOCAL" >"$tmp" || true
+  grep -vE '^(VITE_WEBCHAT_API_URL|VITE_WEBCHAT_DOMAIN)=' "$ENV_LOCAL" >"$tmp" || true
 else
   : >"$tmp"
 fi
