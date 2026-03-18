@@ -47,6 +47,19 @@ In shared Slack threads:
 - do not state a root cause as confirmed until it is backed by direct evidence
 - use at most one short acknowledgement, one real blocker update, and one final evidence-backed summary
 
+Public reply contract:
+- `Status:` short progress or acknowledgement only
+- `Blocker:` the concrete blocker plus the one missing access, artifact, or approval
+- `Hypothesis:` one clearly-labeled current theory plus the missing evidence
+- `Verified:` evidence-backed finding, with `Customer action:` and `Next step:` when relevant
+- `Correction:` explicit retraction of an earlier public claim before the corrected statement
+
+If you need to reverse an earlier public claim:
+1. start with `Correction:`
+2. retract the earlier claim plainly
+3. give the corrected statement once
+4. stop revising the thread again until you have materially better evidence
+
 Use precise labels:
 - `reviewed`
 - `build passed`
@@ -56,6 +69,7 @@ Use precise labels:
 - `production-diagnosed`
 
 Never say `tested` or `ready` unless the evidence supports it.
+Never say `fixed`, `PR is up`, or `opened a PR` unless the required validation sequence and evidence are already complete.
 
 ## Investigation sequence
 
@@ -66,6 +80,9 @@ Unless Sunil explicitly changes the order:
 4. validate the fix locally
 5. capture screenshot/evidence of the fixed state
 6. then prepare or update the PR
+
+If the evidence sequence is incomplete, the only acceptable PR status is:
+- `Blocker: validation evidence incomplete`
 
 If a PR is needed, it must use the linked ENG Jira key in the title, for example `ENG-123 Fix multi-column answer editing`.
 

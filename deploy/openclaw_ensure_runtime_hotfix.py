@@ -382,13 +382,44 @@ const SHARED_SLACK_LOW_SIGNAL_PATTERNS = [
 const SHARED_SLACK_EVIDENCE_PATTERNS = [
 \t/\\bStatus\\s*:/i,
 \t/\\bBlocker\\s*:/i,
+\t/\\bVerified\\s*:/i,
+\t/\\bCorrection\\s*:/i,
 \t/\\breviewed\\b/i,
 \t/\\bbuild passed\\b/i,
 \t/\\btypecheck passed\\b/i,
 \t/\\bbackend validated locally\\b/i,
 \t/\\bfully locally tested\\b/i,
 \t/\\bstaging-tested\\b/i,
-\t/\\bhypothesis\\b/i
+\t/\\bhypothesis\\b/i,
+\t/\\breproduced locally\\b/i,
+\t/\\bscreenshot\\b/i,
+\t/\\bscreen recording\\b/i,
+\t/\\bvideo\\b/i,
+\t/\\btrace\\b/i,
+\t/\\blog\\b/i,
+\t/\\bread[- ]back\\b/i
+];
+const SHARED_SLACK_PROVIDER_ERROR_PATTERNS = [
+\t/\\bLLM error\\b/i,
+\t/\\bapi_error\\b/i,
+\t/\\bInternal server error\\b/i,
+\t/\\brequest_id\\s*:/i
+];
+const SHARED_SLACK_CERTAINTY_PATTERNS = [
+\t/\\broot cause\\b/i,
+\t/\\bfound it\\b/i,
+\t/\\bconfirmed\\b/i,
+\t/\\bdefinitively\\b/i,
+\t/\\bexactly why\\b/i,
+\t/\\bthis proves\\b/i
+];
+const SHARED_SLACK_PR_OR_READY_PATTERNS = [
+\t/\\bPR is up\\b/i,
+\t/\\bopened (?:the )?PR\\b/i,
+\t/\\bcut (?:the )?PR\\b/i,
+\t/\\bready to merge\\b/i,
+\t/\\bfully locally tested\\b/i,
+\t/\\bstaging-tested\\b/i
 ];
 function normalizeSlackPrivacyTarget(to) {
 \tif (typeof to !== "string") return "";
@@ -409,8 +440,62 @@ function sanitizeSharedSlackText(text) {
 \tfor (const [pattern, replacement] of SHARED_SLACK_TEXT_REDACTIONS) scrubbed = scrubbed.replace(pattern, replacement);
 \treturn scrubbed;
 }
+function dedupeSharedSlackText(text) {
+\tif (typeof text !== "string") return "";
+\tconst paragraphs = text.split(/\\n{2,}/).map((part) => part.trim()).filter(Boolean);
+\tconst seenParagraphs = new Set();
+\tconst dedupedParagraphs = [];
+\tfor (const paragraph of paragraphs) {
+\t\tconst normalized = paragraph.replace(/\\s+/g, " ").trim().toLowerCase();
+\t\tif (!normalized || seenParagraphs.has(normalized)) continue;
+\t\tseenParagraphs.add(normalized);
+\t\tconst lines = paragraph.split(/\\n/).map((line) => line.trimRight());
+\t\tconst dedupedLines = [];
+\t\tlet lastLineKey = "";
+\t\tfor (const line of lines) {
+\t\t\tconst lineKey = line.replace(/\\s+/g, " ").trim().toLowerCase();
+\t\t\tif (!lineKey) {
+\t\t\t\tdedupedLines.push("");
+\t\t\t\tlastLineKey = "";
+\t\t\t\tcontinue;
+\t\t\t}
+\t\t\tif (lineKey === lastLineKey) continue;
+\t\t\tdedupedLines.push(line);
+\t\t\tlastLineKey = lineKey;
+\t\t}
+\t\tdedupedParagraphs.push(dedupedLines.join("\\n").trim());
+\t}
+\treturn dedupedParagraphs.join("\\n\\n").trim();
+}
 function hasSharedSlackEvidenceSignal(text) {
 \treturn SHARED_SLACK_EVIDENCE_PATTERNS.some((pattern) => pattern.test(text));
+}
+function isSharedSlackProviderError(text) {
+\treturn SHARED_SLACK_PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(text));
+}
+function normalizeSharedSlackProviderError(text) {
+\tif (!isSharedSlackProviderError(text)) return text;
+\treturn "Status: temporary model error. I hit an upstream provider failure; retrying or failing over is the next step.";
+}
+function requiresSharedSlackEvidenceGate(text) {
+\treturn SHARED_SLACK_PR_OR_READY_PATTERNS.some((pattern) => pattern.test(text)) && !hasSharedSlackEvidenceSignal(text);
+}
+function shouldDowngradeSharedSlackCertainty(text) {
+\tif (hasSharedSlackEvidenceSignal(text)) return false;
+\tif (/^\\s*(?:Hypothesis|Blocker|Verified|Status|Correction)\\s*:/i.test(text)) return false;
+\treturn SHARED_SLACK_CERTAINTY_PATTERNS.some((pattern) => pattern.test(text));
+}
+function downgradeSharedSlackCertainty(text) {
+\tlet next = typeof text === "string" ? text.trim() : "";
+\tif (!next) return next;
+\tnext = next.replace(/\\broot cause\\b/gi, "likely cause");
+\tnext = next.replace(/\\bthis proves\\b/gi, "this suggests");
+\tnext = next.replace(/\\bconfirmed\\b/gi, "suggested");
+\tnext = next.replace(/\\bdefinitively\\b/gi, "");
+\tnext = next.replace(/\\bexactly why\\b/gi, "why this may be happening");
+\tnext = next.replace(/^\\s*found it\\.?\\s*/i, "");
+\tif (!/^\\s*Hypothesis\\s*:/i.test(next)) next = `Hypothesis: ${next.trim()}`;
+\treturn next;
 }
 function isLowSignalSharedSlackUpdate(text) {
 \tif (typeof text !== "string") return false;
@@ -427,8 +512,12 @@ function sanitizeSharedSlackNormalizedPayload(params, normalized) {
 \tif (!isSharedSlackSurface(params) || !normalized || typeof normalized !== "object") return normalized;
 \tlet next = normalized;
 \tconst originalText = typeof next.text === "string" ? next.text : "";
-\tconst scrubbedText = sanitizeSharedSlackText(originalText);
+\tlet scrubbedText = sanitizeSharedSlackText(originalText);
+\tscrubbedText = dedupeSharedSlackText(scrubbedText);
+\tscrubbedText = normalizeSharedSlackProviderError(scrubbedText);
 \tif (isLowSignalSharedSlackUpdate(scrubbedText)) return null;
+\tif (requiresSharedSlackEvidenceGate(scrubbedText)) scrubbedText = "Blocker: validation evidence incomplete. I still need local reproduction plus broken-state and fixed-state evidence before I can call this PR-ready or tested.";
+\telse if (shouldDowngradeSharedSlackCertainty(scrubbedText)) scrubbedText = downgradeSharedSlackCertainty(scrubbedText);
 \tif (scrubbedText !== originalText) next = {
 \t\t...next,
 \t\ttext: scrubbedText

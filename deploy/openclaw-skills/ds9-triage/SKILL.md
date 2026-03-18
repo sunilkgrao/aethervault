@@ -36,6 +36,19 @@ Use only:
 - one blocker update if genuinely stuck
 - one final evidence-backed summary
 
+Shared Slack response contract:
+- `Status:` short progress or acknowledgement only
+- `Blocker:` the concrete blocker plus the one missing access, artifact, or approval
+- `Hypothesis:` one clearly-labeled current theory plus the missing evidence
+- `Verified:` evidence-backed finding, with `Customer action:` and `Next step:` when relevant
+- `Correction:` explicit retraction of an earlier public claim before the corrected statement
+
+If a new public conclusion conflicts with an earlier one:
+- start with `Correction:`
+- retract the earlier claim in one sentence
+- then give the corrected conclusion
+- do not just replace one theory with another as if nothing changed
+
 Hard cap:
 - at most one non-final public progress message per thread
 - if you already sent a blocker update, the next public reply must be the final summary unless Sunil explicitly asks a new question
@@ -51,6 +64,7 @@ Use precise status labels:
 - `staging-tested`
 
 Never say `tested` or `ready to merge` unless the evidence actually supports that claim.
+Never say `fixed`, `PR is up`, `opened a PR`, or equivalent unless the required validation sequence and evidence are complete.
 
 ## Investigation discipline
 
@@ -73,6 +87,7 @@ If local reproduction is blocked:
 - stop publicly hypothesizing beyond one clearly-labeled hypothesis
 - do not keep the thread updated with every failed attempt
 - either continue silently until you have evidence, or ask Sunil for the specific missing access/input
+- if you need to correct an earlier public claim, do it once with `Correction:` and then stop revising the thread until you have materially better evidence
 
 If the issue depends on customer-specific or project-specific data shape:
 1. prefer the exact local data shape if it already exists
@@ -130,6 +145,7 @@ Do not open a DS9 PR without Jira linkage unless Sunil explicitly overrides that
 11. In customer-facing bug threads, prefer one verified workaround over a menu of speculative workarounds. Do not recommend a workaround you have not verified or clearly caveated.
 12. For issues tied to a specific customer project, prefer reproducing against the real data shape locally before building standalone harnesses or theory-heavy minimal test pages.
 13. When standing up local DS9 infra, run the ds9-pr-testing preflight first and treat foreign-port ownership, low inotify limits, and missing E2E workbook data as first-class blockers rather than app-level mysteries.
+14. Before opening, updating, or claiming PR readiness, require the full validation sequence from `ds9-pr-testing`: broken-state evidence, fix, fixed-state evidence, then PR update.
 
 ## Branch and worktree policy
 

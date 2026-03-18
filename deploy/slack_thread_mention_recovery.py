@@ -205,6 +205,31 @@ def recent_thread_candidates(channel_id: str, bot_user_id: str) -> list[dict[str
     return matches
 
 
+def recent_root_candidates(channel_id: str, bot_user_id: str) -> list[dict[str, Any]]:
+    history = slack_api("conversations.history", {"channel": channel_id, "limit": str(HISTORY_LIMIT)})
+    now = time.time()
+    matches: list[dict[str, Any]] = []
+    for root in history.get("messages", []):
+        root_ts = root.get("ts")
+        if not isinstance(root_ts, str):
+            continue
+        try:
+            root_ts_value = float(root_ts)
+        except Exception:
+            continue
+        if root_ts_value < now - RECENT_WINDOW_SECS:
+            continue
+        if root_ts_value > now - RECOVERY_DELAY_SECS:
+            continue
+        if is_bot_authored(root, bot_user_id):
+            continue
+        text = str(root.get("text") or "")
+        if f"<@{bot_user_id}>" not in text:
+            continue
+        matches.append(root)
+    return matches
+
+
 def thread_messages(channel_id: str, thread_ts: str) -> list[dict[str, Any]]:
     replies = slack_api(
         "conversations.replies",
@@ -326,10 +351,9 @@ def main() -> int:
         raise SystemExit("Could not resolve Slack bot user id")
     log(f"thread-recovery: bot_user_id={bot_user_id}")
     while True:
-        if gateway_has_builtin_thread_poll():
-            log("thread-recovery: builtin gateway thread poll detected; worker idle")
-            time.sleep(max(POLL_SECONDS, 300))
-            continue
+        builtin_thread_poll = gateway_has_builtin_thread_poll()
+        if builtin_thread_poll:
+            log("thread-recovery: builtin gateway thread poll detected; threaded recovery idle, root recovery active")
         state = load_state()
         handled = state.setdefault("handled", {})
         channel_ids = discover_channel_ids()
@@ -339,27 +363,47 @@ def main() -> int:
             try:
                 info = slack_api("conversations.info", {"channel": channel_id})
                 channel_name = str(info.get("channel", {}).get("name") or channel_id)
-                for candidate in recent_thread_candidates(channel_id, bot_user_id):
-                    root = candidate["root"]
-                    reply = candidate["reply"]
-                    reply_ts = str(reply["ts"])
-                    state_key = f"{channel_id}:{root['ts']}"
-                    if handled.get(state_key) == reply_ts:
-                        continue
-                    thread = thread_messages(channel_id, str(root["ts"]))
-                    if has_bot_reply_after(thread, reply_ts, bot_user_id):
+                if not builtin_thread_poll:
+                    for candidate in recent_thread_candidates(channel_id, bot_user_id):
+                        root = candidate["root"]
+                        reply = candidate["reply"]
+                        reply_ts = str(reply["ts"])
+                        state_key = f"thread:{channel_id}:{root['ts']}"
+                        if handled.get(state_key) == reply_ts:
+                            continue
+                        thread = thread_messages(channel_id, str(root["ts"]))
+                        if has_bot_reply_after(thread, reply_ts, bot_user_id):
+                            handled[state_key] = reply_ts
+                            save_state(state)
+                            log(
+                                f"thread-recovery: skipping channel={channel_name} thread={root['ts']} ts={reply_ts} because bot already replied"
+                            )
+                            continue
+                        log(f"thread-recovery: handling missed threaded mention channel={channel_name} thread={root['ts']} ts={reply_ts}")
+                        response = process_candidate(channel_id, channel_name, root, reply, thread)
+                        sent_ts = slack_post_message(channel_id, response, thread_ts=str(root["ts"]))
                         handled[state_key] = reply_ts
                         save_state(state)
+                        log(f"thread-recovery: posted threaded reply ts={sent_ts}")
+                for root in recent_root_candidates(channel_id, bot_user_id):
+                    root_ts = str(root["ts"])
+                    state_key = f"root:{channel_id}:{root_ts}"
+                    if handled.get(state_key) == root_ts:
+                        continue
+                    thread = thread_messages(channel_id, root_ts)
+                    if has_bot_reply_after(thread, root_ts, bot_user_id):
+                        handled[state_key] = root_ts
+                        save_state(state)
                         log(
-                            f"thread-recovery: skipping channel={channel_name} thread={root['ts']} ts={reply_ts} because bot already replied"
+                            f"thread-recovery: skipping channel={channel_name} root={root_ts} because bot already replied"
                         )
                         continue
-                    log(f"thread-recovery: handling missed mention channel={channel_name} thread={root['ts']} ts={reply_ts}")
-                    response = process_candidate(channel_id, channel_name, root, reply, thread)
-                    sent_ts = slack_post_message(channel_id, response, thread_ts=str(root["ts"]))
-                    handled[state_key] = reply_ts
+                    log(f"thread-recovery: handling missed root mention channel={channel_name} thread={root_ts}")
+                    response = process_candidate(channel_id, channel_name, root, root, thread)
+                    sent_ts = slack_post_message(channel_id, response, thread_ts=root_ts)
+                    handled[state_key] = root_ts
                     save_state(state)
-                    log(f"thread-recovery: posted reply ts={sent_ts}")
+                    log(f"thread-recovery: posted root reply ts={sent_ts}")
             except Exception as err:
                 log(f"thread-recovery: channel {channel_id} failed: {err}")
         time.sleep(POLL_SECONDS)

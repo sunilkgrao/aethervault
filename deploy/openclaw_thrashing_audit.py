@@ -6,9 +6,12 @@ import json
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
+
+
+UTC = timezone.utc
 
 
 LOW_SIGNAL_PATTERNS = [
@@ -22,15 +25,52 @@ REVERSAL_PATTERNS = [
     re.compile(r"\b(?:actually|wait|that changes the picture|my .* hypothesis was wrong|premature|i need a different approach)\b", re.I),
 ]
 
+CORRECTION_PATTERNS = [
+    re.compile(r"^\s*Correction\s*:", re.I),
+]
+
+CERTAINTY_PATTERNS = [
+    re.compile(r"\broot cause\b", re.I),
+    re.compile(r"\bfound it\b", re.I),
+    re.compile(r"\bconfirmed\b", re.I),
+    re.compile(r"\bdefinitively\b", re.I),
+    re.compile(r"\bexactly why\b", re.I),
+    re.compile(r"\bthis proves\b", re.I),
+]
+
+PR_CLAIM_PATTERNS = [
+    re.compile(r"\bPR is up\b", re.I),
+    re.compile(r"\bopened (?:the )?PR\b", re.I),
+    re.compile(r"\bcut (?:the )?PR\b", re.I),
+    re.compile(r"\bready to merge\b", re.I),
+    re.compile(r"\bfully locally tested\b", re.I),
+    re.compile(r"\bstaging-tested\b", re.I),
+]
+
+PROVIDER_ERROR_PATTERNS = [
+    re.compile(r"\bLLM error\b", re.I),
+    re.compile(r"\bapi_error\b", re.I),
+    re.compile(r"\brequest_id\s*:", re.I),
+    re.compile(r"\bInternal server error\b", re.I),
+]
+
 EVIDENCE_PATTERNS = [
     re.compile(r"\bStatus\s*:", re.I),
     re.compile(r"\bBlocker\s*:", re.I),
+    re.compile(r"\bVerified\s*:", re.I),
+    re.compile(r"\bHypothesis\s*:", re.I),
+    re.compile(r"\bCorrection\s*:", re.I),
     re.compile(r"\breproduced locally\b", re.I),
     re.compile(r"\bbuild passed\b", re.I),
     re.compile(r"\btypecheck passed\b", re.I),
     re.compile(r"\bbackend validated locally\b", re.I),
     re.compile(r"\bfully locally tested\b", re.I),
     re.compile(r"\bscreenshot", re.I),
+    re.compile(r"\bscreen recording\b", re.I),
+    re.compile(r"\bvideo\b", re.I),
+    re.compile(r"\btrace\b", re.I),
+    re.compile(r"\blog\b", re.I),
+    re.compile(r"\bread[- ]back\b", re.I),
 ]
 
 SIGNAL_TO_LESSON = [
@@ -40,6 +80,8 @@ SIGNAL_TO_LESSON = [
     (re.compile(r"\breadonly\b.*\bprod|\bproduction data\b.*\blocal\b", re.I), "Prefer approved readonly production-data clone to local over hand-built partial fixtures for customer-specific bugs."),
     (re.compile(r"\bscreen recording\b|\bshare a recording\b", re.I), "If local repro is blocked, ask once for the smallest missing artifact that collapses uncertainty fastest."),
     (re.compile(r"\bapi\b.*\bworks\b.*\bfrontend\b", re.I), "API-only success does not prove the UI bug was reproduced; keep backend validation separate from UI root cause."),
+    (re.compile(r"\bLLM error\b|\bapi_error\b|\brequest_id\s*:", re.I), "Mask raw provider errors in shared Slack and fail over before surfacing anything to users."),
+    (re.compile(r"\bPR is up\b|\bopened (?:the )?PR\b|\bready to merge\b", re.I), "Do not claim PR readiness before the broken-state and fixed-state evidence are complete."),
 ]
 
 
@@ -54,6 +96,8 @@ class SessionFinding:
     low_signal_count: int = 0
     reversal_count: int = 0
     evidence_count: int = 0
+    contract_violation_count: int = 0
+    provider_error_count: int = 0
     examples: list[str] = field(default_factory=list)
     lesson_hits: Counter = field(default_factory=Counter)
 
@@ -112,6 +156,24 @@ def is_low_signal(text: str) -> bool:
     return hits >= 2 or (hits >= 1 and line_count >= 3)
 
 
+def has_evidence_signal(text: str) -> bool:
+    return any(pattern.search(text) for pattern in EVIDENCE_PATTERNS)
+
+
+def is_unbacked_certainty(text: str) -> bool:
+    if has_evidence_signal(text):
+        return False
+    if any(pattern.search(text) for pattern in CORRECTION_PATTERNS):
+        return False
+    if any(pattern.search(text) for pattern in PR_CLAIM_PATTERNS):
+        return False
+    return any(pattern.search(text) for pattern in CERTAINTY_PATTERNS)
+
+
+def is_pr_claim_without_evidence(text: str) -> bool:
+    return any(pattern.search(text) for pattern in PR_CLAIM_PATTERNS) and not has_evidence_signal(text)
+
+
 def analyze_session(path: Path) -> SessionFinding | None:
     finding = SessionFinding(path=path, score=0)
     try:
@@ -153,8 +215,23 @@ def analyze_session(path: Path) -> SessionFinding | None:
                 finding.score += 2
                 if len(finding.examples) < 4:
                     finding.examples.append(text[:240].replace("\n", " "))
+            if any(pattern.search(text) for pattern in PROVIDER_ERROR_PATTERNS):
+                finding.provider_error_count += 1
+                finding.score += 2
+                if len(finding.examples) < 4:
+                    finding.examples.append(text[:240].replace("\n", " "))
             if any(pattern.search(text) for pattern in EVIDENCE_PATTERNS):
                 finding.evidence_count += 1
+            if is_unbacked_certainty(text):
+                finding.contract_violation_count += 1
+                finding.score += 3
+                if len(finding.examples) < 4:
+                    finding.examples.append(text[:240].replace("\n", " "))
+            if is_pr_claim_without_evidence(text):
+                finding.contract_violation_count += 1
+                finding.score += 4
+                if len(finding.examples) < 4:
+                    finding.examples.append(text[:240].replace("\n", " "))
             if is_low_signal(text):
                 finding.low_signal_count += 1
                 finding.score += 3
@@ -170,8 +247,11 @@ def analyze_session(path: Path) -> SessionFinding | None:
         finding.score += 3
     if finding.reversal_count >= 2:
         finding.score += 2
+    if finding.contract_violation_count >= 2:
+        finding.score += 3
     if finding.low_signal_count == 0 and finding.reversal_count == 0:
-        return None
+        if finding.contract_violation_count == 0 and finding.provider_error_count == 0:
+            return None
     return finding
 
 
@@ -205,6 +285,8 @@ def render_report(findings: list[SessionFinding], lookback_hours: int) -> str:
         lines.append(f"- low-signal messages: {finding.low_signal_count}")
         lines.append(f"- reversal messages: {finding.reversal_count}")
         lines.append(f"- evidence messages: {finding.evidence_count}")
+        lines.append(f"- contract violations: {finding.contract_violation_count}")
+        lines.append(f"- raw provider errors: {finding.provider_error_count}")
         if finding.first_user:
             lines.append(f"- first user prompt: {finding.first_user}")
         if finding.examples:

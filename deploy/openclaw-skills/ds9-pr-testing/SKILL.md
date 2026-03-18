@@ -22,6 +22,7 @@ Example durable instruction:
 5. only then cut or update the PR
 
 Do not compress, reorder, or skip those steps just because a code read points to a likely cause.
+If those steps are incomplete, do not say `fixed`, `tested`, `ready`, `PR is up`, or `opened a PR`. Report `Blocker: validation evidence incomplete` instead.
 
 ## Thread-isolated worktrees
 
