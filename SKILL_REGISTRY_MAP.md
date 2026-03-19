@@ -3,8 +3,8 @@
 ## Overview
 The skill_registry subsystem provides SQLite-backed persistence for reusable agent procedures. It supports storing, searching, and tracking skill execution statistics.
 
-**Module Location:** `/Users/sunilrao/dev/aether/aethervault/src/skill_registry.rs`
-**Database Location:** `{workspace}/skills.sqlite` (default workspace: `~/.aethervault`)
+**Module Location:** `src/skill_registry.rs`
+**Database Location:** `{workspace}/skills.sqlite` (default workspace: `~/.openclaw/workspace`)
 
 **Status:** Implementation complete, but database not yet used in practice. No `skills.sqlite` file exists on the system; subsystem is ready for first use via `skill_store` tool invocation.
 
@@ -258,7 +258,7 @@ pub(crate) struct ToolSkillStoreArgs {
 
 **Workflow:**
 1. Parse `skill_store` tool invocation args
-2. Resolve workspace (from override or default `~/.aethervault`)
+2. Resolve workspace (from override or default `~/.openclaw/workspace`)
 3. Open DB via `open_skill_db(&db_path)`
 4. Create `SkillRecord` with:
    - User-provided: `name`, `trigger`, `steps`, `tools`, `notes`
@@ -272,7 +272,7 @@ pub(crate) struct ToolSkillStoreArgs {
   "output": "Skill 'fetch_and_parse' stored in SQLite.",
   "details": {
     "name": "fetch_and_parse",
-    "db": "/Users/username/.aethervault/skills.sqlite"
+    "db": "/Users/username/.openclaw/workspace/skills.sqlite"
   },
   "is_error": false
 }

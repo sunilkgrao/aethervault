@@ -105,12 +105,12 @@ This example shows /last30days learning **domain-specific prompting techniques**
 
 ---
 
-## Example: AetherVault Use Cases (Community Research)
+## Example: OpenClaw Use Cases (Community Research)
 
-**Query:** `/last30days best aethervault use cases`
+**Query:** `/last30days best openclaw use cases`
 
 **Research Output:**
-> AetherVault is a self-hosted AI assistant that runs on your devices and connects via messaging apps (Telegram, WhatsApp, Discord, Slack, iMessage). Unlike ChatGPT/Claude, it has persistent memory and can proactively message you. The killer feature is its 24/7 autonomous operation - it handles multi-day tasks, monitors for replies, and initiates contact.
+> OpenClaw-style self-hosted assistants run on your devices and connect through real channels. Unlike one-shot chat products, they preserve memory, can operate asynchronously, and can carry multi-step work over time.
 
 **Most mentioned use cases:**
 
@@ -140,12 +140,12 @@ This example shows /last30days as a **product research tool** - discovering real
 
 ---
 
-## Example: AetherVault Setup (Installation Guide)
+## Example: OpenClaw Setup (Installation Guide)
 
-**Query:** `/last30days how to best setup aethervault`
+**Query:** `/last30days how to best setup openclaw`
 
 **Research Output:**
-> AetherVault setup varies by deployment style - Docker is the most recommended path, but users are also deploying via bare metal and cloud VMs. The community has converged on key best practices: use the setup wizard for initial config, start with conservative hardware (you can scale up), and configure authentication before exposing any endpoints.
+> OpenClaw setup varies by deployment style. Docker is common, but users also deploy on bare metal and cloud VMs. The community best practices are to start with conservative hardware, keep auth in place before exposing endpoints, and validate the core runtime before layering on integrations.
 
 **🛠️ Setup patterns by engagement:**
 
@@ -162,15 +162,15 @@ This example shows /last30days as a **product research tool** - discovering real
 1. **Use the setup wizard** - Don't manually edit config files first; the wizard handles 90% of initial setup
 2. **Start small on hardware** - 8GB RAM minimum, but 16GB+ recommended if running local models
 3. **Docker > bare metal** - Easier updates, better isolation, community-tested compose files
-4. **Secure before exposing** - Set up authentication before opening ports; AetherVault has built-in auth
+4. **Secure before exposing** - Set up authentication before opening ports
 5. **Cost management** - Set API rate limits early; one user reported $200 overnight bill from runaway tasks
 
 **Quick-start commands (community-verified):**
 
 ```bash
 # Clone and setup
-git clone https://github.com/aethervault/aethervault.git
-cd aethervault
+git clone https://github.com/openclaw/openclaw.git
+cd openclaw
 
 # Run setup wizard (recommended)
 ./setup.sh

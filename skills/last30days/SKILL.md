@@ -171,11 +171,11 @@ The Judge Agent must:
 **CRITICAL: Ground your synthesis in the ACTUAL research content, not your pre-existing knowledge.**
 
 Read the research output carefully. Pay attention to:
-- **Exact product/tool names** mentioned (e.g., if research mentions "AetherVault" or "@aethervault", that's a DIFFERENT product than "Claude Code" - don't conflate them)
+- **Exact product/tool names** mentioned. If research is about a different product, do not silently rewrite it into the tool the user asked about.
 - **Specific quotes and insights** from the sources - use THESE, not generic knowledge
 - **What the sources actually say**, not what you assume the topic is about
 
-**ANTI-PATTERN TO AVOID**: If user asks about "aethervault skills" and research returns AetherVault content (self-hosted AI agent), do NOT synthesize this as "Claude Code skills" just because both involve "skills". Read what the research actually says.
+**ANTI-PATTERN TO AVOID**: If the user asks about one product and research returns a different product with a similar term, do NOT collapse them together. Read what the research actually says.
 
 ### If QUERY_TYPE = RECOMMENDATIONS
 
@@ -269,7 +269,7 @@ Share your vision for what you want to create and I'll write a thoughtful prompt
 
 **Use real numbers from the research output.** The patterns should be actual insights from the research, not generic advice.
 
-**SELF-CHECK before displaying**: Re-read your "What I learned" section. Does it match what the research ACTUALLY says? If the research was about AetherVault (a self-hosted AI agent), your summary should be about AetherVault, not Claude Code. If you catch yourself projecting your own knowledge instead of the research, rewrite it.
+**SELF-CHECK before displaying**: Re-read your "What I learned" section. Does it match what the research ACTUALLY says? If not, rewrite it before displaying.
 
 **IF TARGET_TOOL is still unknown after showing results**, ask NOW (not before research):
 ```

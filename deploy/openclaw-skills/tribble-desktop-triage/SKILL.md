@@ -96,24 +96,26 @@ Reuse only when:
 - or Sunil explicitly points Linus at an existing PR / branch
 
 Do not:
-- implement in `/home/sunil/tribble-desktop` on `raoDesktop`
+- implement in the anchor checkout itself
 - stack unrelated work on an existing feature branch from another thread
 
 Preferred branch pattern:
 - `linus/<thread-key>/<issue-slug>`
 
 Preferred worktree roots:
+- droplet: `/root/tribble-desktop-worktrees`
 - `raoDesktop` WSL: `/home/sunil/tribble-desktop-worktrees`
 
 Anchor checkout:
+- droplet: `/root/tribble-desktop`
 - `raoDesktop` WSL: `/home/sunil/tribble-desktop`
 
 Use the helper before any code change or local test bootstrapping:
 
 ```bash
-bash /home/sunil/.local/share/linus/tribble-desktop-triage/scripts/ensure_thread_worktree.sh \
-  "/home/sunil/tribble-desktop" \
-  "/home/sunil/tribble-desktop-worktrees" \
+bash /root/.openclaw/workspace/skills/tribble-desktop-triage/scripts/ensure_thread_worktree.sh \
+  "/root/tribble-desktop" \
+  "/root/tribble-desktop-worktrees" \
   "slack-<thread-id>" \
   "<issue-slug>"
 ```
@@ -148,7 +150,8 @@ If you only have:
 say that plainly.
 
 If Sunil asks for screenshots or asks whether the fix actually works:
-- run the real local repro path on `raoDesktop`
+- run the real local repro path on the droplet first
+- fall back to a workstation only if the droplet cannot reproduce the needed OS-integrated behavior
 - capture screenshots or screen evidence
 - state exactly what was reproduced and exactly what was validated
 

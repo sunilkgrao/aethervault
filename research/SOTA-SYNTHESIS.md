@@ -1,13 +1,13 @@
-# AetherVault: SOTA Synthesis & Concrete Roadmap
+# Linus/OpenClaw: SOTA Synthesis & Concrete Roadmap
 
 **Date**: 2026-02-23
 **Based on**: 4 parallel research sweeps across 120+ sources (2025-2026)
 
 ---
 
-## Where AetherVault Sits Today
+## Where Linus/OpenClaw Sits Today
 
-After Skill System v2, AetherVault has:
+After Skill System v2, Linus/OpenClaw has:
 - Lean skill injection (~200 tokens vs ~1500) with progressive disclosure
 - Keyword search with stemming + synonym expansion (works to ~50 skills)
 - Browser output wrapped with `[EXTERNAL CONTENT]` tags
@@ -139,7 +139,7 @@ Phase 4 — Memory poisoning prevention:
   - Prevents persistent poisoning across sessions
 ```
 
-**Expected impact**: Taint tracking alone (AgentArmor) reduces attack success from ~90%+ to 3%. Content sanitization eliminates structural injection. The combination makes AetherVault meaningfully harder to exploit than any current production agent (Claude Computer Use, ChatGPT Atlas, Microsoft Copilot all lack runtime taint tracking).
+**Expected impact**: Taint tracking alone (AgentArmor) reduces attack success from ~90%+ to 3%. Content sanitization eliminates structural injection. The combination makes Linus/OpenClaw meaningfully harder to exploit than any current production agent (Claude Computer Use, ChatGPT Atlas, Microsoft Copilot all lack runtime taint tracking).
 
 ---
 
@@ -210,7 +210,7 @@ From production deployments (Devin, Claude Code, DORA Report):
 - **No production system** has shipped autonomous skill learning
 - **"The agents may code YOLO, but the infrastructure they run on does not"** (Mike Mason)
 
-AetherVault implementing items 1-8 from the priority stack would put it ahead of every open-source agent framework and competitive with the best commercial offerings on the skill/learning axis. Items 9-12 would push into genuinely novel territory — especially auto skill distillation with quality gates, which nobody has shipped in production.
+Implementing items 1-8 from the priority stack would put Linus/OpenClaw ahead of every open-source agent framework and competitive with the best commercial offerings on the skill/learning axis. Items 9-12 would push into genuinely novel territory — especially auto skill distillation with quality gates, which nobody has shipped in production.
 
 ---
 

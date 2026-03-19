@@ -1,73 +1,31 @@
-# AetherVault Operations — Infrastructure State
+# Linus Operations
 
-> This file is versioned with the code and deployed automatically via upgrade.sh.
-> Last deploy: see `git log -1 --format=%H` on the droplet.
+## Purpose
 
-## Subagent Pool Routing (deployed 2026-02-22)
+Keep the operational doctrine short and current.
 
-The binary handles all subagent routing natively in Rust (`src/pool_state.rs`).
-No Python subprocess needed for backend selection.
+## Routing
 
-### Backends (priority order):
-1. **Codex CLI** — `codex exec -m gpt-5.4 --json --skip-git-repo-check -c 'model_reasoning_effort="xhigh"'`
-2. **Claude Code CLI** — `claude -p "prompt" --output-format json`
+- DS9 issue work: use the DS9 skill surface
+- production diagnosis: use the readonly prod-debug lane
+- media evidence: use the media-analysis skill
+- Jira linkage: use the Jira skill before PR workflow
 
-### Accounts:
-| Account | Service | Auth Location | Email |
-|---------|---------|--------------|-------|
-| codex-primary | codex | /root/.codex/ | sunil@tribble.ai |
-| codex-secondary | codex | /root/codex-alt/.codex/ | sunilkgrao@gmail.com |
-| claude-code-max | claude-code | /root/.claude/ | (Max plan) |
+## Validation
 
-### How routing works:
-- `builtin:pool` (default) — tries codex-primary, then codex-secondary, then claude-code
-- `builtin:codex` — codex only (skips claude-code)
-- `builtin:claude-code` — claude-code only (skips codex)
-- On rate limit: account is cooled down (codex: 300s, claude-code: 120s), next account tried
-- Config: `/root/.aethervault/config/auth-profiles.json`
-- The Rust binary sets HOME to the parent of each account's config dir (codex reads $HOME/.codex/)
+- reproduce first
+- capture broken-state evidence
+- validate the fix
+- capture fixed-state evidence
+- inspect downloads or exports when the workflow depends on them
 
-### Subagent specs (assistant/config.json):
-- `researcher` — read-only, builtin:pool
-- `coder` — full access, builtin:pool
-- `coder-codex` — full access, builtin:codex (explicit Codex)
-- `coder-claude` — full access, builtin:claude-code (explicit Claude Code)
-- `critic` — read-only, builtin:pool
+## Communication
 
-### Rules:
-- Codex is ALWAYS invoked via CLI, NEVER via API
-- Model: ALWAYS `gpt-5.4` with `model_reasoning_effort="xhigh"`
-- The binary handles rate limit detection and failover automatically
-- Do NOT manually run `codex auth login` — accounts are pre-authenticated
-- Do NOT tell the user to re-authenticate — the pool handles it
-- For long-running coding work, disable the bridge wall-clock deadline with `OPENCLAW_BRIDGE_TIMEOUT_SECS=0`
-- Do not kill coding agents just because they have been running for a long time; only stop them if they are done, explicitly canceled, or clearly wedged/dead
+- public shared-Slack replies stay concise and evidence-backed
+- no internal tool chatter in shared Slack
+- use `Status`, `Blocker`, `Hypothesis`, `Verified`, `Correction`
 
-## Deployment
+## Focus
 
-- Droplet: clawdbot (167.172.140.221)
-- Binary: blue-green at /opt/aethervault/{blue,green}/
-- Deploy: `cd /root/aethervault && git pull && bash deploy/upgrade.sh`
-- Service: `systemctl restart aethervault`
-- Self-improve: every 6h via systemd timer
-
-## Exa Web Search (added 2026-02-22)
-
-- Tool: `exa_search` — backup web search via Exa API
-- Auth: `EXA_API_KEY` env var (in /root/.secrets/master.env)
-- **Usage policy:** Try free web search first (browser, http_request). Use Exa ONLY for:
-  - People/company lookup (category: "people", "company")
-  - Research paper search (category: "research paper")
-  - Tweet/social media search (category: "tweet")
-  - Paywalled or walled-garden content
-  - When user explicitly requests Exa search
-- Categories: people, company, news, research paper, tweet
-- Content modes: text (full), highlights (excerpts), none (URLs only)
-- No approval required (read-only search)
-
-## Hooks Architecture (consolidated 2026-02-22)
-
-- `hooks/common.py` — shared utilities (send_telegram, load_env, call_claude, logging)
-- All hook files import from common.py (no duplication)
-- Python hooks remain as fallback for external hook invocation
-- Main code path uses Rust-native builtin: hooks
+- do not let long investigations drift
+- keep the current objective, blocker, and next verification step explicit

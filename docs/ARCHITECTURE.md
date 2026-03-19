@@ -1,79 +1,53 @@
-# AetherVault Architecture
+# Clawdbot Architecture
 
 ## Thesis
 
-The capsule is the durable substrate, but the product is not just a memory file. AetherVault is an agent runtime with one shared operating model for interactive chat, scheduled executive-assistant jobs, and delegated worker execution.
+This repo should be small, sharp, and boring.
 
-## Core planes
+It exists to move Linus cleanly onto OpenClaw and to preserve the skills, memory, and validation discipline that still matter. It should not grow back into a second runtime.
 
-### State plane
+## Core Planes
 
-- `.mv2` capsule: append-only content, logs, approvals, skills, reflections, and retrieval traces.
-- Workspace files: `SOUL.md`, `USER.md`, `MEMORY.md`, and `STATE.{md,json}`.
-- `STATE` is the live executive state for priorities, commitments, waiting-fors, drafts, follow-ups, and closures.
-- The knowledge graph enriches entities and relationships; it does not define task truth.
+### Export Plane
 
-### Control plane
+- exports durable state into an OpenClaw workspace
+- preserves `SOUL.md`, `USER.md`, `MEMORY.md`, `STATE.md`, and `STATE.json`
+- carries forward imported transcripts and other durable context needed for continuity
 
-The runtime decides:
+### Workspace Plane
 
-- prompt assembly
-- memory retrieval
-- tool exposure
-- approval routing
-- worker delegation
-- failure recovery and reflection
+- `MEMORY.md` holds durable facts and long-lived context
+- `STATE.md` and `STATE.json` hold live priorities, open loops, waiting-fors, and active work
+- exported workspace content is for runtime use, not a competing repo doctrine
 
-Delegation is elastic. The main loop can choose zero, one, or many workers based on task shape and policy.
+### Skill Plane
 
-### Execution plane
+- ported operational skills live under `deploy/openclaw-skills/`
+- reusable helper skills live under `skills/`
+- skills must stay aligned with OpenClaw and with the repo control docs
 
-The binary is still large, but the internal seams are explicit:
+### Control Plane
 
-- `agent_runtime.rs`: loop orchestration, prompt guidance, compaction, session continuity
-- `agent_logs.rs`: durable session logging and log export
-- `executive_state.rs`: durable executive-state model and rendering
-- `workspace_state.rs`: workspace bootstrap and capsule/workspace sync
-- `executive_tools.rs`: EA-focused tool handlers
-- `host_tools.rs`: host I/O, filesystem, browser, webhook, and local status tools
-- `policy.rs`: approval and filesystem guardrails
-- `bridge_runtime.rs`: chat connector adapters
-- `tool_registry.rs`: tool schema surface
+The control plane for this repo is the kept markdown set:
+- `README.md`
+- `AGENTS.md`
+- `docs/SOURCE-OF-TRUTH.md`
+- `FINAL_STATE.md`
+- `docs/OPENCLAW_REFOUND.md`
+- the relevant task skill docs
 
-## Retrieval model
+## Invariants
 
-Each query builds a plan:
+- one live runtime: upstream OpenClaw
+- one live executive state: `STATE`
+- one durable memory contract: workspace plus imported durable history
+- one validation doctrine: evidence before claims
+- one architecture narrative: update the kept docs, do not create side doctrines
 
-1. Parse inline constraints and scope.
-2. Expand when useful.
-3. Retrieve across lexical and optional vector lanes.
-4. Fuse and rerank.
-5. Return human text, JSON, file lists, or a context pack.
+## What Is Out Of Scope
 
-This keeps the agent fast by loading context progressively instead of re-injecting whole files.
-
-## Agent contract
-
-The runtime exposes:
-
-- context packs
-- logs
-- feedback
-- MCP server compatibility
-- an agent loop with tools, approvals, and elastic worker orchestration
-
-Tool results are split into:
-
-- `output`: concise LLM-facing text
-- `details`: structured JSON for workflows and downstream automation
-
-## EA contract
-
-Interactive chat and scheduled jobs should agree on the same reality:
-
-- morning briefing reads `STATE` and supporting context
-- evening check-in reads `STATE` and unclosed loops
-- nightly consolidation updates `MEMORY`, `STATE`, and the knowledge graph
-- chat bridges use the same policies and state model as scheduled jobs
-
-If a subsystem cannot speak that shared contract, it should be removed or rewritten.
+Do not reintroduce:
+- runtime ownership in this repo
+- connector sprawl in this repo
+- machine-specific operational notebooks as architecture
+- competing memory/state models

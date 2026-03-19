@@ -8,7 +8,12 @@ fi
 
 TARGET_DS9="$1"
 ALLOW_FOREIGN_STACK="${ALLOW_FOREIGN_STACK:-0}"
-CHECK_PORTS="${CHECK_PORTS:-50051 50061 3000 3091 7072 3001 5173 5174}"
+LCARS_PORT="${LCARS_PORT:-3000}"
+CHAT_PORT="${CHAT_PORT:-3001}"
+POSITRONIC_FILES_PORT="${POSITRONIC_FILES_PORT:-7072}"
+UI_PORT="${UI_PORT:-5173}"
+UI_FALLBACK_PORT="${UI_FALLBACK_PORT:-5174}"
+CHECK_PORTS="${CHECK_PORTS:-50051 50061 ${LCARS_PORT} 3091 ${POSITRONIC_FILES_PORT} ${CHAT_PORT} ${UI_PORT} ${UI_FALLBACK_PORT}}"
 MIN_WATCHERS="${MIN_WATCHERS:-524288}"
 MIN_INSTANCES="${MIN_INSTANCES:-1024}"
 
@@ -27,6 +32,10 @@ foreign=0
 echo "== target checkout =="
 printf 'target_ds9=%s\n' "$TARGET_DS9"
 git -C "$TARGET_DS9" rev-parse --abbrev-ref HEAD 2>/dev/null | sed 's/^/branch=/'
+printf 'lcars_port=%s\n' "$LCARS_PORT"
+printf 'chat_port=%s\n' "$CHAT_PORT"
+printf 'positronic_files_port=%s\n' "$POSITRONIC_FILES_PORT"
+printf 'ui_port=%s\n' "$UI_PORT"
 echo
 
 echo "== canonical port owners =="
@@ -91,4 +100,3 @@ echo "== guidance =="
 echo "If this bug is tied to a spreadsheet/E2E questionnaire, local content_detail rows alone are not enough."
 echo "You also need the matching e2e_workbook/e2e_sheet/e2e_answer_entry data shape."
 echo "If that exact shape is missing locally, prefer an approved readonly production-data clone over hand-building partial workbook state."
-

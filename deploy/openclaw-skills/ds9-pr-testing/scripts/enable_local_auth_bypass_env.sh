@@ -46,9 +46,11 @@ write_kv() {
 
 write_kv "$UI_ENV_LOCAL" \
   VITE_LOCAL_DEV_AUTH_BYPASS \
-  VITE_LOCAL_DEV_AUTH_EMAIL <<EOF
+  VITE_LOCAL_DEV_AUTH_EMAIL \
+  VITE_LOCAL_DEV_AUTH_TOKEN <<EOF
 VITE_LOCAL_DEV_AUTH_BYPASS=true
 VITE_LOCAL_DEV_AUTH_EMAIL=${EMAIL}
+VITE_LOCAL_DEV_AUTH_TOKEN=${TOKEN_DOTTED}
 EOF
 
 write_kv "$LCARS_ENV_LOCAL" \
@@ -78,6 +80,6 @@ token_dotted=${TOKEN_DOTTED}
 token_colon=${TOKEN_COLON}
 
 warning: this only prepares local env flags.
-It assumes the DS9 checkout already contains the local-auth-bypass implementation in UI/backend source.
+Pair it with apply_local_only_auth_overlay.sh unless the checkout already has an equivalent local-auth implementation.
 Never commit those bypass source changes in a branch or PR. Keep them local-only for testing.
 EOF

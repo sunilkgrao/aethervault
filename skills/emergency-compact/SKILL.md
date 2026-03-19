@@ -1,7 +1,7 @@
 ---
 name: emergency-compact
 description: Emergency context compaction - truncate older messages and force compaction when hitting context limits.
-metadata: {"aethervault":{"emoji":"🗜️","requires":{"bins":["jq"]}}}
+metadata: {"openclaw":{"emoji":"🗜️","requires":{"bins":["jq"]}}}
 ---
 
 # Emergency Compact
@@ -22,11 +22,11 @@ Use this skill when:
 
 ```bash
 # Find current session ID
-AETHERVAULT_HOME="${AETHERVAULT_HOME:-$HOME/.aethervault}"
-if [ ! -d "$AETHERVAULT_HOME" ] && [ -d "$HOME/.aethervault" ]; then
-  AETHERVAULT_HOME="$HOME/.aethervault"
+OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+if [ ! -d "$OPENCLAW_HOME" ] && [ -d "$HOME/.openclaw" ]; then
+  OPENCLAW_HOME="$HOME/.openclaw"
 fi
-AGENT_DIR="$AETHERVAULT_HOME/agents/main"
+AGENT_DIR="$OPENCLAW_HOME/agents/main"
 SESSION_ID=$(jq -r '."agent:main:main".sessionId' "$AGENT_DIR/sessions/sessions.json")
 SESSION_FILE="$AGENT_DIR/sessions/${SESSION_ID}.jsonl"
 
@@ -100,10 +100,10 @@ echo '{"type":"message","timestamp":"'"$TIMESTAMP"'","message":{"role":"user","c
 If truncation doesn't help:
 1. Check if session file is locked: `ls -la ${SESSION_FILE}.lock`
 2. Remove lock if stale: `rm ${SESSION_FILE}.lock`
-3. Restart aethervault: `systemctl restart aethervault`
+3. Restart the runtime process if needed
 
 ## One-Liner for Quick Fix
 
 ```bash
-AETHERVAULT_HOME="${AETHERVAULT_HOME:-$HOME/.aethervault}" && [ -d "$HOME/.aethervault" ] && [ ! -d "$AETHERVAULT_HOME" ] && AETHERVAULT_HOME="$HOME/.aethervault" && AGENT_DIR="$AETHERVAULT_HOME/agents/main" && SESSION_ID=$(jq -r '."agent:main:main".sessionId' "$AGENT_DIR/sessions/sessions.json") && SF="$AGENT_DIR/sessions/${SESSION_ID}.jsonl" && cp "$SF" "$SF.bak" && (head -1 "$SF"; tail -50 "$SF") > "$SF.tmp" && mv "$SF.tmp" "$SF" && echo "Truncated to 50 messages"
+OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}" && [ -d "$HOME/.openclaw" ] && [ ! -d "$OPENCLAW_HOME" ] && OPENCLAW_HOME="$HOME/.openclaw" && AGENT_DIR="$OPENCLAW_HOME/agents/main" && SESSION_ID=$(jq -r '."agent:main:main".sessionId' "$AGENT_DIR/sessions/sessions.json") && SF="$AGENT_DIR/sessions/${SESSION_ID}.jsonl" && cp "$SF" "$SF.bak" && (head -1 "$SF"; tail -50 "$SF") > "$SF.tmp" && mv "$SF.tmp" "$SF" && echo "Truncated to 50 messages"
 ```

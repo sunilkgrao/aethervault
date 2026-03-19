@@ -267,7 +267,9 @@ async function maybeSendQueuedBusyAck(params) {
 \tconst threadId = params.followupRun.originatingThreadId;
 \tconst chatType = typeof params.sessionCtx.ChatType === "string" ? params.sessionCtx.ChatType.toLowerCase() : "";
 \tconst isDirectish = chatType === "direct" || chatType === "dm" || chatType === "private" || channel === "telegram" || typeof to === "string" && to.startsWith("user:");
-\tif (!channel || !to || !isDirectish) return;
+\tconst isSharedSlack = channel === "slack";
+\tconst canAck = isDirectish || isSharedSlack;
+\tif (!channel || !to || !canAck) return;
 \tconst ackKey = JSON.stringify([
 \t\tparams.queueKey ?? params.sessionKey ?? "",
 \t\tchannel,
@@ -278,7 +280,7 @@ async function maybeSendQueuedBusyAck(params) {
 \tif (RECENT_BUSY_QUEUE_ACKS.check(ackKey)) return;
 \tawait routeReply({
 \t\tpayload: {
-\t\t\ttext: "Still working on the current task. I queued your follow-up and will answer it next."
+\t\t\ttext: "Still working on the current task. I queued this request and will reply here next."
 \t\t},
 \t\tchannel,
 \t\tto,
@@ -287,7 +289,7 @@ async function maybeSendQueuedBusyAck(params) {
 \t\tcfg: params.cfg,
 \t\tsessionKey: params.sessionKey,
 \t\tmirror: false,
-\t\tisGroup: false
+\t\tisGroup: !isDirectish
 \t});
 }
 function resolveActiveRunQueueAction(params) {

@@ -7,6 +7,7 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -77,11 +78,18 @@ def slack_post_message(channel: str, text: str) -> str:
 
 def load_state() -> dict[str, Any]:
     if not STATE_PATH.exists():
-        return {"handled": {}}
+        return {"handled": {}, "lineage": {}}
     try:
-        return json.loads(STATE_PATH.read_text())
+        state = json.loads(STATE_PATH.read_text())
     except Exception:
-        return {"handled": {}}
+        return {"handled": {}, "lineage": {}}
+    if not isinstance(state, dict):
+        return {"handled": {}, "lineage": {}}
+    if not isinstance(state.get("handled"), dict):
+        state["handled"] = {}
+    if not isinstance(state.get("lineage"), dict):
+        state["lineage"] = {}
+    return state
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -96,6 +104,20 @@ def ts_value(value: str | None) -> float:
         return float(value)
     except Exception:
         return 0.0
+
+
+def sanitize_session_component(value: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in value)
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return cleaned or "surface"
+
+
+def lineage_session_id(prefix: str, *parts: str) -> str:
+    raw = "::".join(parts)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    slug = "-".join(sanitize_session_component(part)[:24] for part in parts if part)
+    slug = slug[:48].strip("-") or prefix
+    return f"{prefix}-{slug}-{digest}"
 
 
 def auth_test() -> dict[str, Any]:
@@ -196,7 +218,7 @@ def build_group_dm_prompt(channel_id: str, channel_name: str, messages: list[dic
     return "\n".join(lines)
 
 
-def run_agent(prompt: str) -> str:
+def run_agent(prompt: str, session_id: str) -> str:
     proc = subprocess.run(
         [
             "openclaw",
@@ -204,6 +226,8 @@ def run_agent(prompt: str) -> str:
             "--agent",
             "main",
             "--local",
+            "--session-id",
+            session_id,
             "--message",
             prompt,
             "--json",
@@ -234,6 +258,7 @@ def main() -> int:
     while True:
         state = load_state()
         handled = state.setdefault("handled", {})
+        lineage = state.setdefault("lineage", {})
         for channel_id in discover_mpim_ids():
             try:
                 info = slack_api("conversations.info", {"channel": channel_id})
@@ -247,16 +272,33 @@ def main() -> int:
                     continue
                 history = slack_api("conversations.history", {"channel": channel_id, "limit": str(HISTORY_LIMIT)})
                 messages = list(reversed(history.get("messages", [])))
+                session_id = lineage_session_id("slack-mpim", channel_id)
                 if has_bot_reply_after(messages, latest_ts, bot_user_id):
                     handled[state_key] = latest_ts
+                    lineage[state_key] = {
+                        "surface": "slack-mpim",
+                        "channel_id": channel_id,
+                        "channel_name": channel_name,
+                        "session_id": session_id,
+                        "last_user_ts": latest_ts,
+                        "last_sent_ts": lineage.get(state_key, {}).get("last_sent_ts"),
+                    }
                     save_state(state)
                     log(f"group-dm-recovery: skipping channel={channel_name} ts={latest_ts} because bot already replied")
                     continue
                 log(f"group-dm-recovery: handling channel={channel_name} ts={latest_ts}")
                 prompt = build_group_dm_prompt(channel_id, channel_name, messages, latest)
-                response = run_agent(prompt)
+                response = run_agent(prompt, session_id)
                 sent_ts = slack_post_message(channel_id, response)
                 handled[state_key] = latest_ts
+                lineage[state_key] = {
+                    "surface": "slack-mpim",
+                    "channel_id": channel_id,
+                    "channel_name": channel_name,
+                    "session_id": session_id,
+                    "last_user_ts": latest_ts,
+                    "last_sent_ts": sent_ts,
+                }
                 save_state(state)
                 log(f"group-dm-recovery: posted reply ts={sent_ts}")
             except Exception as err:

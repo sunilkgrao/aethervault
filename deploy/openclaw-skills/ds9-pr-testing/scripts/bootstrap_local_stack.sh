@@ -9,6 +9,7 @@ fi
 SOURCE_DS9="$1"
 TARGET_DS9="$2"
 BRANCH_OR_REF="${3:-}"
+SECRET_ENV_ROOT="${LOCAL_DEV_SECRET_ROOT:-}"
 
 if [[ ! -d "$SOURCE_DS9/.git" && ! -f "$SOURCE_DS9/.git" ]]; then
   echo "SOURCE_DS9 is not a git checkout: $SOURCE_DS9" >&2
@@ -48,6 +49,29 @@ done < <(
 )
 
 printf 'copied_count=%s\n' "$copied"
+
+if [[ -z "$SECRET_ENV_ROOT" && -d /root/.secrets/local-dev/ds9 ]]; then
+  SECRET_ENV_ROOT=/root/.secrets/local-dev/ds9
+fi
+
+if [[ -n "$SECRET_ENV_ROOT" && -d "$SECRET_ENV_ROOT" ]]; then
+  secret_copied=0
+  while IFS= read -r -d '' rel; do
+    rel="${rel#./}"
+    mkdir -p "$TARGET_DS9/$(dirname "$rel")"
+    cp "$SECRET_ENV_ROOT/$rel" "$TARGET_DS9/$rel"
+    printf 'secret_overlay %s\n' "$rel"
+    secret_copied=$((secret_copied + 1))
+  done < <(
+    cd "$SECRET_ENV_ROOT" &&
+      find . \
+        \( -name '.env' -o -name '.env.*' -o -name 'local.settings.json' -o -name 'local.settings.*.json' \) \
+        ! -name '*.sample' \
+        -type f \
+        -print0
+  )
+  printf 'secret_overlay_count=%s\n' "$secret_copied"
+fi
 
 for rel in .node-version lcars/.node-version Q/.node-version; do
   if [[ -f "$TARGET_DS9/$rel" ]]; then

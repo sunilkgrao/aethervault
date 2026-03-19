@@ -24,7 +24,7 @@ curl -X POST http://localhost:11435/v1/embeddings \
 
 1. **Copy service file:**
 ```bash
-sudo cp /path/to/aethervault/services/embedding-service/embedding-service.service /etc/systemd/system/
+sudo cp /path/to/clawdbot/services/embedding-service/embedding-service.service /etc/systemd/system/
 ```
 
 2. **Enable and start:**
@@ -39,7 +39,7 @@ sudo systemctl start embedding-service
 sudo systemctl status embedding-service
 ```
 
-## Configure AetherVault
+## Configure OpenClaw
 
 1. **Stop current Ollama tunnel** (if running):
 ```bash
@@ -47,9 +47,9 @@ sudo systemctl stop ollama-tunnel.service
 sudo systemctl disable ollama-tunnel.service
 ```
 
-2. **Update AetherVault config:**
+2. **Update runtime config:**
 
-Edit `~/.aethervault/aethervault.json`:
+Edit your runtime config so embeddings point at `http://localhost:11435/v1`.
 
 ```json
 {
@@ -69,18 +69,17 @@ Edit `~/.aethervault/aethervault.json`:
 }
 ```
 
-3. **Restart AetherVault:**
+3. **Restart the runtime:**
 ```bash
-aethervault gateway restart
+# restart your runtime process
 ```
 
 ## Verify
 
-After AetherVault restarts:
+After the runtime restarts:
 
 ```bash
-# Check AetherVault memory search is working
-aethervault memory search "test query"
+# Check memory search is working through the runtime
 ```
 
 ## Logs
@@ -118,19 +117,19 @@ sudo journalctl -u embedding-service -f
 sudo journalctl -u embedding-service -n 50
 
 # Try manual start
-cd /path/to/aethervault/services/embedding-service
+cd /path/to/clawdbot/services/embedding-service
 npm start
 ```
 
-### AetherVault not connecting
+### Runtime not connecting
 1. Verify service: `curl http://localhost:11435/health`
-2. Check AetherVault config has correct baseUrl
-3. Restart: `aethervault gateway restart`
+2. Check runtime config has correct baseUrl
+3. Restart the runtime
 
 ### Model not downloading
 - Check disk space: `df -h`
 - Check cache dir: `ls -lh ~/.cache/embedding-service/models/`
-- Manual download: `cd /path/to/aethervault/services/embedding-service && npm start`
+- Manual download: `cd /path/to/clawdbot/services/embedding-service && npm start`
 
 ## Next Steps
 

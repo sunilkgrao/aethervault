@@ -1,114 +1,26 @@
 # Deployment Guide
 
-This document covers local, Docker, and generic cloud/server deployments with minimal setup.
+This repo does not own the live assistant deployment.
 
-## Local (native)
+Use upstream OpenClaw for the runtime.
 
-```bash
-cargo build --release
-./target/release/aethervault init ./data/knowledge.mv2
-./target/release/aethervault bootstrap ./data/knowledge.mv2 --workspace ./assistant
-./target/release/aethervault mcp ./data/knowledge.mv2
-```
+## What This Repo Should Be Used For
 
-## Docker (single container)
+- building and validating the migration/export utility
+- exporting Linus state into `~/.openclaw/workspace`
+- maintaining the kept docs and skill surface
 
-```bash
-docker build -t aethervault .
-mkdir -p data
-
-docker run --rm -it -v "$(pwd)/data:/data" aethervault init /data/knowledge.mv2
-docker run --rm -it -v "$(pwd)/data:/data" aethervault mcp /data/knowledge.mv2
-```
-
-## Docker Compose (local or server)
+## Minimal Validation
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-export ANTHROPIC_MODEL=claude-<model>
-
-docker compose up --build
+cargo build --locked
+cargo test
+cargo run --bin linus-migrate -- export-open-claw /path/to/memory.mv2 \
+  --workspace ~/.openclaw/workspace
 ```
 
-## Generic Linux host (Ubuntu, Docker)
+## What Not To Deploy
 
-1. Provision a Linux host.
-2. Install Docker:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y docker.io docker-compose-plugin
-sudo usermod -aG docker $USER
-newgrp docker
-```
-
-3. Clone and build:
-
-```bash
-git clone <your-repo-url>
-cd aethervault
-mkdir -p data
-
-docker build -t aethervault .
-```
-
-4. Run the service:
-
-```bash
-docker run -d --restart unless-stopped \
-  --name aethervault \
-  -v "$(pwd)/data:/data" \
-  aethervault mcp /data/knowledge.mv2
-```
-
-5. (Optional) Use systemd to manage the container if you prefer.
-
-## Kubernetes / other cloud
-
-Use the Docker image and mount a persistent volume to `/data`. The CLI is stateless; the `.mv2` capsule is the only state you need to persist.
-
-## Production tuning
-
-- Build/run in `--release` (Docker already does this).
-- Keep the capsule on SSD-backed storage.
-- Use `aethervault compact` during low-traffic windows to keep indexes tight.
-- For audit-grade logs set `--log-commit-interval 1` (or `agent.log_commit_interval=1` in config).
-- For higher throughput set `--log-commit-interval 8` or higher.
-  - Note: batched commits can drop the last `log_commit_interval` log entries on crash.
-
-## Chat connectors
-
-Rust-native Telegram, WhatsApp, and Twilio Voice callback bridges are built in. See `docs/CONNECTORS.md` for full setup.
-
-Minimal Docker example (Telegram):
-
-```bash
-docker run --rm -it \
-  -e TELEGRAM_BOT_TOKEN=123456:ABC \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
-  -e ANTHROPIC_MODEL=claude-<model> \
-  -v "$(pwd)/data:/data" \
-  aethervault bridge telegram --mv2 /data/knowledge.mv2
-```
-
-Minimal Docker example (WhatsApp + Twilio):
-
-```bash
-docker run --rm -it -p 8080:8080 \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
-  -e ANTHROPIC_MODEL=claude-<model> \
-  -v "$(pwd)/data:/data" \
-  aethervault bridge whatsapp --mv2 /data/knowledge.mv2 --bind 0.0.0.0 --port 8080
-```
-
-Minimal Docker example (Twilio Voice callback bridge):
-
-```bash
-docker run --rm -it -p 8090:8090 \
-  -e TWILIO_ACCOUNT_SID=AC... \
-  -e TWILIO_AUTH_TOKEN=... \
-  -e TWILIO_VOICE_FROM=+15551234567 \
-  -e AETHERVAULT_PUBLIC_BASE_URL=https://linus.example.com \
-  -v "$(pwd)/data:/data" \
-  aethervault bridge voice --mv2 /data/knowledge.mv2 --bind 0.0.0.0 --port 8090
-```
+- a second assistant runtime from this repo
+- connector stacks from this repo
+- machine-specific operational sprawl

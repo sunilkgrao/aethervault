@@ -1,4 +1,4 @@
-# AetherVault -- Owner Context
+# Linus -- Owner Context
 
 > Private-only. Read when interacting personally, planning gifts/events, coordinating family or household logistics, or drafting communications in a Sunil-private context. Never use this file in shared Slack channels, shared threads, or group DMs. For identity, see [SOUL.md](SOUL.md).
 
@@ -17,7 +17,7 @@ Software engineer, technical founder, builder. Builds from scratch. Doesn't buy 
 - **Local airport**: Fort Lauderdale (FLL)
 
 ### What Drives Him
-Self-sovereignty. He wants to own his data, infrastructure, AI stack, and tools. He moved off managed platforms onto his own DigitalOcean droplets. He built AetherVault from the ground up. This isn't just technical preference -- it's a worldview. Respect it. Reinforce it. Help him execute on it.
+Self-sovereignty. He wants to own his data, infrastructure, AI stack, and tools. He moved off managed platforms onto his own DigitalOcean droplets. He built his own assistant stack from the ground up. This isn't just technical preference -- it's a worldview. Respect it. Reinforce it. Help him execute on it.
 
 ### Health
 - **Lipoma removal**: Ongoing / tracked. Don't bring up unprompted, but track updates if he shares them.
@@ -92,8 +92,8 @@ Active process with Circle Surrogacy. Deeply personal and important. Be supporti
   - Company: Tribble.ai (Philippines-based)
   - Handles: Meeting scheduling, pet care coordination, travel planning, vendor coordination, calendar management
   - Access: Slack, company data, calendar
-  - Delegation model: AetherVault analyzes and extracts tasks -> Rhaine executes real-world actions
-  - AetherVault and Rhaine are complementary, not competing.
+  - Delegation model: Linus analyzes and extracts tasks -> Rhaine executes real-world actions
+  - Linus and Rhaine are complementary, not competing.
 
 ### Team Context
 - **Derek** -- Team member (work context)
@@ -137,7 +137,7 @@ Active process with Circle Surrogacy. Deeply personal and important. Be supporti
 
 | Provider | Purpose | Notes |
 |----------|---------|-------|
-| DigitalOcean | Cloud infrastructure | Droplet hosting for AetherVault |
+| DigitalOcean | Cloud infrastructure | Droplet hosting for Linus/OpenClaw |
 | Anthropic | Primary AI (Claude) | Opus 4.6 + Sonnet failover |
 | OpenAI | Codex coding subagent | GPT-5.4 with xhigh reasoning for explicit Codex coding/investigation requests |
 | Anthropic | Claude coding subagent | Claude Code lane for explicit Claude coding/investigation requests and review |
@@ -155,11 +155,11 @@ Active process with Circle Surrogacy. Deeply personal and important. Be supporti
 
 ## Active Projects
 
-### AetherVault (Primary)
-- Rust-powered, memory-persistent AI companion and digital EA
+### Linus (Primary)
+- OpenClaw-based executive assistant and operator
 - Platform: DigitalOcean droplet (clawdbot, 8GB RAM, Ubuntu 24.04)
 - Status: Fully operational, ongoing improvements
-- Migration date: 2026-02-10 (OpenClaw -> AetherVault)
+- Migration date: 2026-02-10 (legacy stack -> OpenClaw-first stack)
 
 ### TachyonGrid
 - Username: linus-1649

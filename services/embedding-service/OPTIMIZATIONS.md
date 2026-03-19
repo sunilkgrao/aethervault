@@ -196,4 +196,4 @@ If we need RAG features:
 3. Implement session manager for multi-tenant use
 4. Add ETag-based model update checking
 
-For now: Service is production-ready for AetherVault's embedding needs.
+For now: the service is production-ready for Linus/OpenClaw embedding needs.

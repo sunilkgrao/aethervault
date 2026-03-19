@@ -18,6 +18,17 @@ Default host order for DS9 local testing:
 
 Do not assume `raoDesktop` is the default lane. Prefer the droplet because it is more reliable and does not depend on Sunil physically re-authing a workstation browser.
 
+Canonical droplet lane:
+- source checkout: `/root/ds9`
+- thread worktrees: `/root/ds9-worktrees`
+- skill helpers: `/root/.openclaw/workspace/skills/ds9-pr-testing/scripts`
+- droplet secret env mirror: `/root/.secrets/local-dev/ds9`
+
+Fallback workstation lane:
+- source checkout: `/home/sunil/ds9`
+- thread worktrees: `/home/sunil/ds9-worktrees`
+- skill helpers: `/home/sunil/.local/share/linus/ds9-pr-testing/scripts`
+
 ## Instruction precedence
 
 If Sunil gives a more explicit debugging or testing order, follow it exactly and treat it as the durable default for similar issue work unless he explicitly overrides it later.
@@ -43,15 +54,16 @@ Rules:
 - when the thread is done and the change is merged or abandoned, remove the worktree and keep the anchor checkout on `main`
 
 Canonical worktree roots:
+- droplet: `/root/ds9-worktrees`
 - macOS: `/Users/sunilrao/dev/ds9-worktrees`
 - `raoDesktop` WSL: `/home/sunil/ds9-worktrees`
 
 Use the thread helper before bootstrapping env/config:
 
 ```bash
-bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/ensure_thread_worktree.sh \
-  "/home/sunil/ds9" \
-  "/home/sunil/ds9-worktrees" \
+bash /root/.openclaw/workspace/skills/ds9-pr-testing/scripts/ensure_thread_worktree.sh \
+  "/root/ds9" \
+  "/root/ds9-worktrees" \
   "slack-<thread-id>" \
   "<issue-slug>"
 ```
@@ -67,6 +79,11 @@ Only after that should you sync env/config into the target worktree and start lo
 ## Canonical variables
 
 ```bash
+if [ -d /root/.openclaw/workspace/skills/ds9-pr-testing/scripts ]; then
+  export SKILL_ROOT=/root/.openclaw/workspace/skills/ds9-pr-testing/scripts
+else
+  export SKILL_ROOT=/home/sunil/.local/share/linus/ds9-pr-testing/scripts
+fi
 export SOURCE_DS9=/path/to/working/ds9
 export TARGET_DS9=/path/to/ds9-pr-under-test
 export ARTIFACT_DIR=/tmp/ds9-pr-test-artifacts
@@ -78,6 +95,7 @@ mkdir -p "$ARTIFACT_DIR"
 - If `TARGET_DS9` does not exist yet, create it as a thread-isolated worktree from `origin/main` using `ensure_thread_worktree.sh`.
 
 Known-good paths on Sunil's machines:
+- droplet source checkout: `/root/ds9`
 - macOS source checkout: `/Users/sunilrao/dev/ds9`
 - `raoDesktop` WSL source checkout: `/home/sunil/ds9`
 
@@ -131,7 +149,7 @@ At minimum, these usually matter:
 Immediately after bootstrap, run the local infra preflight:
 
 ```bash
-bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/preflight_local_infra.sh "$TARGET_DS9"
+bash "$SKILL_ROOT/preflight_local_infra.sh" "$TARGET_DS9"
 ```
 
 This catches the exact failure modes that waste time during local DS9 repro:
@@ -141,6 +159,31 @@ This catches the exact failure modes that waste time during local DS9 repro:
 - the target bug needs spreadsheet/E2E workbook data that the local DB does not actually contain
 
 Do not start guessing about the app until this preflight is clean or the blocker is explicitly acknowledged.
+
+## Droplet local-auth and alternate-port lane
+
+If droplet browser testing is blocked by real Auth0 login or by canonical port collisions:
+
+```bash
+bash "$SKILL_ROOT/prepare_droplet_local_test_lane.sh" "$TARGET_DS9" "sunil@tribble.ai"
+```
+
+That helper will:
+- pick a clean droplet port lane when `3000`, `3001`, `5173`, or `7072` are already occupied
+- apply a local-only DS9 auth overlay to the worktree so UI/backend testing does not require a real Auth0 roundtrip
+- write local env values for the chosen `lcars`, UI, and chat ports
+- print the exact `AUTH_TOKEN`, `LCARS_PORT`, `CHAT_PORT`, `POSITRONIC_FILES_PORT`, and `UI_PORT` to reuse in later commands
+
+Important rules:
+- this overlay is for local validation only and must never be committed or pushed
+- before staging, committing, or opening a PR, revert it:
+
+```bash
+bash "$SKILL_ROOT/revert_local_only_auth_overlay.sh" "$TARGET_DS9"
+```
+
+- if the bug specifically depends on real external login/provider callback behavior, say the droplet auth-bypass lane is not representative and use the right environment instead
+- do not talk about this local-only bypass in shared Slack; only report the actual repro and validation evidence
 
 ## Decide what to run
 
@@ -190,6 +233,8 @@ Machine prerequisites that must already work:
 - Playwright Chromium
 - native libs for PDF / Office / image handling when export flows are involved
 
+When the droplet local-auth lane is available, prefer it over asking Sunil to physically re-auth a workstation browser.
+
 ## Install and migrate
 
 ```bash
@@ -222,7 +267,7 @@ Before chasing app bugs, verify the local DB substrate:
 
 ```bash
 DATABASE_URL="${DATABASE_URL:-postgres://tribbledev@localhost:5432/postgres}" \
-bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/verify_local_ds9_db.sh
+bash "$SKILL_ROOT/verify_local_ds9_db.sh"
 ```
 
 If this check fails, do not claim the local stack is ready. Fix the DB first.
@@ -270,7 +315,7 @@ Examples of failed pivots that should trigger this stop rule:
 
 ## Network access to Azure-backed local services
 
-After syncing the real local config into the workstation checkout, DS9 local dev may still need Azure firewall/network rules opened for the workstation IP.
+After syncing the real local config into the droplet or workstation checkout, DS9 local dev may still need Azure firewall/network rules opened for the current machine IP.
 
 From the repo root on the workstation:
 
@@ -293,7 +338,7 @@ If `setupNetworkRulesDev.sh` fails while parsing `.env` or hits stale Azure CLI 
 
 ```bash
 cd "$TARGET_DS9"
-python3 /home/sunil/.local/share/linus/ds9-pr-testing/scripts/setup_network_rules_dev_safe.py
+python3 "$SKILL_ROOT/setup_network_rules_dev_safe.py"
 ```
 
 This helper:
@@ -311,7 +356,7 @@ Use separate PTYs or terminals so logs stay readable.
 Before starting the UI, make local chat deterministic:
 
 ```bash
-bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/prepare_lcars_local_chat_env.sh "$TARGET_DS9"
+bash "$SKILL_ROOT/prepare_lcars_local_chat_env.sh" "$TARGET_DS9"
 ```
 
 Why this matters:
@@ -330,8 +375,8 @@ cd "$TARGET_DS9/Q" && nvm use "$(cat .node-version)" && npm run dev
 cd "$TARGET_DS9/apps/exocomp" && nvm use 20.19.0 && PORT=3091 npm run dev
 cd "$TARGET_DS9/tribble-chat" && nvm use 20.19.0 && npm run dev
 cd "$TARGET_DS9/positronic-files" && nvm use 20.19.0 && npm run dev
-bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/start_lcars_canonical_local.sh "$TARGET_DS9" server
-bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/start_lcars_canonical_local.sh "$TARGET_DS9" ui
+bash "$SKILL_ROOT/start_lcars_canonical_local.sh" "$TARGET_DS9" server
+bash "$SKILL_ROOT/start_lcars_canonical_local.sh" "$TARGET_DS9" ui
 ```
 
 Expected ports:
@@ -370,7 +415,7 @@ Use the bundled verifier:
 
 ```bash
 REQUIRED_PORTS="50051 50061 3000 3091 7072 3001" \
-bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/verify_stack.sh
+bash "$SKILL_ROOT/verify_stack.sh"
 ```
 
 That checks listeners, `positronic-files` health, and the canonical UI origin.
@@ -378,14 +423,14 @@ That checks listeners, `positronic-files` health, and the canonical UI origin.
 If you have a real valid bearer token from the authenticated browser session, you may also pass:
 
 ```bash
-AUTH_TOKEN="<real bearer token>" bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/verify_stack.sh
+AUTH_TOKEN="<real bearer token>" bash "$SKILL_ROOT/verify_stack.sh"
 ```
 
 For chat-based DS9 validation, also require the authenticated browser to prove the chat box is actually usable:
 
 ```bash
 TARGET_DS9="$TARGET_DS9" \
-bash /home/sunil/.local/share/linus/ds9-pr-testing/scripts/assert_chat_ready_via_cdp.sh
+bash "$SKILL_ROOT/assert_chat_ready_via_cdp.sh"
 ```
 
 This attaches to the Windows Chrome CDP session, opens the blue chat critter if needed, and verifies:
@@ -536,6 +581,23 @@ If you only validated:
 - embeddings or metadata existing in SQL
 
 then the PR was **not** fully E2E tested yet. Say `build passed`, `typecheck passed`, `backend validated locally`, or `UI setup validated`, but do not say `tested` without the real chat/user flow.
+
+## Questionnaire / Answer-Generation Truth
+
+For DS9 questionnaire and workbook flows, “fully locally tested” means more than upload or analysis. Require the actual answer path and export path.
+
+Minimum proof:
+1. the required local services for that route are running, including every touched answer-generation dependency, not just `lcars` and `Q`
+2. the source document or brain surface used for retrieval is present locally and reachable by the agent flow
+3. question extraction completed for the local project
+4. answer generation ran through the real product path
+5. the resulting answers are visible in the UI or persisted in the expected answer-entry tables
+6. the exported workbook/file was opened and inspected
+7. the exported cells or sections contain the expected answers
+8. screenshots or artifacts exist for both the source surface and the answered/exported result
+
+If retrieval only produced null-source or placeholder answers, do not call the workflow proven even if export technically succeeded.
+If export succeeded only after manual DB backfills, say exactly that; it proves a partial lane, not a hands-off product proof.
 
 If the local environment does not contain the original customer documents, create a realistic synthetic document and prove the exact behavior against that mock. Be explicit that the original customer data was not reproduced locally.
 

@@ -103,7 +103,7 @@ The repo should converge toward this shape:
 - OpenClaw upstream handles the canonical runtime, channels, sandboxing, and session model.
 - This repo only keeps Linus-specific migration and memory/state export long enough to complete cutover cleanly.
 - `docs/` stays small and explicit about what is upstream OpenClaw versus what is Linus-specific.
-- Historical AetherVault behavior is retained only long enough to export/import data safely.
+- Legacy runtime behavior is retained only long enough to export/import data safely.
 
 If a subsystem does not clearly support the executive-assistant product, it should be split, archived, or demoted from the main path.
 

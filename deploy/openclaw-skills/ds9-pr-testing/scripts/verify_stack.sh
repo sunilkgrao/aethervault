@@ -2,8 +2,11 @@
 set -euo pipefail
 
 AUTH_TOKEN="${AUTH_TOKEN:-}"
-REQUIRED_PORTS="${REQUIRED_PORTS:-50051 50061 3000 3091 7072 3001}"
+LCARS_PORT="${LCARS_PORT:-3000}"
+CHAT_PORT="${CHAT_PORT:-3001}"
+POSITRONIC_FILES_PORT="${POSITRONIC_FILES_PORT:-7072}"
 UI_PORT="${UI_PORT:-5173}"
+REQUIRED_PORTS="${REQUIRED_PORTS:-50051 50061 ${LCARS_PORT} 3091 ${POSITRONIC_FILES_PORT} ${CHAT_PORT}}"
 DATABASE_URL="${DATABASE_URL:-postgres://tribbledev@localhost:5432/postgres}"
 VERIFY_CHAT_READY="${VERIFY_CHAT_READY:-0}"
 TARGET_DS9="${TARGET_DS9:-}"
@@ -22,7 +25,7 @@ lsof_args=()
 for port in $REQUIRED_PORTS; do
   lsof_args+=("-iTCP:${port}")
 done
-lsof_args+=("-iTCP:${UI_PORT}" "-iTCP:5174" "-sTCP:LISTEN")
+lsof_args+=("-iTCP:${UI_PORT}" "-sTCP:LISTEN")
 lsof -nP "${lsof_args[@]}" || true
 
 missing=0
@@ -38,13 +41,9 @@ if ! lsof -nP -iTCP:"$UI_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   missing=1
 fi
 
-if lsof -nP -iTCP:5174 -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "warning: unexpected listener on port 5174; authenticated local auth may break if the browser uses that origin" >&2
-fi
-
 echo
 echo "== positronic-files health =="
-curl -fsS http://127.0.0.1:7072/api/health
+curl -fsS "http://127.0.0.1:${POSITRONIC_FILES_PORT}/api/health"
 echo
 
 echo
@@ -62,12 +61,12 @@ echo
 if [[ -n "$AUTH_TOKEN" ]]; then
   echo
   echo "== lcars user detail =="
-  curl -i -s http://127.0.0.1:3000/api/user_detail \
+  curl -i -s "http://127.0.0.1:${LCARS_PORT}/api/user_detail" \
     -H "Authorization: Bearer $AUTH_TOKEN"
   echo
   echo
   echo "== lcars projects =="
-  curl -s http://127.0.0.1:3000/api/projects \
+  curl -s "http://127.0.0.1:${LCARS_PORT}/api/projects" \
     -H "Authorization: Bearer $AUTH_TOKEN"
   echo
 fi

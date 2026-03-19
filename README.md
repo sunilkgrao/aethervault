@@ -1,316 +1,68 @@
-# Linus Legacy Migration Utility
+# Clawdbot Migration Utility
 
-This repository is no longer the intended runtime for Linus.
+This repo exists to keep the Linus stack clean during and after the OpenClaw cutover.
 
-The target end state is:
-- upstream **OpenClaw** as the only live runtime
-- a clean `~/.openclaw/workspace/` with Linus memory and state
-- this Rust code used only to export legacy AetherVault data safely
+It has three jobs:
+- export durable assistant state into an OpenClaw workspace
+- keep the Linus/OpenClaw doc surface coherent
+- preserve and improve the specific skills that still matter
 
-If you are looking for the runtime, use upstream OpenClaw.
-If you are looking for the bridge off the old system without losing memory, use this repo.
+This repo does not own the live runtime. Upstream OpenClaw does.
 
-## What This Repo Still Does
+## Start Here
 
-- **Memory is portable, auditable, and mergeable**: everything (content + indexes + query/feedback traces) lives in one capsule you can diff/merge like a repo.
-- **Queries are first‑class memory**: searches, expansions, reranks, and feedback are stored as frames, so the system improves while staying explainable.
-- **Hybrid retrieval by design**: expansion → lex + vec lanes → fusion → rerank → blend, with hook points for local or remote models.
-- **Time‑travel retrieval**: "what did the agent know at time T?" is a built‑in query mode.
-- **One-time export path**: move Linus memory/state/history into an OpenClaw workspace without dropping durable context.
+Read these files first:
+- `docs/SOURCE-OF-TRUTH.md`
+- `FINAL_STATE.md`
+- `docs/OPENCLAW_REFOUND.md`
+- `AGENTS.md`
 
-## Transitional Shape
-
-```mermaid
-flowchart LR
-  A[Legacy AetherVault Data] --> B[linus-migrate exporter]
-  B --> C[OpenClaw workspace files]
-  C --> D[Upstream OpenClaw runtime]
-```
-
-```mermaid
-flowchart TB
-  CAP[Legacy capsule + workspace]
-  CAP --> EXP[linus-migrate export-open-claw]
-  EXP --> WS[~/.openclaw/workspace]
-  WS --> OC[OpenClaw]
-```
-
-## Design docs
-
-- `docs/ARCHITECTURE.md`
-- `FINAL_STATE.md` for the product north star
-- `docs/OPENCLAW_REFOUND.md` for the clean-slate migration target onto upstream OpenClaw
-
-## Quick start
+## Core Command
 
 ```bash
 cargo build --locked
 
-./target/debug/linus-migrate export-open-claw /path/to/memory.mv2 \
+cargo run --bin linus-migrate -- export-open-claw /path/to/memory.mv2 \
   --workspace ~/.openclaw/workspace
 ```
 
-The goal is to get these files into `~/.openclaw/workspace/`:
+The export target is a clean OpenClaw workspace containing:
 - `SOUL.md`
 - `USER.md`
 - `MEMORY.md`
 - `STATE.md`
 - `STATE.json`
-- legacy logs/sessions under `imports/legacy-aethervault/`
+- imported logs and transcripts under `imports/legacy-runtime/`
 
-## What not to do
+## What Belongs In This Repo
 
-- Do not treat this binary as the future OpenClaw runtime.
-- Do not keep adding AetherVault bridge/runtime behavior here.
-- Do not dual-maintain two assistant brains.
+- migration/export code
+- state and memory portability logic
+- Linus/OpenClaw architecture docs
+- ported skill docs and validation doctrine
 
-## Transitional commands
+## What Does Not Belong In This Repo
 
-- `--json` returns a structured plan + results payload.
-- `--files` emits tab‑separated `score,frame_id,uri,title`.
-- `--log` appends the query + ranked results back into the capsule as an auditable frame.
-- `embed` precomputes local embeddings for fast vector retrieval.
-- `context` builds a prompt‑ready JSON pack (context + citations + plan).
-- `log` records agent turns in the capsule for later audits.
-- `feedback` records explicit relevance feedback to bias future rankings.
-- `config` stores portable capsule config at `aethervault://config/...`.
-- `diff` / `merge` provide git‑like ops for capsules.
-- `mcp` starts a stdio tool server.
-- `agent` runs a minimal hook‑based assistant loop.
-- `bridge` runs Rust‑native Telegram/WhatsApp connectors.
-- `bootstrap` scaffolds soul + memory workspace and writes default agent config.
-- `schedule` runs daily/weekly autonomous briefings (Telegram optional).
-- `watch` runs event-driven triggers (email/calendar).
-- `exec` tool executes host commands (host mode default; wrap with `AETHERVAULT_COMMAND_WRAPPER` for sandboxing).
-- `connect` runs a built-in OAuth broker for Google/Microsoft tokens.
-- Gmail/Calendar and Microsoft mail/calendar tools are available after OAuth (`gmail_*`, `gcal_*`, `ms_*`).
-- `http_request` provides a generic API surface (non-GET requires approval).
-- `browser` provides CLI-based browser automation via agent-browser (ref-based element selection, named sessions).
-- `fs_list`, `fs_read`, `fs_write` give controlled filesystem access within allowed roots.
-- `phone_call` / `phone_call_status` provide approval-gated outbound calling backed by Twilio Voice, with optional structured answer capture when the voice callback bridge is running.
-- Sensitive tools require approval; reply `approve <id>` or `reject <id>` when prompted.
-- `tool_search` enables dynamic tool lookup (no bloated prompt).
-- `session_context` fetches recent session logs efficiently.
-- `agent-logs` exports persisted agent logs by session/date for audits and offline jobs.
-- `state_focus` / `state_list` / `state_capture` / `state_close` maintain live executive state (`STATE`) for priorities, follow-ups, and waiting-fors.
-- `reflect` stores self-critique in the capsule for iterative improvement.
-- `skill_store` / `skill_search` capture reusable procedures.
-- `subagent_list` / `subagent_invoke` / `subagent_batch` provide elastic multi-session orchestration; the core agent can decide when to spin up zero, one, or many specialists.
-- `compact` runs vacuum compaction + index rebuilds (SOTA maintenance).
-- `doctor` exposes full repair/verify controls.
+- a second runtime
+- bespoke connector ownership
+- environment-specific operational sprawl
+- duplicate memory/state doctrines
+- stale docs kept around after the doctrine changed
 
-## Deployment and connectors
+## Ported Skill Surface
 
-- `docs/DEPLOYMENT.md` for local, Docker, and cloud deployment.
-- `docs/CONNECTORS.md` for Telegram, WhatsApp, Twilio Voice callbacks, and multi-session worker orchestration.
-- Rust‑native connectors are built in (`bridge`).
-- Optional: Himalaya integration enables `email_*` tools for Gmail IMAP workflows.
-- `notify`, `signal_send`, `imessage_send` provide outbound messaging helpers.
-- Approval gates remain enforced for sensitive tools, including bridge-triggered actions.
-- Set `AETHERVAULT_FS_ROOTS` to restrict filesystem tools.
-- Browser automation requires `agent-browser` CLI installed (`npm install -g agent-browser`).
-- Set `AETHERVAULT_BROWSER_ENDPOINT` to a local browser broker.
-- Set `AETHERVAULT_BRIDGE_TIMEOUT_SECS=0` to disable the default 15-minute wall-clock timeout for bridge runs.
+The kept operational skill surface lives under `deploy/openclaw-skills/`:
+- `ds9-triage`
+- `ds9-pr-testing`
+- `ds9-prod-debug`
+- `slack-media-analysis`
+- `tribble-desktop-triage`
+- `jira-eng-board`
 
-## Maintenance (SOTA compaction)
+Additional reusable skills under `skills/` should stay current, product-accurate, and OpenClaw-native.
 
-```bash
-./target/release/aethervault compact knowledge.mv2
-```
+## Development Rules
 
-For full control:
-
-```bash
-./target/release/aethervault doctor knowledge.mv2 --vacuum --rebuild-time --rebuild-lex --rebuild-vec
-./target/release/aethervault doctor knowledge.mv2 --dry-run --json
-```
-
-## URI schemes
-
-- `aether://<collection>/<path>` for content
-- `aethervault://config/<key>` for portable capsule config
-
-## Optional vector lane
-
-Build with vector support and provide local embedding models:
-
-```bash
-cargo build --locked --features vec
-```
-
-The embed backend prints a download command if the ONNX model/tokenizer is missing.
-Tune performance with `embed --batch N` and query flags like `--embed-cache`.
-
-## Agent hook (minimal harness)
-
-`agent` expects a hook command that reads JSON on stdin and returns JSON:
-
-```bash
-./target/debug/aethervault agent knowledge.mv2 --model-hook builtin:claude
-```
-
-`builtin:claude` runs the Rust hook in‑process (no subprocess).
-
-## Workspace (Soul + State)
-
-The agent can optionally read `SOUL.md`, `USER.md`, `STATE.md`, and a daily log in `memory/YYYY-MM-DD.md`
-from a workspace directory (default `./assistant` or `AETHERVAULT_WORKSPACE`). `MEMORY.md` remains the durable
-fact store, but the runtime no longer injects the whole file into every prompt; live priorities and open loops come
-from `STATE`. Workspace memory/state writes via tools are mirrored into the capsule under `aethervault://memory/*`
-so the single‑file `.mv2` remains the source of truth.
-
-Bootstrap creates templates and writes config:
-
-```bash
-./target/release/aethervault bootstrap knowledge.mv2 --workspace ./assistant
-```
-
-## Autonomous scheduling
-
-Run daily/weekly briefings (Telegram delivery optional):
-
-```bash
-export TELEGRAM_BOT_TOKEN=123456:ABC
-export AETHERVAULT_TELEGRAM_CHAT_ID=123456789
-
-./target/release/aethervault schedule knowledge.mv2 --workspace ./assistant --model-hook builtin:claude
-```
-
-For longer tool‑using sessions, raise the step budget:
-
-```bash
-./target/release/aethervault agent knowledge.mv2 --model-hook builtin:claude --max-steps 128 --log-commit-interval 8
-```
-
-See `docs/ARCHITECTURE.md` for the hook payload shapes.
-
-## Claude hook (Anthropic)
-
-Set env vars and run the agent with the hook:
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-export ANTHROPIC_MODEL=claude-<model>
-export ANTHROPIC_MAX_TOKENS=1024
-
-./target/release/aethervault agent knowledge.mv2 --model-hook builtin:claude
-```
-
-Optional hook env vars: `ANTHROPIC_BASE_URL`, `ANTHROPIC_TEMPERATURE`, `ANTHROPIC_TOP_P`,
-`ANTHROPIC_TIMEOUT`, `ANTHROPIC_MAX_RETRIES`.
-Performance toggles: `ANTHROPIC_PROMPT_CACHE=1`, `ANTHROPIC_PROMPT_CACHE_TTL=5m`,
-`ANTHROPIC_TOKEN_EFFICIENT=1` (token‑efficient tools beta).
-
-Optional: persist the hook in the capsule config so you can omit `--model-hook`:
-
-```bash
-./target/release/aethervault config set --key index --json '{
-  "agent": {
-    "model_hook": { "command": "builtin:claude", "timeout_ms": 60000 },
-    "log": true,
-    "max_steps": 128,
-    "log_commit_interval": 1
-  }
-}'
-```
-
-Note: `log_commit_interval=1` fsyncs each log entry (best durability). Increasing it improves throughput but can lose the last N log entries on a crash.
-
-## Docker deploy (minimal)
-
-Build and run the CLI in a container (mount a capsule at `/data`):
-
-```bash
-docker build -t aethervault .
-docker run --rm -it -v "$(pwd)/data:/data" aethervault init /data/knowledge.mv2
-docker run --rm -it -v "$(pwd)/data:/data" aethervault mcp /data/knowledge.mv2
-```
-
-Or with Compose:
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-export ANTHROPIC_MODEL=claude-<model>
-docker compose up --build
-```
-
-If you want to run the Claude hook inside the container, you can use the built‑in Rust hook:
-
-```bash
-docker build -t aethervault .
-docker run --rm -it \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
-  -e ANTHROPIC_MODEL=claude-<model> \
-  -v "$(pwd)/data:/data" \
-  aethervault agent /data/knowledge.mv2 --model-hook builtin:claude
-```
-
-## Implemented roadmap
-
-- Optional vector search lane with on‑device embeddings (default build is lex‑only).
-- Pluggable reranker + expansion hooks (drop‑in local or remote).
-- MCP‑compatible tool server backed by the capsule.
-- Portable capsule config stored at `aethervault://config/...`.
-- Capsule diff + merge tooling (git‑like for memory).
-
----
-
-## Automation Layer
-
-The Python layer is now deliberately narrow: it should consume the same workspace state and capsule-backed memory contract as the Rust runtime, not invent a parallel product.
-
-### What stays in Python
-
-- `knowledge-graph.py` enriches entity and relationship context.
-- `scripts/morning-briefing.py`, `scripts/proactive-checkin.py`, and `scripts/nightly-consolidation.py` are scheduled jobs around the same `STATE` and `MEMORY` contract used by the interactive agent.
-- `scripts/session-manager.py` and `scripts/capabilities.py` remain operational helpers.
-- `scripts/notifier.py` centralizes outbound Telegram delivery for lifecycle jobs.
-
-### Optional provider adapters
-
-`vertex_proxy.py`, `moonshot_proxy.py`, `llama_proxy.py`, and `start_services.sh` are optional infrastructure for model routing. They are not the assistant itself.
-
-### Automation quick start
-
-```bash
-pip install -r requirements-core.txt
-
-# Optional model/provider adapters
-# Enable only the adapters you want in ~/.aethervault/.env:
-# ENABLE_VERTEX_PROXY=1
-# ENABLE_MOONSHOT_PROXY=1
-# ENABLE_LLAMA_TUNNEL=1
-bash start_services.sh
-
-# Example cron entries
-# 0 8 * * 1-5 /path/to/repo/scripts/morning-briefing.sh
-# 0 20 * * * /path/to/repo/scripts/proactive-checkin.sh
-# 0 3 * * * /path/to/repo/scripts/nightly-consolidation.sh
-```
-
-### Configuration
-
-Copy `config/env.example` to `~/.aethervault/.env` and edit it. Runtime configuration comes from capsule config (`aethervault://config/*`) plus the workspace files such as `SYSTEM.md`, `SOUL.md`, `USER.md`, `MEMORY.md`, and `STATE`.
-
-See `config/env.example` for the supported environment variables and defaults.
-
-### Repository shape
-
-```
-.
-├── src/                        # Rust runtime and harness
-├── scripts/                    # Scheduled jobs and operational helpers
-├── services/                   # Optional infrastructure, e.g. embedding service
-├── config/                     # Env templates and runtime config
-├── docs/                       # Canonical docs
-├── knowledge-graph.py          # Entity/relationship enrichment
-├── vertex_proxy.py             # Optional Vertex adapter
-├── moonshot_proxy.py           # Optional Moonshot/Kimi adapter
-├── llama_proxy.py              # Optional llama.cpp adapter
-├── start_services.sh           # Starts optional provider adapters
-└── requirements-core.txt       # Python automation dependencies
-```
-
-## License
-
-MIT License. See [LICENSE](LICENSE).
+- prefer small, targeted diffs
+- update the authoritative docs when architecture or workflow assumptions change
+- do not reintroduce old runtime vocabulary, old service assumptions, or split-brain docs

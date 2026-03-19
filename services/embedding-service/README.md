@@ -115,9 +115,9 @@ Response:
 }
 ```
 
-## AetherVault Integration
+## OpenClaw Integration
 
-Update your `aethervault.json`:
+Update your runtime embedding config:
 
 ```json
 {
@@ -137,9 +137,9 @@ Update your `aethervault.json`:
 }
 ```
 
-Then restart AetherVault:
+Then restart the runtime:
 ```bash
-aethervault gateway restart
+# restart your local runtime process
 ```
 
 ## Systemd Service
@@ -215,8 +215,8 @@ sudo journalctl -u embedding-service -n 50
 npm run build && npm start
 ```
 
-### AetherVault not connecting
+### Runtime not connecting
 
 1. Verify service is running: `curl http://localhost:11435/health`
-2. Check AetherVault config has correct `baseUrl`
-3. Restart AetherVault: `aethervault gateway restart`
+2. Check the runtime config has the correct `baseUrl`
+3. Restart the runtime process

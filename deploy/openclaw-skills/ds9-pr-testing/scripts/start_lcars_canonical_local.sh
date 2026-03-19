@@ -10,6 +10,9 @@ TARGET_DS9="$1"
 MODE="$2"
 LCARS_DIR="$TARGET_DS9/lcars"
 UI_DIR="$LCARS_DIR/ui"
+LCARS_PORT="${LCARS_PORT:-3000}"
+UI_PORT="${UI_PORT:-5173}"
+UI_HOST="${UI_HOST:-localhost}"
 
 if [[ ! -d "$LCARS_DIR" || ! -d "$UI_DIR" ]]; then
   echo "missing lcars/ui under $TARGET_DS9" >&2
@@ -25,18 +28,14 @@ case "$MODE" in
   server)
     cd "$LCARS_DIR"
     nvm use "$(cat ../.node-version)" >/dev/null
-    echo "starting lcars backend from $LCARS_DIR"
-    exec npm run dev:server
+    echo "starting lcars backend from $LCARS_DIR on http://localhost:${LCARS_PORT}"
+    exec env PORT="$LCARS_PORT" npm run dev:server
     ;;
   ui)
-    # Auth0 local dev only works reliably when the UI origin is the canonical
-    # localhost callback origin. Clear stale Vite listeners first so strictPort
-    # can enforce that origin.
-    kill_port 5173
-    kill_port 5174
+    kill_port "$UI_PORT"
     cd "$UI_DIR"
-    echo "starting lcars ui from $UI_DIR on http://localhost:5173"
-    exec npm run dev -- --host localhost --port 5173 --strictPort
+    echo "starting lcars ui from $UI_DIR on http://${UI_HOST}:${UI_PORT} -> http://localhost:${LCARS_PORT}"
+    exec env VITE_LOCAL_API_ORIGIN="http://localhost:${LCARS_PORT}" npm run dev -- --host "$UI_HOST" --port "$UI_PORT" --strictPort
     ;;
   *)
     echo "invalid mode: $MODE (expected server or ui)" >&2
