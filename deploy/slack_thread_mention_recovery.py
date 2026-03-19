@@ -7,6 +7,7 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -85,11 +86,18 @@ def slack_post_message(channel: str, text: str, thread_ts: str | None = None) ->
 
 def load_state() -> dict[str, Any]:
     if not STATE_PATH.exists():
-        return {"handled": {}}
+        return {"handled": {}, "lineage": {}}
     try:
-        return json.loads(STATE_PATH.read_text())
+        state = json.loads(STATE_PATH.read_text())
     except Exception:
-        return {"handled": {}}
+        return {"handled": {}, "lineage": {}}
+    if not isinstance(state, dict):
+        return {"handled": {}, "lineage": {}}
+    if not isinstance(state.get("handled"), dict):
+        state["handled"] = {}
+    if not isinstance(state.get("lineage"), dict):
+        state["lineage"] = {}
+    return state
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -104,6 +112,20 @@ def ts_value(value: str | None) -> float:
         return float(value)
     except Exception:
         return 0.0
+
+
+def sanitize_session_component(value: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in value)
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return cleaned or "surface"
+
+
+def lineage_session_id(prefix: str, *parts: str) -> str:
+    raw = "::".join(parts)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    slug = "-".join(sanitize_session_component(part)[:24] for part in parts if part)
+    slug = slug[:48].strip("-") or prefix
+    return f"{prefix}-{slug}-{digest}"
 
 
 def discover_channel_ids() -> list[str]:
@@ -306,7 +328,7 @@ def build_prompt(channel_id: str, channel_name: str, root: dict[str, Any], reply
     return "\n".join(lines)
 
 
-def run_agent(prompt: str) -> str:
+def run_agent(prompt: str, session_id: str) -> str:
     env = os.environ.copy()
     proc = subprocess.run(
         [
@@ -315,6 +337,8 @@ def run_agent(prompt: str) -> str:
             "--agent",
             "main",
             "--local",
+            "--session-id",
+            session_id,
             "--message",
             prompt,
             "--json",
@@ -336,11 +360,12 @@ def run_agent(prompt: str) -> str:
     return texts[-1]
 
 
-def process_candidate(channel_id: str, channel_name: str, root: dict[str, Any], reply: dict[str, Any], thread: list[dict[str, Any]]) -> str:
+def process_candidate(channel_id: str, channel_name: str, root: dict[str, Any], reply: dict[str, Any], thread: list[dict[str, Any]]) -> tuple[str, str]:
     thread_ts = str(root["ts"])
     media_summary = maybe_build_media_summary(channel_id, thread_ts)
     prompt = build_prompt(channel_id, channel_name, root, reply, thread, media_summary)
-    return run_agent(prompt)
+    session_id = lineage_session_id("slack-thread", channel_id, thread_ts)
+    return run_agent(prompt, session_id), session_id
 
 
 def main() -> int:
@@ -356,6 +381,7 @@ def main() -> int:
             log("thread-recovery: builtin gateway thread poll detected; threaded recovery idle, root recovery active")
         state = load_state()
         handled = state.setdefault("handled", {})
+        lineage = state.setdefault("lineage", {})
         channel_ids = discover_channel_ids()
         if channel_ids:
             log(f"thread-recovery: scanning {len(channel_ids)} channels")
@@ -372,17 +398,36 @@ def main() -> int:
                         if handled.get(state_key) == reply_ts:
                             continue
                         thread = thread_messages(channel_id, str(root["ts"]))
+                        session_id = lineage_session_id("slack-thread", channel_id, str(root["ts"]))
                         if has_bot_reply_after(thread, reply_ts, bot_user_id):
                             handled[state_key] = reply_ts
+                            lineage[state_key] = {
+                                "surface": "slack-thread",
+                                "channel_id": channel_id,
+                                "channel_name": channel_name,
+                                "thread_ts": str(root["ts"]),
+                                "session_id": session_id,
+                                "last_user_ts": reply_ts,
+                                "last_sent_ts": lineage.get(state_key, {}).get("last_sent_ts"),
+                            }
                             save_state(state)
                             log(
                                 f"thread-recovery: skipping channel={channel_name} thread={root['ts']} ts={reply_ts} because bot already replied"
                             )
                             continue
                         log(f"thread-recovery: handling missed threaded mention channel={channel_name} thread={root['ts']} ts={reply_ts}")
-                        response = process_candidate(channel_id, channel_name, root, reply, thread)
+                        response, session_id = process_candidate(channel_id, channel_name, root, reply, thread)
                         sent_ts = slack_post_message(channel_id, response, thread_ts=str(root["ts"]))
                         handled[state_key] = reply_ts
+                        lineage[state_key] = {
+                            "surface": "slack-thread",
+                            "channel_id": channel_id,
+                            "channel_name": channel_name,
+                            "thread_ts": str(root["ts"]),
+                            "session_id": session_id,
+                            "last_user_ts": reply_ts,
+                            "last_sent_ts": sent_ts,
+                        }
                         save_state(state)
                         log(f"thread-recovery: posted threaded reply ts={sent_ts}")
                 for root in recent_root_candidates(channel_id, bot_user_id):
@@ -391,17 +436,36 @@ def main() -> int:
                     if handled.get(state_key) == root_ts:
                         continue
                     thread = thread_messages(channel_id, root_ts)
+                    session_id = lineage_session_id("slack-thread", channel_id, root_ts)
                     if has_bot_reply_after(thread, root_ts, bot_user_id):
                         handled[state_key] = root_ts
+                        lineage[state_key] = {
+                            "surface": "slack-thread",
+                            "channel_id": channel_id,
+                            "channel_name": channel_name,
+                            "thread_ts": root_ts,
+                            "session_id": session_id,
+                            "last_user_ts": root_ts,
+                            "last_sent_ts": lineage.get(state_key, {}).get("last_sent_ts"),
+                        }
                         save_state(state)
                         log(
                             f"thread-recovery: skipping channel={channel_name} root={root_ts} because bot already replied"
                         )
                         continue
                     log(f"thread-recovery: handling missed root mention channel={channel_name} thread={root_ts}")
-                    response = process_candidate(channel_id, channel_name, root, root, thread)
+                    response, session_id = process_candidate(channel_id, channel_name, root, root, thread)
                     sent_ts = slack_post_message(channel_id, response, thread_ts=root_ts)
                     handled[state_key] = root_ts
+                    lineage[state_key] = {
+                        "surface": "slack-thread",
+                        "channel_id": channel_id,
+                        "channel_name": channel_name,
+                        "thread_ts": root_ts,
+                        "session_id": session_id,
+                        "last_user_ts": root_ts,
+                        "last_sent_ts": sent_ts,
+                    }
                     save_state(state)
                     log(f"thread-recovery: posted root reply ts={sent_ts}")
             except Exception as err:
